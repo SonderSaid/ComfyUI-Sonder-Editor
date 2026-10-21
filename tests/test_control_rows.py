@@ -249,6 +249,20 @@ def test_sdk_candidates_list_the_group_once_instead_of_its_fields():
     assert ("2", "loras") in [(c["path"], c["input"]) for c in cd.sdk_candidates(prompt([]), lookup)]
 
 
+def test_the_app_runner_offers_the_group_from_comfyuis_registry(monkeypatch):
+    # sdk_routes builds the runner without a class lookup; + Setting must still see the group.
+    from server import sdk_runner
+
+    monkeypatch.setattr(cd, "_comfy_class_lookup", lookup)
+    runner = sdk_runner.SdkRunner()
+    try:
+        inventory = runner._inventory(prompt([], bindings={}))
+    finally:
+        runner.close()
+    entry = next(e for e in inventory if (e["path"], e["input"]) == ("2", "loras"))
+    assert (entry["status"], entry["kind"]) == ("ok", "ROWS")
+
+
 def test_inventory_offers_the_group_and_refuses_fields():
     p = prompt(bindings={})
     inventory = cd.candidate_inventory(p, [{"path": "2", "input": "loras", "targets": [{"path": "2", "input": "loras"}]},

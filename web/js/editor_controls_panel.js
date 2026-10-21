@@ -9,7 +9,7 @@ import { EDITOR_PARTITION, comparePanelRows, canArrange, planPanelMove } from ".
 import { moveToGroupItems, openGroupMenu, startGroupRename } from "./controls_panel_groups.js";
 import { changesRun } from "./control_targets.js";
 import { openContextMenu } from "./editor_context_menu.js";
-import { disclosureKey, entryVisible, groupPlan, hasAdvanced, hiddenAdvanced, matchEntry, noteDisclosureKey } from "./controls_panel_view.js";
+import { disclosureKey, entryVisible, groupPlan, hasAdvanced, hasNotes, hiddenAdvanced, hiddenNotes, matchEntry, noteDisclosureKey, noteShown } from "./controls_panel_view.js";
 import * as S from "./controls_panel_style.js";
 import { renderPanelMarkdown, splitPanelMarkdownTitle } from "./panel_markdown.js";
 import { createDisclosureMemory } from "./disclosure_memory.js";
@@ -124,6 +124,9 @@ export function mountControlsPanel(container, host) {
     const settings = () => host.getEditorSettings?.() || {};
     const cards = () => !manageOn && settings().controls?.view === "cards";
     const showAdvanced = () => settings().controls?.showAdvanced === true;
+    const showNotes = () => settings().controls?.showNotes !== false;
+    // Whether a displayed Control shows its note now (Show notes, search, Manage).
+    const notesShown = () => noteShown({ query, showNotes: showNotes(), manage: manageOn });
     // Target -> reason of its latest refused or unconfirmed save, shown on the row
     // until a newer save of it succeeds or an authoritative view arrives.
     const failed = new Map();
@@ -137,7 +140,7 @@ export function mountControlsPanel(container, host) {
     container.style.cssText = `display:flex;flex-direction:column;flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;padding:${SPACE.s3}px;gap:${SPACE.s2}px;font:${TYPE.t12}px ${FONT.sans};color:${COLORS.text};`;
     applyNativeControlTheme(container);
 
-    // Header: search, a discreet Manage toggle, and the hidden-Advanced line.
+    // Header: search, a discreet Manage toggle, and the Advanced and notes lines.
     const header = make("div");
     // Sticky, so search and Manage stay in reach in a long list.
     header.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;position:sticky;top:-${SPACE.s3}px;z-index:1;`
@@ -172,6 +175,15 @@ export function mountControlsPanel(container, host) {
     quietLine.dataset.controlsAdvancedLine = "true";
     quietLine.style.cssText = S.quietLineCss;
     quietLine.addEventListener("click", () => writeSetting("controls.showAdvanced", !showAdvanced()));
+    const notesLine = make("button");
+    notesLine.type = "button";
+    notesLine.dataset.controlsNotesLine = "true";
+    notesLine.style.cssText = S.quietLineCss;
+    notesLine.addEventListener("click", () => writeSetting("controls.showNotes", !showNotes()));
+    // Both lines share one row, so turning on Advanced adds no second line of chrome.
+    const quietRow = make("div");
+    quietRow.style.cssText = `flex-wrap:wrap;align-items:baseline;column-gap:${SPACE.s3}px;row-gap:${SPACE.s1}px;`;
+    quietRow.append(quietLine, notesLine);
     const presets = mountPresets(host, {flushPending: () => flushPending(), track, notify: reason => warning(reason),
         // Switching workflows remounts the panel: Manage drafts would be lost.
         canSwitch: () => {
@@ -185,7 +197,7 @@ export function mountControlsPanel(container, host) {
     header.append(headerTop);
     container.append(header);
     header.after(presets.el);
-    presets.el.after(quietLine);
+    presets.el.after(quietRow);
     const restore = mountRestore(host, {flushPending: () => flushPending(), track: work => track(work),
         notify: reason => warning(reason), rebind: row => { setManage(true); manage?.setRebind(row); }});
     header.after(restore.el);
@@ -1164,7 +1176,7 @@ export function mountControlsPanel(container, host) {
                 row.note.title = manageOn ? "Double-click to edit" : "";
                 // A binding's empty note takes no space (Manage adds one through its Note action).
                 row.note.style.fontStyle = "normal";
-                row.note.style.display = row.noteText ? "" : "none";
+                row.note.style.display = row.noteText && notesShown() ? "" : "none";
                 clampNote(row);
             }
         }
@@ -1176,7 +1188,7 @@ export function mountControlsPanel(container, host) {
     // it whole. The expanded state is ephemeral.
     function clampNote(row) {
         const note = row.note, style = note.style;
-        const clamp = cards() && !!row.noteText;
+        const clamp = cards() && !!row.noteText && notesShown();
         if (clamp && !row.noteMore) {
             row.noteMore = make("button");
             row.noteMore.type = "button";
@@ -1211,7 +1223,7 @@ export function mountControlsPanel(container, host) {
         const rowsToCheck = [...noteChecks];
         noteChecks.clear();
         // Rechecked here: a later render may have left Cards or cleared the note.
-        const shown = rowsToCheck.map(row => !destroyed && cards() && !!row.noteText && !!row.noteMore
+        const shown = rowsToCheck.map(row => !destroyed && cards() && !!row.noteText && notesShown() && !!row.noteMore
             && (row.noteExpanded || row.note.scrollHeight > row.note.clientHeight + 1));
         rowsToCheck.forEach((row, i) => { if (row.noteMore) row.noteMore.hidden = !shown[i]; });
     }
@@ -1222,7 +1234,7 @@ export function mountControlsPanel(container, host) {
         const current = settings();
         const scale = Number(current.layout?.scaleControls) || 1;
         container.style.zoom = scale !== 1 ? String(scale) : "";
-        const filter = { query, showAdvanced: showAdvanced(), manage: manageOn };
+        const filter = { query, showAdvanced: showAdvanced(), showNotes: showNotes(), manage: manageOn };
         const allSpecs = [...(view.bindings || []).map(d => ({ ...d, source: "binding" })), ...(view.notes || []).map(d => ({ ...d, source: "note" }))];
         const empty = !allSpecs.some(d => manageOn || !d.hidden);
         restore.render(view);
@@ -1283,7 +1295,17 @@ export function mountControlsPanel(container, host) {
         quietLine.title = filter.showAdvanced
             ? "Hide the settings this workflow marks Advanced (their values still apply)"
             : "Show the settings this workflow marks Advanced";
-        quietLine.setAttribute("aria-pressed", String(filter.showAdvanced));
+        // No aria-pressed: the label already states what a click does, and
+        // "pressed" beside "Hide …" would read as the opposite.
+        const notesHidden = hiddenNotes(allSpecs, filter);
+        notesLine.textContent = filter.showNotes ? "Hide notes" : `${notesHidden} ${notesHidden === 1 ? "note" : "notes"} hidden`;
+        setShown(notesLine, !manageOn && hasNotes(allSpecs, filter));
+        notesLine.title = filter.showNotes
+            ? "Hide the workflow's notes (Manage shows them; a search shows a matching setting's note)"
+            : "Show the workflow's notes";
+        // Not setShown: showing again would clear the row's flex display.
+        quietRow.hidden = quietLine.hidden && notesLine.hidden;
+        quietRow.style.display = quietRow.hidden ? "none" : "flex";
 
         // The Editor group: your settings first, then the workflow's Editor settings.
         const editorBody = editorGroup.content;

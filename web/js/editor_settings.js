@@ -481,7 +481,8 @@ export const DEFAULT_EDITOR_SETTINGS = {
     },
     // Controls sidebar presentation (personal, every editor mode). Show advanced
     // reveals Controls their workflow marks Advanced; their values apply either way.
-    controls: { view: "rows", showAdvanced: false },
+    // Show notes off hides the workflow's notes outside Manage and search.
+    controls: { view: "rows", showAdvanced: false, showNotes: true },
     // Browser preferences for Reference work (Settings → References). The
     // project-wide Reference settings there are stored with the project instead.
     references: {
@@ -1629,6 +1630,9 @@ export function normalizeEditorSettings(source = null) {
             showAdvanced: typeof stored?.controls?.showAdvanced === "boolean"
                 ? stored.controls.showAdvanced
                 : defaults.controls.showAdvanced,
+            showNotes: typeof stored?.controls?.showNotes === "boolean"
+                ? stored.controls.showNotes
+                : defaults.controls.showNotes,
         },
         references: {
             openLaneSetupOnFirstStage:
@@ -1658,6 +1662,7 @@ export const CONTROLS_PANEL_SETTINGS = Object.freeze({
         return Number(text);
     },
     "controls.showAdvanced": readBool,
+    "controls.showNotes": readBool,
     "controls.view": value => {
         if (!VALID_CONTROLS_VIEWS.has(value)) throw new Error("Choose Rows or Cards.");
         return value;

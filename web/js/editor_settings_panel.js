@@ -233,6 +233,7 @@ function syncSettingsPanelControls() {
     if (controls.scaleControlsLabel) controls.scaleControlsLabel.textContent = `${Math.round(this._settings.layout.scaleControls * 100)}%`;
     if (controls.controlsView) controls.controlsView.value = this._settings.controls.view;
     if (controls.controlsShowAdvanced) controls.controlsShowAdvanced.checked = !!this._settings.controls.showAdvanced;
+    if (controls.controlsShowNotes) controls.controlsShowNotes.checked = this._settings.controls.showNotes !== false;
     if (controls.linkedVideoAudioDrop) controls.linkedVideoAudioDrop.checked = this._settings.timelineBehavior.linkedVideoAudioDrop !== false;
     if (controls.snappingEnabled) controls.snappingEnabled.checked = !!this._settings.timelineBehavior.snappingEnabled;
     if (controls.snapThreshold) controls.snapThreshold.value = String(this._settings.timelineBehavior.snapThreshold);
@@ -1153,6 +1154,14 @@ function showSettingsPanel() {
         "Show Controls the workflow marks Advanced. Hidden ones still apply their values.",
         () => this._settings.controls.showAdvanced,
         (checked) => updateCategory("controls", "showAdvanced", checked)
+    );
+    createCheckbox(
+        controlsSection,
+        "controlsShowNotes",
+        "Show notes",
+        "Show the notes the workflow adds to its settings. Manage shows them; a search shows a matching setting's note.",
+        () => this._settings.controls.showNotes !== false,
+        (checked) => updateCategory("controls", "showNotes", checked)
     );
 
     const timelineSection = createSection(

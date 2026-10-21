@@ -21,7 +21,8 @@ A workflow without Controls says *No Controls yet*. Click
 [Manage](#manage) and add a setting; on the canvas, the editor adds the
 **Sonder Control Relay** node to the graph for you (one per workflow).
 
-<!-- Placeholder: link the Controls example workflow here when it ships. -->
+For a workflow that already has Controls, presets and notes, open
+**Sonder LTX 2.5 Edit & VFX** from [Examples](../README.md#examples).
 
 ## Change a setting
 
@@ -32,6 +33,17 @@ In the Sonder App, values are saved for that imported workflow.
 
 A setting that can't be used — its node was removed, muted or linked to
 another node — says why and is skipped, so the workflow's own value runs.
+
+To see only the settings, click **Hide notes** in the small line near the top
+of the Controls tab, under the search box (and under the **Preset** picker when
+the workflow has presets). The workflow's notes disappear, both the standalone
+ones and the ones under a setting; it then reads **2 notes hidden** (your
+count), which you click to bring them back. Settings the workflow marks Advanced start
+hidden the same way: the line reads **1 advanced hidden** (your count); click
+it to show them. Both choices are also checkboxes in **Settings → Controls**
+(**Show notes** and **Show advanced settings**), and each browser remembers
+them. Hidden settings keep and apply their values. [Manage](#manage) shows
+everything, and a search shows every setting it matches, with its note.
 
 Each take records the values it used. Open the take in **Assets** and look for
 **Controls at run** in its details.

@@ -1008,8 +1008,10 @@ def sdk_candidates(prompt: dict, class_lookup: Callable[[str], Any] | None = Non
     Settings inside subgraphs flatten to ``host:inner`` paths and are exposed
     from ComfyUI instead; links and the legacy PrimitiveNode never qualify. A
     dynamic row group is one candidate in place of its row fields, also when
-    the workflow holds none of its rows.
+    the workflow holds none of its rows. Without ``class_lookup`` (the Sonder
+    App runner) it reads ComfyUI's registry, as ``candidate_inventory`` does.
     """
+    class_lookup = class_lookup or _comfy_class_lookup
     found = []
     cache: dict = {}
     for key, node in prompt.items():
@@ -1019,7 +1021,7 @@ def sdk_candidates(prompt: dict, class_lookup: Callable[[str], Any] | None = Non
             continue
         groups: list[str] = []
         class_def = None
-        if class_lookup is not None and isinstance(node.get("class_type"), str):
+        if isinstance(node.get("class_type"), str):
             try:
                 class_def = class_lookup(node["class_type"])
                 groups = control_rows.group_ids(_class_base_inputs(class_def, cache)) if class_def is not None else []

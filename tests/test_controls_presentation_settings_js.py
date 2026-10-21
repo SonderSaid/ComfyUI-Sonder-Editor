@@ -16,15 +16,15 @@ globalThis.localStorage = { getItem() { return null; }, setItem() {} };
 const settings = await import(SETTINGS_URL);
 const launcher = await import(LAUNCHER_URL);
 
-// Defaults and normalization: Rows, Show advanced off, scale 1.
+// Defaults and normalization: Rows, Show advanced off, Show notes on, scale 1.
 const defaults = settings.normalizeEditorSettings();
-assert.deepEqual(defaults.controls, { view: 'rows', showAdvanced: false });
+assert.deepEqual(defaults.controls, { view: 'rows', showAdvanced: false, showNotes: true });
 assert.equal(defaults.layout.scaleControls, 1);
-const invalid = settings.normalizeEditorSettings({ controls: { view: 'grid', showAdvanced: 'yes' }, layout: { scaleControls: 9 } });
-assert.deepEqual(invalid.controls, { view: 'rows', showAdvanced: false });
+const invalid = settings.normalizeEditorSettings({ controls: { view: 'grid', showAdvanced: 'yes', showNotes: 'no' }, layout: { scaleControls: 9 } });
+assert.deepEqual(invalid.controls, { view: 'rows', showAdvanced: false, showNotes: true });
 assert.equal(invalid.layout.scaleControls, 2);
-const valid = settings.normalizeEditorSettings({ controls: { view: 'cards', showAdvanced: true }, layout: { scaleControls: 0.8 } });
-assert.deepEqual(valid.controls, { view: 'cards', showAdvanced: true });
+const valid = settings.normalizeEditorSettings({ controls: { view: 'cards', showAdvanced: true, showNotes: false }, layout: { scaleControls: 0.8 } });
+assert.deepEqual(valid.controls, { view: 'cards', showAdvanced: true, showNotes: false });
 assert.equal(valid.layout.scaleControls, 0.8);
 // The Controls scale is new: it never inherits the legacy global scale key.
 assert.equal(settings.normalizeEditorSettings({}).layout.scaleControls, 1);
@@ -33,6 +33,8 @@ assert.equal(settings.normalizeEditorSettings({}).layout.scaleControls, 1);
 const patch = settings.controlsPanelSettingPatch;
 assert.deepEqual(patch('render.takePlacementMuted', true), { render: { takePlacementMuted: true } });
 assert.deepEqual(patch('controls.showAdvanced', false), { controls: { showAdvanced: false } });
+assert.deepEqual(patch('controls.showNotes', false), { controls: { showNotes: false } });
+assert.throws(() => patch('controls.showNotes', 'off'), /on or off/);
 assert.deepEqual(patch('controls.view', 'cards'), { controls: { view: 'cards' } });
 assert.deepEqual(patch('batchRender.maxFramesPerChunk', '97'), { batchRender: { maxFramesPerChunk: 97 } });
 assert.deepEqual(patch('batchRender.maxFramesPerChunk', 0), { batchRender: { maxFramesPerChunk: 0 } });

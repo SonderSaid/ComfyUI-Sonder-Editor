@@ -221,7 +221,7 @@ automatically.
 
 <a id="example-workflows"></a>
 <a id="example-projects"></a>
-Two ready-wired workflows. Drop either file onto the ComfyUI canvas, or open
+Three ready-wired workflows. Drop any of the files onto the ComfyUI canvas, or open
 it from ComfyUI's **Templates**, under **Extensions › sonder-editor**.
 
 **[Sonder LTX 2.3 Playground](example_workflows/sonder_ltx_2_3_playground.json)** —
@@ -240,7 +240,12 @@ Its matching project is
 on Hugging Face, the project behind the western showcase, and needs Sonder
 Editor 0.6.0 or newer.
 
-<!-- Placeholder: add the Controls example workflow here when it ships. -->
+**[Sonder LTX 2.5 Edit & VFX](example_workflows/sonder_ltx_2_5_edit_vfx.json)** —
+LTX 2.5 editing and effects, each one a **Preset** in [Controls](docs/controls.md):
+edit footage with a prompt or an edited picture, remove people, make a subject
+mask, follow a video's layout, body movement or outlines, add sound to a video,
+or make new video and sound. Its notes in Controls list the node packs and model
+files and walk through a first take. It needs no sample project.
 
 Every sample project, with its matching workflow, showcase video, tested editor
 version and opening instructions, is on

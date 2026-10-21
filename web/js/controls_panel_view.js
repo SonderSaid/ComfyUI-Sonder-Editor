@@ -1,7 +1,7 @@
 // What the Controls panel shows, and where (SDK v2 Phase 4). DOM-free: the
 // panel (editor_controls_panel.js) owns rows, listeners and writes.
 //
-// Search and Advanced only change what is displayed. Every row of the view is
+// Search, Advanced and Show notes only change what is displayed. Every row of the view is
 // still built and reconciled, so a save in flight on a row a query hides keeps
 // its token and its `Not saved:` line.
 
@@ -32,12 +32,31 @@ export function matchEntry(spec, query) {
 const isAdvanced = spec => spec.source === "binding" && spec.advanced === true;
 
 /** Whether a row is displayed. Manage shows everything; a query shows matches, Advanced included. */
-export function entryVisible(spec, { query = "", showAdvanced = false, manage = false } = {}) {
+export function entryVisible(spec, { query = "", showAdvanced = false, showNotes = true, manage = false } = {}) {
     if (manage) return true;
     if (spec.hidden) return false; // hidden in the Sonder App: not part of the menu
     if (String(query ?? "").trim()) return matchEntry(spec, query);
+    if (spec.source === "note") return showNotes;
     return !isAdvanced(spec) || showAdvanced;
 }
+
+/** Whether a displayed Control shows its own note: the same precedence as Advanced. */
+export const noteShown = ({ query = "", showNotes = true, manage = false } = {}) =>
+    manage || showNotes || !!String(query ?? "").trim();
+
+// Untrimmed, as the panel decides whether a note takes space: a blank-line note still shows.
+const hasText = value => !!String(value ?? "");
+// The notes Show notes governs, counting a Control's note only while its row is displayed.
+const governedNotes = (specs, showAdvanced) => (specs || []).filter(spec => !spec.hidden && (spec.source === "note"
+    ? hasText(spec.text)
+    : hasText(spec.note) && (!isAdvanced(spec) || showAdvanced)));
+
+/** Notes Show notes off is hiding now: what turning it on reveals. */
+export function hiddenNotes(specs, { showNotes = true, showAdvanced = false } = {}) {
+    return showNotes ? 0 : governedNotes(specs, showAdvanced).length;
+}
+
+export const hasNotes = (specs, { showAdvanced = false } = {}) => governedNotes(specs, showAdvanced).length > 0;
 
 /** Advanced Controls the panel is not showing, and how many of those differ from the workflow (Sonder App). */
 export function hiddenAdvanced(specs, { showAdvanced = false } = {}) {

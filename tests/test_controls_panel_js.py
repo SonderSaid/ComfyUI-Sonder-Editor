@@ -64,7 +64,7 @@ if(SCENARIO==='markdown'){
         notes:[{source:'note',note_id:'intro',text:'# Intro',status:'ok',order:0,group:''}]};
     const calls=[],notices=[],settingWrites=[],listeners=new Set();
     const settings={render:{takePlacementMuted:false,linkedTakePlacement:true},batchRender:{maxFramesPerChunk:121},
-        layout:{scaleControls:1},controls:{view:'rows',showAdvanced:false}};
+        layout:{scaleControls:1},controls:{view:'rows',showAdvanced:false,showNotes:true}};
     let refuse=false,defer=false,resolveWrite=null,refuseSetting=false;
     const host={getView:()=>view,subscribe(cb){listeners.add(cb);return()=>listeners.delete(cb);},getEditorSettings:()=>settings,
         setEditorSetting(k,v){settingWrites.push([k,v]);if(refuseSetting)throw Error('setting refused');const [s,n]=k.split('.');settings[s][n]=v;},notify:m=>notices.push(m),
@@ -335,6 +335,48 @@ if(SCENARIO==='markdown'){
         settings.controls.showAdvanced=false;toggleManage();assert.equal(byTarget('binding:steps:value').hidden,false);assert.equal(line.hidden,true);
         const flag=walk(byTarget('binding:steps:value')).find(n=>n.dataset.controlsAdvancedToggle==='steps');assert.equal(flag.attributes['aria-pressed'],'true');
         flag.dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:steps:advanced':false});
+    }
+    if(SCENARIO==='notes-hidden'){
+        const line=walk(container).find(n=>n.dataset.controlsNotesLine==='true');
+        const stepsNote=()=>note('binding:steps:note');
+        assert.equal(line.hidden,false);assert.equal(line.textContent,'Hide notes');assert.equal(line.attributes['aria-pressed'],undefined);
+        // The lines' row keeps its flex layout through hide and show (live-found).
+        assert.equal(line.parentElement.style.display,'flex');
+        assert.equal(stepsNote().style.display,'');assert.equal(byTarget('note:intro:text').hidden,false);
+        // Cards with notes on: a long note clamps, with More (the mock has no layout, so set it).
+        Object.assign(stepsNote(),{scrollHeight:100,clientHeight:20});
+        settings.controls.view='cards';panel.render();
+        const more=()=>walk(byTarget('binding:steps:value')).find(n=>n.dataset.noteMore==='true');
+        assert.equal(stepsNote().style.display,'-webkit-box');assert.equal(more().hidden,false);
+        settings.controls.view='rows';panel.render();
+        line.dispatch('click');assert.deepEqual(settingWrites.at(-1),['controls.showNotes',false]);panel.render();
+        // Both kinds hide; the Control itself stays, and so does its value.
+        assert.equal(byTarget('note:intro:text').hidden,true);assert.equal(byTarget('note:intro:text').style.display,'none');
+        assert.equal(byTarget('binding:steps:value').hidden,false);assert.equal(input('binding:steps:value').value,'20');
+        assert.equal(stepsNote().style.display,'none');
+        assert.equal(line.textContent,'2 notes hidden');
+        // Cards never clamps a hidden note back into view, nor offers More.
+        settings.controls.view='cards';panel.render();
+        assert.equal(stepsNote().style.display,'none');assert.equal(more().hidden,true);
+        settings.controls.view='rows';panel.render();
+        // Search shows a matching Control's note, as it shows a hidden Advanced one;
+        // standalone notes are never searched.
+        const box=walk(container).find(n=>n.dataset.controlsSearch==='true');box.value='steps';box.dispatch('input');
+        assert.equal(stepsNote().style.display,'');assert.equal(byTarget('note:intro:text').hidden,true);
+        box.value='';box.dispatch('input');assert.equal(stepsNote().style.display,'none');
+        // Manage shows every note and drops the line.
+        toggleManage();assert.equal(byTarget('note:intro:text').hidden,false);assert.equal(stepsNote().style.display,'');assert.equal(line.hidden,true);
+        assert.equal(line.parentElement.style.display,'none');
+        toggleManage();assert.equal(stepsNote().style.display,'none');assert.equal(line.parentElement.style.display,'flex');
+        // The count is what turning notes on reveals: not a hidden Advanced row's note,
+        // nor a note hidden in the Sonder App.
+        publish({...view,bindings:view.bindings.map(d=>d.binding_id==='steps'?{...d,advanced:true}:d)});
+        assert.equal(line.textContent,'1 note hidden');
+        publish({...view,notes:view.notes.map(d=>({...d,hidden:true}))});
+        assert.equal(line.hidden,true);
+        settings.controls.showAdvanced=true;panel.render();assert.equal(line.textContent,'1 note hidden');
+        line.dispatch('click');assert.deepEqual(settingWrites.at(-1),['controls.showNotes',true]);panel.render();
+        assert.equal(stepsNote().style.display,'');assert.equal(line.textContent,'Hide notes');
     }
     if(SCENARIO==='advanced-refusal'){
         // A refused Advanced save keeps its reason on the row, even when the
@@ -876,7 +918,7 @@ if(SCENARIO==='markdown'){
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app','pickers','note-titles'])
+@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','notes-hidden','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app','pickers','note-titles'])
 def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')
