@@ -56,6 +56,7 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup counts a chip as attached to an item under MiniMax H3 when it cites one of the item's members, directly or through a Subject.
 
 ### Fixed
+- Sonder App takes no longer fail with "This run's SDK session has ended" when ComfyUI runs with `--cache-none` or is short of memory, and in that case the Editor no longer renders twice in one run. Save Video no longer saves a second take, and Save Bridge no longer misses files its saver already wrote. When a Sonder App take is refused, the message now says why: the take already ran, it belongs to another project, or it expired.
 - Prompt: Attach and the Mention menu no longer offer a "Subject: <Reference>" row for a Reference that has no Subject yet. Choosing it made the run fail. A chip already bound that way still says it needs a new source.
 - MiniMax H3 Full Reference: the Preservation detail warning names the label, such as `<Subject 1>`, and the field, and its **Fix** button in Prompt Management opens that chip on the field. Preserved prose from outside the render window no longer raises the warning.
 - Timeline snapping: dragging a guide no longer stops the prompt section with the same number from being a snap target, and a drag no longer snaps to where a swap preview briefly moved a neighbour.

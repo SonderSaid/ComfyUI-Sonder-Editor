@@ -22,6 +22,7 @@ from ..server import prompt_channel_templates
 from ..server import prompt_graph
 from ..server import prompt_payload
 from ..server import sdk_runs
+from .prompt_once import run_once_per_prompt
 from ..server.editor_inputs import editor_optional_inputs
 from ..server.session_registry import project_event_aliases
 from ..server.timeline_state import (
@@ -695,9 +696,24 @@ class SonderEditor:
         if key:
             sdk_runs.note_project(key, proj.project_dir, aliases)
         token = self._run_token(prompt, unique_id)
-        if token and sdk_runs.claim_token(token, aliases, key) != sdk_runs.TOKEN_OK:
-            raise RuntimeError("This run's SDK session has ended. Start it again from the editor.")
+        if token:
+            verdict = sdk_runs.claim_token(token, aliases, key)
+            if verdict != sdk_runs.TOKEN_OK:
+                raise RuntimeError(self._token_refusal(verdict))
         return key, token
+
+    @staticmethod
+    def _token_refusal(verdict: str) -> str:
+        # A repeat within one prompt never gets here (run_once_per_prompt), so a
+        # used token means the prompt itself was queued again.
+        if verdict == sdk_runs.TOKEN_USED:
+            return ("This Sonder App take already ran. Queuing its prompt again from ComfyUI "
+                    "is not supported; Generate again in the Sonder App.")
+        if verdict == sdk_runs.TOKEN_MISMATCH:
+            return "This Sonder App take belongs to another project. Generate it from that project's Sonder App."
+        # A finished run's token is forgotten, so re-queuing its prompt lands here too.
+        return ("This Sonder App take is no longer known: its prompt was queued again from ComfyUI, "
+                "its session ended, or it expired. Generate again in the Sonder App.")
 
     def execute(self, project, project_name, fps, width, height,
                 scene_id="", selection_start=0, selection_end=0,
@@ -707,6 +723,27 @@ class SonderEditor:
                 take_placement_linked=True, take_placement_muted=False,
                 render_cache_max_bytes=0, render_queue_active=True,
                 take_fit_mode=DEFAULT_FIT_MODE, take_crop_position=DEFAULT_CROP_POSITION):
+        # A repeat within one prompt must not claim the run token or a queue job
+        # again, or hand downstream nodes a second project object.
+        return run_once_per_prompt(prompt, unique_id, "SonderEditor", lambda: self._execute_once(
+            project, project_name, fps, width, height,
+            scene_id=scene_id, selection_start=selection_start, selection_end=selection_end,
+            pre_context_frames=pre_context_frames, post_context_frames=post_context_frames,
+            mask_pre_offset=mask_pre_offset, mask_post_offset=mask_post_offset,
+            prompt=prompt, unique_id=unique_id, take_placement_mode=take_placement_mode,
+            take_placement_linked=take_placement_linked, take_placement_muted=take_placement_muted,
+            render_cache_max_bytes=render_cache_max_bytes, render_queue_active=render_queue_active,
+            take_fit_mode=take_fit_mode, take_crop_position=take_crop_position,
+        ))
+
+    def _execute_once(self, project, project_name, fps, width, height,
+                      scene_id="", selection_start=0, selection_end=0,
+                      pre_context_frames=0, post_context_frames=0,
+                      mask_pre_offset=0, mask_post_offset=0,
+                      prompt=None, unique_id=None, take_placement_mode="trimmed",
+                      take_placement_linked=True, take_placement_muted=False,
+                      render_cache_max_bytes=0, render_queue_active=True,
+                      take_fit_mode=DEFAULT_FIT_MODE, take_crop_position=DEFAULT_CROP_POSITION):
         base_dir = _get_projects_base_dir()
         execute_started_at = time.perf_counter()
         render_cache_requested = render_cache_max_bytes

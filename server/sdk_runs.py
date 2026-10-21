@@ -16,6 +16,11 @@ stand in for it.
 - **Run tokens** identify an SDK-submitted run. They are registered before submit,
   consumed by the first execute that presents one, refused afterwards, and removed
   when the run's record closes. One that never executes expires.
+- **First results** let a node with one-shot side effects run once per prompt.
+  ComfyUI can execute a finished node again within the same prompt (``--cache-none``,
+  or RAM-pressure eviction, when a lazy input or a node expansion links to it late);
+  the repeat gets the first result instead of claiming, saving or writing again.
+  They live on the open record, so they go with it.
 
 Stdlib only and thread-safe: the hook runs on ComfyUI's prompt-worker thread and
 routes run on the event loop. Everything here is ephemeral by design; ComfyUI's
@@ -95,6 +100,7 @@ def open_release(key: Any, prompt_id: Any = "", prompt: Any = None) -> bool:
             "token": "",
             "hinted_token": "",
             "token_project_ids": [],
+            "results": {},
         }
         hinted_token = _prompt_run_token(prompt)
         hinted = _TOKENS.get(hinted_token)
@@ -181,6 +187,8 @@ def close_release(key: Any) -> dict[str, Any] | None:
         record = _RELEASES.pop(key, None)
         if record is None:
             return None
+        # First results can hold the run's frames; nothing reads them after close.
+        record.pop("results", None)
         _KEY_BY_PROMPT_OBJECT.pop(record.get("prompt_object_id"), None)
         for token in (record.get("token"), record.get("hinted_token")):
             if token:
@@ -190,6 +198,29 @@ def close_release(key: Any) -> dict[str, Any] | None:
             _RELEASE_STATE_BY_PROMPT[record["prompt_id"]] = (RELEASE_CLOSED, now)
         _prune_release_states_locked(now)
     return record
+
+
+def first_result(key: Any, node_id: Any) -> tuple[bool, Any]:
+    """``(True, value)`` when this open run already recorded ``node_id``'s result."""
+    key, node_id = _key(key), _key(node_id)
+    with _LOCK:
+        record = _RELEASES.get(key)
+        results = record.get("results") if record is not None else None
+        if not node_id or results is None or node_id not in results:
+            return False, None
+        return True, results[node_id]
+
+
+def remember_result(key: Any, node_id: Any, value: Any) -> bool:
+    """Record ``node_id``'s first result on its open run. A later value never replaces it."""
+    key, node_id = _key(key), _key(node_id)
+    with _LOCK:
+        record = _RELEASES.get(key)
+        results = record.get("results") if record is not None else None
+        if not node_id or results is None:
+            return False
+        results.setdefault(node_id, value)
+        return True
 
 
 def run_token_of(record: dict[str, Any]) -> str:

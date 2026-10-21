@@ -66,6 +66,29 @@ def test_tokens_are_single_use_and_bound_to_their_project():
     assert sdk_runs.claim_token("tok-1", ["proj"]) == sdk_runs.TOKEN_UNKNOWN
 
 
+def test_a_first_result_lives_on_its_open_run_and_is_never_replaced():
+    marker = object()
+    assert not sdk_runs.remember_result("5", "1", marker)
+    assert sdk_runs.first_result("5", "1") == (False, None)
+
+    sdk_runs.open_release("5", "prompt-5")
+    assert sdk_runs.first_result("5", "1") == (False, None)
+    assert sdk_runs.remember_result("5", 1, marker)
+    assert sdk_runs.remember_result("5", "1", object())
+    assert sdk_runs.first_result("5", "1") == (True, marker)
+    # A falsy result is still a result; another node and another run are not.
+    assert sdk_runs.remember_result("5", "2", None)
+    assert sdk_runs.first_result("5", "2") == (True, None)
+    assert sdk_runs.first_result("6", "1") == (False, None)
+    assert not sdk_runs.remember_result("5", "", marker)
+
+    assert "results" not in sdk_runs.close_release("5")
+    assert sdk_runs.first_result("5", "1") == (False, None)
+    # Reopening the key (ComfyUI reusing a queue item id) starts empty.
+    sdk_runs.open_release("5", "prompt-5b")
+    assert sdk_runs.first_result("5", "1") == (False, None)
+
+
 def test_a_registered_token_that_never_runs_expires(monkeypatch):
     now = [1000.0]
     monkeypatch.setattr(sdk_runs, "time", types.SimpleNamespace(time=lambda: now[0]))

@@ -3020,6 +3020,41 @@ def test_save_video_marks_queue_job_completed(tmp_path, monkeypatch):
     assert result["result"][0].endswith(".mp4")
 
 
+def test_save_video_repeated_within_one_prompt_places_one_take(tmp_path, monkeypatch):
+    # A Save Video upstream of a lazy branch is re-executed under --cache-none; the
+    # repeat must not write a second file, asset or take.
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+    runs = _fresh_sdk_runs(io_nodes)
+
+    project_dir = tmp_path / "project"
+    (project_dir / "media").mkdir(parents=True, exist_ok=True)
+    (project_dir / "cache" / "thumbnails").mkdir(parents=True, exist_ok=True)
+    scene = timeline_state.Scene(scene_id="scene-1", name="Scene 1", duration_frames=48, video_lane_count=1)
+    project = timeline_state.TimelineProject(project_dir=str(project_dir), name="Repeat Save", scenes=[scene])
+    project._execution_context = {"scene_id": "scene-1", "scene_name": "Scene 1",
+                                  "selection_start": 0, "selection_end": 8}
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode_video_success(io_nodes))
+    monkeypatch.setattr(io_nodes, "save_project", lambda project: None)
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+    prompt = _prompt_graph({"7": _prompt_node("SonderSaveVideo")})
+    runs.open_release("44", "prompt-44", prompt)
+    frames = torch.zeros(8, 2, 2, 3, dtype=torch.float32)
+
+    first = io_nodes.SonderSaveVideo().save_video(
+        project, frames, filename_prefix="once", mode="Take", prompt=prompt, unique_id="7")
+    again = io_nodes.SonderSaveVideo().save_video(
+        project, frames, filename_prefix="once", mode="Take", prompt=prompt, unique_id="7")
+
+    # The repeat carries no "ui", so ComfyUI keeps the first preview instead of remounting it.
+    assert again == {"result": first["result"]}
+    assert len(project.assets) == 1
+    assert len(scene.clips) == 1
+    runs.reset_for_tests()
+
+
 def test_save_video_take_placement_mode_controls_trimmed_vs_untrimmed(tmp_path, monkeypatch):
     io_nodes = _import_io_nodes(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")
@@ -4242,17 +4277,78 @@ def test_bind_run_refuses_an_unknown_used_or_foreign_token(tmp_path, monkeypatch
     prompt["1"]["_meta"] = {"title": "Sonder Editor", "sonder_run": "tok-1"}
     node = editor_node.SonderEditor()
 
-    with pytest.raises(RuntimeError, match="SDK session has ended"):
+    with pytest.raises(RuntimeError, match="no longer known: its prompt was queued again"):
         node._bind_run(project, prompt, "1")
 
     runs.register_token("tok-1", ["someone-else"])
-    with pytest.raises(RuntimeError, match="SDK session has ended"):
+    with pytest.raises(RuntimeError, match="belongs to another project"):
         node._bind_run(project, prompt, "1")
 
     runs.register_token("tok-1", ["proj-id"])
     assert node._bind_run(project, prompt, "1") == ("", "tok-1")
-    with pytest.raises(RuntimeError, match="SDK session has ended"):
+    # Only a re-queued prompt reaches a used token: a repeat within one prompt
+    # returns the first result before binding (run_once_per_prompt).
+    with pytest.raises(RuntimeError, match="already ran. Queuing its prompt again"):
         node._bind_run(project, prompt, "1")
+    runs.reset_for_tests()
+
+
+def test_execute_repeated_within_one_prompt_reuses_its_first_result(tmp_path, monkeypatch):
+    # ComfyUI re-executes a finished Editor when a lazy input pulls it back in under
+    # --cache-none or RAM-pressure eviction: the repeat must not claim again.
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(editor_node)
+    prompt = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    prompt["1"]["_meta"] = {"title": "Sonder Editor", "sonder_run": "tok-1"}
+    runs.register_token("tok-1", ["proj-id"])
+    runs.open_release("31", "prompt-31", prompt)
+    calls = []
+    project = types.SimpleNamespace(project_id="proj-id", project_dir=str(tmp_path / "proj"))
+
+    def fake_execute_once(self, *args, **kwargs):
+        calls.append(kwargs["unique_id"])
+        self._bind_run(project, kwargs["prompt"], kwargs["unique_id"])
+        return (project, object())
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_execute_once", fake_execute_once)
+    first = editor_node.SonderEditor().execute("p", "n", 24, 64, 64, prompt=prompt, unique_id="1")
+    # ComfyUI's null object cache gives the repeat a fresh instance.
+    again = editor_node.SonderEditor().execute("p", "n", 24, 64, 64, prompt=prompt, unique_id="1")
+
+    assert again is first
+    assert calls == ["1"]
+    assert runs.token_state("tok-1")["state"] == "executing"
+    record = runs.close_release("31")
+    assert "results" not in record
+    runs.reset_for_tests()
+
+
+def test_execute_is_not_remembered_without_a_queue_run_or_after_a_failure(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(editor_node)
+    untrusted = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    trusted = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    runs.open_release("32", "prompt-32", trusted)
+    outcomes = [RuntimeError("render failed"), ("second",)]
+    calls = []
+
+    def fake_execute_once(self, *args, **kwargs):
+        calls.append(kwargs["prompt"] is trusted)
+        result = outcomes.pop(0) if kwargs["prompt"] is trusted else ("untrusted", len(calls))
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_execute_once", fake_execute_once)
+    node = editor_node.SonderEditor()
+    # No queue hook opened this prompt: every execution runs.
+    assert node.execute("p", "n", 24, 64, 64, prompt=untrusted, unique_id="1") == ("untrusted", 1)
+    assert node.execute("p", "n", 24, 64, 64, prompt=untrusted, unique_id="1") == ("untrusted", 2)
+    # A failed first execution records nothing, so a later one runs.
+    with pytest.raises(RuntimeError, match="render failed"):
+        node.execute("p", "n", 24, 64, 64, prompt=trusted, unique_id="1")
+    assert node.execute("p", "n", 24, 64, 64, prompt=trusted, unique_id="1") == ("second",)
+    assert calls == [False, False, True, True]
     runs.reset_for_tests()
 
 

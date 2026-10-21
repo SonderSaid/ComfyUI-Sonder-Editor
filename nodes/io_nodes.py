@@ -45,6 +45,7 @@ from ..server.project_commit import (
     snapshot_item_ids,
 )
 from .metadata_collector import TRACKED_METADATA_CONTEXT_KEY, collector_chain_for_consumer
+from .prompt_once import run_once_per_prompt
 from ..server.controls_snapshot import controls_snapshot
 from ..server.prompt_graph import downstream_set
 from ..server.color_correction import (
@@ -1882,6 +1883,39 @@ class SonderSaveVideo:
                     prompt=None,
                     extra_pnginfo=None,
                     unique_id=None):
+        # A repeat within one prompt would write a second file, asset and take.
+        return run_once_per_prompt(prompt, unique_id, "SonderSaveVideo", lambda: self._save_video_once(
+            project, frames, filename_prefix=filename_prefix, fps=fps,
+            mode=mode, place_audio_on_timeline=place_audio_on_timeline,
+            mark_queue_complete=mark_queue_complete, audio=audio,
+            save_preset=save_preset, custom_output_kind=custom_output_kind,
+            custom_container=custom_container, custom_video_codec=custom_video_codec,
+            custom_pix_fmt=custom_pix_fmt, custom_crf=custom_crf,
+            custom_encoder_preset=custom_encoder_preset, custom_audio_codec=custom_audio_codec,
+            custom_audio_bitrate_kbps=custom_audio_bitrate_kbps,
+            custom_png_compression=custom_png_compression, embed_metadata=embed_metadata,
+            autoplay_preview=autoplay_preview, color_drift_correction=color_drift_correction,
+            prompt=prompt, extra_pnginfo=extra_pnginfo, unique_id=unique_id,
+        ))
+
+    def _save_video_once(self, project, frames, filename_prefix="output", fps=24.0,
+                         mode="Video", place_audio_on_timeline=True, mark_queue_complete=False, audio=None,
+                         save_preset=DEFAULT_SAVE_VIDEO_PRESET,
+                         custom_output_kind=CUSTOM_OUTPUT_KIND_VIDEO,
+                         custom_container="mp4",
+                         custom_video_codec="libx264",
+                         custom_pix_fmt="yuv420p",
+                         custom_crf=18,
+                         custom_encoder_preset="slow",
+                         custom_audio_codec="aac",
+                         custom_audio_bitrate_kbps=192,
+                         custom_png_compression=0,
+                         embed_metadata=True,
+                         autoplay_preview=False,
+                         color_drift_correction=True,
+                         prompt=None,
+                         extra_pnginfo=None,
+                         unique_id=None):
         # Save to media/ so it appears in the project's asset gallery
         media_dir = _require_project_media_root(project)
         # Baseline for the created-set hand-off: anything added to `project` below
@@ -2351,6 +2385,14 @@ class SonderSaveBridge:
         return True
 
     def prepare_output(self, project, target_folder="", prefix="", mark_queue_complete=False, prompt=None, unique_id=None):
+        # A repeat within one prompt would rewrite the sidecar's pre-existing list,
+        # so files the external saver already wrote would never be registered.
+        return run_once_per_prompt(prompt, unique_id, "SonderSaveBridge", lambda: self._prepare_output_once(
+            project, target_folder=target_folder, prefix=prefix,
+            mark_queue_complete=mark_queue_complete, prompt=prompt, unique_id=unique_id,
+        ))
+
+    def _prepare_output_once(self, project, target_folder="", prefix="", mark_queue_complete=False, prompt=None, unique_id=None):
         prompt_key, prompt_key_source = _resolve_bridge_prompt_key(prompt)
         bridge_node_id = str(unique_id or uuid.uuid4().hex[:8])
         execution_context = _copy_execution_context(project)

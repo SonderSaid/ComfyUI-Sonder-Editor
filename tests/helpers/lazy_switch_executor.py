@@ -26,6 +26,8 @@ pkg = types.ModuleType("sonder_executor_testpkg")
 pkg.__path__ = [str(Path(repo))]
 sys.modules[pkg.__name__] = pkg
 lazy = importlib.import_module(f"{pkg.__name__}.nodes.lazy_switches")
+prompt_once = importlib.import_module(f"{pkg.__name__}.nodes.prompt_once")
+sdk_runs = importlib.import_module(f"{pkg.__name__}.server.sdk_runs")
 executed, sunk = [], {}
 
 
@@ -65,8 +67,28 @@ class Sink(io.ComfyNode):
         return io.NodeOutput()
 
 
+class OnceSource:
+    """A source with one-shot side effects, guarded like the Editor and the save nodes."""
+
+    RETURN_TYPES = ("INT",)
+    FUNCTION = "run"
+    CATEGORY = "testing"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"value": ("INT", {"default": 0})},
+                "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"}}
+
+    def run(self, value, prompt=None, unique_id=None):
+        def body():
+            executed.append(value)
+            return (value,)
+        return prompt_once.run_once_per_prompt(prompt, unique_id, "SonderTestOnce", body)
+
+
 nodes.NODE_CLASS_MAPPINGS.update(lazy.LAZY_NODE_CLASS_MAPPINGS)
-nodes.NODE_CLASS_MAPPINGS.update({"SonderTestSource": Source, "SonderTestSelection": Selection, "SonderTestSink": Sink})
+nodes.NODE_CLASS_MAPPINGS.update({"SonderTestSource": Source, "SonderTestSelection": Selection,
+                                  "SonderTestSink": Sink, "SonderTestOnce": OnceSource})
 
 
 def source(value, tuple_payload=False):
@@ -88,11 +110,35 @@ def switch_prompt(selected, linked=False, indices=(0, 1, 2), tuple_payload=False
     return prompt
 
 
-async def run_case(name, prompt, expected_sources=(), expected_outputs=None, error=None, switch=False):
+def repeat_prompt(class_type):
+    """A shared upstream node read eagerly (the Cluster's select) and lazily (its branch).
+
+    Under the null cache the lazy request re-stages the finished upstream node, the
+    shape that re-ran the Editor in Sonder App takes (2026-10-21).
+    """
+    upstream = ({"class_type": class_type, "inputs": {"value": 0}} if class_type == "SonderTestOnce"
+                else source(0))
+    return {
+        "shared": upstream,
+        "selection": {"class_type": "SonderTestSelection", "inputs": {"value": ["shared", 0]}},
+        "dormant": source(9),
+        "subject": {"class_type": "SonderLazyCluster", "inputs": {
+            "select": ["selection", 0], "branches": 2, "lanes": 1,
+            "b0_l0": ["shared", 0], "b1_l0": ["dormant", 0]}},
+        "sink": sink(),
+    }
+
+
+async def run_case(name, prompt, expected_sources=(), expected_outputs=None, error=None, switch=False,
+                   queue_key=""):
     executed.clear()
     sunk.clear()
+    sdk_runs.reset_for_tests()
     valid, validation_error, outputs, node_errors = await execution.validate_prompt(name, prompt, None)
     executor = None
+    if valid and queue_key:
+        # What the prompt-queue hook does when ComfyUI takes the prompt off its queue.
+        sdk_runs.open_release(queue_key, name, prompt)
     if valid:
         executor = execution.PromptExecutor(
             SimpleNamespace(client_id=None, send_sync=Mock(), last_node_id=None),
@@ -166,6 +212,15 @@ async def main():
         prompt.update(sinkA=sink(0, "A"), sinkB=sink(1, "B"))
         cases.append(await run_case(f"gate-{condition}", prompt, [0] if condition else [],
                                     {"A": 0 if condition else None, "B": None}))
+
+    # Characterization: the null cache runs a finished upstream node again when a lazy
+    # branch pulls it in. If ComfyUI stops doing this, the guard below is moot.
+    cases.append(await run_case("repeat-unguarded", repeat_prompt("SonderTestSource"), [0, 0], {"result": 0}))
+    # The guard: one execution per prompt, same output, once the queue hook opened the run.
+    cases.append(await run_case("repeat-guarded", repeat_prompt("SonderTestOnce"), [0], {"result": 0},
+                                queue_key="77"))
+    # Without a queue run (no trusted key) the guard stays out of the way.
+    cases.append(await run_case("repeat-untrusted", repeat_prompt("SonderTestOnce"), [0, 0], {"result": 0}))
     print("SONDER_LAZY_REPORT=" + json.dumps({"core": __version__, "requires_lazy": requires_lazy, "cases": cases}))
     return 0 if all(case["passed"] for case in cases) else 1
 

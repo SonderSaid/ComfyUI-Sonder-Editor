@@ -1110,3 +1110,27 @@ def test_bridge_finalize_does_not_register_output_swapped_to_symlink_when_suppor
     assert restored.assets == []
     assert external_file.is_file()
     assert list((Path(project.project_dir) / "media").iterdir()) == []
+
+
+def test_bridge_repeated_within_one_prompt_keeps_files_already_written(tmp_path, monkeypatch):
+    # ComfyUI can re-execute a finished bridge in the same prompt (--cache-none or
+    # RAM-pressure eviction, pulled in by a lazy input). Preparing again would list
+    # the saver's files as pre-existing, so they would never register.
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+    runs = io_nodes.sdk_runs
+    runs.reset_for_tests()
+    prompt = {"bridge-1": {"class_type": "SonderSaveBridge", "inputs": {}}}
+    io_nodes._set_bridge_prompt_key_for_object("41", prompt)
+    runs.open_release("41", "prompt-41", prompt)
+
+    first = io_nodes.SonderSaveBridge().prepare_output(project, prompt=prompt, unique_id="bridge-1")
+    _write_png(Path(first[0]) / "frame.png")
+    again = io_nodes.SonderSaveBridge().prepare_output(project, prompt=prompt, unique_id="bridge-1")
+    assert again == first
+
+    io_nodes._finalize_prompt_bridges("41")
+    restored = _load_saved_project(project_manager, project)
+    assert len(restored.assets) == 1
+    runs.reset_for_tests()
