@@ -24,6 +24,7 @@ import {
 import {
     controlsSuppliedLookup,
     renderTrackedSectionBody,
+    renderTrackedFieldBody,
     trackedFieldMatchForEntry,
     TRACKED_RENDERERS,
 } from "./tracked_metadata_renderers.js";
@@ -2112,7 +2113,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function handleTrackedFieldClick(event, info, surface) {
         if (!info || !info.fieldKey) return;
         event?.stopPropagation();
-        const token = fieldSearchToken(info.fieldKey, info.value);
+        const token = fieldSearchToken(info.filterFieldKey ?? info.fieldKey, info.value);
         if (compareModeActive()) {
             toggleCompareSearchToken("A", token);
             return;
@@ -2124,7 +2125,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (!info || !info.fieldKey) return;
         event?.preventDefault();
         event?.stopPropagation();
-        const token = fieldSearchToken(info.fieldKey, info.value);
+        const token = fieldSearchToken(info.filterFieldKey ?? info.fieldKey, info.value);
         if (compareModeActive()) {
             toggleCompareSearchToken("B", token);
             return;
@@ -2275,7 +2276,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const pinned = isFieldPinned(entry, fieldKey, surface);
         const tokenActive = searchHasToken(token);
         const copies = info.displayKind === "power_lora_row"
-            ? resolvePowerLoraRowCopies(entry, info.rowIndex)
+            ? resolvePowerLoraRowCopies(entry, info.rowIndex, fieldKey)
             : null;
         const copyItems = copies
             ? [copyMenuItem(copies.name), copyMenuItem(copies.row)]
@@ -3776,7 +3777,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             tokenActiveB: (token) => compareModeActive() && compareSearchHasToken("B", token),
             onFieldClick: (event, info) => handleTrackedFieldClick(event, info, surface),
             onFieldContextMenu: (event, info) => handleTrackedFieldContextMenu(event, info, surface),
-            rowCopy: (entry, rowIndex) => resolvePowerLoraRowCopies(entry, rowIndex).row,
+            rowCopy: (entry, rowIndex, fieldKey) => resolvePowerLoraRowCopies(entry, rowIndex, fieldKey).row,
             // Same rule as attachCopyToElement: hover shows Copy only in Compare.
             copyOnHover: () => compareModeActive(),
             onFieldCopy: (copy) => { if (copy.kind !== "unavailable") copyToClipboardSafe(copy.text); },
@@ -3919,6 +3920,12 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         for (const { entry, pinnedKeys } of pinnedByEntry) {
             const sectionLabel = String(entry?.label || "section");
+            const fieldBodies = new Map();
+            for (const key of pinnedKeys) {
+                const dom = renderTrackedFieldBody(entry, key, ctx);
+                if (dom) fieldBodies.set(key, dom);
+            }
+            const fallbackKeys = pinnedKeys.filter((key) => !fieldBodies.has(key));
 
             // Ask the structured renderer (if any) to render its body; capture
             // which field keys it consumes so we know which pinned keys still
@@ -3926,7 +3933,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             // once in the natural section below) — acceptable for Phase 1 scope.
             let consumedFields = new Set();
             let structuredDom = null;
-            const bodyResult = renderTrackedSectionBody(entry, ctx);
+            const bodyResult = fallbackKeys.length ? renderTrackedSectionBody(entry, ctx) : null;
             if (bodyResult) {
                 if (typeof bodyResult === "object" && "dom" in bodyResult) {
                     structuredDom = bodyResult.dom;
@@ -3939,9 +3946,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                 }
             }
 
-            const structuredPinnedKeys = pinnedKeys.filter((k) => consumedFields.has(k));
-            const genericPinnedKeys = pinnedKeys.filter((k) => !consumedFields.has(k));
-            if (!structuredPinnedKeys.length && !genericPinnedKeys.length) continue;
+            const structuredPinnedKeys = fallbackKeys.filter((k) => consumedFields.has(k));
+            const genericPinnedKeys = fallbackKeys.filter((k) => !consumedFields.has(k));
+            if (!fieldBodies.size && !structuredPinnedKeys.length && !genericPinnedKeys.length) continue;
 
             // One sub-card per entry with a single `from <section>` subtitle so
             // the lifted structured body and any generic cells share provenance.
@@ -3955,6 +3962,10 @@ export function mountSharedAssetGallery(container, options = {}) {
             subtitle.appendChild(subLabel);
             subCard.appendChild(subtitle);
 
+            for (const dom of fieldBodies.values()) {
+                subCard.appendChild(dom);
+                totalLifted++;
+            }
             if (structuredPinnedKeys.length && structuredDom) {
                 subCard.appendChild(structuredDom);
                 totalLifted += structuredPinnedKeys.length;

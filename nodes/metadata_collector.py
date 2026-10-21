@@ -7,6 +7,8 @@ import os
 import re
 from typing import Any
 
+from ..server.lora_metadata import NATIVE_LORA_STACKS, native_lora_fields
+
 from .subgraph_provenance import (
     checked_workflow_node,
     find_workflow_node,
@@ -211,46 +213,6 @@ def _power_lora_transform(inputs: dict) -> dict | None:
     }
 
 
-# ComfyUI 0.40's native LoRA stack loaders: one dynamic row group ``loras``
-# whose rows reach the prompt as flat ``loras.<i>.<field>`` keys.
-NATIVE_LORA_STACKS = frozenset({"LoadLoraModel", "LoadLoraTextEncoder"})
-_NATIVE_LORA_KEY = re.compile(r"^loras\.(0|[1-9][0-9]*)\.(lora_name|strength|enabled)$")
-
-
-def _native_lora_transform(inputs: dict) -> dict | None:
-    """Native stack rows in the Power LoRA shape, numbered from 1 in prompt order.
-
-    ``skipped`` marks a row the node does not apply (off or strength 0),
-    matching ``LoadLoraModel.execute``; a row without a file is dropped.
-    """
-    grouped: dict[int, dict[str, Any]] = {}
-    for key, value in inputs.items():
-        match = _NATIVE_LORA_KEY.match(str(key))
-        if match:
-            grouped.setdefault(int(match.group(1)), {})[match.group(2)] = value
-    rows = []
-    for index in sorted(grouped):
-        values = grouped[index]
-        name = values.get("lora_name")
-        if name is None or str(name).strip() in {"", "None", "none"}:
-            continue
-        row = {"slot": len(rows) + 1, "name": str(name), "enabled": values.get("enabled") is not False}
-        if "strength" in values:
-            row["strength"] = values["strength"]
-        if not row["enabled"] or values.get("strength") == 0:
-            row["skipped"] = True
-        rows.append(row)
-    if not rows:
-        return None
-    return {
-        "power_loras": rows,
-        # Rows switched on, as the Power LoRA producer counts them; a row at
-        # strength 0 is on but skipped.
-        "enabled_lora_count": sum(1 for row in rows if row["enabled"]),
-        "total_lora_count": len(rows),
-    }
-
-
 # Compatibility registry. Add a new node-pack handler by appending to this list.
 # Each entry: {"display_type", "predicate", "transform"}.
 #   - predicate(class_type: str) -> bool  : matches the node's prompt class_type.
@@ -267,7 +229,7 @@ COMPAT_HANDLERS: list[dict] = [
     {
         "display_type": "native_lora_stack",
         "predicate": lambda class_type: class_type in NATIVE_LORA_STACKS,
-        "transform": _native_lora_transform,
+        "transform": native_lora_fields,
         "header": {"source_group": "loras"},
     },
 ]

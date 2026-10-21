@@ -471,3 +471,28 @@ def test_save_bridge_controls_follow_its_consumers(tmp_path, monkeypatch):
     section = _controls_section(entry["generation_params"]["editor_export"]["tracked_metadata"])
     assert section["fields"] == {"Seed": str(2 ** 60 + 1), "Steps": "12"}
     _clear_bridge_state(io_nodes)
+
+
+
+def test_native_controls_rows_flow_through_video_save_without_collector(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module('torch')
+    _patch_save_deps(io_nodes, monkeypatch, [])
+    project = _project(tmp_path)
+    project._execution_context = {}
+    prompt = {'L': {'class_type':'LoadLoraModel','inputs':{'loras.0.lora_name':'probe.safetensors',
+              'loras.0.strength':0.75,'loras.0.enabled':True}},
+              'S': {'class_type':'SonderSaveVideo','inputs':{'frames':['L',0]}},
+              'R': {'class_type':'SonderControlRelay','inputs':{'manifest':json.dumps({'v':1,'bindings':{}})}}}
+    descriptor={'binding_id':'stack','status':'ok','kind':'ROWS','label':'Stack','group':'','order':0,
+                'targets':[{'path':'L','input':'loras'}],
+                'value':[{'lora_name':'probe.safetensors','strength':0.75,'enabled':True}]}
+    original = io_nodes.controls_snapshot
+    monkeypatch.setattr(io_nodes,'controls_snapshot',lambda p,c,**kw:original(p,c,**kw,
+                        describe=lambda *a,**k:{'bindings':[descriptor]}))
+    io_nodes.SonderSaveVideo().save_video(project,torch.zeros(2,2,2,3),embed_metadata=False,prompt=prompt,unique_id='S')
+    tracked=project.assets[0].generation_params['editor_export']['tracked_metadata']
+    assert len(tracked)==1
+    section=_controls_section(tracked)
+    assert section['fields']['Stack'][0]['name']=='probe.safetensors'
+    assert section['controls'][0]['display_type']=='native_lora_stack'

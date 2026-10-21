@@ -20,6 +20,9 @@
 //     remaining field keys in a generic 2-col grid below the renderer body. Null falls
 //     back fully to the generic field grid.
 //
+//   renderField(entry, fieldKey, ctx) -> HTMLElement | null
+//     Optional field-specific body for the pinned panel; null uses existing fallback.
+//
 //   matchField(entry, fieldKey, value) -> boolean | null
 //     For the given field-name search token, returns a definitive match decision.
 //     Null/undefined means "no opinion — fall through to the generic substring matcher."
@@ -71,6 +74,17 @@ export function renderTrackedSectionBody(entry, ctx) {
         return handler.render(entry, ctx);
     } catch (err) {
         console.warn("[tracked_metadata_renderers] render failed for", displayType, err);
+        return null;
+    }
+}
+
+export function renderTrackedFieldBody(entry, fieldKey, ctx) {
+    const handler = TRACKED_RENDERERS[resolveDisplayType(entry)];
+    if (typeof handler?.renderField !== "function") return null;
+    try {
+        return handler.renderField(entry, fieldKey, ctx);
+    } catch (err) {
+        console.warn("[tracked_metadata_renderers] field render failed", err);
         return null;
     }
 }
@@ -129,20 +143,22 @@ function parsePowerLoraFilterValue(value) {
     return null;
 }
 
-function renderPowerLoraBody(entry, ctx, heading = "Power LoRAs") {
-    const rows = Array.isArray(entry?.fields?.power_loras)
-        ? entry.fields.power_loras.map((row, index) => ({ row, index }))
+function renderPowerLoraBody(entry, ctx, heading = "Power LoRAs", fieldKey = "power_loras", counts = false) {
+    const rows = Array.isArray(entry?.fields?.[fieldKey])
+        ? entry.fields[fieldKey].map((row, index) => ({ row, index }))
             .filter(({ row }) => row && typeof row === "object")
         : [];
-    if (!rows.length) return null;
+    if (!rows.length && !counts) return null;
 
     const { style, CHROME, formatGenerationValue, fieldSearchToken,
         tokenActiveA, tokenActiveB, onFieldClick, onFieldContextMenu, rowCopy, onFieldCopy, copyOnHover } = ctx;
 
     const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:5px;min-width:0;`);
-    const label = style(document.createElement("div"), `color:#8fa4b6;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
-    label.textContent = heading;
-    const supplied = ctx.controlSupplied?.(entry, "power_loras");
+    const label = style(document.createElement("div"), `color:${CHROME.textSecondary};font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
+    label.textContent = counts
+        ? `${heading} · ${rows.length} LoRA${rows.length === 1 ? "" : "s"} · ${rows.filter(({ row }) => row.enabled).length} on`
+        : heading;
+    const supplied = ctx.controlSupplied?.(entry, fieldKey);
     if (supplied) {
         const chip = style(document.createElement("span"), `margin-left:6px;padding:0 4px;border-radius:3px;border:1px solid rgba(143,192,240,0.4);color:#8fc0f0;font-size:9px;text-transform:none;letter-spacing:0;`);
         chip.textContent = "Control";
@@ -182,12 +198,14 @@ function renderPowerLoraBody(entry, ctx, heading = "Power LoRAs") {
             display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;
             padding:7px 48px 7px 8px;border-radius:6px;border:1px solid ${border};
             background:${bg};
-            color:${enabled && !skipped ? "#e4edf4" : "#9ca8b2"};cursor:pointer;
+            color:${enabled && !skipped ? CHROME.text : CHROME.textSecondary};cursor:pointer;
             box-shadow:${shadow};
         `);
         const main = style(document.createElement("div"), `min-width:0;display:flex;flex-direction:column;gap:2px;`);
         const title = style(document.createElement("div"), `font-size:10px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         title.textContent = `${row.slot != null ? `${row.slot}. ` : ""}${name}`;
+        title.title = name;
+        line.title = name;
         const parts = [];
         for (const [key, labelText] of [
             ["strength", "strength"],
@@ -196,16 +214,17 @@ function renderPowerLoraBody(entry, ctx, heading = "Power LoRAs") {
         ]) {
             if (row[key] != null && row[key] !== "") parts.push(`${labelText} ${formatGenerationValue(row[key])}`);
         }
-        const sub = style(document.createElement("div"), `color:#8fa4b6;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        const sub = style(document.createElement("div"), `color:${CHROME.textSecondary};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         sub.textContent = parts.length ? parts.join(" | ") : "-";
         main.append(title, sub);
-        const status = style(document.createElement("div"), `font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.05em;color:${enabled ? "#b7e4b4" : "#c0a49a"};`);
+        const status = style(document.createElement("div"), `font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.05em;color:${CHROME.textSecondary};`);
         status.textContent = !enabled ? "Off" : skipped ? "Skipped" : "On";
         line.append(main, status);
 
         const cellInfo = {
             entry,
-            fieldKey: "power_loras",
+            fieldKey,
+            filterFieldKey: "power_loras",
             value: filterValue,
             displayKind: "power_lora_row",
             rowMeta: row,
@@ -214,8 +233,8 @@ function renderPowerLoraBody(entry, ctx, heading = "Power LoRAs") {
         line.addEventListener("click", (event) => onFieldClick?.(event, cellInfo));
         line.addEventListener("contextmenu", (event) => onFieldContextMenu?.(event, cellInfo));
         const rowWrap = style(document.createElement("div"), `position:relative;min-width:0;`);
-        const copy = rowCopy?.(entry, index);
-        const copyButton = style(document.createElement("button"), `appearance:none;position:absolute;right:6px;top:7px;padding:2px 4px;border-radius:4px;border:1px solid rgba(143,192,240,0.4);background:#1d2b38;color:#dce8f2;font-size:9px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity 120ms;`);
+        const copy = rowCopy?.(entry, index, fieldKey);
+        const copyButton = style(document.createElement("button"), `appearance:none;position:absolute;right:6px;top:7px;padding:2px 4px;border-radius:4px;border:1px solid ${CHROME.accentBorder};background:${CHROME.panelRaised};color:${CHROME.text};font-size:9px;cursor:pointer;opacity:0;pointer-events:none;transition:opacity 120ms;`);
         copyButton.type = "button";
         copyButton.textContent = "Copy";
         copyButton.title = copy?.label || "Copy row JSON";
@@ -247,7 +266,7 @@ function renderPowerLoraBody(entry, ctx, heading = "Power LoRAs") {
     // Tell the gallery we consumed only the structured `power_loras` list; let the generic
     // grid render any sibling count fields (enabled_lora_count, total_lora_count, etc.) so
     // the at-a-glance summary cells don't disappear when the rich rows take over.
-    return { dom: wrap, consumedFields: ["power_loras"] };
+    return { dom: wrap, consumedFields: [fieldKey] };
 }
 
 function matchPowerLoraField(entry, fieldKey, value) {
@@ -368,6 +387,72 @@ const SEED_MODE_TEXT = {
     randomize: "randomize",
 };
 
+// A display annotation alone cannot turn arbitrary stored JSON into LoRA rows.
+function nativeControlRows(entry, control) {
+    const rows = entry?.fields?.[control?.field];
+    if (control?.kind !== "ROWS" || control.display_type !== "native_lora_stack" || !Array.isArray(rows)) return null;
+    return rows.every((row) => row && typeof row === "object" && typeof row.name === "string"
+        && typeof row.enabled === "boolean" && typeof row.strength === "number" && Number.isFinite(row.strength)
+        && Number.isSafeInteger(row.slot) && row.slot > 0) ? rows : null;
+}
+
+function decorateControl(cell, control, ctx) {
+    const { style, CHROME } = ctx;
+    const parts = [`Control ${control.binding_id || ""}`.trim()];
+    if (control.origin === "local") parts.push("App only");
+    if (control.advanced === true) parts.push("Advanced");
+    const mode = SEED_MODE_TEXT[control.seed_mode];
+    if (mode) parts.push(`seed ${mode}`);
+    cell.title = [cell.title, parts.join(" · ")].filter(Boolean).join("\n");
+    const titleEl = cell.firstChild;
+    if (titleEl && mode) {
+        const note = style(document.createElement("span"), `color:${CHROME.textSecondary};margin-left:6px;`);
+        note.textContent = `· ${mode}`;
+        titleEl.appendChild(note);
+    }
+    if (titleEl && control.advanced === true) {
+        const tag = style(document.createElement("span"),
+            `margin-left:6px;padding:0 4px;border:1px solid ${CHROME.border};border-radius:3px;color:${CHROME.textDim};font-size:9px;`);
+        tag.textContent = "Adv";
+        tag.dataset.controlsAdvanced = "true";
+        titleEl.appendChild(tag);
+    }
+    if (control.rows_omitted === true) {
+        const note = style(document.createElement("div"), `color:${CHROME.textSecondary};font-size:10px;line-height:1.4;`);
+        note.textContent = "LoRA rows were not recorded because this metadata section exceeded its size limit.";
+        cell.appendChild(note);
+    }
+}
+
+function renderControlField(entry, fieldKey, ctx) {
+    const control = controlsOf(entry).find((item) => item.field === fieldKey);
+    if (nativeControlRows(entry, control) === null) return null;
+    const body = renderPowerLoraBody(entry, ctx, String(control.field), fieldKey, true).dom;
+    decorateControl(body, control, ctx);
+    return body;
+}
+
+function matchControlsField(entry, fieldKey, value) {
+    if (fieldKey !== "power_loras") return null;
+    let hasRows = false;
+    const typedFields = new Set();
+    for (const control of controlsOf(entry)) {
+        const rows = nativeControlRows(entry, control);
+        if (rows === null) continue;
+        hasRows = true;
+        typedFields.add(control.field);
+        if (matchPowerLoraField({ fields: { power_loras: rows } }, fieldKey, value)) return true;
+    }
+    // An actual scalar Control may use the same name as the virtual row field.
+    for (const [key, literal] of Object.entries(entry?.fields || {})) {
+        if (key.toLowerCase() !== fieldKey || typedFields.has(key)) continue;
+        const text = literal == null || literal === "" ? "-"
+            : typeof literal === "object" ? JSON.stringify(literal) : String(literal);
+        if (text.toLowerCase().includes(String(value).toLowerCase())) return true;
+    }
+    return hasRows ? false : null;
+}
+
 function renderControlsBody(entry, ctx) {
     const { style, CHROME } = ctx;
     const controls = controlsOf(entry);
@@ -401,34 +486,27 @@ function renderControlsBody(entry, ctx) {
         }
         const members = bySection.get(name);
         const byField = new Map(members.map((control) => [control.field, control]));
-        const grid = ctx.renderFieldGrid(entry, members.map((control) => control.field), (cell, field) => {
-            const control = byField.get(field);
-            if (!control) return;
-            const parts = [`Control ${control.binding_id || ""}`.trim()];
-            if (control.origin === "local") parts.push("App only");
-            if (control.advanced === true) parts.push("Advanced");
-            const mode = SEED_MODE_TEXT[control.seed_mode];
-            if (mode) parts.push(`seed ${mode}`);
-            cell.title = [cell.title, parts.join(" · ")].filter(Boolean).join("\n");
-            const titleEl = cell.firstChild;
-            if (titleEl && mode) {
-                const note = style(document.createElement("span"), `color:#8fa4b6;margin-left:6px;`);
-                note.textContent = `· ${mode}`;
-                titleEl.appendChild(note);
+        let pending = [];
+        const flush = () => {
+            if (!pending.length) return;
+            const grid = ctx.renderFieldGrid(entry, pending.map((control) => control.field), (cell, field) => {
+                decorateControl(cell, byField.get(field), ctx);
+            });
+            if (grid) wrap.appendChild(grid);
+            pending = [];
+        };
+        for (const control of members) {
+            const body = renderControlField(entry, control.field, ctx);
+            if (body) {
+                flush();
+                wrap.appendChild(body);
+            } else {
+                pending.push(control);
             }
-            if (titleEl && control.advanced === true) {
-                // The panel's "Adv" tag: the Control was marked Advanced for this run.
-                const tag = style(document.createElement("span"),
-                    `margin-left:6px;padding:0 4px;border:1px solid ${CHROME.border};border-radius:3px;color:${CHROME.textDim};font-size:9px;`);
-                tag.textContent = "Adv";
-                tag.dataset.controlsAdvanced = "true";
-                titleEl.appendChild(tag);
-            }
-        });
-        if (grid) wrap.appendChild(grid);
+        }
+        flush();
     }
-    // Every field is drawn above through the gallery's own cells, so pins,
-    // filters and Copy behave as in any section; a pinned field lifts as a cell.
+    // Scalars use gallery cells; native stacks have a field-specific pin body.
     const fields = entry?.fields && typeof entry.fields === "object" ? entry.fields : {};
     const consumed = controls.map((control) => control.field)
         .filter((field) => Object.prototype.hasOwnProperty.call(fields, field));
@@ -437,4 +515,6 @@ function renderControlsBody(entry, ctx) {
 
 registerTrackedRenderer("controls", {
     render: renderControlsBody,
+    renderField: renderControlField,
+    matchField: matchControlsField,
 });

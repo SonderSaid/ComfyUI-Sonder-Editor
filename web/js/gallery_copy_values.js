@@ -82,6 +82,8 @@ export function resolveTrackedFieldCopy(entry, fieldKey) {
     const preview = entry?.fields?.[key];
     if (entry?.display_type === "controls") {
         if (preview == null) return unavailable();
+        const control = Array.isArray(entry.controls) ? entry.controls.find((item) => item?.field === key) : null;
+        if (control?.rows_omitted === true) return full(copyTextForValue(preview), "Copy summary");
         return typeof preview === "string" && preview.endsWith(CONTROLS_TRUNCATED_MARKER)
             ? { kind: "unavailable", label: "Full value is only in the run's source prompt", text: "" }
             : full(copyTextForValue(preview));
@@ -110,17 +112,17 @@ export function resolveTrackedFieldCopy(entry, fieldKey) {
     return rawSectionCopy(entry);
 }
 
-function powerLoraRows(entry) {
-    const previewRows = entry?.fields?.power_loras;
+function powerLoraRows(entry, fieldKey) {
+    const previewRows = entry?.fields?.[fieldKey];
     if (!Array.isArray(previewRows)) return null;
-    const completeRows = entry?.full_fields?.power_loras;
+    const completeRows = entry?.full_fields?.[fieldKey];
     if (completeRows === undefined) return previewRows;
     return Array.isArray(completeRows) && completeRows.length === previewRows.length
         ? completeRows : null;
 }
 
-export function resolvePowerLoraRowCopies(entry, rowIndex) {
-    const rows = powerLoraRows(entry);
+export function resolvePowerLoraRowCopies(entry, rowIndex, fieldKey = "power_loras") {
+    const rows = powerLoraRows(entry, fieldKey);
     const row = Number.isSafeInteger(rowIndex) && rowIndex >= 0 ? rows?.[rowIndex] : null;
     if (!row || typeof row !== "object") {
         const fallback = rawSectionCopy(entry);
@@ -137,8 +139,8 @@ export function resolvePowerLoraRowCopies(entry, rowIndex) {
     };
 }
 
-export function resolvePowerLoraNamesCopy(entry) {
-    const rows = powerLoraRows(entry);
+export function resolvePowerLoraNamesCopy(entry, fieldKey = "power_loras") {
+    const rows = powerLoraRows(entry, fieldKey);
     if (!rows || rows.some(containsTruncatedMarker)) return rawSectionCopy(entry);
     return full(rows.map((row) => row && (row.name || row.lora || ""))
         .filter(Boolean).join("\n"), "Copy LoRA names");

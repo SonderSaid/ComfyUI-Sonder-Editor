@@ -271,7 +271,7 @@ def summary(rows: Any, spec: dict) -> str:
     return text
 
 
-def detail(rows: Any, spec: dict, limit: int) -> str:
+def detail(rows: Any, spec: dict, limit: int, *, marker: str = "…") -> str:
     """The summary followed by each row's values, for provenance text."""
     fields = [field["id"] for field in spec.get("fields") or []]
     parts = []
@@ -279,7 +279,7 @@ def detail(rows: Any, spec: dict, limit: int) -> str:
         if isinstance(row, dict):
             parts.append(", ".join(_text(row.get(field)) for field in fields))
     text = summary(rows, spec) + (": " + "; ".join(parts) if parts else "")
-    return text if len(text) <= limit else text[:limit - 1] + "…"
+    return text if len(text) <= limit else text[:limit - len(marker)] + marker
 
 
 def _text(value: Any) -> str:

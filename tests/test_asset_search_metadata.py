@@ -30,6 +30,9 @@ TRACKED = [
     ["an", "array", "entry"],
     None,
     {"label": "Seed", "fields": {"seed": 7}},
+    {"label": "Controls at run", "display_type": "controls",
+     "fields": {"Stack": [{"slot": 1, "name": "folder/模型 %.safetensors", "strength": -0.5, "enabled": True}]},
+     "controls": [{"field": "Stack", "kind": "ROWS", "binding_id": "stack", "display_type": "native_lora_stack"}]},
 ]
 
 

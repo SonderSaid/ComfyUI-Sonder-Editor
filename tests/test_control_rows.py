@@ -410,14 +410,17 @@ def test_presets_capture_match_and_preview_row_lists():
 
 # ── Provenance and models ────────────────────────────────────────────────────
 
-def test_controls_at_run_records_the_rows_as_text_only():
+def test_controls_at_run_records_native_rows_once_without_a_collector():
     section = controls_snapshot.controls_snapshot(prompt([row(), row(LORAS[1], 0.5, False)]), ["3"],
                                                   class_lookup=lookup)
     label = "Load LoRA (Model) · LoRAs"
-    assert section["fields"][label].startswith("2 LoRAs · 1 on: sonder_test_a.safetensors, 1, on;")
+    assert section["fields"][label] == [
+        {"slot": 1, "name": LORAS[0], "enabled": True, "strength": 1.0},
+        {"slot": 2, "name": LORAS[1], "enabled": False, "strength": 0.5, "skipped": True}]
     record = section["controls"][0]
-    # The value lives only in fields (a Take stores the section three times).
-    assert record["kind"] == "ROWS" and "rows" not in record
+    assert record["display_type"] == "native_lora_stack" and record["kind"] == "ROWS"
+    assert not {"rows", "value"} & record.keys()
+    assert not {"full_fields", "raw_widget_text"} & section.keys()
 
 
 def test_a_missing_row_lora_names_the_loras_folder(monkeypatch):
@@ -432,3 +435,97 @@ def test_controls_at_run_marks_a_native_stacks_rows_as_control_set():
                {"label": "Power", "display_type": "power_loras", "source_node_id": "2", "fields": {"power_loras": []}}]
     section = controls_snapshot.controls_snapshot(prompt([row()]), ["3"], tracked=tracked, class_lookup=lookup)
     assert section["supplied"] == [{"section_index": 0, "field": "power_loras", "binding_id": "stack"}]
+
+
+@pytest.mark.parametrize("class_type", ["LoadLoraModel", "LoadLoraTextEncoder"])
+def test_native_snapshot_preserves_executed_literals_despite_options_and_frontend_hints(monkeypatch, class_type):
+    monkeypatch.setitem(CLASSES, "LoadLoraTextEncoder", LoadLoraModel)
+    p = prompt([row("folder/模型 % old.safetensors", -0.75), row(LORAS[1], 0), row(LORAS[2], 1, False), row("")],
+               bindings={"stack": binding(rows_unavailable=True)})
+    p["2"]["class_type"] = class_type
+    # Sparse flattened indices still preserve prompt order.
+    p["2"]["inputs"] = {key.replace("loras.1.", "loras.8."): value for key, value in p["2"]["inputs"].items()}
+    d = stack(describe(p))
+    assert d["rows_unavailable"] is True and d["error"]
+    section = controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup)
+    rows = next(iter(section["fields"].values()))
+    assert [(r["slot"], r["name"], r.get("skipped", False)) for r in rows] == [
+        (1, "folder/模型 % old.safetensors", False), (2, LORAS[2], True), (3, LORAS[1], True)]
+    p["2"]["inputs"]["loras.0.strength"] = 99
+    assert rows[0]["strength"] == -0.75
+
+
+@pytest.mark.parametrize("count", [0, 20])
+def test_native_snapshot_handles_empty_and_full_stacks(count):
+    p = prompt([row(f"style_{i}.safetensors", i / 10) for i in range(count)])
+    section = controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup)
+    assert len(next(iter(section["fields"].values()))) == count
+    assert section["controls"][0]["display_type"] == "native_lora_stack"
+
+
+def test_native_snapshot_keeps_long_names_and_roundtrips():
+    name = "folder/" + "é" * 700 + ".safetensors"
+    section = controls_snapshot.controls_snapshot(prompt([row(name)]), ["3"], class_lookup=lookup)
+    assert next(iter(json.loads(json.dumps(section))["fields"].values()))[0]["name"] == name
+    from server.lora_metadata import native_lora_fields
+    assert next(iter(section["fields"].values())) == native_lora_fields(flat([row(name)]))["power_loras"]
+
+
+def test_oversized_first_stack_shrinks_before_it_evicts_later_controls():
+    p = prompt([row("界" * 6000)], bindings={"stack": binding(label="First", order=0),
+                                          "seed": binding(path="4", name="rows", label="Later", order=1)})
+    p["4"] = {"class_type": "SeedRows", "inputs": flat([{"seed": 2}], "rows")}
+    p["3"]["inputs"]["other"] = ["4", 0]
+    section = controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup)
+    assert set(section["fields"]) == {"First", "Later"} and "truncated" not in section
+    first = next(c for c in section["controls"] if c["binding_id"] == "stack")
+    assert first["rows_omitted"] is True and "display_type" not in first
+    assert section["fields"]["First"] == "1 LoRA · 1 on"
+    assert isinstance(section["fields"]["Later"], str)
+    assert len(json.dumps(section, ensure_ascii=False, separators=(",", ":")).encode()) <= controls_snapshot.MAX_SECTION_BYTES
+
+
+def test_new_malformed_native_fallback_marks_clipped_text():
+    p = prompt([row("x" * 1000, float("nan"))])
+    section = controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup)
+    value = next(iter(section["fields"].values()))
+    assert value.endswith(controls_snapshot.TRUNCATED_MARKER)
+    assert "display_type" not in section["controls"][0]
+
+
+def test_multiple_stacks_with_duplicate_control_labels_preserve_each_value():
+    p = prompt([row()], bindings={"stack": binding(label="Stack"), "second": binding(path="4", label="Stack")})
+    p["4"] = {"class_type": "LoadLoraModel", "inputs": {"model": ["2", 0], **flat([row(LORAS[1], 0.5)])}}
+    p["3"]["inputs"]["model"] = ["4", 0]
+    section = controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup)
+    assert len(section["fields"]) == 2
+    assert {rows[0]["name"] for rows in section["fields"].values()} == set(LORAS[:2])
+    assert len({c["field"] for c in section["controls"]}) == 2
+
+
+@pytest.mark.parametrize("bad", [None, {}, [None], [row(strength=True)], [row(strength=float("inf"))],
+                                  [row(enabled=1)], [row(name=4)], [row(strength=10 ** 1000)]])
+def test_native_capture_refuses_unrepresentable_rows(bad):
+    from server.lora_metadata import captured_native_lora_rows
+    assert captured_native_lora_rows(bad) is None
+
+
+
+def test_native_stack_near_byte_cap_reserves_the_final_truncation_count():
+    # Fill the one-Control envelope to just below the cap, including UTF-8 bytes.
+    p = prompt([row("x")], bindings={"stack": binding(label="Stack")})
+    base = controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup)
+    encoded = lambda section: len(json.dumps(section, ensure_ascii=False, separators=(",", ":")).encode())
+    name = "x" * (controls_snapshot.MAX_SECTION_BYTES - encoded(base) - 3)
+    p["2"]["inputs"]["loras.0.lora_name"] = name
+    alone = controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup)
+    assert alone["controls"][0]["display_type"] == "native_lora_stack"
+    manifest = json.loads(p["8"]["inputs"]["manifest"])
+    manifest["bindings"]["later"] = binding(path="4", name="rows", label="Later", order=10)
+    p["8"]["inputs"]["manifest"] = json.dumps(manifest)
+    p["4"] = {"class_type": "SeedRows", "inputs": flat([{"seed": 2}], "rows")}
+    p["3"]["inputs"]["other"] = ["4", 0]
+    section = controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup)
+    assert section is not None and encoded(section) <= controls_snapshot.MAX_SECTION_BYTES
+    assert set(section["fields"]) == {"Stack", "Later"} and "truncated" not in section
+    assert section["controls"][0]["rows_omitted"] is True

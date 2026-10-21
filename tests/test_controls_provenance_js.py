@@ -196,3 +196,153 @@ def test_gallery_wires_the_controls_lookup_and_grid():
     assert "bodyResult.pinnedFieldsGeneric" in source
     # Collector fields a Control set keep their cell and gain a Control chip (tag display).
     assert 'chip.textContent = "Control";' in source and "controlsAlsoIn" not in source
+
+
+
+def test_native_control_rows_keep_source_identity_for_events_copy_and_field_rendering():
+    imports = f"""
+import {{ renderTrackedFieldBody, trackedFieldMatchForEntry }} from {json.dumps(RENDERERS.as_uri())};
+import {{ resolvePowerLoraRowCopies }} from {json.dumps(COPY_MODULE.as_uri())};
+"""
+    result = _run(FAKE_DOM + _imports() + imports + r"""
+Object.assign(El.prototype, {
+ addEventListener(type, fn) { (this.events ||= {})[type] = fn; }, setAttribute() {}, contains() { return false; }
+});
+const filename = 'folder/模型 % choice.safetensors';
+const rows = [{slot: 1, name: filename, enabled: true, strength: 0.8},
+ {slot: 2, name: filename, enabled: false, strength: 0, skipped: true}];
+const entry = {display_type: 'controls', fields: {First: rows, Second: [{...rows[0], name: 'other'}], Scalar: 20},
+ controls: [{field: 'First', kind: 'ROWS', binding_id: 'a', display_type: 'native_lora_stack', advanced: true},
+ {field: 'Second', kind: 'ROWS', binding_id: 'b', display_type: 'native_lora_stack'},
+ {field: 'Scalar', kind: 'INT', binding_id: 'c'}]};
+const events = [], copies = [];
+const ctx = {style, CHROME, formatGenerationValue: String, fieldSearchToken: (k,v) => 'field:'+encodeURIComponent(k)+'='+encodeURIComponent(v),
+ tokenActiveA: () => true, tokenActiveB: () => false,
+ onFieldClick: (e, info) => events.push(info), onFieldContextMenu: (e,info) => events.push(info),
+ rowCopy: (e,i,k) => resolvePowerLoraRowCopies(e,i,k).row, onFieldCopy: copy => copies.push(copy),
+ renderFieldGrid: () => document.createElement('div')};
+const dom = renderTrackedFieldBody(entry, 'First', ctx);
+const row = dom.children[1], button = row.children[0], copy = row.children[1];
+const event = {preventDefault() {}, stopPropagation() {}};
+button.events.click(event); button.events.contextmenu(event); copy.events.click(event);
+const needle = events[0].value.toLowerCase();
+const collector = {display_type:'power_loras', fields:{power_loras:[{name:filename, enabled:true, strength:'0.80'}]}};
+const wrong = structuredClone(entry); wrong.fields.First[0].strength = 0.9;
+const collision = {...entry, fields:{...entry.fields,power_loras:'a literal value'}};
+console.log(JSON.stringify({
+ heading: dom.children[0].text, ownField: events.every(i=>i.entry===entry && i.fieldKey==='First' && i.filterFieldKey==='power_loras' && i.rowIndex===0),
+ copy: copies[0].text, name:resolvePowerLoraRowCopies(entry,0,'First').name.text,
+ match: trackedFieldMatchForEntry(entry,'power_loras',needle), cross:trackedFieldMatchForEntry(collector,'power_loras',needle),
+ wrong:trackedFieldMatchForEntry(wrong,'power_loras',needle), plain:trackedFieldMatchForEntry(entry,'power_loras','模型 %'),
+ collision:trackedFieldMatchForEntry(collision,'power_loras','literal'), unrelated:trackedFieldMatchForEntry(entry,'scalar','20'),
+ noOther:!dom.text.includes('other'), scalarHook:renderTrackedFieldBody(entry,'Scalar',ctx), events:events.length
+}));
+""")
+    assert result['ownField'] and result['match'] and result['cross'] and result['plain'] and result['collision']
+    assert result['wrong'] is False and result['unrelated'] is None
+    assert result['noOther'] and result['scalarHook'] is None and result['events'] == 2
+    assert 'Adv' in result['heading'] and '2 LoRAs' in result['heading']
+    assert json.loads(result['copy'])['name'] == result['name'] == 'folder/模型 % choice.safetensors'
+
+
+def test_controls_mixed_scalar_stack_order_and_unknown_tags_fall_back():
+    imports = f"import {{ renderTrackedFieldBody }} from {json.dumps(RENDERERS.as_uri())};\n"
+    result = _run(FAKE_DOM + _imports() + imports + r"""
+Object.assign(El.prototype,{addEventListener(){},setAttribute(){},contains(){return false;}});
+const entry = {display_type:'controls',fields:{Before:1,Stack:[],After:2},controls:[
+ {field:'Before',binding_id:'a',kind:'INT'},
+ {field:'Stack',binding_id:'b',kind:'ROWS',display_type:'native_lora_stack'},
+ {field:'After',binding_id:'c',kind:'INT'}]};
+const ctx={style,CHROME,formatGenerationValue:String,fieldSearchToken:()=>'',renderFieldGrid:(e,keys)=>{
+ const grid=document.createElement('div');grid.textContent=keys.join(',');return grid;
+}};
+const body=renderTrackedSectionBody(entry,ctx).dom;
+const unknown=structuredClone(entry);unknown.controls[1].display_type='future';
+const malformed=structuredClone(entry);malformed.fields.Stack=[{name:'x'}];
+console.log(JSON.stringify({order:body.children.slice(1).map(e=>e.text),
+ unknown:renderTrackedFieldBody(unknown,'Stack',ctx),bad:renderTrackedFieldBody(malformed,'Stack',ctx)}));
+""")
+    assert result['order'] == ['Before', 'Stack · 0 LoRAs · 0 on', 'After']
+    assert result['unknown'] is None and result['bad'] is None
+
+
+def test_omitted_stack_copy_is_a_summary_and_clipped_native_fallback_is_unavailable():
+    result = _run(_imports() + r"""
+const entry={display_type:'controls',fields:{Stack:'20 LoRAs · 10 on',Bad:'prefix'+CONTROLS_TRUNCATED_MARKER},
+ controls:[{field:'Stack',rows_omitted:true}]};
+console.log(JSON.stringify({summary:resolveTrackedFieldCopy(entry,'Stack'),bad:resolveTrackedFieldCopy(entry,'Bad')}));
+""")
+    assert result['summary']['label'] == 'Copy summary'
+    assert result['bad']['kind'] == 'unavailable'
+
+
+
+def test_actual_gallery_click_context_and_search_use_virtual_filter_key():
+    source = GALLERY.read_text(encoding='utf-8')
+    def between(start, end):
+        return source[source.index(start):source.index(end, source.index(start))]
+    code = between('    function handleTrackedFieldClick(', '    function handleTrackedSectionContextMenu(')
+    code += between('function parseAssetSearchQuery(', '// The one authority for which')
+    code += between('function trackedFieldMatches(', 'function canOpenWorkflowFor(')
+    code += between('function formatGenerationValue(', 'function assetExtension(')
+    code += between('    function fieldSearchToken(', '    function activeSearchTokens(')
+    imports = f"import {{ trackedFieldMatchForEntry }} from {json.dumps(RENDERERS.as_uri())};\n"
+    result = _run(imports + code + r"""
+const toggles=[];
+const compareModeActive=()=>true;
+const toggleCompareSearchToken=(side,token)=>toggles.push([side,token]);
+const row={slot:1,name:'folder/模型 % X.safetensors',strength:0.8,enabled:true};
+const entry={display_type:'controls',fields:{Stack:[row]},controls:[{kind:'ROWS',field:'Stack',display_type:'native_lora_stack'}]};
+const info={entry,fieldKey:'Stack',filterFieldKey:'power_loras',rowIndex:0,value:JSON.stringify({n:row.name,e:1,s:'0.8'})};
+const event={stopPropagation(){},preventDefault(){}};
+handleTrackedFieldClick(event,info,'fullscreen');handleTrackedFieldContextMenu(event,info,'fullscreen');
+const term=parseAssetSearchQuery(toggles[0][1]).fieldTerms[0];
+console.log(JSON.stringify({sides:toggles.map(t=>t[0]),key:term.name,
+ match:trackedFieldMatches([entry],term.name,term.value),
+ wrong:trackedFieldMatches([{...entry,fields:{Stack:[{...row,strength:0.5}]}}],term.name,term.value),
+ normal:trackedFieldMatches([entry],'stack','模型 %')}));
+""")
+    assert result == {'sides':['A','B'],'key':'power_loras','match':True,'wrong':False,'normal':True}
+
+
+def test_actual_pinned_panel_lifts_only_one_native_stack_and_keeps_scalar_pin():
+    source = GALLERY.read_text(encoding='utf-8')
+    code = source[source.index('    function renderPinnedFieldsTopGroup('):source.index('    function renderTrackedSectionContainer(')]
+    imports = f"import {{ renderTrackedFieldBody }} from {json.dumps(RENDERERS.as_uri())};\n"
+    result = _run(FAKE_DOM + _imports() + imports + code + r"""
+Object.assign(El.prototype,{addEventListener(){},setAttribute(){},contains(){return false;},prepend(node){this.children.unshift(node);}});
+const rows=name=>[{slot:1,name,enabled:true,strength:0.8}];
+const entry={label:'Controls at run',display_type:'controls',fields:{One:rows('chosen.safetensors'),Two:rows('UNPINNED.safetensors'),Scalar:42},
+ controls:[{field:'One',kind:'ROWS',display_type:'native_lora_stack'},
+ {field:'Two',kind:'ROWS',display_type:'native_lora_stack'},{field:'Scalar',kind:'INT'}]};
+const pins=new Set(['One','Scalar']);
+const pinSetsForSurface=()=>({fields:pins});
+const trackedFieldPinKey=(e,key)=>key;
+const ctx={style,CHROME,formatGenerationValue:String,fieldSearchToken:()=>'',renderFieldGrid:(e,keys)=>{
+ const dom=document.createElement('div');dom.textContent=keys.join(',');return dom;
+}};
+const trackedRenderContext=()=>ctx,withControlsLookup=c=>c;
+const formatGenerationValue=v=>JSON.stringify(v),fieldSearchToken=()=>'';
+const makeMetaCell=(key,value)=>{const c=document.createElement('div');c.appendChild(document.createElement('div'));c.firstChild.textContent=key;return c;};
+const attachCopyToElement=()=>{},applyFieldCellActiveStyle=()=>{},handleTrackedFieldContextMenu=()=>{},handleTrackedFieldClick=()=>{};
+const result=renderPinnedFieldsTopGroup([entry],'fullscreen');
+console.log(JSON.stringify({text:result.text,unrelated:result.text.includes('UNPINNED'),
+ chosen:result.text.split('chosen.safetensors').length-1,scalar:result.text.includes('Scalar')}));
+""")
+    assert result['chosen'] == 1 and result['scalar'] and not result['unrelated']
+    assert 'Pinned Fields (2)' in result['text']
+
+
+
+def test_native_control_heading_preserves_duplicate_label_suffix():
+    imports = f"import {{ renderTrackedFieldBody }} from {json.dumps(RENDERERS.as_uri())};\n"
+    result = _run(FAKE_DOM + _imports() + imports + r"""
+Object.assign(El.prototype,{addEventListener(){},setAttribute(){},contains(){return false;}});
+const row={slot:1,name:'probe.safetensors',enabled:true,strength:1};
+const entry={display_type:'controls',fields:{Stack:[row],'Stack [second]':[row]},controls:[
+ {field:'Stack',label:'Stack',kind:'ROWS',display_type:'native_lora_stack'},
+ {field:'Stack [second]',label:'Stack',kind:'ROWS',display_type:'native_lora_stack'}]};
+const ctx={style,CHROME,formatGenerationValue:String,fieldSearchToken:()=>''};
+console.log(JSON.stringify(entry.controls.map(c=>renderTrackedFieldBody(entry,c.field,ctx).children[0].text)));
+""")
+    assert result == ['Stack · 1 LoRA · 1 on', 'Stack [second] · 1 LoRA · 1 on']

@@ -20,10 +20,12 @@ off at run time is still listed; the gallery says so. Notes are never recorded.
 
 The section keeps the collector's searchable shape (``label`` and ``fields``,
 keyed by Control label) so ``tracked:``/``field:`` search, pins and Copy work,
-and adds ``controls`` (per-binding detail without the value, which lives only
+and adds ``controls`` (per-binding detail and optional native-stack display
+annotation, without the value, which lives only
 in ``fields``) and ``supplied`` (generic collector fields a binding set). It
 has no ``raw_widget_text``: a Take stores the section three times inline, and
-a third copy of the values would only repeat ``fields``. It is capped at
+a third copy of the values would only repeat ``fields``. Native LoRA values
+are complete normalized row arrays; other ROWS values remain text. It is capped at
 ``MAX_SECTION_BYTES``.
 
 Pure apart from the injectable ``describe``/``class_lookup``; it never raises
@@ -38,6 +40,7 @@ import math
 from typing import Any, Callable
 
 from . import control_descriptors, control_manifest, control_rows, prompt_graph
+from .lora_metadata import NATIVE_LORA_STACKS, NATIVE_LORA_DISPLAY, captured_native_lora_rows
 
 SECTION_LABEL = "Controls at run"
 DISPLAY_TYPE = "controls"
@@ -203,15 +206,25 @@ def read_sdk_delta(prompt: dict) -> dict:
 
 # ── Snapshot ─────────────────────────────────────────────────────────────────
 
+def _native_stack(descriptor: dict, prompt: dict) -> bool:
+    targets = descriptor.get("targets") or []
+    first = targets[0] if targets else {}
+    node = prompt.get(str(first.get("path")))
+    return (descriptor.get("kind") == control_rows.ROWS_KIND and first.get("input") == "loras"
+            and isinstance(node, dict) and node.get("class_type") in NATIVE_LORA_STACKS)
+
+
 def _recorded_value(descriptor: dict, prompt: dict) -> Any:
     """The first target's literal, as the run received it; INT/SEED as decimal text."""
     targets = descriptor.get("targets") or []
     first = targets[0] if targets else {}
     kind = descriptor.get("kind")
     if kind == control_rows.ROWS_KIND:
-        # A row list reads as text (``2 LoRAs · 1 on: a, 1, on; …``) so the
-        # generic grid and search stay readable. The full rows are the
-        # collector's own section for that node (``power_loras``).
+        if _native_stack(descriptor, prompt):
+            rows = captured_native_lora_rows(descriptor.get("value"))
+            if rows is not None:
+                return rows
+            return control_rows.detail(descriptor.get("value"), descriptor, TEXT_VALUE_LIMIT, marker=TRUNCATED_MARKER)
         return control_rows.detail(descriptor.get("value"), descriptor, TEXT_VALUE_LIMIT)
     value = prompt_graph.node_inputs(prompt, first.get("path")).get(first.get("input"))
     if kind in ("INT", "SEED") and isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -294,7 +307,7 @@ def _record(entry: dict, field: str) -> dict:
         record["origin"] = entry["origin"]
     if entry["advanced"]:
         record["advanced"] = True
-    for name in ("seed_mode", "targets_truncated"):
+    for name in ("seed_mode", "targets_truncated", "display_type", "rows_omitted"):
         if name in entry:
             record[name] = entry[name]
     return record
@@ -381,6 +394,8 @@ def controls_snapshot(
             "value": _recorded_value(descriptor, prompt),
             "targets": targets[:MAX_TARGETS],
         }
+        if _native_stack(descriptor, prompt) and isinstance(entry["value"], list):
+            entry["display_type"] = NATIVE_LORA_DISPLAY
         if len(targets) > MAX_TARGETS:
             entry["targets_truncated"] = len(targets) - MAX_TARGETS
         mode = delta["seed_modes"].get(binding_id, descriptor.get("seed_mode"))
@@ -396,6 +411,15 @@ def controls_snapshot(
     entries.sort(key=lambda entry: _sort_key(entry, positions))
     truncated = max(0, len(entries) - MAX_BINDINGS)
     kept = entries[:MAX_BINDINGS]
+    # Shrink an individually oversized stack before it can evict later Controls.
+    # Reserve the omission count if this becomes the only retained Control.
+    for entry in kept:
+        if (entry.get("display_type") == NATIVE_LORA_DISPLAY
+                and _encoded_size(_assemble([entry], tracked, max(0, len(entries) - 1))) > MAX_SECTION_BYTES):
+            rows = entry["value"]
+            entry["value"] = f"{len(rows)} LoRA{'s' if len(rows) != 1 else ''} · {sum(row['enabled'] for row in rows)} on"
+            del entry["display_type"]
+            entry["rows_omitted"] = True
     section = _assemble(kept, tracked, truncated)
     while _encoded_size(section) > MAX_SECTION_BYTES and len(kept) > 1:
         # Drop from the end (Editor section and late groups first) until it fits.
