@@ -36,6 +36,11 @@ assert.ok(Object.keys(edMove).length&&Object.keys(edMove).every(k=>k.endsWith(':
 assert.deepEqual(apply(ed,edMove).filter(d=>d.group===EDITOR_PARTITION).sort(comparePanelRows).map(d=>d.base),['binding:12','binding:10','binding:11']);
 assert.throws(()=>planPanelMove(ed,'binding:12','','binding:13'),/stay in Editor/);
 assert.throws(()=>planPanelMove(ed,'binding:13',EDITOR_PARTITION,'binding:10'),/stay in Editor/);
+// A read-only row (a node switch in the Sonder App) is never renumbered.
+// Moving A just before D would otherwise renumber the switch C between them.
+const ro=[{...row(0,0),label:'A'},{...row(1,0),label:'B'},{base:'execution:x',label:'C',order:0,group:'',status:'ok',read_only:true},{...row(2,0),label:'D'},{...row(3,0),label:'E'}];
+const roMove=planPanelMove(ro,'binding:0','','binding:2');
+assert.ok(Object.keys(roMove).length&&!Object.keys(roMove).some(k=>k.startsWith('execution:x')));
 let state=1234567;const rnd=()=>{state=(Math.imul(state,1664525)+1013904223)>>>0;return state;};
 for(let trial=0;trial<300;trial++){
     const rows=Array.from({length:25},(_,i)=>row(i,(rnd()%60)-30,i%3?'':'Advanced'));

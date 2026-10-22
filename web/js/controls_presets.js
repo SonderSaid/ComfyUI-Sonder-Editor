@@ -7,10 +7,12 @@ import { SPACE, TYPE, EDITOR_COLORS as COLORS, setButtonDisabled, setButtonVaria
 import { inputCss, quietLineCss } from "./controls_panel_style.js";
 
 let serial = 0;
+// Settings plus node switches: the most specific matching preset is shown.
+const size = preset => preset.members.length + (preset.execution || []).length;
 export function selectedPreset(presets, lastApplied) {
     const matches = presets.filter(p => p.state === "match");
     return matches.find(p => p.id === lastApplied)
-        || matches.sort((a, b) => b.members.length - a.members.length || a.order - b.order)[0]
+        || matches.sort((a, b) => size(b) - size(a) || a.order - b.order)[0]
         || null;
 }
 

@@ -14,7 +14,8 @@
 // Pure on import: the caller (control_relay.js) supplies the canvas and graph.
 import { CONTROL_SEED_MODES, findControlWidget } from "./control_widgets.js";
 import {
-    cleanGroup, defaultBindingLabel, effectiveGroupOrder, nodeType, parseManifest, pickerFor, planRestore, relayCensus, resolveAnchor, resolveBindings, sectionOf,
+    cleanGroup, defaultBindingLabel, effectiveGroupOrder, nodeType, parseManifest, pickerFor, planRestore, relayCensus, resolveAnchor,
+    resolveBindings, resolveExecution, sectionOf,
 } from "./control_bindings.js";
 import { readRows, summary } from "./control_rows.js";
 import { parseLaneSelection } from "./reference_bridge_shape.js";
@@ -72,14 +73,32 @@ export function planRows(relay, root) {
     // each group under a separator. Advanced rows stay (a personal Show
     // advanced toggle must never resize the saved node) and carry a suffix.
     const editor = [], ungrouped = [], grouped = new Map();
-    const entries = Object.entries(manifest.bindings).map(([id, entry]) => ({ id, ...entry }));
+    const switches = resolveExecution(root, manifest);
+    const entries = [...Object.entries(manifest.bindings).map(([id, entry]) => ({ id, ...entry })),
+        ...Object.entries(switches.entries).map(([id, entry]) => ({ id, ...entry, switch: true,
+            label: entry.label || switches.controls[id]?.title || "Node switch" }))];
     for (const entry of entries.sort(byOrder)) {
+        if (entry.switch) {
+            // A node switch is switched in Controls (one history step for its
+            // group); the Relay shows its current mode, read live.
+            const name = entry.advanced ? `${entry.label} · Adv` : entry.label;
+            // The mode text rides on the row: this tick's plan already resolved every switch.
+            const own = [{ id: `~x:${entry.id}`, switchId: entry.id, role: "summary", type: "text", label: name, options: {},
+                switchText: switchSummary(switches.controls[entry.id]) }];
+            const group = cleanGroup(entry.group);
+            if (!group) ungrouped.push(...own);
+            else grouped.set(group, [...(grouped.get(group) || []), ...own]);
+            continue;
+        }
         const resolved = bindings[entry.id];
         const type = ROW_TYPES[resolved?.widget?.type];
         if (resolved?.status !== "ok" || (!type && !resolved.rows)) continue;
         const anchor = resolved.anchor;
         const name = entry.label || defaultBindingLabel(resolved);
-        const label = entry.advanced ? `${name} · Adv` : name;
+        // A setting on a muted or bypassed node stays editable; the suffix says it does not run.
+        const off = resolved.participation === "partial" ? " · Partly off"
+            : resolved.participation === "inactive" ? (resolved.inactiveReason?.mode === "bypassed" ? " · Bypassed" : " · Muted") : "";
+        const label = `${name}${off}${entry.advanced ? " · Adv" : ""}`;
         const own = [];
         const picker = pickerOf(resolved);
         if (resolved.rows) {
@@ -102,7 +121,7 @@ export function planRows(relay, root) {
         else grouped.set(group, [...(grouped.get(group) || []), ...own]);
     }
     const rows = [...editor, ...ungrouped];
-    for (const group of effectiveGroupOrder(manifest, bindings)) {
+    for (const group of effectiveGroupOrder(manifest, bindings, switches.controls)) {
         const own = grouped.get(group);
         if (!own) continue;
         rows.push({ id: group, role: "separator", type: "text", label: group }, ...own);
@@ -147,8 +166,21 @@ export function pickerSummary(kind, value) {
     return String(value ?? "");
 }
 
+const SWITCH_MODES = { enabled: "Enabled", muted: "Muted", bypassed: "Bypassed" };
+
+/** A node switch's Relay text: its mode, or Mixed for a group whose nodes differ. */
+export function switchSummary(resolved) {
+    if (!resolved || resolved.status !== "ok") return "Unavailable — repair in Controls → Manage";
+    if (resolved.mode === "mixed") {
+        const off = resolved.members.filter(member => member.mode !== "enabled").length;
+        return `Mixed (${off} of ${resolved.members.length} off) — switch in Controls`;
+    }
+    return `${SWITCH_MODES[resolved.mode] || ""} — switch in Controls`;
+}
+
 // A row list's Relay text, read live: "3 LoRAs · 2 on — edit in Controls".
 export function summaryText(root, row) {
+    if (row.switchId) return row.switchText ?? "";
     if (row.picker) {
         const native = nativeFor(root, row);
         return native ? `${pickerSummary(row.picker, native.widget.value)}${PICKER_SUFFIX}` : "";

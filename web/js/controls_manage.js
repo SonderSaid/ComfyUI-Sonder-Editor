@@ -41,11 +41,13 @@ export function smallButton(text, variant = "secondary") {
 
 const KIND_NAMES = { INT: "number", FLOAT: "number", SEED: "seed", BOOLEAN: "on/off", COMBO: "choice", STRING: "text", ROWS: "list" };
 export const kindName = kind => KIND_NAMES[kind] || "";
+// The server's locator for a node or group candidate (control_execution).
+const switchLocator = c => (c.kind === "group" ? { kind: "group", group_id: c.group_id } : { kind: c.kind, path: c.path });
 
 export function mountManageSection(host, { notify = () => {}, track = work => work, flushPending = async () => true, changed = () => {} } = {}) {
     const id = ++nextManage;
     let destroyed = false,
-        rebind = null, // {binding_id, label} while choosing a new setting for a binding
+        rebind = null, // {binding_id | execution_id, label} while choosing a new target for a Control
         filter = "",
         filterTimer = null,
         busy = false,
@@ -102,15 +104,22 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     const description = mountWorkflowDescription(host, { track });
     const presets = mountPresetsManage(host, {track, notify, flushPending, changed});
     const cleanup = mountCleanup(host, {track, notify, flushPending});
+    // What Export (API) would leave out: settings and switches whose nodes are
+    // off now. Advice only: Sonder never enables a node for the author.
+    const readiness = make("div");
+    readiness.dataset.controlsReadiness = "true";
+    readiness.style.cssText = `display:none;flex-direction:column;gap:2px;font-size:${TYPE.t11}px;color:${COLORS.textDim};`
+        + `padding:${SPACE.s1 + 2}px ${SPACE.s2}px;border:1px solid ${COLORS.warningBorder};border-radius:${RADIUS.r2}px;background:${COLORS.warningSoft};`;
     // The action row comes first, so "+ Setting" opens its picker below it.
     // The note editor opens right under its button, above an open picker.
-    el.append(description.el, presets.el, footer, noteBox, heading, filterInput, banner, list, cleanup.el);
+    el.append(description.el, readiness, presets.el, footer, noteBox, heading, filterInput, banner, list, cleanup.el);
 
     function apply(changes, button) {
         return track(applyNow(changes, button), changes);
     }
     async function applyNow(changes, button) {
-        const affected = (host.getView().presets || []).filter(p => p.members.some(m => `binding:${m.binding_id}:rebind` in changes));
+        const affected = (host.getView().presets || []).filter(p => p.members.some(m => `binding:${m.binding_id}:rebind` in changes)
+            || (p.execution || []).some(m => `execution:${m.execution_id}:rebind` in changes));
         if (busy || destroyed) return false;
         busy = true;
         if (button) setButtonDisabled(button, true);
@@ -131,6 +140,46 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
 
     const expose = (candidate, button) =>
         apply({ [`binding:${mintId()}:expose`]: { candidate: { path: candidate.path, input: candidate.input } } }, button);
+
+    const exposeSwitch = (candidate, button) => apply({ [`execution:${mintId()}:expose`]: { candidate: switchLocator(candidate) } }, button);
+
+    // A node or group a switch may act on; a refused one shows why, without a button.
+    function switchRow(candidate, action) {
+        const row = make("div");
+        row.dataset.executionCandidate = candidate.kind === "group" ? `group:${candidate.group_id}` : candidate.path;
+        row.style.cssText = `display:flex;gap:${SPACE.s2}px;align-items:center;justify-content:space-between;min-width:0;padding:2px 0;`;
+        const text = make("div");
+        text.style.cssText = "display:flex;flex-direction:column;min-width:0;";
+        const name = make("span", candidate.title || (candidate.kind === "group" ? "Group" : "Node"));
+        name.style.cssText = `overflow-wrap:anywhere;color:${candidate.reason ? COLORS.textDim : COLORS.text};`;
+        const count = candidate.member_count ?? 0;
+        const what = candidate.kind === "group" ? `Group · ${count} ${count === 1 ? "node" : "nodes"}`
+            : candidate.kind === "instance" ? "Subgraph" : "Node";
+        const detail = make("span", candidate.reason ? `${what} · ${candidate.reason}` : what);
+        detail.style.cssText = `font-size:${TYPE.t11}px;color:${COLORS.textDim};overflow-wrap:anywhere;`;
+        text.append(name, detail);
+        row.append(text);
+        if (!candidate.reason) {
+            const button = smallButton(action.label, "accentSoft");
+            button.title = action.title;
+            button.addEventListener("click", () => void action.run(candidate, button));
+            row.append(button);
+        }
+        return row;
+    }
+
+    function renderReadiness(view) {
+        const ready = view.export_readiness;
+        const off = [...(ready?.settings || []), ...(ready?.execution || [])];
+        readiness.style.display = off.length ? "flex" : "none";
+        if (!off.length) return;
+        const title = make("div", "Before Export (API) for the Sonder App");
+        title.style.cssText = `font-weight:${TYPE.fwBold};color:${COLORS.warningText};`;
+        const names = off.slice(0, 6).map(item => `“${item.label}”`).join(", ") + (off.length > 6 ? ` and ${off.length - 6} more` : "");
+        const body = make("div", `${names} ${off.length === 1 ? "is" : "are"} on nodes that are off now, so an export leaves them out. `
+            + "Enable them before Export (API) so the Sonder App can set and switch them. Presets keep your disabled setups.");
+        readiness.replaceChildren(title, body);
+    }
 
     function candidateRow(candidate, action) {
         const row = make("div");
@@ -166,15 +215,20 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         description.render(view);
         presets.render(view);
         cleanup.render(view);
+        renderReadiness(view);
         // Rebuilt only when what it lists changes: the panel renders on every
         // focus change, and a rebuild between a press and its click loses it.
-        const key = JSON.stringify([rebind, filter, open, view.candidates, view.suggestions, view.candidates_truncated]);
+        const key = JSON.stringify([rebind, filter, open, view.candidates, view.suggestions, view.candidates_truncated,
+            view.execution_candidates, view.execution_candidates_truncated]);
         if (key === renderedKey) return;
         renderedKey = key;
-        const candidates = view.candidates || [];
+        const switching = rebind?.execution_id !== undefined;
+        // A switch is rebound to a node or group, a setting to a setting.
+        const candidates = switching ? [] : view.candidates || [];
+        const switches = rebind && !switching ? [] : view.execution_candidates || [];
         const showing = open || !!rebind;
         banner.style.display = rebind ? "flex" : "none";
-        bannerText.textContent = rebind ? `Choose a new setting for “${rebind.label}”.` : "";
+        bannerText.textContent = rebind ? `Choose a new ${switching ? "node or group" : "setting"} for “${rebind.label}”.` : "";
         // A Rebind keeps its own banner; the picker header names what it offers.
         heading.style.display = open && !rebind ? "flex" : "none";
         addSetting.setAttribute("aria-expanded", String(open && !rebind));
@@ -189,6 +243,9 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
             ? { label: "Use", title: "Bind this Control to this setting", run: (c, b) => apply({ [`binding:${rebind.binding_id}:rebind`]: { candidate: { path: c.path, input: c.input } } }, b).then(ok => { if (ok) setRebind(null); }) }
             : { label: "Add", title: "Expose this setting as a Control", run: (c, b) => expose(c, b) };
         const recommended = rebind ? [] : candidates.filter(c => c.recommended);
+        const switchAction = switching
+            ? { label: "Use", title: "Point this switch at this node or group", run: (c, b) => apply({ [`execution:${rebind.execution_id}:rebind`]: { candidate: switchLocator(c) } }, b).then(ok => { if (ok) setRebind(null); }) }
+            : { label: "Add", title: "Add an Enabled / Muted / Bypassed switch for it", run: (c, b) => exposeSwitch(c, b) };
         if (recommended.length) {
             const all = smallButton("Add all recommended", "accentSoft");
             all.addEventListener("click", () => {
@@ -231,13 +288,17 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
             subgraphs.style.cssText = `font-size:${TYPE.t11}px;color:${COLORS.textDim};`;
             nodes.push(subgraphs);
         }
-        if (view.candidates_truncated) {
+        if (switches.length) {
+            nodes.push(groupHeading("Nodes and groups"));
+            nodes.push(...switches.map(c => switchRow(c, switchAction)));
+        }
+        if (view.candidates_truncated || view.execution_candidates_truncated) {
             const more = make("div", "Narrow the filter to see more.");
             more.style.cssText = `font-size:${TYPE.t11}px;color:${COLORS.textDim};`;
             nodes.push(more);
         }
         if (!nodes.length) {
-            const empty = make("div", view.candidates === undefined ? "Loading settings…"
+            const empty = make("div", view.candidates === undefined && view.execution_candidates === undefined ? "Loading settings…"
                 : filter ? "No settings match the filter." : "No more settings to expose.");
             empty.style.cssText = `color:${COLORS.textDim};`;
             nodes.push(empty);
@@ -246,7 +307,9 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     }
 
     function setRebind(binding) {
-        rebind = binding ? { binding_id: binding.binding_id, label: binding.label || binding.binding_id } : null;
+        rebind = !binding ? null : binding.execution_id
+            ? { execution_id: binding.execution_id, label: binding.label || binding.execution_id }
+            : { binding_id: binding.binding_id, label: binding.label || binding.binding_id };
         render(lastView || host.getView());
         if (rebind) filterInput.focus();
     }

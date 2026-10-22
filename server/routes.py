@@ -250,6 +250,17 @@ def _describe_controls_body(raw: bytes) -> dict:
         except control_descriptors.ControlValueError as exc:
             raise _ControlsRequestError(str(exc)) from None
         inventory = control_descriptors.candidate_inventory(prompt, candidates)
+    # Muted and bypassed target nodes the export left out: read and validated,
+    # never queued. Absent means a caller that cannot see them (none today).
+    from . import control_execution
+    try:
+        authoring = (control_descriptors.clean_authoring(body["inactive"], prompt)
+                     if body.get("inactive") is not None else None)
+        execution_inventory = (control_execution.clean_candidates(body["execution_candidates"])
+                               if body.get("execution_candidates") is not None else None)
+    except control_descriptors.ControlValueError as exc:
+        raise _ControlsRequestError(str(exc)) from None
+    readable = control_descriptors.authoring_prompt(prompt, authoring)
     # The Editor node hosting the canvas panel, so picker hints can tell its own
     # project from another Editor's. Only a key naming an Editor in this prompt.
     # An explicit null: the hosting Editor is not in this prompt (muted, bypassed,
@@ -262,7 +273,7 @@ def _describe_controls_body(raw: bytes) -> dict:
     try:
         view = control_descriptors.describe_bindings(prompt, relay_census=census,
                                                     orphan_manifest=body.get("orphan_manifest"),
-                                                    host_editor=editor_key)
+                                                    host_editor=editor_key, authoring=authoring)
     except control_descriptors.control_manifest.ManifestError as exc:
         raise _ControlsRequestError(str(exc)) from None
     from . import control_cleanup
@@ -284,11 +295,17 @@ def _describe_controls_body(raw: bytes) -> dict:
                                     if node.get("class_type") == f.class_type]
         listed, truncated = control_descriptors.manage_candidates(inventory or [], view)
         view.update(candidates=listed, candidates_truncated=truncated or body.get("candidates_truncated") is True)
-    view["presets"] = control_descriptors.preset_states(view, view.get("_presets", {}), prompt=prompt)
+        switches, switches_truncated = control_execution.manage_candidates(
+            execution_inventory or [], view, query=body.get("filter") if isinstance(body.get("filter"), str) else "")
+        view.update(execution_candidates=switches, execution_candidates_truncated=switches_truncated)
+    if authoring is not None:
+        view["export_readiness"] = control_execution.export_readiness(view)
+    view["presets"] = control_descriptors.preset_states(view, view.get("_presets", {}), prompt=readable)
     # Validation uses the full view, before json_safe caps display-only previews.
     if "changes" in body:
         cleaned, rejected = control_descriptors.validate_binding_changes(
-            view, body["changes"], prompt=prompt, structural="canvas", inventory=inventory or [])
+            view, body["changes"], prompt=readable, structural="canvas", inventory=inventory or [],
+            execution_inventory=execution_inventory or [])
         view.update(ok=not bool(rejected), changes={} if rejected else cleaned, rejected=rejected)
     return control_descriptors.json_safe(view)
 

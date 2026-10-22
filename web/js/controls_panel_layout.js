@@ -4,7 +4,8 @@ export const comparePanelRows = (a, b) =>
     (a.order || 0) - (b.order || 0) ||
     String(a.label || "").localeCompare(String(b.label || "")) ||
     a.base.localeCompare(b.base);
-export const canArrange = d => !!d.base && !["missing_id", "duplicate_id"].includes(d.status);
+// A read-only row (a node switch in the Sonder App, for now) is never renumbered.
+export const canArrange = d => !!d.base && !d.read_only && !["missing_id", "duplicate_id"].includes(d.status);
 // Exposed Editor settings arrange among themselves: their own partition, keyed by
 // a name no workflow group can have (group names refuse control characters) and
 // never written to a binding. Their section comes from the node's class.

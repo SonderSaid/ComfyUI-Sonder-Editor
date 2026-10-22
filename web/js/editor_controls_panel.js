@@ -2,6 +2,7 @@ import { mountRestore } from "./controls_restore.js";
 import { mountPresets } from "./controls_presets.js";
 import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
 import { mountRowsEditor, NO_ROWS_NOTICE } from "./controls_rows_editor.js";
+import { mountExecutionRow, switchScope } from "./controls_execution_row.js";
 import { mountDriverLanePicker, mountReferenceLanePicker, normalizeAssetFolder } from "./controls_lane_pickers.js";
 import { mountManageSection, smallButton } from "./controls_manage.js";
 import { mountPanelArrangement } from "./controls_panel_arrangement.js";
@@ -18,9 +19,23 @@ import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, applyNativeControlT
 
 let nextPanel = 0;
 const SEED_MODES = ["fixed", "increment", "decrement", "randomize"];
-const editable = d => d.status === "ok";
-const identified = d => !!(d.binding_id || d.note_id);
-const baseOf = d => (d.binding_id ? "binding:" + d.binding_id : d.note_id ? "note:" + d.note_id : "");
+const editable = d => d.status === "ok" && !d.read_only;
+const identified = d => !!(d.binding_id || d.note_id || d.execution_id);
+const baseOf = d => (d.binding_id ? "binding:" + d.binding_id : d.note_id ? "note:" + d.note_id
+    : d.execution_id ? "execution:" + d.execution_id : "");
+// Settings and node switches share their row actions: rename, note, Advanced, group.
+const isControl = d => d.source === "binding" || d.source === "execution";
+const sourceOf = d => d.source || ("note_id" in d ? "note" : "execution_id" in d ? "execution" : "binding");
+// Why a setting does not run now: its node, or a subgraph holding it, is off.
+// Its value is kept and still editable.
+function participationNote(spec) {
+    if (spec.source !== "binding" || !["inactive", "partial"].includes(spec.participation)) return "";
+    const reason = spec.inactive_reason || {};
+    const mode = reason.mode === "bypassed" ? "bypassed" : "muted";
+    const who = reason.by === "parent" && reason.label ? `“${reason.label}” is ${mode}` : `its node is ${mode}`;
+    return spec.participation === "partial" ? `Partly off: ${who}. Its value is kept.`
+        : `Off: ${who}. Its value is kept and applies once it runs again.`;
+}
 const inEditor = d => d.source === "binding" && d.section === "editor";
 const CANVAS_EMPTY = "No Controls yet. Choose Manage to expose this workflow's settings here.";
 const EMPTY_NOTE = "Double-click to write this note. Start it with a bold line to make it collapsible.";
@@ -91,6 +106,7 @@ export function mountControlsPanel(container, host) {
     // plain field for the kind, with a note saying why.
     function editorKind(spec) {
         if (spec.source === "note") return "note";
+        if (spec.source === "execution") return "execution";
         if (spec.kind === "ROWS") return "rows";
         const picker = spec.picker;
         if (pickers && picker?.source === "host") {
@@ -453,7 +469,8 @@ export function mountControlsPanel(container, host) {
         const view = host.getView();
         // Exposed Editor settings reorder within their own partition (the
         // built-in mirrors above them are not rows and stay put).
-        return [...(view.bindings || []).map(d => ({ ...d, source: "binding" })), ...(view.notes || [])]
+        return [...(view.bindings || []).map(d => ({ ...d, source: "binding" })), ...(view.notes || []),
+            ...(view.execution || []).map(d => ({ ...d, source: "execution" }))]
             .map(d => ({ ...d, ...(inEditor(d) ? { group: EDITOR_PARTITION } : {}), base: baseOf(d) }));
     }
     async function saveLayout(changes) {
@@ -622,7 +639,8 @@ export function mountControlsPanel(container, host) {
     }
     // Structural Manage actions (remove, hide, unhide) on one row.
     function structural(changes, button) {
-        const affected = (host.getView().presets || []).filter(p => p.members.some(m => `binding:${m.binding_id}:remove` in changes));
+        const affected = (host.getView().presets || []).filter(p => p.members.some(m => `binding:${m.binding_id}:remove` in changes)
+            || (p.execution || []).some(m => `execution:${m.execution_id}:remove` in changes));
         if (button) button.disabled = true;
         const work = Promise.resolve()
             .then(() => host.applyChanges(changes))
@@ -646,7 +664,7 @@ export function mountControlsPanel(container, host) {
             before = row.labelOptimistic ?? row.spec.label ?? "";
         input.replaceWith(row.label);
         // An empty name goes back to the default one (node title and setting).
-        if (save && next !== before) void commit(row, `binding:${row.spec.binding_id}:label`, next, before);
+        if (save && next !== before) void commit(row, `${baseOf(row.spec)}:label`, next, before);
         render();
     }
     function openRename(row) {
@@ -675,38 +693,44 @@ export function mountControlsPanel(container, host) {
         // Rebuilt only when what it offers changes: a refresh between a
         // press and its click must not swap the button out from under it.
         const caps = capabilities();
-        const advanced = spec.source === "binding" && effectiveAdvanced(row);
-        const key = JSON.stringify([manageOn, local, !!spec.hidden, spec.status, spec.source, spec.section, caps, advanced, !!row.noteText]);
+        const advanced = isControl(spec) && effectiveAdvanced(row);
+        const key = JSON.stringify([manageOn, local, !!spec.hidden, !!spec.read_only, spec.status, spec.source, spec.section, caps, advanced, !!row.noteText]);
         if (row.actionsKey === key) return;
         row.actionsKey = key;
         const items = [];
+        if (spec.read_only) {
+            // The workflow's node switches are switched and arranged on the canvas for now.
+            box.replaceChildren(marker("Canvas only", "Switch and arrange node switches on the canvas."));
+            return;
+        }
         if (local) items.push(marker("App only", "Added in the Sonder App; not part of the workflow file."));
         if (spec.hidden) items.push(marker("Hidden", "Not shown or applied in this app."));
-        if (spec.source === "binding") {
+        if (isControl(spec)) {
             const rename = smallButton("Rename");
             rename.addEventListener("click", () => openRename(row));
             items.push(rename);
             const note = smallButton(row.noteText ? "Edit note" : "Note");
-            note.title = "A Markdown note shown under this setting";
+            note.title = spec.source === "execution" ? "A Markdown note shown under this switch" : "A Markdown note shown under this setting";
             note.addEventListener("click", () =>
-                openNote(row, row.note, `binding:${spec.binding_id}:note`, row.noteText, identified(spec) && !spec.note_truncated));
+                openNote(row, row.note, `${baseOf(spec)}:note`, row.noteText, identified(spec) && !spec.note_truncated));
             items.push(note);
             const flag = smallButton(advanced ? "Advanced ✓" : "Advanced", advanced ? "accentSoft" : "secondary");
-            flag.dataset.controlsAdvancedToggle = spec.binding_id;
+            flag.dataset.controlsAdvancedToggle = spec.binding_id || spec.execution_id;
             flag.setAttribute("aria-pressed", String(advanced));
             flag.title = advanced
                 ? "Shown only when Show advanced is on; its value still applies"
                 : "Hide it unless Show advanced is on; its value still applies";
             flag.addEventListener("click", () => {
                 const next = !effectiveAdvanced(row);
-                void commit(row, `binding:${spec.binding_id}:advanced`, next, !next);
+                void commit(row, `${baseOf(spec)}:advanced`, next, !next);
                 render();
             });
             items.push(flag);
             if (!inEditor(spec)) items.push(groupButton(row));
             if (spec.status !== "ok" && spec.status !== "shadowed" && (caps.removeAuthored || local)) {
                 const rebind = smallButton("Rebind");
-                rebind.title = "Bind this Control to another setting, keeping its id";
+                rebind.title = spec.source === "execution" ? "Point this switch at another node or group, keeping its id"
+                    : "Bind this Control to another setting, keeping its id";
                 rebind.addEventListener("click", () => manage?.setRebind(spec));
                 items.push(rebind);
             }
@@ -919,7 +943,9 @@ export function mountControlsPanel(container, host) {
                 row.editing = on;
                 if (!on) render();
             };
-            if (row.editorKind === "rows") {
+            if (row.editorKind === "execution") {
+                row.editor = mountExecutionRow({ commit: (next, before) => commit(row, row.target, next, before), onEditing });
+            } else if (row.editorKind === "rows") {
                 // A row list edits as a whole; each edit carries the list it was made from.
                 row.editor = mountRowsEditor({
                     commit: (next, before) => commit(row, row.target, { rows: next, base: before }, before),
@@ -1015,7 +1041,7 @@ export function mountControlsPanel(container, host) {
             }
             row.line.append(row.label, row.control);
             row.el.append(row.line);
-            row.note = noteBox(row, `binding:${spec.binding_id}:note`, false);
+            row.note = noteBox(row, `${baseOf(spec)}:note`, false);
             row.el.append(row.note);
         }
         row.status = make("div");
@@ -1067,6 +1093,14 @@ export function mountControlsPanel(container, host) {
             tag.style.cssText = S.tagCss;
             tags.push(tag);
         }
+        if (spec.source === "binding" && ["inactive", "partial"].includes(spec.participation)) {
+            const mode = spec.inactive_reason?.mode === "bypassed" ? "Bypassed" : "Muted";
+            const tag = make("span", spec.participation === "partial" ? "Partly off" : mode);
+            tag.title = participationNote(spec);
+            tag.dataset.controlsInactive = spec.participation;
+            tag.style.cssText = S.tagCss;
+            tags.push(tag);
+        }
         if (advanced && spec.overridden) {
             const dot = make("span");
             dot.title = "Differs from the workflow's own value";
@@ -1082,17 +1116,18 @@ export function mountControlsPanel(container, host) {
         row.presetMember.replaceChildren(...(membership ? [membership] : []));
         if (row.grip) {
             const base = baseOf(spec);
-            const allowed = manageOn && canArrange({ ...spec, base });
+            const allowed = manageOn && !spec.read_only && canArrange({ ...spec, base });
             row.grip.draggable = allowed;
             row.grip.hidden = !allowed;
             if (allowed) row.el.dataset.panelBase = base;
             else delete row.el.dataset.panelBase;
         }
         // The status line is not an input, so it stays current while the row is edited.
-        const noteTarget = spec.source === "note" ? row.target : `binding:${spec.binding_id}:note`;
-        const modeTarget = `binding:${spec.binding_id}:seed_mode`;
-        const labelTarget = `binding:${spec.binding_id}:label`;
-        const advancedTarget = `binding:${spec.binding_id}:advanced`;
+        const base = baseOf(spec);
+        const noteTarget = spec.source === "note" ? row.target : `${base}:note`;
+        const modeTarget = `${base}:seed_mode`;
+        const labelTarget = `${base}:label`;
+        const advancedTarget = `${base}:advanced`;
         if (fresh && !row.mutations.get(advancedTarget)?.pending) row.advancedOptimistic = undefined;
         if (row.label) {
             const label = row.labelOptimistic || spec.label || "";
@@ -1114,6 +1149,8 @@ export function mountControlsPanel(container, host) {
               ? "Edit this longer note on the canvas."
               : spec.reason ||
                 (rowsNotice ? "" : spec.error) ||
+                participationNote(spec) ||
+                (spec.source === "execution" ? switchScope(spec) : "") ||
                 pickerNote(spec) ||
                 // A folder is any label by design; the run-time check says nothing new.
                 (spec.checked_at_run && !spec.picker ? "Checked by the node when the run starts." : "");
@@ -1235,17 +1272,18 @@ export function mountControlsPanel(container, host) {
         const scale = Number(current.layout?.scaleControls) || 1;
         container.style.zoom = scale !== 1 ? String(scale) : "";
         const filter = { query, showAdvanced: showAdvanced(), showNotes: showNotes(), manage: manageOn };
-        const allSpecs = [...(view.bindings || []).map(d => ({ ...d, source: "binding" })), ...(view.notes || []).map(d => ({ ...d, source: "note" }))];
+        const allSpecs = [...(view.bindings || []).map(d => ({ ...d, source: "binding" })), ...(view.notes || []).map(d => ({ ...d, source: "note" })),
+            ...(view.execution || []).map(d => ({ ...d, source: "execution" }))];
         const empty = !allSpecs.some(d => manageOn || !d.hidden);
         restore.render(view);
         manage?.render(view);
         presets.render(view, manageOn);
         const entries = [];
-        for (const spec of [...(view.bindings || []), ...(view.notes || [])]) {
-            const source = spec.source || ("note_id" in spec ? "note" : "binding");
-            const id = source === "note" ? spec.note_id : spec.binding_id;
+        for (const spec of [...(view.bindings || []), ...(view.notes || []), ...(view.execution || []).map(d => ({ ...d, source: "execution" }))]) {
+            const source = sourceOf(spec);
+            const id = source === "note" ? spec.note_id : source === "execution" ? spec.execution_id : spec.binding_id;
             if (!id) continue;
-            const target = source === "note" ? `note:${id}:text` : `binding:${id}:value`;
+            const target = source === "note" ? `note:${id}:text` : source === "execution" ? `execution:${id}:mode` : `binding:${id}:value`;
             entries.push({ target, spec: { ...spec, source }, group: spec.group || "" });
         }
         if (view.state === "ready") {
@@ -1258,7 +1296,7 @@ export function mountControlsPanel(container, host) {
                         target,
                         `${base}:order`,
                         `${base}:group`,
-                        ...(spec.source === "binding"
+                        ...(isControl(spec)
                             ? [`${base}:note`, `${base}:label`, `${base}:advanced`,
                                 ...(spec.kind === "SEED" ? [`${base}:seed_mode`] : [])]
                             : []),
@@ -1360,7 +1398,7 @@ export function mountControlsPanel(container, host) {
                 if (!groups.has(group)) groups.set(group, makeGroup(group, group));
                 body = groups.get(group).content;
                 used.add(group);
-                if (visible && spec.source === "binding") counts.set(group, (counts.get(group) || 0) + 1);
+                if (visible && isControl(spec)) counts.set(group, (counts.get(group) || 0) + 1);
                 if (visible) counts.set(`${group}\u0000any`, true);
             }
             // A row being edited keeps its parent until the edit ends.

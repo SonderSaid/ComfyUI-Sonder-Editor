@@ -102,9 +102,24 @@ const copy = node(root, 'KSampler', [widget('steps', 1)], ['steps']);
 anchor(copy, 'steps', 'steps1');
 assert.equal(B.resolveBindings(root, B.parseManifest(manifestText)).bindings.steps1.status, 'duplicate');
 root._nodes.splice(root._nodes.indexOf(copy), 1);
+// A muted or bypassed node keeps its binding: structurally ok, not running.
 sampler.mode = 2;
-assert.equal(B.resolveBindings(root, B.parseManifest(manifestText)).bindings.seed1.status, 'missing');
+const muted = B.resolveBindings(root, B.parseManifest(manifestText)).bindings.seed1;
+assert.equal(muted.status, 'ok');
+assert.equal(muted.participation, 'inactive');
+assert.deepEqual(muted.inactiveReason, { mode: 'muted', by: 'self', label: sampler.title || 'KSampler' });
+assert.deepEqual(muted.targets.map(t => [t.path, t.input]), [[String(sampler.id), 'seed']]);
+const mutedExport = JSON.parse(B.exportManifest(manifestText, root)).bindings.seed1;
+assert.equal(mutedExport.status, 'ok');
+assert.equal(mutedExport.participation, 'inactive');
+assert.equal(mutedExport.inactive_reason.mode, 'muted');
+sampler.mode = 4;
+assert.equal(B.resolveBindings(root, B.parseManifest(manifestText)).bindings.seed1.inactiveReason.mode, 'bypassed');
+sampler.mode = 1; // ON_EVENT serializes like ALWAYS: it runs
+assert.equal(B.resolveBindings(root, B.parseManifest(manifestText)).bindings.seed1.participation, 'active');
 sampler.mode = 0;
+assert.equal(B.resolveBindings(root, B.parseManifest(manifestText)).bindings.seed1.participation, 'active');
+assert.equal(JSON.parse(B.exportManifest(manifestText, root)).bindings.seed1.participation, undefined);
 
 // Hostile anchors are ignored, not trusted.
 const hostile = node(root, 'KSampler', [widget('cfg', 1)], ['cfg']);

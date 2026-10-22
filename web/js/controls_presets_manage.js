@@ -22,11 +22,12 @@ export function mountPresetsManage(host, { track, notify, flushPending = async (
     actions.append(save, remove, reset);
     editor.append(name, description, missing, actions);
     el.append(heading, list, add, editor);
-    let view = {}, selected = null, draft = false, members = new Set(), busy = false, destroyed = false, membershipDirty = false;
+    // `members` holds setting ids, `switches` node-switch ids; a preset may hold both.
+    let view = {}, selected = null, draft = false, members = new Set(), switches = new Set(), busy = false, destroyed = false, membershipDirty = false;
     let tail = Promise.resolve(), queued = 0;
     const pendingText = new Map();
     const current = () => (view.presets || []).find(p => p.id === selected);
-    const dirty = () => draft && (!!name.value || !!description.value || members.size > 0);
+    const dirty = () => draft && (!!name.value || !!description.value || members.size > 0 || switches.size > 0);
     const canLeave = () => !busy && (!dirty() || globalThis.confirm("Discard this unsaved preset draft?"));
     function select(id, isDraft = false) {
         if (!canLeave()) return false;
@@ -34,6 +35,7 @@ export function mountPresetsManage(host, { track, notify, flushPending = async (
         const p = current();
         name.value = p?.name || ""; description.value = p?.description || "";
         members = new Set((p?.members || []).map(m => m.binding_id));
+        switches = new Set((p?.execution || []).map(m => m.execution_id));
         render(view); changed(); return true;
     }
     add.addEventListener("click", () => {
@@ -78,14 +80,31 @@ export function mountPresetsManage(host, { track, notify, flushPending = async (
     save.addEventListener("mousedown", e => e.preventDefault());
     save.addEventListener("click", () => {
         saveText("name", name); saveText("description", description);
-        void write(draft ? "create" : "capture", {members: [...members], ...(draft ? {name: name.value.trim(), description: description.value} : {})});
+        void write(draft ? "create" : "capture", {members: [...members], ...(switches.size ? {execution: [...switches]} : {}),
+            ...(draft ? {name: name.value.trim(), description: description.value} : {})});
     });
     remove.addEventListener("click", () => {
         if (host.capabilities?.hide && !globalThis.confirm(`Delete preset “${current()?.name || name.value}”?`)) return;
         void write("remove", true);
     });
     reset.addEventListener("click", () => void write("reset", true));
+    // A node switch member: its captured modes against the current ones.
+    function switchControl(spec) {
+        const eid = spec.execution_id, p = current(), stored = (p?.execution || []).find(m => m.execution_id === eid);
+        const label = make("label"), checkbox = make("input"), text = make("span");
+        checkbox.type = "checkbox"; checkbox.checked = switches.has(eid);
+        checkbox.disabled = busy || ((!stored && !checkbox.checked) && (spec.status !== "ok" || spec.read_only));
+        checkbox.setAttribute("aria-label", `Include ${spec.label || eid} in preset`);
+        text.textContent = spec.absent ? `${eid} · In preset` : "In preset";
+        if (stored && stored.status !== "ok") text.textContent += " · Changed since captured: update the preset";
+        else if (stored) text.textContent += ` · Preset: ${stored.preview}`;
+        label.style.cssText = `display:flex;gap:${SPACE.s1}px;align-items:center;color:${COLORS.textSecondary};font-size:${TYPE.t11}px;`;
+        checkbox.addEventListener("change", () => { checkbox.checked ? switches.add(eid) : switches.delete(eid); membershipDirty = true; });
+        label.append(checkbox, text);
+        return label;
+    }
     function memberControl(spec) {
+        if (selected && spec.execution_id) return switchControl(spec);
         if (!selected || !spec.binding_id) return null;
         const bid = spec.binding_id, p = current(), stored = p?.members.find(m => m.binding_id === bid);
         const label = make("label"), checkbox = make("input"), text = make("span");
@@ -108,13 +127,16 @@ export function mountPresetsManage(host, { track, notify, flushPending = async (
     function render(next = host.getView()) {
         view = next || {};
         const presets = view.presets || [], p = current();
-        if (!draft && p && !membershipDirty) members = new Set(p.members.map(m => m.binding_id));
+        if (!draft && p && !membershipDirty) {
+            members = new Set(p.members.map(m => m.binding_id));
+            switches = new Set((p.execution || []).map(m => m.execution_id));
+        }
         if (!draft && p) {
             if (document.activeElement !== name && !pendingText.has(`preset:${selected}:name`)) name.value = p.name;
             if (document.activeElement !== description && !pendingText.has(`preset:${selected}:description`)) description.value = p.description;
         }
         list.replaceChildren(...presets.map((item, i) => {
-            const row = make("div"), choose = button(`${item.name} · ${item.members.length} · ${item.state} · ${item.origin.replace("_", " ")}`), up = button("↑"), down = button("↓");
+            const row = make("div"), choose = button(`${item.name} · ${item.members.length + (item.execution || []).length} · ${item.state} · ${item.origin.replace("_", " ")}`), up = button("↑"), down = button("↓");
             row.style.cssText = `display:flex;gap:${SPACE.s1}px;`; choose.style.flex = "1"; choose.style.minWidth = "0"; choose.style.whiteSpace = "normal"; choose.style.overflowWrap = "anywhere";
             setButtonDisabled(choose, busy);
             choose.title = item.reason || item.description; choose.setAttribute("aria-pressed", String(selected === item.id));
@@ -135,6 +157,12 @@ export function mountPresetsManage(host, { track, notify, flushPending = async (
         if (absent.length) {
             missing.append(make("div", "Members without a Control"));
             for (const member of absent) missing.append(memberControl({binding_id: member.binding_id, status: "missing", absent: true}));
+        }
+        const switchIds = new Set((view.execution || []).map(d => d.execution_id));
+        const gone = (p?.execution || []).filter(m => !switchIds.has(m.execution_id));
+        if (gone.length) {
+            if (!absent.length) missing.append(make("div", "Members without a Control"));
+            for (const member of gone) missing.append(switchControl({execution_id: member.execution_id, status: "missing", absent: true}));
         }
     }
     const unregister = register({id: `controls-presets-manage:${++serial}`, priority: PRIORITY.TEXT_EDITOR, keydown: e => {

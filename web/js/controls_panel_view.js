@@ -29,7 +29,8 @@ export function matchEntry(spec, query) {
     return haystack.some(value => text(value).includes(q));
 }
 
-const isAdvanced = spec => spec.source === "binding" && spec.advanced === true;
+// A setting or a node switch may be Advanced; a note never is.
+const isAdvanced = spec => (spec.source === "binding" || spec.source === "execution") && spec.advanced === true;
 
 /** Whether a row is displayed. Manage shows everything; a query shows matches, Advanced included. */
 export function entryVisible(spec, { query = "", showAdvanced = false, showNotes = true, manage = false } = {}) {

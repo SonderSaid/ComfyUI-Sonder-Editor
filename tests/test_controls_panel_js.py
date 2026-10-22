@@ -912,13 +912,47 @@ if(SCENARIO==='markdown'){
             }
         }
     }
+    if(SCENARIO==='switches'){
+        // Node switches and inactive settings (plans/output-views-phase-1a.md).
+        publish({...view, bindings:[...view.bindings, {source:'binding',binding_id:'off',label:'Pass 2 steps',kind:'INT',value:'8',status:'ok',
+            order:4,group:'',section:'workflow',note:'',participation:'inactive',inactive_reason:{mode:'muted',by:'self',label:'Pass 2'}}],
+            execution:[{source:'execution',execution_id:'x',label:'First pass',kind:'group',status:'ok',mode:'mixed',value:'mixed',
+                members:[{path:'3',mode:'enabled'},{path:'4',mode:'muted'}],member_count:2,order:5,group:'',advanced:false,note:''}]});
+        await settle();
+        const seg=t=>walk(byTarget('execution:x:mode')).find(n=>n.dataset.executionMode===t);
+        assert.match(byTarget('execution:x:mode').textContent,/Mixed \(1 of 2 off\)/);
+        assert.match(byTarget('execution:x:mode').textContent,/Group · 2 nodes/);
+        assert.equal(seg('muted').attributes['aria-checked'],'false');
+        seg('muted').dispatch('click');await settle();
+        assert.deepEqual(calls.at(-1),{'execution:x:mode':'muted'});
+        // Generate and preset capture flush every row editor; a switch holds nothing to flush.
+        assert.equal(await panel.flushPending(),true);
+        // A muted setting keeps its row, says why and stays editable.
+        const off=byTarget('binding:off:value');
+        assert.match(off.textContent,/Off: its node is muted/);
+        assert.ok(walk(off).some(n=>n.dataset.controlsInactive==='inactive'));
+        assert.equal(input('binding:off:value').disabled,false);
+        // Search finds a switch by its mode; Manage gives it a setting's actions.
+        toggleManage();await settle();
+        assert.ok(button(byTarget('execution:x:mode'),'Rename'));
+        assert.ok(button(byTarget('execution:x:mode'),'Remove'));
+        toggleManage();await settle();
+        // The Sonder App shows it read-only for now.
+        publish({...view, execution:[{...view.execution[0], mode:'muted', value:'muted', read_only:true, reason:'Switch these on the canvas for now.'}]});
+        await settle();
+        assert.equal(seg('enabled').disabled,true);
+        assert.match(byTarget('execution:x:mode').textContent,/on the canvas/);
+        toggleManage();await settle();
+        assert.ok(!button(byTarget('execution:x:mode'),'Remove'));
+        assert.match(byTarget('execution:x:mode').textContent,/Canvas only/);
+    }
     panel.destroy();assert.equal(listeners.size,0);assert.equal(container.children.length,0);
     if(SCENARIO==='pickers'){assert.equal(pickerSubs.size,0);assert.deepEqual(pickerInterest,[]);}
 }
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','notes-hidden','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app','pickers','note-titles'])
+@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','notes-hidden','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app','pickers','note-titles','switches'])
 def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

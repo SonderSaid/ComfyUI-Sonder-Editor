@@ -6,10 +6,17 @@ Saved in a workflow it holds presentation only, keyed by ``binding_id``:
     {"v": 1,
      "bindings": {"<id>": {"label", "section", "group", "order", "advanced", "note"}},
      "notes": {"<id>": {"text", "group", "order"}},
-     "groups": {"<name>": {"order"}}}
+     "groups": {"<name>": {"order"}},
+     "execution": {"v": 1, "controls": {"<id>": {"label", "group", "order", "advanced", "note",
+                                                "target": {"kind": "node"|"instance"|"group", "group_id"?}}}}}
+
+A node or instance target is located by ``node.properties.sonderExecution`` on a
+root node (as a binding is by its anchor); a group by its root ``group.id``.
 
 Its API export (``web/js/control_relay.js`` ``serializeValue``) adds, per binding,
-``status``, ``targets: [{path, input}]`` and ``seed_mode``, plus ``suggestions``
+``status``, ``targets: [{path, input}]``, ``seed_mode`` and ``participation``
+(with ``inactive_reason``); per execution Control, ``status``, ``members`` and
+``title``; plus ``suggestions``
 (anchors without a manifest entry) and, when the frontend resolver failed,
 ``error``. The server never trusts an exported ``ok``: ``control_descriptors``
 re-checks every target against the prompt itself.
@@ -52,6 +59,27 @@ FORBIDDEN_KEYS = frozenset({"__proto__", "constructor", "prototype"})
 SECTIONS = ("workflow", "editor")
 EXPORT_STATUSES = frozenset({"ok", "missing", "duplicate", "linked", "no_widget", "unsupported"})
 SEED_MODES = ("fixed", "increment", "decrement", "randomize")
+# A binding's exported participation: its target nodes run, are off (muted or
+# bypassed themselves or under a muted or bypassed subgraph host), or both.
+PARTICIPATIONS = frozenset({"active", "inactive", "partial"})
+INACTIVE_MODES = ("muted", "bypassed")
+
+# Execution Controls: a root node, a root subgraph instance or a root canvas
+# group switched Enabled, Muted or Bypassed. Versioned apart from the manifest:
+# an unknown version turns off this section only. web/js/control_bindings.js
+# mirrors it.
+EXECUTION_VERSION = 1
+MAX_EXECUTION = 64
+# Members one execution Control (a group) may switch, and the distinct node
+# effects one preset may hold beside its other targets.
+MAX_EXECUTION_MEMBERS = 64
+EXECUTION_KINDS = ("node", "instance", "group")
+EXECUTION_MODES = ("enabled", "muted", "bypassed")
+EXECUTION_STATUSES = frozenset({"ok", "missing", "duplicate", "unsupported"})
+# Why the canvas resolver refused a target, as a code the server words itself.
+EXECUTION_PROBLEMS = frozenset({"infrastructure", "too_many", "empty", "kind", "virtual", "budget"})
+# Root execution ids (litegraph node ids); a member is never inside a subgraph.
+_ROOT_PATH_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class ManifestError(ValueError):
@@ -92,7 +120,8 @@ def clean_group(value: Any) -> str:
 
 
 def empty_manifest() -> dict:
-    return {"v": MANIFEST_VERSION, "bindings": {}, "notes": {}, "groups": {}, "suggestions": [], "description": "", "presets": {}}
+    return {"v": MANIFEST_VERSION, "bindings": {}, "notes": {}, "groups": {}, "suggestions": [], "description": "", "presets": {},
+            "execution": {}, "execution_error": None}
 
 
 def _check_shape(value: Any, depth: int = 1) -> None:
@@ -183,7 +212,131 @@ def _binding(raw: Any) -> dict:
     # rows anyway, because its prompt is built on the server.
     if raw.get("rows_unavailable") is True:
         entry["rows_unavailable"] = True
+    participation = raw.get("participation")
+    if participation in PARTICIPATIONS:
+        entry["participation"] = participation
+        reason = raw.get("inactive_reason")
+        if isinstance(reason, dict) and reason.get("mode") in INACTIVE_MODES and reason.get("by") in ("self", "parent"):
+            label = reason.get("label")
+            entry["inactive_reason"] = {"mode": reason["mode"], "by": reason["by"],
+                                        "label": label[:LABEL_MAX] if isinstance(label, str) else ""}
     return entry
+
+
+def _root_path(value: Any) -> str | None:
+    return value if isinstance(value, str) and _ROOT_PATH_RE.match(value) and value not in FORBIDDEN_KEYS else None
+
+
+def _execution_entry(raw: Any) -> dict:
+    """One execution Control: presentation, its target and, exported, its state."""
+    if not isinstance(raw, dict):
+        raise ManifestError("An execution Control must be an object.")
+    advanced = raw.get("advanced", False)
+    if not isinstance(advanced, bool):
+        raise ManifestError("A Controls advanced flag must be true or false.")
+    target = raw.get("target")
+    kind = target.get("kind") if isinstance(target, dict) else None
+    if kind not in EXECUTION_KINDS:
+        raise ManifestError("An execution Control names no node, subgraph or group.")
+    stored = {"kind": kind}
+    if kind == "group":
+        group_id = target.get("group_id")
+        if isinstance(group_id, bool) or not isinstance(group_id, int) or abs(group_id) > 2 ** 31:
+            raise ManifestError("An execution Control names an invalid group.")
+        stored["group_id"] = group_id
+    entry = {
+        "label": _text(raw.get("label"), LABEL_MAX, "label").strip(),
+        "group": clean_group(raw.get("group")),
+        "order": _order(raw.get("order")),
+        "advanced": advanced,
+        "note": _text(raw.get("note"), NOTE_MAX, "note"),
+        "target": stored,
+    }
+    # Export-only facts, read tolerantly: the server rechecks them.
+    status = raw.get("status")
+    if status is not None:
+        entry["status"] = status if status in EXECUTION_STATUSES else "missing"
+    problem = raw.get("problem")
+    if problem in EXECUTION_PROBLEMS:
+        entry["problem"] = problem
+    title = raw.get("title")
+    if isinstance(title, str):
+        entry["title"] = title[:LABEL_MAX]
+    count = raw.get("member_count")
+    if isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 100000:
+        entry["member_count"] = count
+    members = raw.get("members")
+    if isinstance(members, list):
+        clean = []
+        for member in members[:MAX_EXECUTION_MEMBERS]:
+            path = _root_path(member.get("path")) if isinstance(member, dict) else None
+            if path is None:
+                continue
+            class_type, mode, label = member.get("class_type"), member.get("mode"), member.get("title")
+            clean.append({"path": path, "class_type": class_type[:256] if isinstance(class_type, str) else "",
+                          "mode": mode if mode in EXECUTION_MODES else "enabled",
+                          "kind": "instance" if member.get("kind") == "instance" else "node",
+                          "title": label[:LABEL_MAX] if isinstance(label, str) else ""})
+        entry["members"] = clean
+    return entry
+
+
+def read_execution(raw: Any) -> tuple[dict, str | None]:
+    """The execution section, or why it is off. Never raises and never hides
+    the workflow's other Controls. Tolerant like ``read_presets``: an invalid
+    entry is skipped (and preserved, since reads never rewrite) and at most
+    ``MAX_EXECUTION`` valid entries are read. Only another section version
+    turns the section off, because its entries may mean something else.
+    web/js/control_bindings.js ``readExecution`` mirrors it."""
+    if not isinstance(raw, dict):
+        return {}, None
+    version = raw.get("v", EXECUTION_VERSION)
+    # JSON 1.0 is 1 in JavaScript; True is not.
+    if isinstance(version, bool) or not isinstance(version, (int, float)) or version != EXECUTION_VERSION:
+        return {}, "This workflow's node switches come from another Sonder version, so they are off."
+    controls = raw.get("controls")
+    if not isinstance(controls, dict):
+        return {}, None
+    result = {}
+    for identity, entry in controls.items():
+        if len(result) >= MAX_EXECUTION:
+            break
+        try:
+            result[_check_id(identity, "execution")] = _execution_entry(entry)
+        except ManifestError:
+            continue
+    return result, None
+
+
+def _execution_member(member: Any) -> dict | None:
+    """A preset's execution member: a node's mode and identity, or a group's
+    exact member modes. None when malformed."""
+    if not isinstance(member, dict):
+        return None
+    if "modes" in member:
+        modes = member.get("modes")
+        if (not isinstance(modes, dict) or not 1 <= len(modes) <= MAX_EXECUTION_MEMBERS
+                or any(_root_path(path) is None or mode not in EXECUTION_MODES for path, mode in modes.items())):
+            return None
+        return {"modes": dict(modes)}
+    node = member.get("node")
+    if member.get("mode") not in EXECUTION_MODES or not isinstance(node, dict):
+        return None
+    path, class_type = _root_path(node.get("path")), node.get("class_type")
+    if path is None or not isinstance(class_type, str) or not class_type or len(class_type) > 256:
+        return None
+    return {"mode": member["mode"], "node": {"path": path, "class_type": class_type}}
+
+
+def execution_effects(members: dict) -> dict | None:
+    """``{path: mode}`` of a preset's execution members; None on a conflict."""
+    effects: dict[str, str] = {}
+    for member in members.values():
+        pairs = member["modes"].items() if "modes" in member else [(member["node"]["path"], member["mode"])]
+        for path, mode in pairs:
+            if effects.setdefault(path, mode) != mode:
+                return None
+    return effects
 
 
 def read_presets(raw: Any, *, limit: int | None = MAX_PRESETS) -> dict:
@@ -218,11 +371,23 @@ def read_presets(raw: Any, *, limit: int | None = MAX_PRESETS) -> dict:
             if "seed_mode" in member and mode not in SEED_MODES:
                 continue
             members[bid] = {"value": value, **({"seed_mode": mode} if "seed_mode" in member else {})}
-        if not members or sum(1 + ("seed_mode" in m) for m in members.values()) > MAX_PRESET_TARGETS:
+        execution = {}
+        for eid, member in (entry.get("execution", {}).items() if isinstance(entry.get("execution"), dict) else []):
+            if not isinstance(eid, str) or not ID_RE.fullmatch(eid) or eid in FORBIDDEN_KEYS:
+                continue
+            clean = _execution_member(member)
+            if clean is not None:
+                execution[eid] = clean
+        effects = execution_effects(execution)
+        # Distinct node effects count beside value and seed-mode targets; a
+        # preset that sets one node two ways is unreadable, never half-applied.
+        if (not (members or execution) or effects is None
+                or sum(1 + ("seed_mode" in m) for m in members.values()) + len(effects) > MAX_PRESET_TARGETS):
             continue
         if limit is not None and len(result) >= limit:
             break
-        result[identity] = {"name": name, "description": description, "order": order, "members": members}
+        result[identity] = {"name": name, "description": description, "order": order, "members": members,
+                            **({"execution": execution} if execution else {})}
     return result
 
 
@@ -261,6 +426,7 @@ def parse_manifest(text: Any) -> dict:
 
     manifest = empty_manifest()
     manifest["presets"] = read_presets(raw.get("presets"))
+    manifest["execution"], manifest["execution_error"] = read_execution(raw.get("execution"))
     manifest["description"] = _text(raw.get("description"), DESCRIPTION_MAX, "description")
     for binding_id, entry in bindings_raw.items():
         manifest["bindings"][_check_id(binding_id)] = _binding(entry)

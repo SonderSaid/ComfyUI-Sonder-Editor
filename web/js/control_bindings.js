@@ -15,7 +15,19 @@ export { DESCRIPTION_MAX, cleanGroup, groupNameError, isStructuralTarget, parseT
 
 export const RELAY_CLASS = "SonderControlRelay";
 export const ANCHOR_PROPERTY = "sonderBindings";
+// A node switch's anchor: `node.properties.sonderExecution = "<id>"` on a root
+// node or subgraph host (one per node). A group is named by its root group.id.
+export const EXECUTION_ANCHOR = "sonderExecution";
 export const MANIFEST_VERSION = 1;
+// Mirrors server/control_manifest.py EXECUTION_* (parity-tested).
+export const EXECUTION_VERSION = 1;
+export const MAX_EXECUTION = 64;
+export const MAX_EXECUTION_MEMBERS = 64;
+export const EXECUTION_KINDS = ["node", "instance", "group"];
+export const EXECUTION_MODES = ["enabled", "muted", "bypassed"];
+// Never a switch, and never inside a group that is one: switching them off
+// would turn off the Controls that switch them back.
+export const INFRASTRUCTURE_CLASSES = new Set(["SonderEditor", "SonderControlRelay"]);
 // Mirrors server/control_manifest.py (Phase 0 P10 hygiene).
 export const MAX_MANIFEST_BYTES = 128 * 1024;
 export const MAX_BINDINGS = 256;
@@ -70,6 +82,9 @@ export const nodesOf = graph => graph?._nodes || graph?.nodes || [];
 const valuesOf = map => (map?.values ? [...map.values()] : Object.values(map || {}));
 const isHost = node => !!node?.subgraph || (typeof node?.isSubgraphNode === "function" && node.isSubgraphNode());
 const isOff = node => node?.mode === MUTED || node?.mode === BYPASS;
+// Modes 1 and 3 serialize like 0 (executionUtil.ts skips only 2 and 4).
+export const modeName = node => (node?.mode === MUTED ? "muted" : node?.mode === BYPASS ? "bypassed" : "enabled");
+export const NATIVE_MODES = { enabled: 0, muted: MUTED, bypassed: BYPASS };
 const isPlainObject = value => !!value && typeof value === "object" && !Array.isArray(value);
 const utf8Bytes = text => new TextEncoder().encode(text).length;
 
@@ -148,7 +163,10 @@ export function installAnchorCopyRule(node, isConfiguring) {
     const original = node.onConfigure;
     const chained = function (...args) {
         const result = original?.apply(this, args);
-        if (!isConfiguring() && hasAnchors(this)) delete this.properties[ANCHOR_PROPERTY];
+        if (!isConfiguring()) {
+            if (hasAnchors(this)) delete this.properties[ANCHOR_PROPERTY];
+            if (this.properties && Object.hasOwn(this.properties, EXECUTION_ANCHOR)) delete this.properties[EXECUTION_ANCHOR];
+        }
         return result;
     };
     node[COPY_RULE] = chained;
@@ -215,7 +233,13 @@ export function editManifest(text, mutate) {
     for (const entry of Object.values(manifest.bindings)) {
         if (!isPlainObject(entry)) continue;
         if (entry.restore_targets === undefined && entry.targets?.length) entry.restore_targets = entry.targets;
-        for (const key of ["status", "targets", "seed_mode", "rows_unavailable"]) delete entry[key];
+        for (const key of ["status", "targets", "seed_mode", "rows_unavailable", "participation", "inactive_reason"]) delete entry[key];
+    }
+    // A newer section is left exactly as saved: its export facts may differ.
+    const ours = isOurExecutionSection(manifest.execution);
+    for (const entry of Object.values(ours && isPlainObject(manifest.execution.controls) ? manifest.execution.controls : {})) {
+        if (!isPlainObject(entry)) continue;
+        for (const key of EXECUTION_EXPORT_KEYS) delete entry[key];
     }
     mutate(manifest);
     manifest.v = MANIFEST_VERSION;
@@ -231,6 +255,67 @@ function rowListShapeOk(value) {
         && Object.entries(row).every(([key, item]) => key.length > 0 && points(key) <= 64
             && (item === null || typeof item === "boolean" || (typeof item === "string" && points(item) <= 4096)
                 || (typeof item === "number" && Number.isFinite(item)))));
+}
+
+// Export-only facts of a node switch (control_manifest._execution_entry).
+const EXECUTION_EXPORT_KEYS = ["status", "problem", "title", "member_count", "members"];
+const ROOT_PATH_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const rootPath = value => (typeof value === "string" && ROOT_PATH_RE.test(value) && !FORBIDDEN_KEYS.has(value) ? value : null);
+
+// A preset's switch member, or null (control_manifest._execution_member).
+function executionMember(member) {
+    if (!isPlainObject(member)) return null;
+    if (Object.hasOwn(member, "modes")) {
+        const modes = member.modes;
+        if (!isPlainObject(modes)) return null;
+        const entries = Object.entries(modes);
+        if (entries.length < 1 || entries.length > MAX_EXECUTION_MEMBERS
+            || entries.some(([path, mode]) => !rootPath(path) || !EXECUTION_MODES.includes(mode))) return null;
+        return {modes: {...modes}};
+    }
+    const node = member.node;
+    if (!EXECUTION_MODES.includes(member.mode) || !isPlainObject(node)) return null;
+    const path = rootPath(node.path);
+    if (!path || typeof node.class_type !== "string" || !node.class_type || [...node.class_type].length > 256) return null;
+    return {mode: member.mode, node: {path, class_type: node.class_type}};
+}
+
+// `{path: mode}` a preset's switches set; null when two set one node differently.
+export function executionEffects(members) {
+    const effects = {};
+    for (const member of Object.values(members || {})) {
+        const pairs = member.modes ? Object.entries(member.modes) : [[member.node.path, member.mode]];
+        for (const [path, mode] of pairs) {
+            if (Object.hasOwn(effects, path) && effects[path] !== mode) return null;
+            effects[path] = mode;
+        }
+    }
+    return effects;
+}
+
+// The saved switches, tolerant like control_manifest.read_execution (parity-
+// tested): invalid entries are skipped, at most MAX_EXECUTION are read, and
+// only another section version turns the section off, with a reason.
+export const isOurExecutionSection = raw =>
+    isPlainObject(raw) && (!Object.hasOwn(raw, "v") || raw.v === EXECUTION_VERSION);
+export function readExecution(raw) {
+    if (!isPlainObject(raw)) return {controls: {}, error: null};
+    if (!isOurExecutionSection(raw))
+        return {controls: {}, error: "This workflow's node switches come from another Sonder version, so they are off."};
+    if (!isPlainObject(raw.controls)) return {controls: {}, error: null};
+    const result = {};
+    const text = (value, limit) => value == null || (typeof value === "string" && [...value].length <= limit);
+    for (const [id, entry] of Object.entries(raw.controls)) {
+        if (Object.keys(result).length >= MAX_EXECUTION) break;
+        const kind = entry?.target?.kind;
+        const groupId = entry?.target?.group_id;
+        if (!ID_RE.test(id) || FORBIDDEN_KEYS.has(id) || !isPlainObject(entry) || !EXECUTION_KINDS.includes(kind)
+            || (kind === "group" && !(Number.isInteger(groupId) && Math.abs(groupId) <= 2 ** 31))
+            || !text(entry.label, LABEL_MAX) || !text(entry.note, NOTE_MAX) || !validOrder(entry.order ?? undefined)
+            || (entry.advanced !== undefined && typeof entry.advanced !== "boolean")) continue;
+        result[id] = {...entry, target: kind === "group" ? {kind, group_id: groupId} : {kind}};
+    }
+    return {controls: result, error: null};
 }
 
 // Mirrors control_manifest.read_presets; reads never rewrite saved metadata.
@@ -253,10 +338,19 @@ export function readPresets(raw) {
             if (Object.hasOwn(member, "seed_mode") && !["fixed", "increment", "decrement", "randomize"].includes(member.seed_mode)) continue;
             members[bid] = {value, ...(Object.hasOwn(member, "seed_mode") ? {seed_mode: member.seed_mode} : {})};
         }
+        const execution = {};
+        for (const [eid, member] of Object.entries(isPlainObject(entry.execution) ? entry.execution : {})) {
+            if (!validId(eid)) continue;
+            const clean = executionMember(member);
+            if (clean) execution[eid] = clean;
+        }
+        const effects = executionEffects(execution);
         const entries = Object.values(members);
-        if (!entries.length || entries.reduce((n, m) => n + 1 + Number(Object.hasOwn(m, "seed_mode")), 0) > MAX_PRESET_TARGETS) continue;
+        // Distinct node effects count beside value and seed-mode targets.
+        if ((!entries.length && !Object.keys(execution).length) || !effects
+            || entries.reduce((n, m) => n + 1 + Number(Object.hasOwn(m, "seed_mode")), 0) + Object.keys(effects).length > MAX_PRESET_TARGETS) continue;
         if (Object.keys(result).length >= MAX_PRESETS) break;
-        result[id] = {name, description, order, members};
+        result[id] = {name, description, order, members, ...(Object.keys(execution).length ? {execution} : {})};
     }
     return result;
 }
@@ -283,9 +377,16 @@ export function applyPresetEdit(manifest, id, field, value) {
 
 // ── Resolve ──────────────────────────────────────────────────────────────────
 
+// Why a node does not run: itself muted or bypassed, or under a muted or
+// bypassed subgraph host (`parent`, which the native serializer never expands).
+const offReason = (node, parent) => (parent || (isOff(node)
+    ? { mode: modeName(node), by: "self", label: String(node.title || nodeType(node)) } : null));
+const asParent = reason => (reason ? { ...reason, by: "parent" } : null);
+
 // Consumers of a promoted input, through nested hosts: a promoted input may
-// feed several inner widgets, each its own API target.
-function promotedTargets(host, name, prefix, depth = 0) {
+// feed several inner widgets, each its own API target. An inactive consumer is
+// still resolved (its setting stays a Control) and carries `inactive`.
+function promotedTargets(host, name, prefix, depth = 0, parent = null) {
     const graph = host?.subgraph, found = [];
     const slot = (graph?.inputs || []).find(input => input?.name === name);
     if (!slot || depth > MAX_NESTING) return found;
@@ -297,34 +398,47 @@ function promotedTargets(host, name, prefix, depth = 0) {
         if (!inner || !input) continue;
         const path = `${prefix}:${inner.id}`;
         const widgetName = input.widget?.name ?? input.name;
-        if (isOff(inner)) {
-            found.push({ path, input: widgetName, status: "missing" });
-        } else if (isHost(inner)) {
-            found.push(...promotedTargets(inner, input.name, path, depth + 1));
+        const inactive = offReason(inner, parent);
+        if (isHost(inner)) {
+            found.push(...promotedTargets(inner, input.name, path, depth + 1, asParent(inactive)));
         } else if (rowFieldGroup(inner, widgetName) || rowGroupOf(inner, widgetName)) {
             // A promoted row field has no stable identity (a removed row renames
             // later ones); a row group is a Control only on its own node.
-            found.push({ path, input: widgetName, status: "unsupported" });
+            found.push({ path, input: widgetName, status: "unsupported", ...(inactive ? { inactive, node: inner } : {}) });
         } else {
             const widget = findControlWidget(inner, widgetName);
-            found.push({ path, input: widgetName, status: widget ? "ok" : "no_widget", node: inner, widget });
+            found.push({ path, input: widgetName, status: widget ? "ok" : "no_widget", node: inner, widget,
+                ...(inactive ? { inactive } : {}) });
         }
     }
     return found;
+}
+
+// A binding's participation from its targets: all run, none run, or some.
+function participationOf(targets) {
+    const off = (targets || []).filter(target => target.inactive);
+    if (!off.length) return { participation: "active" };
+    return { participation: off.length === targets.length ? "inactive" : "partial", inactiveReason: off[0].inactive };
 }
 
 function hostInput(host, name) {
     return (host.inputs || []).find(input => input?._subgraphSlot?.name === name || input?.name === name) || null;
 }
 
-// One binding on the live graph: its status, its native widget and its API
-// targets. Never writes.
+// One binding on the live graph: its status, its native widget, its API
+// targets and its participation. A muted or bypassed node keeps its binding:
+// `status` is structural only, and `participation` says whether it runs.
+// Never writes.
 export function resolveAnchor(node, name) {
-    if (isOff(node)) return { status: "missing", targets: [] };
+    const resolved = resolveStructure(node, name);
+    return { ...resolved, ...participationOf(resolved.targets) };
+}
+
+function resolveStructure(node, name) {
     if (isHost(node)) {
         const input = hostInput(node, name);
         if (!input) return { status: "missing", targets: [] };
-        const targets = promotedTargets(node, name, String(node.id));
+        const targets = promotedTargets(node, name, String(node.id), 0, asParent(offReason(node, null)));
         if (!targets.length) return { status: "missing", targets: [] };
         if (input.link != null) return { status: "linked", targets };
         const widget = node.getWidgetFromSlot?.(input) || findControlWidget(node, input.widget?.name || input.name);
@@ -336,7 +450,8 @@ export function resolveAnchor(node, name) {
         const mode = seedModeWidget(widget) || targets.map(t => seedModeWidget(t.widget)).find(Boolean) || null;
         return { status: "ok", node, widget, modeWidget: mode, targets };
     }
-    const targets = [{ path: String(node.id), input: name }];
+    const inactive = offReason(node, null);
+    const targets = [{ path: String(node.id), input: name, ...(inactive ? { inactive } : {}) }];
     // A dynamic row group is one Control; a single row field has no stable
     // identity (removing a row renames every later one), so it is refused.
     const group = rowGroupOf(node, name);
@@ -435,7 +550,7 @@ function explicitGroups(manifest) {
 // group_order (a shared fixture pins them): groups in `groups` first, by order
 // then name; then groups only named by Workflow bindings or notes, by first
 // appearance. An Editor-section binding's group shows nowhere, so it adds none.
-export function effectiveGroupOrder(manifest, resolved = {}) {
+export function effectiveGroupOrder(manifest, resolved = {}, switches = {}) {
     const explicit = explicitGroups(manifest);
     const ordered = [...explicit.keys()]
         .sort((a, b) => clampOrder(explicit.get(a)[1].order) - clampOrder(explicit.get(b)[1].order) || compareCodePoints(a, b));
@@ -444,6 +559,9 @@ export function effectiveGroupOrder(manifest, resolved = {}) {
             .filter(([id, entry]) => sectionOf(resolved[id], entry?.section) !== "editor")
             .map(([id, entry]) => ({ id, ...entry, label: entry?.label || defaultBindingLabel(resolved[id]) })),
         ...Object.entries(manifest?.notes || {}).map(([id, entry]) => ({ id, ...entry, label: "" })),
+        // Node switches name groups too (server group_order counts them).
+        ...Object.entries(readExecution(manifest?.execution).controls)
+            .map(([id, entry]) => ({ id, ...entry, label: entry.label || switchLabel(switches[id], entry) })),
     ].sort((a, b) => clampOrder(a.order) - clampOrder(b.order)
         || compareCodePoints(String(a.label || "").toLowerCase(), String(b.label || "").toLowerCase())
         || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -458,9 +576,14 @@ export function effectiveGroupOrder(manifest, resolved = {}) {
 // manifest copy, inside the canvas writer's single editManifest call. Members
 // are re-keyed in place; `groups` is rewritten in display order, so implied
 // groups keep their place and unknown keys of an entry survive.
-export function applyGroupPlan(manifest, name, plan, resolved = {}) {
-    const order = effectiveGroupOrder(manifest, resolved);
-    const members = [...Object.values(manifest.bindings || {}), ...Object.values(manifest.notes || {})].filter(isPlainObject);
+export function applyGroupPlan(manifest, name, plan, resolved = {}, switches = {}) {
+    const order = effectiveGroupOrder(manifest, resolved, switches);
+    // Settings, notes and node switches regroup together; a newer switch
+    // section is never rewritten.
+    const switchEntries = isOurExecutionSection(manifest.execution) && isPlainObject(manifest.execution.controls)
+        ? Object.values(manifest.execution.controls) : [];
+    const members = [...Object.values(manifest.bindings || {}), ...Object.values(manifest.notes || {}), ...switchEntries]
+        .filter(isPlainObject);
     const regroup = (from, to) => { for (const entry of members) if (cleanGroup(entry.group) === from) entry.group = to; };
     const explicit = explicitGroups(manifest);
     const place = names => {
@@ -523,7 +646,9 @@ export function listCandidates(root, { filter = "", limit = MAX_CANDIDATES, labe
                 const name = hostInputName(input);
                 if (!name || Object.hasOwn(anchored, name) || input.link != null) continue;
                 const resolved = resolveAnchor(node, name);
-                if (resolved.status === "ok") push(node, name, resolved.targets, input.label);
+                // An inactive consumer is still a Control once exposed, but Manage
+                // offers only settings that run now: enable the node to expose it.
+                if (resolved.status === "ok" && resolved.participation === "active") push(node, name, resolved.targets, input.label);
             }
             continue;
         }
@@ -552,7 +677,7 @@ export function resolveCandidate(root, candidate) {
     const node = nodesOf(root).find(n => String(n?.id) === String(candidate?.path));
     if (!node || !candidate?.input) return null;
     const resolved = resolveAnchor(node, candidate.input);
-    if (resolved.status !== "ok") return null;
+    if (resolved.status !== "ok" || resolved.participation !== "active") return null;
     return { node, name: candidate.input, targets: publicTargets(resolved.targets),
         node_title: String(node.title || nodeType(node)) };
 }
@@ -623,11 +748,16 @@ export function dropAllAnchors(root, id) {
 
 export function applyCleanupPlan(manifest, plan) {
     for (const id of plan.bindings || []) delete manifest.bindings[id];
-    for (const {preset_id, binding_id} of plan.preset_members || []) {
-        const preset = manifest.presets?.[preset_id];
-        if (!isPlainObject(preset?.members)) throw new Error("The preset changed. Reopen the cleanup review.");
-        delete preset.members[binding_id];
-        if (!Object.keys(preset.members).length) delete manifest.presets[preset_id];
+    for (const id of plan.execution || []) {
+        if (isPlainObject(manifest.execution?.controls)) delete manifest.execution.controls[id];
+    }
+    for (const row of plan.preset_members || []) {
+        const preset = manifest.presets?.[row.preset_id];
+        const table = row.execution_id ? "execution" : "members";
+        if (!isPlainObject(preset?.[table])) throw new Error("The preset changed. Reopen the cleanup review.");
+        delete preset[table][row.execution_id || row.binding_id];
+        const left = table === "members" ? preset.execution : preset.members;
+        if (!Object.keys(preset[table]).length && !(isPlainObject(left) && Object.keys(left).length)) delete manifest.presets[row.preset_id];
     }
 }
 
@@ -664,6 +794,273 @@ export function restoreAnchors(node, snapshot) {
 export const publicTargets = targets =>
     (targets || []).slice(0, MAX_TARGETS).map(({ path, input }) => ({ path, input }));
 
+// ── Node switches (execution Controls) ───────────────────────────────────────
+
+export function readExecutionAnchor(node) {
+    const id = node?.properties?.[EXECUTION_ANCHOR];
+    return typeof id === "string" && ID_RE.test(id) && !FORBIDDEN_KEYS.has(id) ? id : null;
+}
+
+export function setExecutionAnchor(node, id) {
+    node.properties ||= {};
+    node.properties[EXECUTION_ANCHOR] = id;
+}
+
+// The raw property, for an exact rollback (it may hold an invalid value).
+export const executionAnchorSnapshot = node =>
+    (node?.properties && Object.hasOwn(node.properties, EXECUTION_ANCHOR) ? { value: node.properties[EXECUTION_ANCHOR] } : undefined);
+
+export function restoreExecutionAnchor(node, snapshot) {
+    if (snapshot === undefined) {
+        if (node.properties) delete node.properties[EXECUTION_ANCHOR];
+    } else {
+        node.properties ||= {};
+        node.properties[EXECUTION_ANCHOR] = snapshot.value;
+    }
+}
+
+// Removes every execution anchor carrying `id`, inside subgraph definitions
+// too (one left there would resurface on unpacking); returns the nodes changed.
+export function dropExecutionAnchors(root, id) {
+    const changed = [];
+    for (const node of graphsOf(root).flatMap(nodesOf)) {
+        if (node?.properties?.[EXECUTION_ANCHOR] !== id) continue;
+        delete node.properties[EXECUTION_ANCHOR];
+        changed.push(node);
+    }
+    return changed;
+}
+
+// A canvas group's nodes by the native rule (LGraphGroup.recomputeInsideNodes,
+// frontend 1.57.1): a root node whose boundingRect centre lies inside the
+// group's bounding (measure.ts containsCentre/isInRect), nested groups' nodes
+// included. Computed here because recomputing mutates the group's caches and
+// re-sorts graph.groups, which an export must never do.
+export function groupMembers(group, nodes) {
+    const box = group?._bounding || group?.bounding;
+    if (!box || box.length < 4) return [];
+    return (nodes || []).filter(node => {
+        const rect = node?.boundingRect;
+        if (!rect || rect.length < 4) return false;
+        const x = rect[0] + rect[2] * 0.5, y = rect[1] + rect[3] * 0.5;
+        return x >= box[0] && x < box[0] + box[2] && y >= box[1] && y < box[1] + box[3];
+    });
+}
+
+// A switch acts on nodes that run: a subgraph host counts (frontend 1.53.10
+// reports isVirtualNode on it), a reroute or note does not.
+const switchable = node => !!node && (isHost(node) || !node.isVirtualNode);
+const rootGroups = root => root?.groups || root?._groups || [];
+
+// A switch's default label (control_execution.default_label): its group's or
+// node's title, else the kind.
+function switchLabel(resolved, entry) {
+    const first = resolved?.members?.[0];
+    return resolved?.title || first?.title || first?.class_type || (entry?.target?.kind === "group" ? "Group" : "Node");
+}
+
+function switchMember(node) {
+    return { path: String(node.id), class_type: nodeType(node), mode: modeName(node),
+        kind: isHost(node) ? "instance" : "node", title: String(node.title || nodeType(node)), node };
+}
+
+const combinedMode = members => {
+    const modes = new Set(members.map(member => member.mode));
+    return modes.size === 1 ? [...modes][0] : modes.size ? "mixed" : null;
+};
+
+function resolveSwitch(root, entry, hits) {
+    const kind = entry.target.kind;
+    if (kind === "group") {
+        const group = rootGroups(root).find(g => g?.id === entry.target.group_id);
+        if (!group) return { status: "missing", kind, members: [] };
+        const nodes = groupMembers(group, nodesOf(root)).filter(switchable);
+        const base = { kind, group, title: String(group.title || "Group"), member_count: nodes.length,
+            members: nodes.slice(0, MAX_EXECUTION_MEMBERS).map(switchMember) };
+        if (!nodes.length) return { ...base, status: "unsupported", problem: "empty" };
+        if (nodes.some(node => INFRASTRUCTURE_CLASSES.has(nodeType(node)))) return { ...base, status: "unsupported", problem: "infrastructure" };
+        if (nodes.length > MAX_EXECUTION_MEMBERS) return { ...base, status: "unsupported", problem: "too_many" };
+        return { ...base, status: "ok", mode: combinedMode(base.members) };
+    }
+    if (hits.length > 1) return { status: "duplicate", kind, members: [] };
+    if (!hits.length) return { status: "missing", kind, members: [] };
+    const node = hits[0], member = switchMember(node);
+    const base = { kind, node, title: member.title, member_count: 1, members: [member] };
+    if ((kind === "instance") !== isHost(node)) return { ...base, status: "unsupported", problem: "kind" };
+    if (INFRASTRUCTURE_CLASSES.has(nodeType(node))) return { ...base, status: "unsupported", problem: "infrastructure" };
+    if (!switchable(node)) return { ...base, status: "unsupported", problem: "virtual" };
+    return { ...base, status: "ok", mode: member.mode };
+}
+
+// Every switch of a manifest on the live graph: {status, kind, members:
+// [{path, class_type, mode, kind, title, node}], mode, problem}. Never writes.
+export function resolveExecution(root, manifest) {
+    const { controls, error } = readExecution(manifest?.execution);
+    const anchored = new Map();
+    for (const node of nodesOf(root)) {
+        const id = readExecutionAnchor(node);
+        if (!id) continue;
+        if (!anchored.has(id)) anchored.set(id, []);
+        anchored.get(id).push(node);
+    }
+    const resolved = Object.create(null);
+    for (const [id, entry] of Object.entries(controls)) resolved[id] = resolveSwitch(root, entry, anchored.get(id) || []);
+    return { controls: resolved, entries: controls, error };
+}
+
+// What Manage may add as a switch: root nodes, root subgraph instances and root
+// canvas groups. Infrastructure is sent too, so the server can say why it is
+// refused; the server decides (control_execution.manage_candidates).
+// `known` holds the manifest's switch ids: an anchor naming no switch (left by
+// a deleted Relay) does not take its node, and a new switch may replace it.
+function nodeCandidate(node, known) {
+    const owner = readExecutionAnchor(node);
+    return { kind: isHost(node) ? "instance" : "node", path: String(node.id), title: String(node.title || nodeType(node)),
+        classes: [nodeType(node)], member_count: 1, anchored_by: owner && (!known || known.has(owner)) ? owner : null };
+}
+
+function groupCandidate(root, group) {
+    const members = groupMembers(group, nodesOf(root)).filter(switchable);
+    // Infrastructure first: the server's cap must never cut it off.
+    const classes = [...new Set(members.map(nodeType))]
+        .sort((a, b) => Number(INFRASTRUCTURE_CLASSES.has(b)) - Number(INFRASTRUCTURE_CLASSES.has(a)))
+        .slice(0, MAX_EXECUTION_MEMBERS + 1);
+    return { kind: "group", group_id: group.id, title: String(group?.title || "Group"), classes, member_count: members.length, anchored_by: null };
+}
+
+// What Manage may add as a switch: root canvas groups (first, as they are few),
+// root subgraph instances and root nodes. Infrastructure is sent too, so the
+// server can say why it is refused; the server decides
+// (control_execution.manage_candidates).
+export function listExecutionCandidates(root, { filter = "", limit = MAX_CANDIDATES, known = null } = {}) {
+    const query = String(filter || "").trim().toLowerCase();
+    const matches = (...texts) => !query || texts.some(text => String(text || "").toLowerCase().includes(query));
+    const found = [];
+    let truncated = false;
+    const push = entry => {
+        if (found.length >= limit) { truncated = true; return; }
+        found.push(entry);
+    };
+    for (const group of rootGroups(root)) {
+        if (truncated) break;
+        if (Number.isInteger(group?.id) && matches(group.title || "Group")) push(groupCandidate(root, group));
+    }
+    for (const node of nodesOf(root)) {
+        if (truncated) break;
+        if (switchable(node) && matches(node.title || nodeType(node), nodeType(node))) push(nodeCandidate(node, known));
+    }
+    return { candidates: found, truncated };
+}
+
+// Only the candidates a batch names, so no listing cap can drop one.
+export function executionCandidatesFor(root, locators, { known = null } = {}) {
+    const found = [];
+    for (const locator of locators || []) {
+        const live = resolveExecutionCandidate(root, locator);
+        if (live?.group) found.push(groupCandidate(root, live.group));
+        else if (live?.node) found.push(nodeCandidate(live.node, known));
+    }
+    return found;
+}
+
+// One candidate on the live graph, for a structural write.
+export function resolveExecutionCandidate(root, candidate) {
+    if (candidate?.kind === "group") {
+        const group = rootGroups(root).find(g => g?.id === candidate.group_id);
+        return group ? { kind: "group", group } : null;
+    }
+    const node = nodesOf(root).find(n => String(n?.id) === String(candidate?.path));
+    if (!node || !switchable(node) || (candidate.kind === "instance") !== isHost(node)) return null;
+    return { kind: candidate.kind, node };
+}
+
+// The API-shaped body of a muted or bypassed node, as the native serializer
+// would have exported it: widget values (the dynamic-prompt template, as
+// restoreDynamicPrompts keeps it) and `[origin, slot]` for linked inputs, the
+// origin qualified by `path`'s instance prefix as an execution id is. An input
+// linked from the subgraph's input boundary takes its value from the host
+// (`promoted`, as ExecutableNodeDTO.resolveInput does), or is left out when
+// that value is unknown. Read and validated by the server, never queued.
+export function inactiveBody(node, inactive, path = String(node?.id), promoted = {}) {
+    const inputs = {};
+    const prefix = path.includes(":") ? path.slice(0, path.lastIndexOf(":") + 1) : "";
+    for (const widget of node.widgets || []) {
+        if (!widget?.name || widget.options?.serialize === false) continue;
+        inputs[widget.name] = Array.isArray(widget.value) ? { __value__: widget.value } : widget.value;
+    }
+    for (const input of node.inputs || []) {
+        if (input?.link == null || !input.name) continue;
+        const link = getGraphLink(node.graph, input.link);
+        const name = input.widget?.name ?? input.name;
+        if (link?.originIsIoNode || String(link?.origin_id) === String(SUBGRAPH_INPUT_ID)) {
+            if (Object.hasOwn(promoted, name)) inputs[name] = promoted[name];
+            else delete inputs[name];
+            continue;
+        }
+        inputs[input.name] = [`${prefix}${link?.origin_id ?? ""}`, Number(link?.origin_slot ?? 0)];
+    }
+    return { class_type: nodeType(node), inputs, _meta: { title: String(node.title || nodeType(node)) },
+        mode: inactive.mode, by: inactive.by, label: inactive.label };
+}
+
+export const MAX_INACTIVE_BODIES = 256;
+
+// Bodies for every inactive node a binding targets, keyed by execution path.
+// A body whose values cannot be serialized is left out: its setting then reads
+// missing instead of turning the whole Controls view into an error.
+export function inactiveBodies(resolvedBindings) {
+    const bodies = {};
+    for (const resolved of Object.values(resolvedBindings || {})) {
+        // A root target's node is its anchor's; a promoted target names its own,
+        // and its value is the host's widget (a promoted input).
+        const host = resolved?.anchor?.node;
+        for (const target of resolved?.targets || []) {
+            const node = target.node || (host && String(host.id) === target.path ? host : null);
+            if (!target.inactive || !node || Object.hasOwn(bodies, target.path)) continue;
+            if (Object.keys(bodies).length >= MAX_INACTIVE_BODIES) return bodies;
+            const promoted = target.node && resolved.widget ? { [target.input]: resolved.widget.value } : {};
+            const body = inactiveBody(node, target.inactive, target.path, promoted);
+            try { JSON.stringify(body); } catch { continue; }
+            bodies[target.path] = body;
+        }
+    }
+    return bodies;
+}
+
+// The export form of each switch: saved presentation plus its state.
+// The exported members are bounded apart from the saved manifest: they travel
+// in every export, which the server caps at 128 KiB. A switch past the budget
+// exports as unavailable rather than turning the whole Relay into an error.
+export const MAX_EXPORTED_MEMBERS = 512;
+const EXPORT_TITLE_MAX = 48;
+
+function exportExecution(saved, root, manifest) {
+    const { controls, entries, error } = resolveExecution(root, manifest);
+    if (error || !isPlainObject(saved) || !isPlainObject(saved.controls)) return saved;
+    const out = { ...saved, controls: {} };
+    let exported = 0;
+    for (const [id, entry] of Object.entries(saved.controls)) {
+        const resolved = controls[id];
+        // An entry the reader skips is exported exactly as saved.
+        if (!resolved || !entries[id] || !isPlainObject(entry)) { out.controls[id] = entry; continue; }
+        const clean = { ...entry };
+        for (const key of EXECUTION_EXPORT_KEYS) delete clean[key];
+        const title = text => String(text || "").slice(0, EXPORT_TITLE_MAX);
+        const members = resolved.members.map(({ path, class_type, mode, kind, title: name }) => ({ path, class_type, mode, kind, title: title(name) }));
+        const overBudget = exported + members.length > MAX_EXPORTED_MEMBERS;
+        if (!overBudget) exported += members.length;
+        out.controls[id] = {
+            ...clean,
+            status: overBudget ? "unsupported" : resolved.status,
+            ...(overBudget ? { problem: "budget" } : resolved.problem ? { problem: resolved.problem } : {}),
+            ...(resolved.title ? { title: title(resolved.title) } : {}),
+            member_count: resolved.member_count ?? resolved.members.length,
+            members: overBudget ? [] : members,
+        };
+    }
+    return out;
+}
+
 // The API export of a manifest: saved presentation plus each binding's
 // targets, status and seed mode. Pure: never writes the widget or the graph,
 // and never throws, because a throw here would stop every Run of the workflow
@@ -688,13 +1085,22 @@ export function exportManifest(text, root) {
             };
             delete out.bindings[id].restore_targets;
             delete out.bindings[id].rows_unavailable;
+            delete out.bindings[id].participation;
+            delete out.bindings[id].inactive_reason;
             if (resolved.rows && !resolved.rows.ready) out.bindings[id].rows_unavailable = true;
+            // An inactive binding's node is absent from this export; the reason
+            // lets an importer say why, since it cannot read a missing body.
+            if (resolved.participation && resolved.participation !== "active") {
+                out.bindings[id].participation = resolved.participation;
+                out.bindings[id].inactive_reason = resolved.inactiveReason;
+            }
             if (resolved.status === "missing" && !resolved.anchor && !resolved.insideSubgraph) {
                 const hint = entry?.restore_targets ?? entry?.targets;
                 if (hint?.length) out.bindings[id].restore_targets = hint;
             }
         }
         out.suggestions = suggestions.map(s => ({ binding_id: s.binding_id, targets: publicTargets(s.targets) }));
+        if (manifest.execution !== undefined) out.execution = exportExecution(manifest.execution, root, manifest);
         return JSON.stringify(out);
     } catch (error) {
         return JSON.stringify({ ...manifest, error: String(error?.message || error || "Controls export failed.") });

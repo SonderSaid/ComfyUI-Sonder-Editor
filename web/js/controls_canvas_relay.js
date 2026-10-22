@@ -38,9 +38,15 @@ export function fitPublicationView(view, envelope) {
     // Preset previews are display-only and shrink before candidate inventories.
     if (!fits(view) && view.presets?.length) view = { ...view, presets: view.presets.map(p => ({...p,
         members: p.members.map(m => ({...m, preview: ""}))})) };
+    // A switch's member titles only name its nodes; the canvas writer checks
+    // member paths against its own fresh describe, never this publication.
+    if (!fits(view) && view.execution?.length) view = { ...view, execution: view.execution.map(d => ({...d,
+        members: (d.members || []).map(m => ({...m, title: ""}))})) };
     // Manage's candidates go first: a narrower filter shows the rest.
-    while (view.candidates?.length && !fits(view)) {
-        view = { ...view, candidates: view.candidates.slice(0, Math.floor(view.candidates.length / 2)), candidates_truncated: true };
+    while ((view.candidates?.length || view.execution_candidates?.length) && !fits(view)) {
+        view = { ...view, candidates: (view.candidates || []).slice(0, Math.floor((view.candidates || []).length / 2)), candidates_truncated: true,
+            execution_candidates: (view.execution_candidates || []).slice(0, Math.floor((view.execution_candidates || []).length / 2)),
+            execution_candidates_truncated: true };
     }
     if (fits(view)) return view;
     // Unlisted anchors are for Manage only; they go next.

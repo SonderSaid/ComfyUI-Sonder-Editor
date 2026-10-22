@@ -4,7 +4,7 @@ import json
 
 from . import control_manifest as cm
 
-CATEGORIES = ("bindings", "suggestions", "definition_anchors", "values", "hidden", "preset_members")
+CATEGORIES = ("bindings", "suggestions", "definition_anchors", "values", "hidden", "execution", "preset_members")
 
 
 def valid_id(value):
@@ -17,11 +17,19 @@ def inventory(view, *, stored=None, definition_anchors=()):
     if view.get("error") or (view.get("relay") or {}).get("status") != "ok":
         return result
     bindings = {b["binding_id"]: b for b in view.get("bindings", [])}
+    switches = {d["execution_id"]: d for d in view.get("execution", []) or []}
     sdk = stored is not None
     restorable = {row["binding_id"] for row in (view.get("restore") or {}).get("restorable", [])}
+    # Only a setting that can't be resolved is missing; one on a muted or
+    # bypassed node is inactive, keeps its binding and is never offered here.
     for bid, binding in bindings.items():
         if bid not in restorable and binding.get("status") == "missing" and (not sdk or binding.get("origin") == "local"):
             result["bindings"].append({"id": bid, "label": binding.get("label") or bid})
+    if not sdk:  # switches are authored on the canvas; the app never removes them
+        # A stale switch (its export and the prompt disagree for a moment) is
+        # not gone: the canvas still resolves it, so it is never offered.
+        result["execution"] = [{"id": eid, "label": d.get("label") or eid}
+                               for eid, d in switches.items() if d.get("status") == "missing" and d.get("problem") != "stale"]
     if sdk:
         known = {f"binding:{bid}" for bid in bindings}
         known.update(f"note:{n['note_id']}" for n in view.get("notes", []))
@@ -40,12 +48,23 @@ def inventory(view, *, stored=None, definition_anchors=()):
         result["definition_anchors"] = [{"id": bid, "label": bid} for bid in dict.fromkeys(definition_anchors)
                                          if valid_id(bid) and bid not in bindings and bid not in root_ids]
     removable = {r["id"] for key in ("bindings", "suggestions", "definition_anchors") for r in result[key]}
+    gone = {r["id"] for r in result["execution"]}
     for pid, preset in view.get("_presets", {}).items():
         for bid in preset["members"]:
             if bid not in bindings or bid in removable:
                 result["preset_members"].append({"preset_id": pid, "binding_id": bid,
                     **({"requires_binding": bid} if bid in bindings else {})})
+        if sdk:
+            continue
+        for eid in preset.get("execution") or {}:
+            if eid not in switches or eid in gone:
+                result["preset_members"].append({"preset_id": pid, "execution_id": eid,
+                    **({"requires_execution": eid} if eid in switches else {})})
     return result
+
+
+def _member_key(row):
+    return (row["preset_id"], row.get("binding_id"), row.get("execution_id"))
 
 
 def validate(view, raw, *, mode):
@@ -62,7 +81,8 @@ def validate(view, raw, *, mode):
         cleaned[key] = []
         for row in rows:
             if key == "preset_members":
-                good = isinstance(row, dict) and set(row) == {"preset_id", "binding_id"} and all(valid_id(v) for v in row.values())
+                good = (isinstance(row, dict) and set(row) in ({"preset_id", "binding_id"}, {"preset_id", "execution_id"})
+                        and all(valid_id(v) for v in row.values()))
             elif key == "hidden":
                 parts = row.split(":") if isinstance(row, str) else []
                 good = len(parts) == 2 and parts[0] in ("binding", "note") and valid_id(parts[1])
@@ -80,10 +100,11 @@ def validate(view, raw, *, mode):
         eligible = {row["id"] for row in available.get(key, [])}
         if any(identity not in eligible for identity in cleaned[key]):
             raise ControlValueError("An item is no longer unavailable. Reopen the cleanup review.")
-    members = {(r["preset_id"], r["binding_id"]): r for r in available.get("preset_members", [])}
+    members = {_member_key(r): r for r in available.get("preset_members", [])}
     for row in cleaned["preset_members"]:
-        found = members.get((row["preset_id"], row["binding_id"]))
-        if found is None or (found.get("requires_binding") and found["requires_binding"] not in cleaned["bindings"]):
+        found = members.get(_member_key(row))
+        if (found is None or (found.get("requires_binding") and found["requires_binding"] not in cleaned["bindings"])
+                or (found.get("requires_execution") and found["requires_execution"] not in cleaned["execution"])):
             raise ControlValueError("A preset member is no longer eligible. Reopen the cleanup review.")
     return cleaned
 
@@ -146,11 +167,12 @@ def remove_members(presets, members):
     """Edit only selected members, preserving unknown metadata on retained entries."""
     changed = set()
     for row in members:
-        pid, bid = row["preset_id"], row["binding_id"]
+        pid = row["preset_id"]
         preset = presets.get(pid)
-        if isinstance(preset, dict) and isinstance(preset.get("members"), dict):
-            preset["members"].pop(bid, None)
+        table = "execution" if "execution_id" in row else "members"
+        if isinstance(preset, dict) and isinstance(preset.get(table), dict):
+            preset[table].pop(row.get("execution_id") or row.get("binding_id"), None)
             changed.add(pid)
-            if not preset["members"]:
+            if not preset.get("members") and not preset.get("execution"):
                 presets.pop(pid)
     return changed

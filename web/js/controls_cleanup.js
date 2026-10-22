@@ -5,7 +5,7 @@ import { register, PRIORITY } from "./keyboard_ownership.js";
 const GROUPS = {
     bindings: "Missing Controls", suggestions: "Exposed before",
     definition_anchors: "Anchors inside subgraphs", values: "Saved values from earlier versions of this workflow",
-    hidden: "Hidden items no longer in the workflow", preset_members: "Preset members",
+    hidden: "Hidden items no longer in the workflow", execution: "Missing node switches", preset_members: "Preset members",
 };
 let nextId = 0;
 const make = (tag, text) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; return el; };
@@ -30,13 +30,16 @@ export function mountCleanup(host, {track = work => work, notify = () => {}, flu
     function selection() {
         const result = Object.fromEntries(Object.keys(GROUPS).map(key => [key, []]));
         for (const {key, row, input} of checkboxes) if (input.checked && !input.disabled)
-            result[key].push(key === "preset_members" ? {preset_id: row.preset_id, binding_id: row.binding_id} : row.id);
+            result[key].push(key !== "preset_members" ? row.id : row.execution_id
+                ? {preset_id: row.preset_id, execution_id: row.execution_id} : {preset_id: row.preset_id, binding_id: row.binding_id});
         return result;
     }
     function sync() {
         const selected = new Set(checkboxes.filter(c => c.key === "bindings" && c.input.checked).map(c => c.row.id));
+        const switches = new Set(checkboxes.filter(c => c.key === "execution" && c.input.checked).map(c => c.row.id));
         for (const {key, row, input} of checkboxes) {
-            input.disabled = busy || (key === "preset_members" && !!row.requires_binding && !selected.has(row.requires_binding));
+            input.disabled = busy || (key === "preset_members" && ((!!row.requires_binding && !selected.has(row.requires_binding))
+                || (!!row.requires_execution && !switches.has(row.requires_execution))));
         }
         if (submit) setButtonDisabled(submit, busy || !ready(host.getView()) || !Object.values(selection()).some(rows => rows.length));
         if (submit) submit.title = !ready(host.getView()) ? "Fix the Sonder Control Relay before cleaning up." : "Remove the checked items";
@@ -75,7 +78,9 @@ export function mountCleanup(host, {track = work => work, notify = () => {}, flu
             }
             for (const row of rows) {
                 const name = key === "preset_members"
-                    ? `${view.presets?.find(p => p.id === row.preset_id)?.name || row.preset_id} · ${view.bindings?.find(b => b.binding_id === row.binding_id)?.label || row.binding_id}`
+                    ? `${view.presets?.find(p => p.id === row.preset_id)?.name || row.preset_id} · ${row.execution_id
+                        ? view.execution?.find(d => d.execution_id === row.execution_id)?.label || row.execution_id
+                        : view.bindings?.find(b => b.binding_id === row.binding_id)?.label || row.binding_id}`
                     : row.label;
                 const label = make("label"), input = make("input"), text = make("span", name);
                 label.style.cssText = `display:flex;align-items:flex-start;gap:${SPACE.s1}px;color:${COLORS.text};overflow-wrap:anywhere;`;

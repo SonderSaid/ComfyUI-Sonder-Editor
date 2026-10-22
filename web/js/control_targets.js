@@ -26,8 +26,9 @@ export function groupNameError(name) {
 // A stored group read tolerantly (server control_manifest.clean_group).
 export const cleanGroup = value => (typeof value === "string" && !groupNameError(value) ? value.trim() : "");
 
-// `binding:<id>:<field>`, `note:<id>:<field>`, `group:<name>:<op>` and `workflow:description`.
-const TARGET_RE = /^(?:(binding|note|preset):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$/;
+// `binding:<id>:<field>`, `note:<id>:<field>`, `execution:<id>:<field>`,
+// `group:<name>:<op>` and `workflow:description`.
+const TARGET_RE = /^(?:(binding|note|preset|execution):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$/;
 export const BINDING_STRUCTURAL_OPS = new Set(["expose", "remove", "rebind", "hide", "unhide", "create"]);
 export const GROUP_OPS = new Set(["create", "rename", "ungroup", "move"]);
 
@@ -42,6 +43,7 @@ export function parseTarget(target) {
 export const STRUCTURAL_OPS = {
     binding: BINDING_STRUCTURAL_OPS, note: new Set(["create", "remove", "hide", "unhide"]),
     group: GROUP_OPS, preset: new Set(["create", "capture", "apply"]), workflow: new Set(["cleanup", "restore"]),
+    execution: new Set(["expose", "remove", "rebind"]),
 };
 
 export function isStructuralTarget(target) {
@@ -55,5 +57,7 @@ export function isStructuralTarget(target) {
 const RUN_FIELDS = new Set(["value", "seed_mode", "expose", "remove", "rebind", "hide", "unhide"]);
 export function changesRun(target) {
     const parsed = parseTarget(target);
-    return (parsed?.source === "binding" && RUN_FIELDS.has(parsed.field)) || (parsed?.source === "preset" && parsed.field === "apply");
+    return (parsed?.source === "binding" && RUN_FIELDS.has(parsed.field)) || (parsed?.source === "preset" && parsed.field === "apply")
+        // A node switch's mode decides what runs; exposing or removing one does not.
+        || (parsed?.source === "execution" && (parsed.field === "mode" || parsed.field === "modes"));
 }

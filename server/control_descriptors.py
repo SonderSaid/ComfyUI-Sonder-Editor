@@ -61,7 +61,7 @@ STATUS_SHADOWED = "shadowed"
 
 STATUS_REASONS = {
     STATUS_SHADOWED: "The workflow now exposes this setting itself, so this app-only Control is off. Remove it.",
-    STATUS_MISSING: "This setting is no longer in the workflow, moved into a subgraph, or its node is muted or bypassed.",
+    STATUS_MISSING: "This setting is no longer in the workflow, or it moved into a subgraph.",
     STATUS_DUPLICATE: "Two nodes carry this Control. Remove one of them.",
     STATUS_LINKED: "Another node is connected to this input, so the Control can't set it.",
     STATUS_NO_WIDGET: "This input has no editable value right now.",
@@ -70,6 +70,13 @@ STATUS_REASONS = {
 }
 
 DEFAULT_LABEL = "Setting"
+
+# A muted or bypassed node is left out of every API export. The canvas sends
+# such nodes' bodies separately (``describe_bindings(authoring=)``) so their
+# settings stay Controls; an imported API file has no body to read.
+INACTIVE_EXPORT_REASON = ("Its node was {mode} when this workflow was exported. "
+                          "Enable it on the canvas and export again.")
+MAX_AUTHORING_BODIES = 256
 
 # Mirrors the frontend 1.53.10 number control (`computeNextNumberValue`), which
 # keeps randomized values inside +-2^50.
@@ -165,9 +172,10 @@ def group_order(view: dict) -> list[str]:
     explicit = view.get("groups") if isinstance(view.get("groups"), dict) else {}
     ordered = sorted((name for name in explicit if isinstance(name, str) and name),
                      key=lambda name: (_clean_order((explicit.get(name) or {}).get("order")), name))
-    rows = [*(d for d in view.get("bindings") or [] if d.get("section") != "editor"), *(view.get("notes") or [])]
+    rows = [*(d for d in view.get("bindings") or [] if d.get("section") != "editor"), *(view.get("notes") or []),
+            *(view.get("execution") or [])]
     rows.sort(key=lambda d: (_clean_order(d.get("order")), str(d.get("label") or "").lower(),
-                             str(d.get("binding_id") or d.get("note_id") or "")))
+                             str(d.get("binding_id") or d.get("note_id") or d.get("execution_id") or "")))
     for row in rows:
         name = row.get("group")
         if isinstance(name, str) and name and name not in ordered:
@@ -302,13 +310,14 @@ def coerce_panel_layout(field: str, raw: Any):
 # control_bindings.js ``parseTarget``): ``binding:<id>:<field>``,
 # ``note:<id>:<field>``, ``group:<name>:<op>`` (a name holds no ``:``) and the
 # two-part ``workflow:description``.
-_TARGET_RE = re.compile(r"^(?:(binding|note|preset):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$")
+_TARGET_RE = re.compile(r"^(?:(binding|note|preset|execution):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$")
 # Manage's structural targets: the validator returns an internal write plan,
 # and the mounted relay forwards the original intent for the canvas to recheck.
 BINDING_STRUCTURAL_OPS = frozenset({"expose", "remove", "rebind", "hide", "unhide", "create"})
 GROUP_OPS = frozenset({"create", "rename", "ungroup", "move"})
 STRUCTURAL_OPS = {"binding": BINDING_STRUCTURAL_OPS, "note": frozenset({"create", "remove", "hide", "unhide"}),
-                  "group": GROUP_OPS, "preset": frozenset({"create", "capture", "apply"}), "workflow": frozenset({"cleanup", "restore"})}
+                  "group": GROUP_OPS, "preset": frozenset({"create", "capture", "apply"}), "workflow": frozenset({"cleanup", "restore"}),
+                  "execution": frozenset({"expose", "remove", "rebind"})}
 
 
 def parse_target(target: Any) -> tuple[str, str, str] | None:
@@ -700,6 +709,8 @@ def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Call
         descriptor["label"] = _default_label(prompt, entry.get("targets") or [])
     if status == STATUS_MISSING and entry.get("restorable"):
         reason = "Reconnect it with Restore Controls on the canvas, then export again."
+    elif status == STATUS_MISSING and entry.get("participation") in ("inactive", "partial"):
+        reason = INACTIVE_EXPORT_REASON.format(mode=(entry.get("inactive_reason") or {}).get("mode", "muted"))
     descriptor["status"] = status
     descriptor["reason"] = reason or STATUS_REASONS.get(status) if status != STATUS_OK else None
     if status != STATUS_OK:
@@ -809,6 +820,55 @@ def _picker_hint(prompt: dict, descriptor: dict, host_editor: Any) -> dict | Non
     return {"kind": kinds.pop(), "source": source}
 
 
+def clean_authoring(raw: Any, prompt: dict) -> dict:
+    """The canvas's bodies of muted and bypassed target nodes, checked.
+
+    Typed apart from the prompt and never merged into one that is queued: they
+    only let a setting on an inactive node be read and validated. A key the
+    prompt also holds is refused (the prompt is the authority for what runs).
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or len(raw) > MAX_AUTHORING_BODIES:
+        raise ControlValueError(f"At most {MAX_AUTHORING_BODIES} inactive nodes can be described.")
+    bodies = {}
+    for key, body in raw.items():
+        if (not isinstance(key, str) or not key or len(key) > 256 or key in control_manifest.FORBIDDEN_KEYS
+                or key in prompt or not isinstance(body, dict)):
+            raise ControlValueError("An inactive node is invalid.")
+        class_type, inputs, mode = body.get("class_type"), body.get("inputs"), body.get("mode")
+        if not isinstance(class_type, str) or not isinstance(inputs, dict) or mode not in ("muted", "bypassed"):
+            raise ControlValueError("An inactive node is invalid.")
+        meta = body.get("_meta") if isinstance(body.get("_meta"), dict) else {}
+        label = body.get("label")
+        bodies[key] = {"class_type": class_type, "inputs": inputs,
+                       "_meta": {"title": meta["title"]} if isinstance(meta.get("title"), str) else {},
+                       "mode": mode, "by": "parent" if body.get("by") == "parent" else "self",
+                       "label": label[:control_manifest.LABEL_MAX] if isinstance(label, str) else ""}
+    return bodies
+
+
+def authoring_prompt(prompt: dict, authoring: dict | None) -> dict:
+    """The prompt plus inactive bodies, for reading and validating settings
+    only. Never queued: a muted node must stay out of what runs."""
+    return {**authoring, **prompt} if authoring else prompt
+
+
+def _mark_participation(descriptor: dict, prompt: dict, authoring: dict) -> None:
+    """``active``, ``inactive`` or ``partial`` from where each target was read.
+    Only a canvas describe (one with ``authoring``) can tell."""
+    if authoring is None:
+        return
+    off = [authoring[t["path"]] for t in descriptor.get("targets", [])
+           if t.get("path") not in prompt and t.get("path") in authoring]
+    if not off:
+        descriptor["participation"] = "active"
+        return
+    total = len(descriptor.get("targets", []))
+    descriptor["participation"] = "inactive" if len(off) == total else "partial"
+    descriptor["inactive_reason"] = {"mode": off[0]["mode"], "by": off[0]["by"], "label": off[0]["label"]}
+
+
 def describe_bindings(
     prompt: Any,
     *,
@@ -818,6 +878,7 @@ def describe_bindings(
     local_notes: Any = None,
     orphan_manifest: Any = None,
     host_editor: Any = SOLE_EDITOR,
+    authoring: dict | None = None,
 ) -> dict:
     """Describe the Relay's bindings and notes in an API prompt.
 
@@ -832,12 +893,20 @@ def describe_bindings(
     template's sidecar); they describe with ``origin: "local"``, also when the
     workflow has no Relay. Blocking only through ``INPUT_TYPES``; callers run it
     off the event loop like any prompt walk.
+
+    ``authoring`` holds the canvas's bodies of muted and bypassed target nodes
+    (``clean_authoring``). A setting read from one stays ``ok`` and is marked
+    ``participation: inactive``; without it (the Sonder App, a run's
+    provenance) such a setting has no body and reads ``missing``.
     """
     if not isinstance(prompt, dict):
         raise ValueError("A prompt must be an object of nodes.")
     class_lookup = class_lookup or _comfy_class_lookup
     cache: dict = {}
-    relay = control_manifest.find_relay(prompt)
+    executable = prompt
+    prompt = authoring_prompt(prompt, authoring)
+    # Only a Relay that runs carries Controls; an inactive body never counts.
+    relay = control_manifest.find_relay(executable)
     census_error = control_manifest.census_error(relay_census)
     if census_error and relay["status"] != "error":
         relay = {**relay, "status": "error", "error": census_error}
@@ -846,7 +915,8 @@ def describe_bindings(
         "bindings": [],
         "notes": [],
         "suggestions": [],
-        "editors": prompt_graph.editor_keys(prompt),
+        "execution": [],
+        "editors": prompt_graph.editor_keys(executable),
     }
     if relay["status"] == "error":
         view["error"] = relay["error"]
@@ -880,6 +950,12 @@ def describe_bindings(
     exposed = {d["binding_id"] for d in view["bindings"]}
     view["suggestions"] = [s for s in view["suggestions"] if s["binding_id"] not in exposed]
     _flag_shared_targets(view["bindings"])
+    for descriptor in view["bindings"]:
+        _mark_participation(descriptor, executable, authoring)
+    from . import control_execution
+    view["execution"], execution_error = control_execution.describe_execution(executable, manifest)
+    if execution_error:
+        view["execution_error"] = execution_error
     if host_editor is SOLE_EDITOR:
         host_editor = view["editors"][0] if len(view["editors"]) == 1 else None
     for descriptor in view["bindings"]:
@@ -1159,6 +1235,8 @@ def _target_table(view: dict) -> dict:
         if isinstance(identity, str) and identity and note.get("status") == STATUS_OK:
             for field in ("text", "order", "group"):
                 table[f"note:{identity}:{field}"] = (note, field)
+    from . import control_execution
+    table.update(control_execution.table_entries(view))
     return table
 
 
@@ -1182,7 +1260,9 @@ def _shares_node(descriptor: dict, others: list[dict]) -> bool:
 def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = None,
                              max_changes: int | None = MAX_CONTROL_CHANGES,
                              structural: str | None = None,
-                             inventory: list[dict] | None = None) -> tuple[dict, list[dict]]:
+                             inventory: list[dict] | None = None,
+                             execution_inventory: list[dict] | None = None,
+                             expanded: bool = False) -> tuple[dict, list[dict]]:
     """Whitelist and coerce panel writes against the current descriptor view.
 
     Returns canonical values and target/reason refusals. Callers reject the whole
@@ -1197,7 +1277,10 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
     (the writer edits anchors and the manifest), ``"sdk"`` (app-only bindings,
     amendment A1) or ``"relay"`` (the mounted pre-check: shape only, because the
     canvas writer re-validates against the live graph). ``inventory`` is the
-    ``candidate_inventory`` of the candidates the batch names.
+    ``candidate_inventory`` of the candidates the batch names, and
+    ``execution_inventory`` the node and group candidates
+    (``control_execution.clean_candidates``). ``expanded`` admits a preset's
+    own expansion targets (a group's per-member ``modes``), which no panel sends.
     """
     if not isinstance(changes, dict) or not changes or (max_changes is not None and len(changes) > max_changes):
         return {}, [{"target": "", "reason": "Send 1 to 64 changes."}]
@@ -1226,9 +1309,11 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
     preset_targets = [target for target in changes if (parse_target(target) or (None,))[0] == "preset"]
     if preset_targets:
         from .control_presets import validate_preset_changes
-        return validate_preset_changes(view, changes, prompt=prompt, structural=structural, inventory=inventory)
+        return validate_preset_changes(view, changes, prompt=prompt, structural=structural, inventory=inventory,
+                                       execution_inventory=execution_inventory)
     table = _target_table(view)
-    batch = _StructuralBatch(view, structural, inventory)
+    batch = _StructuralBatch(view, structural, inventory, execution_inventory)
+    effects: dict[str, tuple[str, str]] = {}
     value_changes = [table[t][0] for t in changes if t in table and table[t][1] == "value"]
     overrides: dict[tuple[str, str], Any] = {}
     for target, raw in changes.items():
@@ -1254,6 +1339,17 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
             if target not in table:
                 raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
             descriptor, field = table[target]
+            if descriptor.get("source") == "execution" and (field in ("mode", "modes") or descriptor.get("read_only")):
+                from . import control_execution
+                if descriptor.get("read_only") or structural == "sdk":
+                    raise ControlValueError(control_execution.SDK_REASON)
+                value = control_execution.coerce_mode(descriptor, field, raw, expanded=expanded) if field in ("mode", "modes") else raw
+                # A node a group and its own switch both set must get one mode.
+                for path, mode in control_execution.effects_of(descriptor, field, value).items():
+                    if effects.setdefault(path, (mode, target))[0] != mode:
+                        raise ControlValueError("Two changes switch the same node differently.")
+                cleaned[target] = value
+                continue
             if field in ("note", "text"):
                 if descriptor.get("note_truncated"):
                     raise ControlValueError("Edit this note on the canvas.")
@@ -1330,8 +1426,10 @@ class _StructuralBatch:
     group of 200 Controls never meets the 64-change cap.
     """
 
-    def __init__(self, view: dict, mode: str | None, inventory: list[dict] | None):
+    def __init__(self, view: dict, mode: str | None, inventory: list[dict] | None,
+                 execution_inventory: list[dict] | None = None):
         self.view, self.mode = view, mode
+        self.execution_inventory, self.execution_state = execution_inventory, {}
         self.bindings = {d.get("binding_id"): d for d in view.get("bindings", [])}
         self.notes = {d.get("note_id"): d for d in view.get("notes", [])}
         self.suggestions = {s.get("binding_id"): s for s in view.get("suggestions", [])}
@@ -1339,7 +1437,7 @@ class _StructuralBatch:
         self.owners = bound_targets(view)
         self.claimed: set = set()
         self.binding_count, self.note_count = len(self.bindings), len(self.notes)
-        orders = [d.get("order") for d in [*view.get("bindings", []), *view.get("notes", [])]
+        orders = [d.get("order") for d in [*view.get("bindings", []), *view.get("notes", []), *(view.get("execution") or [])]
                   if not d.get("group") and isinstance(d.get("order"), int) and not isinstance(d.get("order"), bool)]
         self.next_order = max(orders, default=0)
         listed = view.get("group_order")
@@ -1475,6 +1573,10 @@ class _StructuralBatch:
         self._require_relay()
         if source == "note":
             return self._note(identity, op, raw)
+        if source == "execution":
+            from . import control_execution
+            return control_execution.validate_structural(self.view, self.execution_inventory, identity, op, raw,
+                                                         self.mode, self.execution_state, self._order)
         existing = self.bindings.get(identity)
         sdk = self.mode == "sdk"
         if op in ("hide", "unhide"):

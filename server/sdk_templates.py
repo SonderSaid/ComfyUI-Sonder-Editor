@@ -315,6 +315,11 @@ def controls_summary_of(view: dict) -> tuple[list[dict], list[str]]:
             has_seed = True
         if binding.get("status") != control_descriptors.STATUS_OK:
             warnings.append(f"“{label}” is off: {binding.get('reason') or 'it cannot be set.'}")
+    for switch in view.get("execution", []) or []:
+        # Its off nodes are not in the file, so no run here can switch them on.
+        if any(member.get("mode") != "enabled" for member in switch.get("members", [])):
+            warnings.append(f"“{switch.get('label') or 'A node switch'}” had nodes off when this workflow was "
+                            "exported. Enable them on the canvas and export again.")
     if not has_seed:
         warnings.append(
             "No seed exposed: every Generate of the same job uses the workflow's fixed seed. "
@@ -894,6 +899,10 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
     description = stored.get("description")
     if isinstance(description, str) and len(description) <= cd.control_manifest.DESCRIPTION_MAX:
         view["description"] = description
+    # Phase 1A interim: the app shows the workflow's node switches without
+    # switching them, so a preset holding one reads unavailable here.
+    from .control_execution import sdk_read_only
+    sdk_read_only(view.get("execution", []) or [])
     if "relay" in view and not view.get("error"):
         view["groups"] = _overlay_groups(view.get("groups"), layouts)
         view["group_order"] = cd.group_order(view)  # the overlays may regroup

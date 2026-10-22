@@ -31,8 +31,12 @@ seed shows its mode beside it (fixed, increment, decrement, randomize).
 
 In the Sonder App, values are saved for that imported workflow.
 
-A setting that can't be used — its node was removed, muted or linked to
-another node — says why and is skipped, so the workflow's own value runs.
+A setting whose node is muted or bypassed (or sits inside a muted or bypassed
+subgraph) shows **Muted** or **Bypassed** beside its name. You can still change
+it: the node stays off, and the value applies once the node runs again.
+
+A setting that can't be used — its node was removed or is linked to another
+node — says why and is skipped, so the workflow's own value runs.
 
 To see only the settings, click **Hide notes** in the small line near the top
 of the Controls tab, under the search box (and under the **Preset** picker when
@@ -48,10 +52,32 @@ everything, and a search shows every setting it matches, with its note.
 Each take records the values it used. Open the take in **Assets** and look for
 **Controls at run** in its details.
 
+## Switch nodes and groups on and off
+
+A workflow can expose a node, a subgraph or a canvas group as a switch with
+three buttons: **Enabled**, **Muted** and **Bypassed**. Click one to set every
+node it covers, like ComfyUI's own mute and bypass. On the canvas, one Undo
+reverts the switch.
+
+- A group switch covers the nodes inside the group on the canvas at the moment
+  you click. When its nodes differ, no button is selected and it reads, for
+  example, *Mixed (1 of 2 off)*.
+- Two switches can cover the same node (a group and a node inside it). The
+  last one you click decides.
+- On the canvas, the **Sonder Control Relay** node shows each switch's state
+  (*Muted — switch in Controls*).
+- In the Sonder App, switches show their state but can't be switched yet;
+  switch them on the canvas.
+
+To add one, see [Manage](#manage).
+
 ## Presets
 
 A preset is a named set of Controls that sets up one job (text-to-video,
-detailing, and so on) in one choice.
+detailing, and so on) in one choice. It can include switches: for example, a
+**Skip first pass** preset that sets the second pass's input and mutes the
+first pass's group. Its values and switches apply together, as one Undo step
+on the canvas.
 
 - **Apply one:** choose it in the **Preset** picker near the top of the
   Controls tab (below the workflow description). Controls outside the preset
@@ -62,7 +88,8 @@ detailing, and so on) in one choice.
   current values**.
 
 A preset whose Control is gone or refused is greyed out and names it; fix it
-in **Manage**. Presets are saved in the workflow and in its API export. In the
+in **Manage**. So is a preset whose group switch now covers different nodes:
+choose it in **Manage** and click **Update from current values**. Presets are saved in the workflow and in its API export. In the
 Sonder App, editing a preset keeps your copy when you re-import the workflow;
 **Reset to workflow's version** brings back the imported one.
 
@@ -75,6 +102,11 @@ Click **Manage** at the top right of the Controls tab. Click **Done** to leave.
   by node or setting** to find one, then click **Add** beside it. In the Sonder
   App, **+ Setting** adds an *App only* Control, which never appears on the
   canvas.
+- **Add a node, subgraph or group switch** (on the canvas): click **+ Setting**
+  and scroll to **Nodes and groups**, or type its title in **Filter by node or
+  setting**, then click **Add**. The **Sonder Editor**, the **Sonder Control
+  Relay** and groups that hold either can't be switches. A setting on a node
+  that is off right now isn't listed: turn the node on to add it.
 - **Bring back removed settings:** **+ Setting → Exposed before → Restore all**
   (up to 64 per click; repeat for more).
 - **Group and order:** **+ Group** adds a group. Drag a row by its handle to
@@ -135,7 +167,10 @@ lists.
 ## Share Controls
 
 - **From the canvas:** save the workflow (it carries the Controls and presets),
-  or use ComfyUI's **Export (API)** for the Sonder App.
+  or use ComfyUI's **Export (API)** for the Sonder App. **Export (API)** leaves
+  out nodes that are muted or bypassed, so first turn on every node a switch
+  or setting needs. **Manage** lists them under **Before Export (API) for the
+  Sonder App** while any is off. Presets keep your switched-off setups.
 - **From the Sonder App:** in the Launcher, open the workflow's **⋮** menu and
   click **Export as API**. The file carries current values, seed modes, labels,
   notes, group order, **Advanced** flags, the description and active app-only
