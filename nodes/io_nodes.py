@@ -21,7 +21,7 @@ from PIL import Image
 
 from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
 from ..server.lane_registry import ensure_lane_index
-from ..server import external_links
+from ..server import comfy_idle, external_links
 from ..server.atomic_io import atomic_replace
 from ..server.project_manager import ProjectVersionConflict, load_project, save_project
 from ..server.path_security import (
@@ -152,6 +152,40 @@ def _settle_after_save(project, queue_job_id: str) -> None:
         pending = []
         project._sonder_settle_after_save = pending
     pending.append(str(queue_job_id))
+
+
+def _build_take_proxy(committed_project, asset_id: str) -> None:
+    """A Save Video output that the browser cannot play gets its proxy before the node
+    returns, from the committed file (``proxy_media.ProxyWorker.build_inline``). A
+    ComfyUI interrupt or a failure hands it to the background worker; the take itself
+    never fails because of its proxy."""
+    try:
+        from ..server import proxy_media
+
+        remap = getattr(committed_project, "_asset_id_remap", {}) or {}
+        committed_id = remap.get(asset_id, asset_id)
+        try:
+            import comfy.model_management as model_management
+
+            interrupted = model_management.processing_interrupted
+        except Exception:
+            interrupted = lambda: False
+        bar = {}
+
+        def progress(done: int, total: int) -> None:
+            try:
+                if "pbar" not in bar:
+                    import comfy.utils
+
+                    bar["pbar"] = comfy.utils.ProgressBar(max(1, int(total)))
+                bar["pbar"].update_absolute(int(done))
+            except Exception:
+                pass
+
+        proxy_media.worker().build_inline(committed_project.project_dir, committed_id,
+                                          interrupted=interrupted, progress=progress)
+    except Exception:
+        logger.warning("Take proxy step failed; the take is saved", exc_info=True)
 
 
 def _save_generated_project(project, base_modified_at: str = "", created_ids=None):
@@ -1182,6 +1216,9 @@ def _install_bridge_prompt_queue_hooks() -> bool:
         if callable(original_get) and not getattr(original_get, "_sonder_bridge_wrapped", False):
             def wrapped_get(*args, **kwargs):
                 result = original_get(*args, **kwargs)
+                if result is not None:
+                    # A prompt starting resets the proxy builds' idle grace period.
+                    comfy_idle.note_busy()
                 try:
                     prompt_key, prompt = _extract_prompt_key_from_queue_get_result(result)
                     _set_bridge_prompt_key_for_object(prompt_key, prompt)
@@ -1210,6 +1247,8 @@ def _install_bridge_prompt_queue_hooks() -> bool:
                 try:
                     return original_task_done(*args, **kwargs)
                 finally:
+                    # The grace period counts from a prompt's end, not its start.
+                    comfy_idle.note_busy()
                     if prompt_key:
                         try:
                             _finalize_prompt_bridges(prompt_key, source="task_done")
@@ -1648,6 +1687,11 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
         if changed:
             committed_project = _save_generated_project(project, entry.get("base_modified_at", ""), created_ids=created_ids_since(_pre_item_ids, project))
             asset_id_remap = getattr(committed_project, "_asset_id_remap", {}) if committed_project is not None else {}
+            from ..server import proxy_media
+            proxy_media.enqueue_after_commit(project.project_dir, [
+                asset_id_remap.get(pending["asset"].asset_id, pending["asset"].asset_id)
+                for pending in completed_moves if pending["asset_type"] == "video"
+            ])
             for pending in completed_moves:
                 if pending["asset_type"] in {"video", "image", "audio"}:
                     from ..server.thumbnail_service import ensure_thumbnail
@@ -2319,7 +2363,8 @@ class SonderSaveVideo:
             ctx = _copy_execution_context(project)
             _mark_queue_job_completed(project, str(ctx.get("queue_job_id") or ""), asset.asset_id)
 
-        _save_generated_project(project, str(execution_context.get("base_modified_at") or ""), created_ids=created_ids_since(_pre_item_ids, project))
+        committed_project = _save_generated_project(project, str(execution_context.get("base_modified_at") or ""), created_ids=created_ids_since(_pre_item_ids, project))
+        _build_take_proxy(committed_project if committed_project is not None else project, asset.asset_id)
 
         # Inline node player descriptor — the saved project media file is served via
         # ComfyUI /view from <output>/sonder-projects/<dir>/media. Poster is the first

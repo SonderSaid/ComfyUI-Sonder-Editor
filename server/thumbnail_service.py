@@ -17,6 +17,19 @@ THUMBNAIL_GENERATION_CONCURRENCY = 2
 _THUMBNAIL_GENERATION_SLOTS = threading.BoundedSemaphore(THUMBNAIL_GENERATION_CONCURRENCY)
 
 
+_ASSET_CACHE_LOCKS_GUARD = threading.Lock()
+_ASSET_CACHE_LOCKS: dict[str, threading.Lock] = {}
+
+
+def asset_cache_lock(project_dir: str, asset_id: str) -> threading.Lock:
+    """The one lock over an asset's derived cache files (thumbnails, strips, waveforms,
+    proxies). Publishing a derived file re-checks the source under it, and replacement
+    clears the cache under it, so a stale derivation can never land after a replace."""
+    key = f"{os.path.normcase(os.path.realpath(project_dir))}|{asset_id}"
+    with _ASSET_CACHE_LOCKS_GUARD:
+        return _ASSET_CACHE_LOCKS.setdefault(key, threading.Lock())
+
+
 def generate_video_thumbnail(video_path: str, output_path: str,
                              size: tuple[int, int] = THUMB_SIZE) -> bool:
     """Extract first frame from video and save as PNG thumbnail."""

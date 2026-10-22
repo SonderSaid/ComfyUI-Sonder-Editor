@@ -137,16 +137,18 @@ def _is_reparse(path: str) -> bool:
         return os.path.islink(path)
 
 
-def _validate_cache_root_path(root: str) -> None:
+def _validate_cache_root_path(root: str, *, leaf: str = "renders") -> None:
+    """``root`` must be ``<project>/cache/<leaf>`` with no reparse point on the way.
+    Shared by every derived cache that keeps its own folder (renders, proxies)."""
     cache_dir = os.path.dirname(root)
     project_dir = os.path.dirname(cache_dir)
-    if os.path.basename(cache_dir) != "cache" or os.path.basename(root) != "renders":
-        raise RenderCacheError("Invalid render cache root")
+    if os.path.basename(cache_dir) != "cache" or os.path.basename(root) != leaf:
+        raise RenderCacheError("Invalid cache root")
     if (
         (os.path.lexists(cache_dir) and external_links.is_reparse_child(project_dir, "cache"))
-        or (os.path.lexists(root) and external_links.is_reparse_child(cache_dir, "renders"))
+        or (os.path.lexists(root) and external_links.is_reparse_child(cache_dir, leaf))
     ):
-        raise RenderCacheError("Render cache root contains a reparse-point ancestor")
+        raise RenderCacheError("Cache root contains a reparse-point ancestor")
 
 
 def render_cache_root(project_or_dir, *, create: bool = False) -> str:

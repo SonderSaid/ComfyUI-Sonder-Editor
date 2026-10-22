@@ -163,6 +163,7 @@ from . import minimax_h3
 from . import prompt_payload
 from . import scene_mutation_addressing
 from . import change_certificates
+from . import proxy_media
 from . import control_descriptors
 from .guide_collision import resolve_execution_window, resolve_guide_collisions
 
@@ -8262,6 +8263,7 @@ def _asset_payload(
     lean: bool = False,
     media_snapshot: dict[str, dict] | None = None,
     thumbnail_snapshot: dict[str, dict] | None = None,
+    proxy_states: dict[str, dict] | None = None,
 ) -> dict:
     from .project_storage import (
         generation_summary, has_generation_provenance, INLINE_GENERATION_PARAM_KEYS, provenance_revision,
@@ -8297,12 +8299,37 @@ def _asset_payload(
         payload["size_bytes"] = _asset_file_size(source_path) if source_path else 0
     payload["trashed_at"] = getattr(asset, "trashed_at", "") or ""
     payload["extension"] = os.path.splitext(getattr(asset, "path", "") or "")[1].lower()
+    if asset.asset_type == "video":
+        if proxy_states is None:
+            proxy_states = _proxy_states(project, [asset])
+        if asset.asset_id in proxy_states:
+            payload["proxy"] = proxy_states[asset.asset_id]
     return payload
+
+
+def _proxy_states(project: TimelineProject, assets) -> dict[str, dict]:
+    """Proxy decision and state of the video assets, from one listing of the project's
+    proxy folder (``proxy_media``). Reads the inline params only, so nothing hydrates."""
+    entries = [
+        (asset.asset_id, asset.inline_generation_params,
+         os.path.splitext(getattr(asset, "path", "") or "")[1].lower())
+        for asset in assets if asset.asset_type == "video"
+    ]
+    if not entries:
+        return {}
+    try:
+        return proxy_media.worker().states(project.project_dir, entries,
+                                           settings=proxy_media.resolve_settings(project.metadata))
+    except Exception:
+        logger.warning("Proxy states unavailable", exc_info=True)
+        return {}
 
 
 def _asset_payloads(project: TimelineProject, assets) -> list[dict]:
     media_snapshot = _project_media_snapshot(project)
     thumbnail_snapshot = _project_thumbnail_snapshot(project)
+    assets = list(assets)
+    proxy_states = _proxy_states(project, assets)
     return [
         _asset_payload(
             project,
@@ -8310,6 +8337,7 @@ def _asset_payloads(project: TimelineProject, assets) -> list[dict]:
             lean=True,
             media_snapshot=media_snapshot,
             thumbnail_snapshot=thumbnail_snapshot,
+            proxy_states=proxy_states,
         )
         for asset in assets
     ]
@@ -8941,6 +8969,7 @@ def _sync_media_folder_versioned(
     if reload_project is None:
         reload_project = lambda: load_project(project.project_dir)
 
+    known_ids = {asset.asset_id for asset in project.assets}
     project = _save_versioned_sync_phase(
         project,
         lambda sync_project: _sync_media_folder(
@@ -8951,6 +8980,10 @@ def _sync_media_folder_versioned(
         ),
         reload_project,
     )
+    proxy_media.enqueue_after_commit(project.project_dir, [
+        asset.asset_id for asset in project.assets
+        if asset.asset_type == "video" and asset.asset_id not in known_ids
+    ])
 
     # Trash purge can delete media files, so run it against a fresh project
     # snapshot after the non-destructive scan/repair phase instead of against a
@@ -9917,6 +9950,9 @@ def _delete_asset_cache_files(project: TimelineProject, asset: Asset) -> None:
                 os.remove(cache_path)
             except OSError:
                 logger.warning("Failed to clear asset cache file: %s", cache_path)
+    # Proxies are matched by exact name, not listed here; a file a browser still holds
+    # is retried by the proxy worker.
+    proxy_media.remove_asset_files(project.project_dir, asset.asset_id)
 
 
 def _asset_storage_key(project: TimelineProject, asset: Asset, *, purpose: str) -> str:
@@ -10558,14 +10594,10 @@ class _StreamedAssetChanged(RuntimeError):
     pass
 
 
-_ASSET_CACHE_LOCKS_GUARD = threading.Lock()
-_ASSET_CACHE_LOCKS: dict[str, threading.Lock] = {}
-
-
 def _asset_cache_lock(project: TimelineProject, asset: Asset) -> threading.Lock:
-    key = f"{os.path.normcase(os.path.realpath(project.project_dir))}|{asset.asset_id}"
-    with _ASSET_CACHE_LOCKS_GUARD:
-        return _ASSET_CACHE_LOCKS.setdefault(key, threading.Lock())
+    from .thumbnail_service import asset_cache_lock
+
+    return asset_cache_lock(project.project_dir, asset.asset_id)
 
 
 def _apply_uploaded_metadata(
@@ -11463,6 +11495,113 @@ async def _stream_prompt_preview(
     return response
 
 
+
+# ---------------------------------------------------------------------------
+# Proxy media (`server/proxy_media.py`). These reads and writes touch only the derived
+# cache and the process's queue, never `project.json`: no version gate, no certificate.
+# ---------------------------------------------------------------------------
+
+_PROXY_CATEGORIES = ("scenes", "references", "unused")
+_PROXY_MAX_IDS = 5000
+_PROXY_FILE_HEADERS = {"Cache-Control": "private, max-age=31536000, immutable", "Content-Type": "video/mp4"}
+
+
+def _proxy_error(message: str, code: str, status: int = 400) -> web.Response:
+    return web.json_response({"error": message, "code": code}, status=status)
+
+
+def _proxy_asset_ids(value) -> list[str]:
+    if not isinstance(value, list) or not value or len(value) > _PROXY_MAX_IDS:
+        _mutation_error(f"asset_ids must be a list of 1 to {_PROXY_MAX_IDS} ids", 400, "invalid_asset_ids")
+    ids = []
+    for raw in value:
+        if not isinstance(raw, str):
+            _mutation_error("asset_ids must hold strings", 400, "invalid_asset_ids")
+        try:
+            ids.append(_safe_route_token(raw, "asset id"))
+        except ValueError:
+            _mutation_error("Invalid asset id", 400, "invalid_asset_ids")
+    return list(dict.fromkeys(ids))
+
+
+def _proxy_categories(value) -> set[str]:
+    if not isinstance(value, list) or not value or any(item not in _PROXY_CATEGORIES for item in value):
+        _mutation_error(f"categories must be a non-empty list of {', '.join(_PROXY_CATEGORIES)}", 400,
+                        "invalid_categories")
+    return set(value)
+
+
+async def _proxy_json_body(request: web.Request) -> dict:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        _mutation_error("Invalid JSON body", 400, "invalid_json")
+    if not isinstance(body, dict):
+        _mutation_error("The body must be an object", 400, "invalid_json")
+    return body
+
+
+def _proxy_category_of(project: TimelineProject):
+    """``asset -> scenes | references | unused | trashed``. A lean usage scan: clips,
+    audio and guides of every scene (Driver lanes are clips), then Reference members."""
+    scene_paths: set[str] = set()
+    guide_ids: set[str] = set()
+    for scene in project.scenes:
+        for clip in scene.clips:
+            scene_paths.add(_normalize_project_relpath(getattr(clip, "source_path", "") or ""))
+        for track in scene.audio_tracks:
+            scene_paths.add(_normalize_project_relpath(getattr(track, "source_path", "") or ""))
+        for guide in scene.guide_frames:
+            guide_ids.add(str(getattr(guide, "asset_id", "") or ""))
+    member_ids = {str(member.asset_id) for reference in project.references for member in reference.members}
+
+    def category(asset: Asset) -> str:
+        if _asset_is_trashed(asset):
+            return "trashed"
+        if _normalize_project_relpath(asset.path) in scene_paths or asset.asset_id in guide_ids:
+            return "scenes"
+        if asset.asset_id in member_ids:
+            return "references"
+        return "unused"
+
+    return category
+
+
+def _proxy_overview(project: TimelineProject) -> dict:
+    videos = [asset for asset in project.assets if asset.asset_type == "video"]
+    states = _proxy_states(project, videos)
+    category = _proxy_category_of(project)
+    categories = {name: {"count": 0, "bytes": 0} for name in (*_PROXY_CATEGORIES, "trashed")}
+    total = {"count": 0, "bytes": 0}
+    items = {}
+    for asset in videos:
+        item = dict(states.get(asset.asset_id) or {})
+        item["category"] = category(asset)
+        items[asset.asset_id] = item
+        if item.get("state") == proxy_media.STATE_READY:
+            size = int(item.get("bytes") or 0)
+            categories[item["category"]]["count"] += 1
+            categories[item["category"]]["bytes"] += size
+            total["count"] += 1
+            total["bytes"] += size
+    worker = proxy_media.worker()
+    return {
+        "project_id": project.project_id,
+        "settings": proxy_media.resolve_settings(project.metadata),
+        "presets": list(proxy_media.PROXY_PRESETS),
+        "timings": list(proxy_media.BUILD_TIMINGS),
+        "epoch": worker.next_epoch(),
+        "items": items,
+        "categories": categories,
+        "total": total,
+        "queue": worker.queue_summary(project.project_dir),
+    }
+
+
+def _proxy_load(request: web.Request) -> TimelineProject:
+    return _load_project_from_request(request, repair_missing_frames=False, version_checked=False)
+
+
 if routes is not None:
 
     # -----------------------------------------------------------------------
@@ -12075,6 +12214,10 @@ if routes is not None:
                 if "reference_crop_position" in incoming_metadata:
                     incoming_metadata["reference_crop_position"] = _validated_crop_position(
                         incoming_metadata["reference_crop_position"])
+                try:
+                    proxy_media.validate_settings_update(incoming_metadata)
+                except ValueError as exc:
+                    _mutation_error(str(exc), 400, "invalid_proxy_setting")
             except ProjectMutationRequestError as exc:
                 return _mutation_json_error(exc)
             body = {**body, "metadata": incoming_metadata}
@@ -12181,6 +12324,8 @@ if routes is not None:
             project.metadata.update(incoming)
 
         await run_project_io(save_project, project)
+        if isinstance(incoming_metadata, dict) and proxy_media.METADATA_TIMING_KEY in incoming_metadata:
+            await asyncio.to_thread(proxy_media.worker().settings_changed, project.project_dir)
         return web.json_response(project.to_dict())
 
     @routes.post("/sonder-editor/project/{project_id}/reveal")
@@ -12545,6 +12690,8 @@ if routes is not None:
                     # The commit reloads its own object; the pre-upload object
                     # would stamp a version older than this successful write.
                     _remember_request_project(request, committed_project)
+                    if asset.asset_type == "video":
+                        proxy_media.enqueue_after_commit(committed_project.project_dir, [asset.asset_id])
                     if asset.asset_type in {"video", "image", "audio"}:
                         await asyncio.to_thread(
                             _regenerate_thumbnail_if_current,
@@ -12653,13 +12800,15 @@ if routes is not None:
             _ensure_asset_folder(project, asset.folder)
         project.add_asset(asset)
         await run_project_io(save_project, project)
+        if asset_type == "video":
+            proxy_media.enqueue_after_commit(project.project_dir, [asset.asset_id])
 
         if asset_type in {"video", "image", "audio"}:
             thumb_path = _asset_thumbnail_path(project, asset)
             if thumb_path:
                 await asyncio.to_thread(ensure_thumbnail, asset_type, dest_path, thumb_path)
 
-        return web.json_response(_asset_payload(project, asset), status=201)
+        return web.json_response(await run_project_io(_asset_payload, project, asset), status=201)
 
     @routes.post("/sonder-editor/project/{project_id}/assets/folders")
     async def api_create_asset_folder(request: web.Request) -> web.Response:
@@ -13099,7 +13248,7 @@ if routes is not None:
         await run_project_io(save_project, project)
         return web.json_response({
             **payload,
-            "asset": _asset_payload(project, asset),
+            "asset": await run_project_io(_asset_payload, project, asset),
         })
 
     @routes.post("/sonder-editor/project/{project_id}/assets/bulk-restore")
@@ -13324,7 +13473,7 @@ if routes is not None:
             asset.favorite = bool(body["favorite"])
 
         await run_project_io(save_project, project)
-        return web.json_response(_asset_payload(project, asset))
+        return web.json_response(await run_project_io(_asset_payload, project, asset))
 
     @routes.get("/sonder-editor/project/{project_id}/assets/{asset_id}/workflow")
     async def api_get_asset_workflow(request: web.Request) -> web.Response:
@@ -13487,6 +13636,9 @@ if routes is not None:
                         committed_project,
                         committed_asset,
                     )
+                    if committed_asset.asset_type == "video":
+                        proxy_media.enqueue_after_commit(
+                            committed_project.project_dir, [committed_asset.asset_id])
                     await asyncio.to_thread(
                         _regenerate_thumbnail_if_current,
                         committed_project.project_dir,
@@ -13566,7 +13718,7 @@ if routes is not None:
         except (ValueError, MediaProbeError) as e:
             return _json_error(str(e), 400)
 
-        _delete_asset_cache_files(project, asset)
+        await asyncio.to_thread(_delete_asset_cache_files, project, asset)
 
         if not _asset_missing(project, asset):
             thumb_path = _asset_thumbnail_path(project, asset)
@@ -13579,6 +13731,8 @@ if routes is not None:
                 )
 
         await run_project_io(save_project, project)
+        if asset.asset_type == "video":
+            proxy_media.enqueue_after_commit(project.project_dir, [asset.asset_id])
         # Mirrors the multipart path: the usage scan takes the project lock, so it is
         # built in a worker rather than while constructing the response.
         payload = await run_project_io(
@@ -13588,6 +13742,168 @@ if routes is not None:
             }
         )
         return web.json_response(payload)
+
+    # -----------------------------------------------------------------------
+    # Proxy media
+    # -----------------------------------------------------------------------
+
+    @routes.get("/sonder-editor/project/{project_id}/proxy/{asset_id}/{rev:[0-9a-f]{16}}.mp4")
+    async def api_get_proxy_file(request: web.Request) -> web.StreamResponse:
+        try:
+            asset_id = _safe_route_token(request.match_info["asset_id"], "asset id")
+        except ValueError:
+            return _proxy_error("Invalid asset id", "invalid_asset_id")
+        try:
+            project_dir = await run_project_io(_project_dir_without_model, request, remember_project=False)
+        except FileNotFoundError:
+            return _proxy_error("Project not found", "project_not_found", 404)
+        path = await asyncio.to_thread(proxy_media.proxy_file_path, project_dir, asset_id,
+                                       request.match_info["rev"])
+        if not path:
+            return _proxy_error("This proxy is not the current one", "proxy_not_current", 404)
+        return web.FileResponse(path, headers=dict(_PROXY_FILE_HEADERS))
+
+    @routes.get("/sonder-editor/project/{project_id}/proxies")
+    async def api_get_proxies(request: web.Request) -> web.Response:
+        try:
+            project = await run_project_io(_proxy_load, request)
+        except FileNotFoundError:
+            return _proxy_error("Project not found", "project_not_found", 404)
+        return web.json_response(await run_project_io(_proxy_overview, project))
+
+    @routes.post("/sonder-editor/project/{project_id}/proxies/build")
+    async def api_build_proxies(request: web.Request) -> web.Response:
+        try:
+            body = await _proxy_json_body(request)
+            ids = _proxy_asset_ids(body.get("asset_ids"))
+            mode = body.get("mode", "queue")
+            if mode not in ("queue", "now"):
+                _mutation_error("mode must be queue or now", 400, "invalid_mode")
+            rebuild = body.get("rebuild", False)
+            if not isinstance(rebuild, bool):
+                _mutation_error("rebuild must be a boolean", 400, "invalid_rebuild")
+            project = await run_project_io(_proxy_load, request)
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
+        except FileNotFoundError:
+            return _proxy_error("Project not found", "project_not_found", 404)
+        videos = {asset.asset_id for asset in project.assets if asset.asset_type == "video"}
+        if any(asset_id not in videos for asset_id in ids):
+            return _proxy_error("Only video assets of this project can have proxies", "not_a_video_asset")
+        worker = proxy_media.worker()
+        reason = proxy_media.REASON_NOW if mode == "now" else proxy_media.REASON_USER
+        queued = worker.enqueue(project.project_dir, ids, reason=reason, rebuild=rebuild, force=True)
+        return web.json_response({"queued": queued, "queue": worker.queue_summary(project.project_dir)})
+
+    @routes.post("/sonder-editor/project/{project_id}/proxies/regenerate")
+    async def api_regenerate_proxies(request: web.Request) -> web.Response:
+        try:
+            body = await _proxy_json_body(request)
+            categories = _proxy_categories(body.get("categories"))
+            project = await run_project_io(_proxy_load, request)
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
+        except FileNotFoundError:
+            return _proxy_error("Project not found", "project_not_found", 404)
+        overview = await run_project_io(_proxy_overview, project)
+        # Rebuild what exists and create only what an asset needs: never a proxy for
+        # every decodable asset. An undecided asset is decided first, without force.
+        ids = [
+            asset_id for asset_id, item in overview["items"].items()
+            if item["category"] in categories and (
+                item.get("state") == proxy_media.STATE_READY
+                or proxy_media.wants_proxy(item.get("decision", ""))
+                or item.get("decision") == proxy_media.DECISION_PENDING)
+        ]
+        worker = proxy_media.worker()
+        queued = worker.enqueue(project.project_dir, ids, reason=proxy_media.REASON_USER, rebuild=True) if ids else 0
+        return web.json_response({"queued": queued, "queue": worker.queue_summary(project.project_dir)})
+
+    @routes.post("/sonder-editor/project/{project_id}/proxies/delete")
+    async def api_delete_proxies(request: web.Request) -> web.Response:
+        try:
+            body = await _proxy_json_body(request)
+            if ("categories" in body) == ("asset_ids" in body):
+                _mutation_error("Give either categories or asset_ids", 400, "invalid_selection")
+            categories = _proxy_categories(body["categories"]) if "categories" in body else None
+            ids = _proxy_asset_ids(body["asset_ids"]) if "asset_ids" in body else []
+            project = await run_project_io(_proxy_load, request)
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
+        except FileNotFoundError:
+            return _proxy_error("Project not found", "project_not_found", 404)
+        if categories is not None:
+            overview = await run_project_io(_proxy_overview, project)
+            # An unchecked category protects its assets; proxies of trashed assets always go.
+            ids = [
+                asset_id for asset_id, item in overview["items"].items()
+                if item["category"] in categories or item["category"] == "trashed"
+            ]
+        else:
+            known = {asset.asset_id for asset in project.assets}
+            ids = [asset_id for asset_id in ids if asset_id in known]
+        removed = await asyncio.to_thread(proxy_media.worker().delete_proxies, project.project_dir, ids)
+        return web.json_response({"removed": removed})
+
+    @routes.post("/sonder-editor/project/{project_id}/proxies/cancel")
+    async def api_cancel_proxies(request: web.Request) -> web.Response:
+        try:
+            project_dir = await run_project_io(_project_dir_without_model, request, remember_project=False)
+        except FileNotFoundError:
+            return _proxy_error("Project not found", "project_not_found", 404)
+        worker = proxy_media.worker()
+        cancelled = await asyncio.to_thread(worker.cancel, project_dir, user_only=True)
+        return web.json_response({"cancelled": cancelled, "queue": worker.queue_summary(project_dir)})
+
+    @routes.post("/sonder-editor/project/{project_id}/proxies/demand")
+    async def api_proxy_demand(request: web.Request) -> web.Response:
+        try:
+            body = await _proxy_json_body(request)
+            ids = _proxy_asset_ids(body.get("asset_ids"))
+            project_dir = await run_project_io(_project_dir_without_model, request, remember_project=False)
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
+        except FileNotFoundError:
+            return _proxy_error("Project not found", "project_not_found", 404)
+        await asyncio.to_thread(proxy_media.worker().note_demand, project_dir, ids[:500])
+        return web.json_response({"ok": True})
+
+    @routes.post("/sonder-editor/project/{project_id}/proxies/runtime-undecodable")
+    async def api_proxy_runtime_undecodable(request: web.Request) -> web.Response:
+        try:
+            body = await _proxy_json_body(request)
+            ids = _proxy_asset_ids([body.get("asset_id")])
+            variant = body.get("variant", "original")
+            if variant not in ("original", "proxy"):
+                _mutation_error("variant must be original or proxy", 400, "invalid_variant")
+            rev = body.get("rev", "")
+            if not isinstance(rev, str) or (variant == "proxy" and not re.fullmatch(r"[0-9a-f]{16}", rev)):
+                _mutation_error("rev must be a proxy rev", 400, "invalid_rev")
+            project_dir = await run_project_io(_project_dir_without_model, request, remember_project=False)
+        except ProjectMutationRequestError as exc:
+            return _mutation_json_error(exc)
+        except FileNotFoundError:
+            return _proxy_error("Project not found", "project_not_found", 404)
+        accepted = await asyncio.to_thread(proxy_media.worker().mark_runtime_undecodable,
+                                           project_dir, ids[0], variant=variant, rev=rev)
+        return web.json_response({"accepted": bool(accepted)})
+
+    @routes.post("/sonder-editor/project/{project_id}/proxies/reconcile")
+    async def api_reconcile_proxies(request: web.Request) -> web.Response:
+        try:
+            project = await run_project_io(_proxy_load, request)
+        except FileNotFoundError:
+            return _proxy_error("Project not found", "project_not_found", 404)
+        def reconcile():
+            videos = [
+                (asset.asset_id, _asset_abspath(project, asset))
+                for asset in project.assets
+                if asset.asset_type == "video" and not _asset_is_trashed(asset)
+            ]
+            known = [asset.asset_id for asset in project.assets]
+            return proxy_media.worker().reconcile(project.project_dir, videos, known)
+
+        return web.json_response(await asyncio.to_thread(reconcile))
 
     @routes.get("/sonder-editor/project/{project_id}/thumbnail/{asset_id}")
     async def api_get_thumbnail(request: web.Request) -> web.Response:
@@ -15643,6 +15959,8 @@ if routes is not None:
 
         register_launcher_routes(routes, projects_dir=_configured_base_dir,
                                  project_dir_for_folder=_project_dir_for_folder)
+        # The proxy worker re-resolves every job the way project routes resolve folders.
+        proxy_media.configure(_project_dir_for_folder)
     except Exception:
         logger.exception("Sonder Launcher routes unavailable")
 

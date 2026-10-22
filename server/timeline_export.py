@@ -959,6 +959,10 @@ class TimelineExportManager:
                 created_ids=created_ids_since(_pre_item_ids, current_project),
             )
             job.result_asset_id = _resolve_committed_asset_id(committed_project, asset.asset_id)
+            if asset_type == "video":
+                from . import proxy_media
+
+                proxy_media.enqueue_after_commit(committed_project.project_dir, [job.result_asset_id])
             job.status = "completed"
             job.phase = "done"
             job.message = "Done"

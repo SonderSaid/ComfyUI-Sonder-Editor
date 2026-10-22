@@ -266,14 +266,11 @@ def render_thumbnail(project, scene, folder: str, key: str, *,
 
 
 def _comfy_queue_busy() -> bool:
-    """Whether ComfyUI has a prompt running or waiting. False when it can't be asked."""
-    try:
-        from server import PromptServer
+    """Whether ComfyUI has a prompt running or waiting (``comfy_idle``, shared with
+    proxy media). False when it can't be asked."""
+    from .comfy_idle import comfy_queue_busy
 
-        running, queued = PromptServer.instance.prompt_queue.get_current_queue_volatile()
-        return bool(running or queued)
-    except Exception:
-        return False
+    return comfy_queue_busy()
 
 
 class _Stopped(Exception):

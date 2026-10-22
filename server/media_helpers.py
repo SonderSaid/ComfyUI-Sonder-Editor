@@ -1657,12 +1657,36 @@ def _terminate_process(proc) -> None:
         pass
 
 
+def _low_priority_popen_kwargs() -> dict:
+    """Run a background encode below normal priority, so generation and the editor keep
+    the CPU: ``BELOW_NORMAL_PRIORITY_CLASS`` on Windows. Elsewhere the priority is
+    lowered after the spawn (``_lower_priority``): ``preexec_fn`` is unsafe in a
+    threaded process."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)}
+    return {}
+
+
+def _lower_priority(proc) -> None:
+    if os.name == "nt":
+        return
+    try:
+        os.setpriority(os.PRIO_PROCESS, proc.pid, 10)
+    except (AttributeError, OSError):
+        pass
+
+
 def run_ffmpeg_command(
     cmd: list,
     *,
     timeout: int | float | None = None,
     cancel_event=None,
-) -> None:
+    low_priority: bool = False,
+    on_poll=None,
+    return_stderr: bool = False,
+) -> str | None:
+    """Run ffmpeg to completion, polling for cancellation and the deadline. With
+    ``return_stderr`` the decoded stderr of a successful run is returned."""
     deadline = time.perf_counter() + float(timeout) if timeout is not None else None
     with tempfile.TemporaryFile() as stderr_file:
         proc = subprocess.Popen(
@@ -1670,18 +1694,23 @@ def run_ffmpeg_command(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=stderr_file,
+            **(_low_priority_popen_kwargs() if low_priority else {}),
         )
+        if low_priority:
+            _lower_priority(proc)
         while True:
             if _cancel_requested(cancel_event):
                 _terminate_process(proc)
                 raise MediaOperationCancelled("media operation cancelled")
+            if on_poll is not None:
+                on_poll()
 
             returncode = proc.poll()
             if returncode is not None:
                 stderr = _read_process_stderr(stderr_file)
                 if returncode != 0:
                     raise RuntimeError(_ffmpeg_failed_message(stderr))
-                return
+                return stderr.decode("utf-8", errors="replace") if return_stderr else None
 
             if deadline is not None and time.perf_counter() >= deadline:
                 _terminate_process(proc)
@@ -1902,14 +1931,22 @@ _ENCODE_COLOR_FLAGS_BT709 = [
 ]
 
 
-def _color_args_for_encode(codec: str, pix_fmt: str, width: int, height: int, output_path: str = "") -> list[str]:
+def _color_args_for_encode(codec: str, pix_fmt: str, width: int, height: int, output_path: str = "",
+                           *, input_color: tuple[str, str] | None = None) -> list[str]:
     """BT.709 conversion + tagging args for YUV encodes; [] for RGB.
+
+    ``input_color`` is the source's (matrix, range) when the input is YUV video
+    rather than RGB frames (a proxy transcode); None means RGB input, which needs
+    no input matrix.
 
     Subsampled pixel formats require even dimensions — odd inputs are evened
     through the same scale filter (with a warning) instead of failing encoder
     init with a cryptic error."""
     if pix_fmt not in _YUV_ENCODE_PIX_FMTS:
         return []
+    input_params = ""
+    if isinstance(input_color, tuple) and input_color[0] in _COLOR_MATRIX_COEFFS:
+        input_params = f"in_color_matrix={input_color[0]}:in_range={input_color[1] or 'tv'}:"
     width = max(0, int(width or 0))
     height = max(0, int(height or 0))
     size_params = ""
@@ -1923,7 +1960,7 @@ def _color_args_for_encode(codec: str, pix_fmt: str, width: int, height: int, ou
             width, height, out_w, out_h, pix_fmt,
         )
         size_params = f"{out_w}:{out_h}:"
-    args = ["-vf", f"scale={size_params}out_color_matrix=bt709:out_range=tv,{_ENCODE_SETPARAMS_BT709}"]
+    args = ["-vf", f"scale={size_params}{input_params}out_color_matrix=bt709:out_range=tv,{_ENCODE_SETPARAMS_BT709}"]
     args += _ENCODE_COLOR_FLAGS_BT709
     if os.path.splitext(str(output_path or ""))[1].lower() == ".mov":
         args += ["-movflags", "+write_colr"]
@@ -2348,3 +2385,200 @@ def encode_audio(
         for path in (output_path, audio_sidecar_path):
             discard_audio_file(path)
         raise
+
+
+# ── Proxy media ───────────────────────────────────────────────────────────────
+# Browser-playable copies of video Chromium cannot decode. The policy (which
+# sources need one, where they live, when they build) is `server/proxy_media.py`;
+# these are only the ffmpeg/ffprobe halves.
+
+_BANNER_INPUT_FORMAT_RE = re.compile(r"Input #0,\s*(?P<format>.+?),\s*from\s")
+_BANNER_VIDEO_CODEC_RE = re.compile(r"Video:\s*(?P<codec>[A-Za-z0-9_]+)(?:\s*\((?P<paren>[^)]*)\))?")
+_FFMPEG_FRAME_COUNT_RE = re.compile(r"frame=\s*(?P<value>\d+)")
+
+
+def probe_video_stream_info(path: str) -> dict:
+    """``{format_name, codec_name, profile, pix_fmt, probed}`` of the first video stream.
+
+    ffprobe first, the ``ffmpeg -i`` banner otherwise (imageio-ffmpeg ships no
+    ffprobe). Nothing is decoded. ``probed`` is False when neither tool answered."""
+    info = {"format_name": "", "codec_name": "", "profile": "", "pix_fmt": "", "probed": False}
+    try:
+        data = _ffprobe_json(path, "stream=codec_name,profile,pix_fmt:format=format_name", select_streams="v:0")
+    except Exception:
+        data = {}
+    stream = next(iter(data.get("streams", []) or []), {}) if data else {}
+    if stream:
+        info.update({
+            "format_name": str((data.get("format") or {}).get("format_name") or "").lower(),
+            "codec_name": str(stream.get("codec_name") or "").lower(),
+            "profile": str(stream.get("profile") or "").lower(),
+            "pix_fmt": str(stream.get("pix_fmt") or "").lower(),
+            "probed": True,
+        })
+        return info
+    text = _ffmpeg_input_text(path)
+    video_line = next((line for line in (text or "").splitlines() if "Video:" in line), "")
+    if not video_line:
+        return info
+    format_match = _BANNER_INPUT_FORMAT_RE.search(text)
+    codec_match = _BANNER_VIDEO_CODEC_RE.search(video_line)
+    pix_match = _BANNER_PIX_FMT_RE.search(video_line[video_line.index("Video:"):])
+    paren = (codec_match.group("paren") or "") if codec_match else ""
+    info.update({
+        "format_name": (format_match.group("format") if format_match else "").strip().lower(),
+        "codec_name": (codec_match.group("codec") if codec_match else "").lower(),
+        # "(avc1 / 0x31637661)" is a fourcc, not a profile.
+        "profile": "" if "/" in paren else paren.strip().lower(),
+        "pix_fmt": (pix_match.group(1) if pix_match else "").lower(),
+        "probed": True,
+    })
+    return info
+
+
+def _count_timeout(path: str) -> float:
+    """Reading the whole file: a minute plus a second per 50 MB (an HDD-safe pace)."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    return 60.0 + size / 50_000_000
+
+
+def count_video_packets(path: str, *, cancel_event=None, low_priority: bool = False) -> int:
+    """Packets in the first video stream, without decoding: an ``ffmpeg`` stream copy
+    into the null muxer (ffprobe is often absent). Cancellable. 0 when it cannot be
+    counted. An edit list can make this larger than what decodes; see
+    ``count_decoded_frames``."""
+    try:
+        text = run_ffmpeg_command(
+            [get_ffmpeg_path(), "-hide_banner", "-nostdin", "-i", str(path), "-map", "0:v:0",
+             "-c", "copy", "-f", "null", "-"],
+            timeout=_count_timeout(path), cancel_event=cancel_event, low_priority=low_priority,
+            return_stderr=True,
+        )
+    except MediaOperationCancelled:
+        raise
+    except Exception:
+        return 0
+    matches = _FFMPEG_FRAME_COUNT_RE.findall(text or "")
+    return _finite_positive_int(matches[-1]) if matches else 0
+
+
+def count_decoded_frames(path: str, *, cancel_event=None, low_priority: bool = False) -> int:
+    """Frames the first video stream decodes to (an edit list drops some packets). A
+    full decode: used only when the packet count and a proxy disagree."""
+    try:
+        text = run_ffmpeg_command(
+            [get_ffmpeg_path(), "-hide_banner", "-nostdin", "-threads", str(proxy_thread_cap()),
+             "-i", str(path), "-map", "0:v:0", "-fps_mode", "passthrough", "-f", "null", "-"],
+            timeout=_count_timeout(path) * 4, cancel_event=cancel_event, low_priority=low_priority,
+            return_stderr=True,
+        )
+    except MediaOperationCancelled:
+        raise
+    except Exception:
+        return 0
+    matches = _FFMPEG_FRAME_COUNT_RE.findall(text or "")
+    return _finite_positive_int(matches[-1]) if matches else 0
+
+
+def proxy_encode_timeout_seconds(preset_id: str, frame_count: int, width: int, height: int) -> int:
+    """A proxy decodes a heavy source and encodes at below-normal priority: the Save
+    Video estimate for its preset plus a decode allowance, three times over."""
+    frames = max(1, int(frame_count or 1))
+    megapixel_frames = frames * max(1, int(width or 1)) * max(1, int(height or 1)) / 1_000_000
+    decode_seconds = 30 + int(math.ceil(megapixel_frames * 0.1))
+    encode_seconds = save_video_encode_timeout_seconds(preset_id, frames, width, height)
+    return int(min(6 * MAX_SAVE_VIDEO_ENCODE_TIMEOUT_SECONDS, (encode_seconds + decode_seconds) * 3))
+
+
+def proxy_thread_cap() -> int:
+    """Half the logical cores, at least 2: bounds x264's frame threads and so its RAM."""
+    return max(2, (os.cpu_count() or 2) // 2)
+
+
+def encode_proxy(
+    source_path: str,
+    output_path: str,
+    *,
+    preset_id: str,
+    width: int,
+    height: int,
+    frame_count: int,
+    input_color: tuple[str, str] | None,
+    timeout: int | float | None,
+    cancel_event=None,
+    low_priority: bool = True,
+    threads: int | None = None,
+    progress_callback=None,
+) -> None:
+    """Transcode ``source_path`` to a browser-playable MP4 at full resolution.
+
+    Video uses the Save Video preset's own arguments with BT.709 conversion from the
+    source's interpretation; audio is a lossless FLAC copy of the first audio stream
+    (absent when the source has none). Every source packet becomes one output frame
+    (``-fps_mode passthrough`` bounded by ``-frames:v``), so the caller can check parity."""
+    spec = SAVE_VIDEO_PRESETS.get(preset_id) or {}
+    if spec.get("codec") != "libx264":
+        raise ValueError(f"Not a proxy preset: {preset_id}")
+    pix_fmt = str(spec.get("pix_fmt") or "yuv420p")
+    video_args = list(spec["video_args"])
+    thread_cap = str(int(threads or proxy_thread_cap()))
+    cmd = [
+        get_ffmpeg_path(), "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
+        # Decoder threads too: ProRes/FFV1 decoders otherwise take every core, and RAM.
+        "-threads", thread_cap,
+        "-i", str(source_path),
+        "-map", "0:v:0", "-map", "0:a:0?",
+        "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1",
+        "-fps_mode", "passthrough",
+    ]
+    if frame_count and int(frame_count) > 0:
+        cmd += ["-frames:v", str(int(frame_count))]
+    cmd += _color_args_for_encode(str(spec.get("codec") or ""), pix_fmt, width, height, output_path,
+                                  input_color=input_color)
+    cmd += video_args
+    cmd += ["-threads", thread_cap]
+    cmd += ["-c:a", "flac", "-bits_per_raw_sample", "24"]
+    progress_path = ""
+    on_poll = None
+    if progress_callback is not None:
+        handle = tempfile.NamedTemporaryFile(prefix="sonder_proxy_progress_", suffix=".txt",
+                                             dir=transient_temp_dir(), delete=False)
+        handle.close()
+        progress_path = handle.name
+        cmd += ["-progress", progress_path, "-stats_period", "0.5"]
+        polled = {"at": 0.0, "frame": -1}
+
+        def on_poll():
+            now = time.monotonic()
+            if now - polled["at"] < 0.5:
+                return
+            polled["at"] = now
+            try:
+                with open(progress_path, "rb") as progress_file:
+                    progress_file.seek(0, os.SEEK_END)
+                    progress_file.seek(max(0, progress_file.tell() - 512))
+                    tail = progress_file.read().decode("ascii", errors="ignore")
+            except OSError:
+                return
+            matches = _FFMPEG_FRAME_COUNT_RE.findall(tail)
+            frame = _finite_positive_int(matches[-1]) if matches else 0
+            if frame != polled["frame"]:
+                polled["frame"] = frame
+                try:
+                    progress_callback(frame)
+                except Exception:
+                    pass
+
+    cmd += ["-f", "mp4", str(output_path)]
+    try:
+        run_ffmpeg_command(cmd, timeout=timeout, cancel_event=cancel_event, low_priority=low_priority,
+                           on_poll=on_poll)
+    finally:
+        if progress_path:
+            try:
+                os.remove(progress_path)
+            except OSError:
+                pass

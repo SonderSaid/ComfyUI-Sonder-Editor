@@ -1357,7 +1357,7 @@ async def unsubscribe(project_id: str, ws: web.WebSocketResponse) -> None:
 
 # High-rate status events kept out of the ws_broadcast diagnostic ring, which
 # would otherwise be flooded by progress and lose the events it exists to trace.
-_UNRECORDED_BROADCAST_TYPES = frozenset({"generation_status"})
+_UNRECORDED_BROADCAST_TYPES = frozenset({"generation_status", "proxy_status"})
 
 
 async def broadcast_project_event(project_id: str, event: dict[str, Any]) -> None:
