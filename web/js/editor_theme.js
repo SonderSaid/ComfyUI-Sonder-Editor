@@ -176,6 +176,9 @@ export const EDITOR_COLORS = Object.freeze({
     dangerSoft: "#321f24",
     dangerBorder: THEME.statusFailed,
     dangerText: "#dfb1b1",
+    successSoft: "#1d2b22",
+    successBorder: THEME.statusCompleted,
+    successText: "#b5d8bf",
 });
 
 export const EDITOR_CHROME = EDITOR_COLORS;

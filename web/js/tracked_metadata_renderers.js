@@ -217,7 +217,12 @@ function renderPowerLoraBody(entry, ctx, heading = "Power LoRAs", fieldKey = "po
         const sub = style(document.createElement("div"), `color:${CHROME.textSecondary};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         sub.textContent = parts.length ? parts.join(" | ") : "-";
         main.append(title, sub);
-        const status = style(document.createElement("div"), `font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.05em;color:${CHROME.textSecondary};`);
+        // Coloured pill so a long stack can be scanned for what applied: green on,
+        // red off, amber for a row that is on but applies nothing.
+        const tone = !enabled ? "danger" : skipped ? "warning" : "success";
+        const status = style(document.createElement("div"), `font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:0.05em;`
+            + `padding:1px 5px;border-radius:3px;border:1px solid ${CHROME[`${tone}Border`]};`
+            + `background:${CHROME[`${tone}Soft`]};color:${CHROME[`${tone}Text`]};`);
         status.textContent = !enabled ? "Off" : skipped ? "Skipped" : "On";
         line.append(main, status);
 
