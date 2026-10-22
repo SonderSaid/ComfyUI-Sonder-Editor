@@ -127,8 +127,10 @@ def test_every_video_preview_surface_consults_the_one_display_authority():
     # The single load funnel must gate before spending the transfer.
     funnel = gallery.split("function loadGalleryMediaAsBlob", 1)[1].split("function loadGalleryMediaViaCache", 1)[0]
     assert "galleryVideoSource(asset)" in funnel and '"blocked"' in funnel
-    # Inspector, detail panel (pill and block) and compare each present the notice.
-    assert gallery.count("videoBlocked(") >= 5, "a gallery video surface is not gated"
+    # Inspector, detail block and compare each present the notice; the detail badge
+    # names the proxy state through the same resolver.
+    assert gallery.count("videoBlocked(") >= 4, "a gallery video surface is not gated"
+    assert "proxyStatusPill(asset)" in gallery and "galleryVideoSource(asset)" in gallery
     # An original nothing has judged yet still loads, so the runtime net stays.
     assert gallery.count("watchVideoDecodeFailure(") >= 3
 

@@ -27,17 +27,33 @@ function projectPath(projectId, suffix) {
     return `/sonder-editor/project/${encodeURIComponent(String(projectId || ""))}${suffix}`;
 }
 
-async function postJson(projectId, suffix, body = {}) {
+/**
+ * POST a proxy request: `{ ok, status, payload, error }`, never a throw. `error` is
+ * the server's code (`proxy_not_current`, `project_not_found`, …) or "network".
+ */
+export async function postProxyRequest(projectId, suffix, body = {}) {
     try {
         const response = await fetch(apiUrl(projectPath(projectId, suffix)), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
         });
-        return response.ok ? await response.json() : null;
+        let payload = null;
+        try { payload = await response.json(); } catch (_) {}
+        return {
+            ok: !!response.ok,
+            status: response.status,
+            payload,
+            error: response.ok ? "" : String(payload?.code || payload?.error_code || `http_${response.status}`),
+        };
     } catch (_error) {
-        return null;
+        return { ok: false, status: 0, payload: null, error: "network" };
     }
+}
+
+async function postJson(projectId, suffix, body = {}) {
+    const result = await postProxyRequest(projectId, suffix, body);
+    return result.ok ? result.payload : null;
 }
 
 /** The URL of an asset's proxy at `rev`. Immutable: a rebuild gets a new rev. */
@@ -48,13 +64,16 @@ export function proxyFileUrl(projectId, assetId, rev) {
 }
 
 /**
- * Read the authoritative proxy state (after a reconnect, say) into the store. Every
- * socket of a project reconnects at once after a restart: one read serves them all.
+ * Read the authoritative proxy state (after a reconnect, say) into the store, and
+ * return `GET /proxies`. Every socket of a project reconnects at once after a
+ * restart: one read serves them all.
  */
-export function refreshProxyStates(projectId, { now = Date.now() } = {}) {
+export function refreshProxyStates(projectId, { now = Date.now(), force = false } = {}) {
     if (!projectId) return Promise.resolve(null);
     const recent = refreshes.get(projectId);
-    if (recent && (recent.pending || now - recent.at < REFRESH_INTERVAL_MS)) return recent.promise;
+    // `force`: a read that must reflect a change just made (a settings save), so
+    // neither a read in flight nor a recent one can answer it.
+    if (!force && recent && (recent.pending || now - recent.at < REFRESH_INTERVAL_MS)) return recent.promise;
     const record = { at: now, pending: true, promise: null };
     record.promise = (async () => {
         try {
@@ -62,6 +81,7 @@ export function refreshProxyStates(projectId, { now = Date.now() } = {}) {
             if (!response.ok) return null;
             const payload = await response.json();
             proxyStore.ingestOverview(projectId, payload);
+            proxyStore.ingestQueue(projectId, payload?.queue, payload?.epoch);
             return payload;
         } catch (_error) {
             return null;

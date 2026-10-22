@@ -1114,6 +1114,49 @@ export function mountSharedAssetGallery(container, options = {}) {
         return blockedState(projectIdFromDir(currentProjectDir()), asset);
     }
 
+    // The badge row's word for a video's proxy: none while it plays its original.
+    function proxyStatusPill(asset) {
+        if (asset?.asset_type !== "video" || assetIsMissing(asset)) return null;
+        const source = galleryVideoSource(asset);
+        if (source.variant === "proxy") return galleryStatusPill("Proxy", "idle");
+        if (source.variant !== "blocked") return null;
+        const state = galleryBlockedState(asset).state;
+        if (state === "building") return galleryStatusPill("Building Proxy", "progress");
+        // runtime: this browser failed it and reported it, which queues a build.
+        if (state === "waiting_idle" || state === "queued" || state === "runtime") {
+            return galleryStatusPill("Proxy Queued", "pending");
+        }
+        if (state === "failed") return galleryStatusPill("Proxy Failed", "failed");
+        return galleryStatusPill("No Preview", "idle");
+    }
+
+    // "Waiting 4 min" under a notice whose build waits for ComfyUI to be idle.
+    function proxyWaitText(asset) {
+        const blocked = galleryBlockedState(asset);
+        if (blocked.state !== "waiting_idle" || !blocked.waitingSince) return "";
+        const minutes = Math.floor(Math.max(0, Date.now() / 1000 - blocked.waitingSince) / 60);
+        return minutes < 1 ? "Waiting less than a minute." : `Waiting ${minutes} min.`;
+    }
+
+    // Build now on a notice: builds this video's proxy at once, whatever the timing.
+    // Hosts without proxy actions get no button.
+    function proxyBuildNowButton(asset) {
+        if (!options.onProxyAction || galleryBlockedState(asset).state === "building") return null;
+        const button = makeActionButton("primary");
+        button.type = "button";
+        button.textContent = "Build now";
+        button.title = "Build this video's proxy now, ahead of other builds, even while ComfyUI is busy.";
+        button.addEventListener("click", (event) => {
+            event.stopPropagation();
+            setButtonDisabled(button, true);
+            // Failed (already reported): the button can be pressed again.
+            void Promise.resolve(options.onProxyAction("now", [asset.asset_id]))
+                .then((result) => { if (!result) setButtonDisabled(button, false); },
+                    () => setButtonDisabled(button, false));
+        });
+        return button;
+    }
+
     function blockedNoticeText(asset) {
         const blocked = galleryBlockedState(asset);
         return `${blocked.title} — ${blocked.detail} The file is intact and exports normally.`;
@@ -5532,8 +5575,12 @@ export function mountSharedAssetGallery(container, options = {}) {
             // over a frozen frame reads as a stall rather than an explanation.
             if (videoBlocked(asset)) {
                 applyThumbnailPlaceholder(stage, asset);
-                const note = style(document.createElement("div"), `margin:auto;padding:10px 14px;border-radius:8px;background:rgba(2,5,7,.78);color:${CHROME.textDim};font-size:12px;text-align:center;max-width:80%;`);
-                note.textContent = blockedNoticeText(asset);
+                const note = style(document.createElement("div"), `margin:auto;padding:10px 14px;border-radius:8px;background:rgba(2,5,7,.78);color:${CHROME.textDim};font-size:12px;text-align:center;max-width:80%;display:flex;flex-direction:column;gap:8px;align-items:center;`);
+                const noteText = document.createElement("div");
+                noteText.textContent = blockedNoticeText(asset);
+                note.appendChild(noteText);
+                const buildNow = proxyBuildNowButton(asset);
+                if (buildNow) note.appendChild(buildNow);
                 stage.appendChild(note);
                 content.appendChild(stage);
                 return;
@@ -6908,9 +6955,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         // "idle", not "failed": the file is intact and exports normally - only this
         // browser has no decoder for it. A red badge would tell users their archive
         // master is broken.
-        if (videoBlocked(asset)) {
-            badges.appendChild(galleryStatusPill("No Preview", "idle"));
-        }
+        const proxyPill = proxyStatusPill(asset);
+        if (proxyPill) badges.appendChild(proxyPill);
         titleRow.append(title, badges);
         const pathLine = style(document.createElement("div"), `color:${assetIsMissing(asset) ? THEME.statusFailed : THEME.fg2};font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         pathLine.textContent = asset.path || "-";
@@ -6958,6 +7004,14 @@ export function mountSharedAssetGallery(container, options = {}) {
             const noPreviewText = style(document.createElement("div"), `color:${THEME.fg2};font-size:10px;line-height:1.45;max-width:280px;`);
             noPreviewText.textContent = `${blocked.detail} The file is intact and exports normally.`;
             noPreviewWrap.append(noPreviewTitle, noPreviewText);
+            const waited = proxyWaitText(asset);
+            if (waited) {
+                const waitedLine = style(document.createElement("div"), `color:${THEME.fg2};font-size:10px;`);
+                waitedLine.textContent = waited;
+                noPreviewWrap.appendChild(waitedLine);
+            }
+            const buildNow = proxyBuildNowButton(asset);
+            if (buildNow) noPreviewWrap.appendChild(buildNow);
             previewSurface.appendChild(noPreviewWrap);
         } else if (asset.asset_type === "video") {
             previewSurface.style.height = "220px";
@@ -7360,6 +7414,47 @@ export function mountSharedAssetGallery(container, options = {}) {
         ];
     }
 
+    // A video's proxy gestures: Create Proxy while it plays its original, Build Proxy
+    // Now while it can't play here, Rebuild/Remove Proxy once it has one.
+    function proxyMenuItems(asset) {
+        if (asset?.asset_type !== "video" || assetIsMissing(asset)) return [];
+        const disabled = !options.onProxyAction;
+        const run = (action) => async () => {
+            selectAsset(asset.asset_id, { focusList: true });
+            await options.onProxyAction?.(action, [asset.asset_id]);
+        };
+        const source = galleryVideoSource(asset);
+        if (source.variant === "proxy") {
+            return [
+                { type: "separator" },
+                { label: "Rebuild Proxy", disabled, action: run("rebuild") },
+                { label: "Remove Proxy", disabled, action: run("remove") },
+            ];
+        }
+        if (source.variant === "blocked") {
+            const building = galleryBlockedState(asset).state === "building";
+            return [
+                { type: "separator" },
+                { label: building ? "Building Proxy…" : "Build Proxy Now", disabled: disabled || building, action: run("now") },
+            ];
+        }
+        return [{ type: "separator" }, { label: "Create Proxy", disabled, action: run("create") }];
+    }
+
+    // Multi-select: one entry that queues proxies for every selected video without one.
+    function proxyBulkMenuItems(selectionAssets) {
+        const ids = selectionAssets
+            .filter((entry) => entry.asset_type === "video" && !assetIsMissing(entry)
+                && galleryVideoSource(entry).variant !== "proxy")
+            .map((entry) => entry.asset_id);
+        if (!ids.length) return [];
+        return [{
+            label: `Create Proxies for ${ids.length} video${ids.length === 1 ? "" : "s"}`,
+            disabled: !options.onProxyAction,
+            action: async () => await options.onProxyAction?.("create", ids),
+        }];
+    }
+
     function assetContextMenuItems(asset) {
         const selectedIds = selectedAssetIdsList();
         if (selectedIds.length > 1 && state.selectedAssetIds.has(asset.asset_id)) {
@@ -7372,6 +7467,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                     disabled: !options.onBulkMoveAssets,
                     action: async () => await handleBulkMove(activeIds),
                 }] : []),
+                ...proxyBulkMenuItems(selectionAssets.filter((entry) => !isTrashed(entry))),
                 ...(activeIds.length ? [{
                     label: `Trash ${activeIds.length} asset${activeIds.length === 1 ? "" : "s"}`,
                     disabled: !options.onBulkDeleteAssets,
@@ -7489,6 +7585,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                     await beginAssetReplace(asset);
                 },
             },
+            ...proxyMenuItems(asset),
             { type: "separator" },
             { label: "Move to Trash", disabled: !options.onDeleteAsset, danger: true, action: async () => await handleAssetDelete(asset) },
         ];

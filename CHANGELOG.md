@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Proxies: video your browser can't play, such as ProRes and Lossless FFV1, now plays everywhere you preview it (viewport, gallery, Inspect, Compare, Crop, Trim & Preview) through a playable copy Sonder builds for it; render, export and guide frames keep using the original. Takes in those formats get theirs before Save Video finishes. Settings ▸ Proxies sets the proxy preset and when proxies build (when ComfyUI is idle, right away, or only when you ask) and regenerates or deletes them by usage; the gallery adds Build now, Create, Rebuild and Remove Proxy and a proxy badge, with progress and Cancel for builds you start. Works in fullscreen, mounted tabs, the Sonder App and the node card.
 - Assets: native LoRA stacks in Controls at run show individual rows with strengths, On/Off/Skipped status, Copy and A/B comparison filters, without needing a Metadata Collector.
 - Controls: **Show notes** (Settings ▸ Controls, on by default) hides the workflow's notes, both the standalone ones and those under a setting, so you see only the settings; their values are unchanged. The **Hide notes** / **N notes hidden** line near the top of the Controls tab switches it from the Controls tab, and, as with Advanced settings, Manage still shows notes and a search shows a matching setting's note. Works in fullscreen, mounted tabs and the Sonder App.
 - Example workflow **Sonder LTX 2.5 Edit & VFX**: LTX 2.5 editing and effects chosen from Controls presets (edit with a prompt or an edited picture, remove people, subject masks, follow a video's layout, body movement or outlines, add sound, or make new video and sound), with setup, model download and first-take notes in Controls.
@@ -57,6 +58,7 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup counts a chip as attached to an item under MiniMax H3 when it cites one of the item's members, directly or through a Subject.
 
 ### Fixed
+- A ProRes or FFV1 clip no longer paints the viewport black, latches Compare's play button on Pause, or leaves Crop, Trim & Preview black: each shows its proxy, or a notice saying what the clip waits for.
 - Sonder App takes no longer fail with "This run's SDK session has ended" when ComfyUI runs with `--cache-none` or is short of memory, and in that case the Editor no longer renders twice in one run. Save Video no longer saves a second take, and Save Bridge no longer misses files its saver already wrote. When a Sonder App take is refused, the message now says why: the take already ran, it belongs to another project, or it expired.
 - Prompt: Attach and the Mention menu no longer offer a "Subject: <Reference>" row for a Reference that has no Subject yet. Choosing it made the run fail. A chip already bound that way still says it needs a new source.
 - MiniMax H3 Full Reference: the Preservation detail warning names the label, such as `<Subject 1>`, and the field, and its **Fix** button in Prompt Management opens that chip on the field. Preserved prose from outside the render window no longer raises the warning.

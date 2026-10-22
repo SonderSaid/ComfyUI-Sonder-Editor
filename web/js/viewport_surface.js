@@ -7643,6 +7643,8 @@ export function createViewportSurface(options = {}) {
 
     function drawPlaybackComposite(snapshot, renderTiming = null) {
         state.playbackBlockedNotice = blockedNoticeFor(snapshot);
+        // Playing into a blocked clip asks for it too (the host throttles per asset).
+        if (state.playbackBlockedNotice) reportBlockedLayers(snapshot);
         const telemetryActive = playbackTelemetryActive();
         const compositeStartedAt = telemetryActive ? performance.now() : 0;
         const preflight = preflightPlaybackComposite(snapshot);

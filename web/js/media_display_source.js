@@ -51,6 +51,7 @@ const entries = new Map();          // `${project}\n${asset_id}` -> proxy state
 // `${project}\n${asset_id}\n${source revision}\n${variant}\n${rev}` that failed to
 // decode here. The source revision lets a Replace (new bytes) play again.
 const localFailures = new Set();
+const queues = new Map();           // project -> the server's build-queue summary, with its epoch
 const listeners = new Set();
 let notifyScheduled = false;
 let pendingChanges = new Map();     // project -> Set(asset_id)
@@ -74,8 +75,13 @@ function scheduleNotify(projectId, assetIds) {
     for (const id of assetIds) pendingChanges.get(key).add(id);
     if (notifyScheduled) return;
     notifyScheduled = true;
-    // One notification per frame however many events arrive.
+    // One notification per frame however many events arrive. A hidden, minimized or
+    // occluded window runs no frames, so a timer delivers the batch there instead:
+    // whichever fires first runs it, once.
+    let ran = false;
     const run = () => {
+        if (ran) return;
+        ran = true;
         notifyScheduled = false;
         const changes = pendingChanges;
         pendingChanges = new Map();
@@ -84,7 +90,17 @@ function scheduleNotify(projectId, assetIds) {
         }
     };
     if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
-    else setTimeout(run, 0);
+    setTimeout(run, typeof requestAnimationFrame === "function" ? 250 : 0);
+}
+
+// What a surface can show differently. Every read carries a newer epoch, so a change
+// of epoch alone is no change: listeners hear only real ones (otherwise a read that
+// listeners answer with another read never ends).
+const SHOWN_PROXY_FIELDS = ["decision", "state", "rev", "waiting_since", "error_code", "rebuilding"];
+const SHOWN_QUEUE_FIELDS = ["pending", "builds", "waiting_idle", "waiting_since", "building", "user_pending"];
+
+function differs(fields, a, b) {
+    return fields.some((field) => (a?.[field] ?? null) !== (b?.[field] ?? null));
 }
 
 function ingestOne(projectId, assetId, proxy, changed) {
@@ -95,7 +111,7 @@ function ingestOne(projectId, assetId, proxy, changed) {
     const merged = mergeProxyState(current, proxy);
     if (merged !== current) {
         entries.set(key, merged);
-        changed.push(id);
+        if (!current || differs(SHOWN_PROXY_FIELDS, current, merged)) changed.push(id);
     }
 }
 
@@ -123,6 +139,24 @@ export const proxyStore = {
         return entries.get(entryKey(projectId, assetId)) || null;
     },
     /**
+     * The project's build queue (`{ pending, waiting_idle, waiting_since, building,
+     * user_pending }`) as of `epoch`; an older summary changes nothing. Listeners
+     * hear the project with no asset ids.
+     */
+    ingestQueue(projectId, queue, epoch) {
+        const key = projectKeyOf(projectId);
+        if (!key || !queue || typeof queue !== "object") return false;
+        const stamp = Number(epoch) || 0;
+        const current = queues.get(key);
+        if (current && stamp < current.epoch) return false;
+        queues.set(key, { ...queue, epoch: stamp });
+        if (!current || differs(SHOWN_QUEUE_FIELDS, current, queue)) scheduleNotify(key, []);
+        return true;
+    },
+    queue(projectId) {
+        return queues.get(projectKeyOf(projectId)) || null;
+    },
+    /**
      * `listener(changes: Map<projectId, Set<assetId>>)`, coalesced per animation
      * frame. Returns unsubscribe.
      */
@@ -148,6 +182,7 @@ export const proxyStore = {
     _reset() {
         entries.clear();
         localFailures.clear();
+        queues.clear();
         listeners.clear();
         pendingChanges = new Map();
         notifyScheduled = false;

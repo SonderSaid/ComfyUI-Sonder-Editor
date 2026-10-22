@@ -99,7 +99,8 @@ EXPECTED_LITERAL_COUNTS = {
 # 55 -> 56 on 2026-10-03: a lane recipe patch is enqueued on its own, beside
 # the lane-config save's coalescing enqueue (backlog step 1, Phase 5).
 # 56 -> 57 on 2026-10-03: the project-wide Reference framing writer.
-EXPECTED_ENQUEUE_SITES = 57
+# 57 -> 58 on 2026-10-22: the project-wide proxy settings writer.
+EXPECTED_ENQUEUE_SITES = 58
 
 # Geometry the client computed from what it could see. Matched with a trailing
 # `[:,}]` so ES6 shorthand counts — `split_clip` passes its frame that way, and a
@@ -3596,7 +3597,8 @@ def _scope_body(item) -> str:
 # 18 -> 17 on 2026-09-22: the legacy guide popup's declined delete was deleted.
 # 17 -> 18 on 2026-10-03: a lane recipe patch declines coalescing (Phase 5).
 # 18 -> 19 on 2026-10-03: the Reference framing writer declines coalescing.
-EXPECTED_STABLE_KEY_OPT_OUTS = 19
+# 19 -> 20 on 2026-10-22: the proxy settings writer declines coalescing.
+EXPECTED_STABLE_KEY_OPT_OUTS = 20
 # 29 -> 30 on 2026-09-29: the Reference panel's field writer on the host.
 # 30 -> 28 on 2026-09-30: the panel's `writeItem` and the append's own enqueue
 # went into that writer.
@@ -4217,6 +4219,13 @@ COALESCE_OPT_OUT_REVIEWED = {
         "the newest intent, so the earlier field's choice would never be sent. "
         "Each pick is one user-paced select change carrying one field, and its "
         "control settles on that write's own acknowledgement."),
+    "editor_widget.js:_setProxySetting:proxy-settings:${}": (
+        DECLINED,
+        "the key is per project, not per field: a Proxy Preset pick and a Build "
+        "Proxies pick share it, and the queue's merge-less coalescing keeps only "
+        "the newest intent, so the earlier field's choice would never be sent. "
+        "Each pick is one user-paced select change carrying one field, and "
+        "Settings shows it (a per-pick token) until that write's own response."),
     "editor_widget.js:_updateSceneFpsWithinGesture:scene:${}:fps": (
         DECLINED,
         "`_fpsUpdatePending` already serialises fps by DROPPING a second "

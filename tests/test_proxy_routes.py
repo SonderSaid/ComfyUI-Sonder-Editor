@@ -158,6 +158,9 @@ def test_regenerate_rebuilds_existing_and_never_mass_creates_for_decodable_asset
 
     status, payload = run(env, scenario)
     assert status == 200
+    # The ids it queued, so the page can say what became of each.
+    assert set(payload["asset_ids"]) >= {"scene"} and "trash" not in payload["asset_ids"]
+    assert payload["queue"]["epoch"] > 0 and "builds" in payload["queue"]
     # scene (ready) is rebuilt; ref and unused want proxies; plain (H.264) is left alone.
     # Trashed assets are not in any category the dialog can tick.
     wait_until(lambda: env.worker.states(env.project_dir, [("scene", {}, "")])["scene"]["rev"] not in ("", before))
@@ -222,6 +225,10 @@ def test_build_cancel_demand_runtime_and_reconcile(env):
 
     built, cancelled, demand, runtime, reconciled = run(env, scenario)
     assert built["queued"] == 1 and "queue" in built
+    # The summary a request leaves carries an epoch minted after it acted, newer than
+    # any proxy_status event read before it (the page's progress compares the two).
+    assert built["queue"]["user_pending"] >= 1 and built["queue"]["epoch"] > 0
+    assert cancelled["queue"]["epoch"] > built["queue"]["epoch"]
     # The Build now was still undecided or building: Cancel stopped it (user-started).
     assert cancelled["cancelled"] == 1 and demand == 200
     # plain had never been decided, so a runtime report finds no decision to correct yet

@@ -46,6 +46,20 @@ import {
     templateFreezeValue,
 } from "./prompt_channel_templates.js";
 import { VARIABLE_TRACK_TYPES, descriptorFor } from "./lane_registry.js";
+import { formatProxyBytes } from "./proxy_maintenance_dialog.js";
+
+// Settings → Proxies. The presets are the Save Video presets the browser plays
+// (server `proxy_media.PROXY_PRESETS`); timings match `proxy_media.BUILD_TIMINGS`.
+const PROXY_PRESET_VALUES = ["Compatible MP4", "High Quality MP4", "Editing Master MP4"];
+const PROXY_PRESET_OPTIONS = SAVE_PRESET_OPTIONS.filter((entry) => PROXY_PRESET_VALUES.includes(entry.value));
+const PROXY_TIMING_OPTIONS = [
+    { value: "idle", label: "When ComfyUI is idle",
+      description: "Builds start once ComfyUI has had nothing to run for 30 seconds, and stop as soon as a prompt starts." },
+    { value: "now", label: "Right away",
+      description: "Builds start as soon as a video arrives, even while ComfyUI is generating." },
+    { value: "manual", label: "Only when I ask",
+      description: "Nothing builds by itself. Use Build now, Create Proxy or Regenerate Proxies…" },
+];
 
 const DECIMAL_GB_BYTES = 1_000_000_000;
 const RENDER_CACHE_SIZE_PRESETS = [
@@ -202,9 +216,20 @@ export function mountEditorSettingsPanel(host) {
     return createHandle(host);
 }
 
+/** Scroll the open panel to a section created with an id ("proxies"). */
+function scrollToSettingsSection(host, id) {
+    const section = host._settingsPanelEl?.querySelector?.(`[data-settings-section="${id}"]`);
+    if (!section) return false;
+    // Instant, not smooth: a smooth scroll needs animation frames, which a hidden or
+    // background page may not run, and the panel just opened anyway.
+    section.scrollIntoView?.({ block: "start" });
+    return true;
+}
+
 function createHandle(host) {
     return {
         element: host._settingsPanelEl,
+        scrollToSection: (id) => scrollToSettingsSection(host, id),
         controls: host._settingsPanelControls,
         renderModelTemplateSettings: () => host._renderModelTemplateSettings?.(),
         unregisterKeyboard: host._settingsPanelKeyOff,
@@ -297,6 +322,7 @@ function syncSettingsPanelControls() {
             controls.clearRenderCacheButton.disabled = !projectName || !usage || Number(usage.size_bytes) <= 0;
         }
     }
+    if (controls.proxyPreset) syncProxyControls.call(this, controls);
     if (controls.guideSnapshotMaxLongEdge) controls.guideSnapshotMaxLongEdge.value = String(this._settings.guides?.guideSnapshotMaxLongEdge ?? 0);
     if (controls.hoverPreviewEnabled) controls.hoverPreviewEnabled.checked = this._settings.guides?.hoverPreviewEnabled ?? true;
     if (controls.hoverPreviewSize) controls.hoverPreviewSize.value = String(this._guideHoverPreviewSize());
@@ -380,6 +406,47 @@ function syncSettingsPanelControls() {
     syncSdkSetupControls.call(this, controls);
     this._renderModelTemplateSettings?.();
     this._renderPromptChannelTemplateSettings?.();
+}
+
+// Settings → Proxies. The host reads `GET /proxies` (`_proxyOverview`); the selects
+// show a choice still saving (`_proxySettingsShown`).
+function proxyUsageText(overview) {
+    const count = Math.max(0, Number(overview?.total?.count) || 0);
+    const parts = [`${count} ${count === 1 ? "proxy" : "proxies"} · ${formatProxyBytes(overview?.total?.bytes)}`];
+    const queue = overview?.queue || {};
+    // Decided builds only: `pending` also counts videos still being checked, most of
+    // which never need a proxy.
+    const builds = Math.max(0, Number(queue.builds ?? queue.pending) || 0);
+    if (queue.building) parts.push("1 building");
+    if (builds) {
+        parts.push(Number(queue.waiting_idle) > 0 && !queue.building
+            ? `${builds} waiting for ComfyUI to be idle`
+            : `${builds} to build`);
+    }
+    return parts.join(" · ");
+}
+
+function syncProxyControls(controls) {
+    const shown = this._proxySettingsShown;
+    const overview = this._proxyOverview;
+    for (const [select, value] of [[controls.proxyPreset, shown?.preset], [controls.proxyTiming, shown?.timing]]) {
+        // Only on a real change: a refresh must not disturb a list the user has open.
+        if (value && select.value !== value) select.value = value;
+        select.disabled = !shown;
+        select._sonderSyncTitle?.();
+    }
+    const name = this._proxyProjectName;
+    const failed = !shown && this._proxyOverviewFailed;
+    controls.proxyUsageLabel.textContent = !name
+        ? "Open a project to manage its proxies."
+        : failed ? "Proxy details could not be loaded. Close and reopen Settings to try again."
+            : !shown ? "Calculating…" : proxyUsageText(overview);
+    const unavailable = !name ? "Open a project first." : failed ? "Proxy details could not be loaded." : "Loading…";
+    setButtonDisabled(controls.proxyRegenerateButton, !shown);
+    controls.proxyRegenerateButton.title = shown ? "" : unavailable;
+    const anyProxies = Number(overview?.total?.count) > 0;
+    setButtonDisabled(controls.proxyDeleteButton, !shown || !anyProxies);
+    controls.proxyDeleteButton.title = !shown ? unavailable : anyProxies ? "" : "This project has no proxies.";
 }
 
 const SDK_MESSAGE_COLORS = {
@@ -473,8 +540,9 @@ function showSettingsPanel() {
         });
     };
 
-    const createSection = (title, description) => {
+    const createSection = (title, description, id = "") => {
         const section = document.createElement("section");
+        if (id) section.dataset.settingsSection = id;
         section.style.cssText = `
             background: ${COLORS.panelRaised};
             border: 1px solid ${COLORS.border};
@@ -2379,6 +2447,55 @@ function showSettingsPanel() {
         })
     );
 
+    const proxiesSection = createSection(
+        "Proxies",
+        "Playable copies of videos this browser can't play, such as ProRes and FFV1. Every preview shows the proxy; render and export always use the original. Proxy Preset and Build Proxies are PROJECT-WIDE.",
+        "proxies"
+    );
+    createSelect(
+        proxiesSection, "proxyPreset", "Proxy Preset (project-wide)",
+        "The Save Video preset proxies are encoded with, at full size, with a lossless copy of the sound. Existing proxies keep theirs until you regenerate them. Saved with this project.",
+        PROXY_PRESET_OPTIONS,
+        () => this._proxySettingsShown?.preset || "High Quality MP4",
+        (value) => { Promise.resolve(this._setProxySetting?.("proxy_preset", value)).catch(() => {}); }
+    );
+    createSelect(
+        proxiesSection, "proxyTiming", "Build Proxies (project-wide)",
+        "When proxies of new videos are built. Build now always builds at once. Saved with this project.",
+        PROXY_TIMING_OPTIONS,
+        () => this._proxySettingsShown?.timing || "idle",
+        (value) => { Promise.resolve(this._setProxySetting?.("proxy_build_timing", value)).catch(() => {}); }
+    );
+    const proxyUsageControl = createRow(
+        proxiesSection,
+        "This Project's Proxies",
+        "Rebuild proxies with the current preset, or delete them to free disk space. Choose which videos in the dialog.",
+    );
+    proxyUsageControl.style.flexDirection = "column";
+    proxyUsageControl.style.alignItems = "flex-end";
+    const proxyUsageLabel = document.createElement("span");
+    proxyUsageLabel.style.cssText = `font-size:10px;color:${COLORS.textSecondary};max-width:230px;text-align:right;`;
+    proxyUsageLabel.textContent = "Calculating…";
+    const proxyButtons = document.createElement("div");
+    proxyButtons.style.cssText = "display:flex;gap:6px;";
+    const proxyRegenerateButton = document.createElement("button");
+    proxyRegenerateButton.type = "button";
+    proxyRegenerateButton.textContent = "Regenerate Proxies…";
+    proxyRegenerateButton.style.cssText = chromeButtonCss({ variant: "subtle", padding: "5px 10px", fontSize: "10px", radius: "6px" });
+    proxyRegenerateButton.addEventListener("click", () => {
+        if (!proxyRegenerateButton.disabled) Promise.resolve(this._openProxyMaintenance?.("regenerate")).catch(() => {});
+    });
+    const proxyDeleteButton = document.createElement("button");
+    proxyDeleteButton.type = "button";
+    proxyDeleteButton.textContent = "Delete Proxies…";
+    proxyDeleteButton.style.cssText = chromeButtonCss({ variant: "danger", padding: "5px 10px", fontSize: "10px", radius: "6px" });
+    proxyDeleteButton.addEventListener("click", () => {
+        if (!proxyDeleteButton.disabled) Promise.resolve(this._openProxyMaintenance?.("delete")).catch(() => {});
+    });
+    proxyButtons.append(proxyRegenerateButton, proxyDeleteButton);
+    proxyUsageControl.append(proxyUsageLabel, proxyButtons);
+    Object.assign(controls, { proxyUsageLabel, proxyRegenerateButton, proxyDeleteButton });
+
     // Last on purpose: an experimental, opt-in entry (Phase 4 Decision 2).
     const sdkSection = createSection(
         "Sonder App (experimental)",
@@ -2426,6 +2543,7 @@ function showSettingsPanel() {
     Promise.resolve(this._loadServerSettings?.()).catch(() => {});
     Promise.resolve(this._loadSdkSetup?.()).catch(() => {});
     Promise.resolve(this._refreshRenderCacheUsage?.()).catch(() => {});
+    Promise.resolve(this._refreshProxyOverview?.()).catch(() => {});
 
     backdrop.addEventListener("click", (e) => {
         if (e.target === backdrop) this._hideSettingsPanel();

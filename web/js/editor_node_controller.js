@@ -33,6 +33,7 @@ import { connectProjectSync } from "./cross_tab_sync.js";
 import { blockedState, changedAssetIds, displayVideoSource, proxyStore } from "./media_display_source.js";
 import { mediaFailedToDecode } from "./media_preview_support.js";
 import { confirmAndReportDecodeFailure, proxyFileUrl, requestProxyReconcile } from "./proxy_client.js";
+import { runProxyAction } from "./proxy_actions.js";
 import { createCanvasControlsHost } from "./controls_host_canvas.js";
 import { createCanvasControlsRelay } from "./controls_canvas_relay.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject, importFailureMessage } from "./editor_widget.js";
@@ -3765,6 +3766,8 @@ export class EditorNodeController {
             onRenameFolder: async (folderName, newFolderName) => await this._renameAssetFolder(folderName, newFolderName),
             onDeleteFolder: async (folderName, force) => await this._deleteAssetFolder(folderName, force),
             onReplaceAsset: async (assetId, file) => await this._replaceAsset(assetId, file),
+            // Create, Rebuild, Remove Proxy and Build now (proxy_actions.js).
+            onProxyAction: (action, assetIds) => runProxyAction(projectIdFromDir(this.state.projectDir), action, assetIds),
             onOpenSourceWorkflow: async (asset) => {
                 await window.__SONDER_OPEN_SOURCE_WORKFLOW__?.(this.state.projectDir, asset);
             },

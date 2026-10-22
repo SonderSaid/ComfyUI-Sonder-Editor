@@ -206,6 +206,23 @@ address.
 
 ## Playback
 
+### A clip shows "No proxy yet", "Proxy queued" or "Proxy waiting for ComfyUI" instead of its picture
+
+Your browser can't play that video's format, and its
+[proxy](assets-and-gallery.md#proxies) isn't ready yet.
+
+- To make it now: select the video in the gallery and click **Build now**
+  under the notice in the inspector, or right-click it and choose **Build
+  Proxy Now**.
+- **Proxy waiting for ComfyUI**: proxies build once ComfyUI has been idle for
+  30 seconds. To build them while you generate, set **Settings ▸ Proxies ▸
+  Build Proxies** to **Right away**.
+- **No proxy yet**: the project is set to **Only when I ask**, or its proxy was
+  deleted. Build it as above.
+- **Proxy failed**: right-click the video and choose **Build Proxy Now** to try
+  again. If it fails again, check the ComfyUI console for an `ffmpeg` error
+  (see [`ffmpeg` not found](#ffmpeg-not-found--export-or-decode-fails)).
+
 ### Video does not play in the editor when ComfyUI runs with `--disable-api-nodes`
 
 Update ComfyUI to **0.40.0 or newer** and restart it; there the option is called

@@ -53,6 +53,7 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
             // it is; handlers only repaint.
             else if (event.type === "proxy_status") {
                 proxyStore.ingestItems(projectId, event.items || []);
+                proxyStore.ingestQueue(projectId, event.queue, event.epoch);
                 handlers.onProxyStatus?.(event);
             }
             else if (event.type === "controls_changed") handlers.onControlsChanged?.(event);

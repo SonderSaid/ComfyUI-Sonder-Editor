@@ -457,7 +457,7 @@ def _color_subject(raw: dict) -> SimpleNamespace:
 
 class _Job:
     __slots__ = ("project_dir", "pkey", "asset_id", "reason", "rebuild", "force", "seq",
-                 "waiting", "waiting_since", "resumed", "user_started")
+                 "waiting", "waiting_since", "resumed", "user_started", "cancelled")
 
     def __init__(self, project_dir: str, pkey: str, asset_id: str, reason: str, seq: int, *,
                  rebuild: bool = False, force: bool = False):
@@ -474,6 +474,8 @@ class _Job:
         self.waiting_since = 0.0
         self.resumed = False
         self.user_started = reason in (REASON_USER, REASON_NOW)
+        # Cancelled while being decided: never queued for a build afterwards.
+        self.cancelled = False
 
 
 class _CancelSignal:
@@ -586,6 +588,9 @@ class ProxyWorker:
         self.condition = threading.Condition()
         self.jobs: "OrderedDict[tuple[str, str], _Job]" = OrderedDict()   # pending builds
         self.undecided: "OrderedDict[tuple[str, str], _Job]" = OrderedDict()
+        # Jobs the decide thread holds right now: still pending for the queue summary
+        # and for Cancel, so a user's build never reads as done while it is decided.
+        self.deciding: dict[tuple[str, str], _Job] = {}
         self.current: _Job | None = None
         self.current_signal: _CancelSignal | None = None
         self.inline: set[tuple[str, str]] = set()   # takes building inside Save Video
@@ -645,6 +650,14 @@ class ProxyWorker:
                     continue
                 key = (pkey, asset_id)
                 existing = self.jobs.get(key) or self.undecided.get(key)
+                deciding = self.deciding.get(key)
+                if existing is None and deciding is not None and not deciding.cancelled \
+                        and (deciding.force or not force) and (deciding.rebuild or not rebuild) \
+                        and _reason_rank(deciding.reason) <= _reason_rank(reason):
+                    # Being decided with everything this asks for (a double-clicked Build
+                    # now): no second job. A request that adds force or a rebuild, which
+                    # the decision may already have passed, is queued as its own.
+                    continue
                 if existing is not None:
                     if _reason_rank(reason) < _reason_rank(existing.reason):
                         existing.reason = reason
@@ -657,7 +670,7 @@ class ProxyWorker:
                     continue
                 # An asset already building is queued again all the same: a replace may
                 # have changed its source, and the build skips a proxy that is current.
-                if len(self.jobs) + len(self.undecided) >= MAX_JOBS:
+                if len(self.jobs) + len(self.undecided) + len(self.deciding) >= MAX_JOBS:
                     break
                 self._seq += 1
                 self.undecided[key] = _Job(project_dir, pkey, asset_id, reason, self._seq,
@@ -706,6 +719,14 @@ class ProxyWorker:
                         continue
                     table.pop(key, None)
                     cancelled.append(job)
+            # A job being decided is marked: the decide thread drops it when done.
+            for key, job in list(self.deciding.items()):
+                if key[0] != pkey or job.cancelled or (wanted is not None and job.asset_id not in wanted):
+                    continue
+                if user_only and not job.user_started:
+                    continue
+                job.cancelled = True
+                cancelled.append(job)
             current = self.current
             if current is not None and current.pkey == pkey \
                     and (wanted is None or current.asset_id in wanted) \
@@ -759,6 +780,9 @@ class ProxyWorker:
         if (current is not None and current.pkey == pkey and current.asset_id == asset_id) or key in self.inline:
             return STATE_BUILDING, 0.0
         job = self.jobs.get(key) or self.undecided.get(key)
+        if job is None:
+            deciding = self.deciding.get(key)
+            job = deciding if deciding is not None and not deciding.cancelled else None
         if job is None:
             return None
         if job.waiting:
@@ -823,12 +847,17 @@ class ProxyWorker:
     def queue_summary(self, project_dir: str) -> dict:
         pkey = self.project_key(project_dir)
         with self.condition:
-            pending = [job for key, job in list(self.jobs.items()) + list(self.undecided.items()) if key[0] == pkey]
+            pending = [job for key, job in list(self.jobs.items()) + list(self.undecided.items())
+                       + list(self.deciding.items()) if key[0] == pkey and not job.cancelled]
             current = self.current if (self.current is not None and self.current.pkey == pkey) else None
             inline = sorted(asset_id for key_pkey, asset_id in self.inline if key_pkey == pkey)
         waiting = [job.waiting_since for job in pending if job.waiting]
+        builds = sum(1 for key, job in list(self.jobs.items()) if key[0] == pkey)
         return {
             "pending": len(pending),
+            # Decided jobs waiting to build (pending also counts decisions that may
+            # end in no build at all, such as a reconcile probing every video).
+            "builds": builds,
             "waiting_idle": len(waiting),
             "waiting_since": min(waiting) if waiting else 0,
             "building": current.asset_id if current is not None else (inline[0] if inline else ""),
@@ -948,6 +977,7 @@ class ProxyWorker:
                 # Newest first, Build now ahead of everything.
                 key, job = min(self.undecided.items(), key=lambda item: (_reason_rank(item[1].reason), -item[1].seq))
                 self.undecided.pop(key, None)
+                self.deciding[key] = job
             try:
                 build = self._decide(job)
             except _Drop:
@@ -955,8 +985,10 @@ class ProxyWorker:
             except Exception:
                 logger.exception("Proxy decision failed for an asset")
                 build = False
-            if build:
-                with self.condition:
+            with self.condition:
+                if self.deciding.get(key) is job:
+                    self.deciding.pop(key, None)
+                if build and not job.cancelled:
                     if not self.stopped:
                         existing = self.jobs.get(key)
                         if existing is None:
@@ -1034,6 +1066,10 @@ class ProxyWorker:
             sidecar.pop("held", None)
             changed = True
         if changed:
+            # Cancelled while deciding: the user's force or un-hold must not stick.
+            with self.condition:
+                if job.cancelled:
+                    raise _Drop()
             sidecar["epoch"] = self.next_epoch()
             with self._asset_lock(job.project_dir, job.asset_id):
                 current = read_sidecar(root, job.asset_id)
@@ -1398,7 +1434,7 @@ class ProxyWorker:
                     self._remove_or_defer(path)
                     count += 1
                     removed["bytes"] += size
-                removed["count"] += count
+                removed["count"] += 1 if count else 0
                 if sidecar and count:
                     sidecar.update({"state": STATE_NONE, "rev": "", "file": "", "bytes": 0,
                                     "error_code": "", "epoch": self.next_epoch()})

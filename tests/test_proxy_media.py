@@ -628,6 +628,38 @@ def test_a_read_after_a_restart_is_newer_than_every_event_before_it(tmp_path, so
     assert state(restarted, project_dir, "a0")["epoch"] > last_event
 
 
+def test_a_job_being_decided_counts_as_pending_and_cancel_drops_it(tmp_path, sources, stopper):
+    # The decide thread holds a job outside both queues while it probes; the page's
+    # progress must not read that as done, and Cancel must not miss it.
+    project_dir = make_project(tmp_path, sources, ("prores.mov",))
+    worker = make_worker()
+    stopper(worker)
+    entered, release = threading.Event(), threading.Event()
+    real_decide = worker._decide
+
+    def held_decide(job):
+        entered.set()
+        release.wait(10)
+        return real_decide(job)
+
+    worker._decide = held_decide
+    worker.enqueue(project_dir, ["a0"], reason=pmx.REASON_NOW, force=True)
+    assert entered.wait(10)
+    assert worker.queue_summary(project_dir)["user_pending"] == 1
+    # A second Build now (a double click) joins the job being decided: one job.
+    assert worker.enqueue(project_dir, ["a0"], reason=pmx.REASON_NOW, force=True) == 0
+    summary = worker.queue_summary(project_dir)
+    assert summary["user_pending"] == 1 and summary["builds"] == 0
+    assert state(worker, project_dir)["state"] == "queued"
+    assert worker.cancel(project_dir, user_only=True) == 1
+    assert worker.queue_summary(project_dir)["user_pending"] == 0
+    release.set()
+    wait_until(lambda: not worker.deciding)
+    time.sleep(0.2)
+    assert not worker.jobs and worker.current is None
+    assert state(worker, project_dir)["state"] != "ready"
+
+
 # ── Save Video inline ───────────────────────────────────────────────────────
 
 def _take_project(tmp_path, sources, metadata=None):
@@ -922,3 +954,26 @@ def test_events_never_read_the_disk_on_the_caller_s_thread(tmp_path, sources, mo
     worker.cancel(project_dir, ["a0"])
     worker._emit_state(project_dir, "a0")
     assert calls == []
+
+
+def test_a_request_the_deciding_job_does_not_cover_is_queued_on_its_own(tmp_path, sources, stopper):
+    # The decision may already have passed the force check: a Create that adds force
+    # to an automatic decision in progress must not be folded into it and lost.
+    project_dir = make_project(tmp_path, sources, ("prores.mov",))
+    worker = make_worker()
+    stopper(worker)
+    entered, release = threading.Event(), threading.Event()
+    real_decide = worker._decide
+
+    def held_decide(job):
+        entered.set()
+        release.wait(10)
+        return real_decide(job)
+
+    worker._decide = held_decide
+    worker.enqueue(project_dir, ["a0"], reason=pmx.REASON_AUTO)
+    assert entered.wait(10)
+    assert worker.enqueue(project_dir, ["a0"], reason=pmx.REASON_USER, force=True) == 1
+    assert worker.queue_summary(project_dir)["pending"] == 2
+    release.set()
+    wait_until(lambda: state(worker, project_dir)["state"] == "ready")

@@ -395,8 +395,13 @@ import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
 import { blockedState, changedAssetIds, displayVideoSource, needsProxy, proxyStore } from "./media_display_source.js";
 import {
-    confirmAndReportDecodeFailure, confirmDecodeFailure, proxyFileUrl, reportDecodeFailure, reportProxyDemand,
+    confirmAndReportDecodeFailure, confirmDecodeFailure, proxyFileUrl, refreshProxyStates, reportDecodeFailure,
+    reportProxyDemand,
 } from "./proxy_client.js";
+import {
+    buildProxies, deleteProxiesByCategory, regenerateProxies, runProxyAction,
+} from "./proxy_actions.js";
+import { openProxyMaintenanceDialog } from "./proxy_maintenance_dialog.js";
 import {
     collapseChannelsForTemplate,
     composeSectionText,
@@ -1179,7 +1184,12 @@ export class EditorWidget {
         // Proxy state (media_display_source.js): the timeline's P badges follow it; the
         // viewport surface repaints itself, the legacy fallback viewport here.
         this._unsubscribeProxyStore = proxyStore.subscribe((changes) => {
-            if (this._destroyed || !changedAssetIds(changes, this._projectDirName()).size) return;
+            if (this._destroyed) return;
+            const projectId = this._projectDirName();
+            if (!changes.has(projectId)) return;
+            // Settings → Proxies shows counts and the queue: keep them current.
+            if (this._settingsPanelHandle) this._scheduleProxyOverviewRefresh();
+            if (!changedAssetIds(changes, projectId).size) return;
             if (this.timelineCanvas) this._renderTimeline();
             if (!this._viewportSurface && this._vpCanvas && !this.isPlaying) this._renderViewportFrame?.();
         });
@@ -1725,6 +1735,8 @@ export class EditorWidget {
             onRenameFolder: async (folderName, newFolderName) => await this._renameAssetFolder(folderName, newFolderName),
             onDeleteFolder: async (folderName, force, diagnostics) => await this._deleteAssetFolder(folderName, force, diagnostics),
             onReplaceAsset: async (assetId, file) => await this._replaceAsset(assetId, file),
+            // Create, Rebuild, Remove Proxy and Build now (proxy_actions.js).
+            onProxyAction: (action, assetIds) => runProxyAction(this._projectDirName(), action, assetIds),
             onSetSceneAspectRatio: (width, height) => this._setSceneAspectRatioFromDimensions(width, height),
             // A detail or search read found the gallery's list older than the asset.
             onRequestAssetListRefresh: async ({ requiredVersion = "", reason = "gallery_detail_mismatch" } = {}) =>
@@ -10685,6 +10697,15 @@ export class EditorWidget {
             _setReferenceProsePolicy: (value) => editor._setReferenceProsePolicy(value),
             _setReferenceFrameThreshold: (value) => editor._setReferenceFrameThreshold(value),
             _setReferenceFraming: (field, value) => editor._setReferenceFraming(field, value),
+            // Proxies section: the overview is `GET /proxies`; the two selects are
+            // host-owned versioned project PUTs, like Reference framing.
+            get _proxyOverview() { return editor._proxyOverview; },
+            get _proxyOverviewFailed() { return !!editor._proxyOverviewFailed; },
+            get _proxySettingsShown() { return editor._shownProxySettings(); },
+            get _proxyProjectName() { return editor._projectDirName(); },
+            _refreshProxyOverview: () => editor._refreshProxyOverview(),
+            _setProxySetting: (field, value) => editor._setProxySetting(field, value),
+            _openProxyMaintenance: (mode) => editor._openProxyMaintenance(mode),
             _keyboardConsumerId: (suffix) => editor._keyboardConsumerId(suffix),
             _hideSettingsPanel: () => editor._hideSettingsPanel(),
         };
@@ -28381,6 +28402,7 @@ export class EditorWidget {
             confirmDecodeFailure: (mediaEl) => confirmDecodeFailure(mediaEl),
             onBlockedLayersVisible: (assets) => {
                 reportProxyDemand(this._projectDirName(), assets.map((entry) => entry.asset_id));
+                this._maybeShowProxyToast(assets);
             },
             onDecodeFailure: (asset, variant, rev) => {
                 reportDecodeFailure(this._projectDirName(), asset, variant, rev);
@@ -28561,6 +28583,150 @@ export class EditorWidget {
 
     _buildViewURL(sourcePath) {
         return buildProjectAssetViewURL(this.projectDir, sourcePath);
+    }
+
+    /**
+     * Once per editor: the first time a clip that can't play here is on screen, say
+     * why and offer Build now and Settings. After that the viewport's notice and the
+     * gallery's own Build now carry it.
+     */
+    _maybeShowProxyToast(assets) {
+        if (this._proxyToastShown || this._destroyed || !assets?.length) return;
+        this._proxyToastShown = true;
+        const projectId = this._projectDirName();
+        const first = assets[0];
+        const blocked = blockedState(projectId, first);
+        const name = first?.name || String(first?.path || "").split(/[/\\]/).pop() || "This clip";
+        const more = assets.length > 1 ? ` and ${assets.length - 1} more` : "";
+        const ids = [...new Set(assets.map((entry) => entry.asset_id).filter(Boolean))];
+        notifyInfo(`${name}${more}: ${blocked.detail}`, {
+            verb: blocked.title,
+            source: `proxy-toast:${projectId}`,
+            // Shown once per editor and it offers actions: long enough to use them.
+            durationMs: 15000,
+            actions: [
+                ...(blocked.state === "building" ? [] : [{
+                    label: "Build now",
+                    variant: "accentSoft",
+                    fn: () => { void buildProxies(projectId, ids, { now: true }).catch(() => {}); },
+                }]),
+                // The toast outlives a closed editor: its Settings then does nothing.
+                { label: "Settings", fn: () => { if (!this._destroyed) this._showSettingsPanel({ section: "proxies" }); } },
+            ],
+        });
+    }
+
+    // ── Settings → Proxies ────────────────────────────────────────────────
+
+    /** `GET /proxies` into the store and the panel. `force` for a read after a save. */
+    async _refreshProxyOverview({ force = false } = {}) {
+        const projectId = this._projectDirName();
+        if (!projectId) {
+            this._proxyOverview = null;
+            this._syncSettingsPanelControls();
+            return null;
+        }
+        const payload = await refreshProxyStates(projectId, { force });
+        if (this._destroyed || this._projectDirName() !== projectId) return null;
+        const sameProject = this._proxyOverviewProject === projectId;
+        this._proxyOverviewFailed = !payload && !(sameProject && this._proxyOverview);
+        // A read that started before a newer one landed (a slow refresh against the
+        // read after a save) must not put old settings back.
+        if (payload && (!sameProject || !this._proxyOverview
+            || (Number(payload.epoch) || 0) >= (Number(this._proxyOverview.epoch) || 0))) {
+            this._proxyOverview = payload;
+            this._proxyOverviewProject = projectId;
+        }
+        this._syncSettingsPanelControls();
+        return payload;
+    }
+
+    _scheduleProxyOverviewRefresh() {
+        if (this._proxyOverviewTimer) return;
+        // Builds report in bursts: one read a second at most while Settings is open.
+        this._proxyOverviewTimer = setTimeout(() => {
+            this._proxyOverviewTimer = 0;
+            if (!this._destroyed && this._settingsPanelHandle) void this._refreshProxyOverview();
+        }, 1000);
+    }
+
+    /** What Settings shows: the saved settings, with a choice still saving on top. */
+    _shownProxySettings() {
+        if (this._proxyOverviewProject !== this._projectDirName()) return null;
+        const saved = this._proxyOverview?.settings;
+        if (!saved) return null;
+        const shown = { ...saved };
+        for (const [key, intent] of Object.entries(this._proxySettingIntents || {})) shown[key] = intent.value;
+        return shown;
+    }
+
+    /** Proxy Preset and Build Proxies: project-wide, saved in `project.metadata`. */
+    async _setProxySetting(field, value) {
+        const key = field === "proxy_preset" ? "preset" : field === "proxy_build_timing" ? "timing" : "";
+        if (!key) throw new Error("Invalid proxy setting.");
+        return this._withMutationGesture("setProxySetting", async (diagnostics) => {
+            const projectDir = this.projectDir;
+            const projectId = this._projectDirName();
+            if (!projectId) return;
+            // Every pick queues, and the last pick is what Settings shows until it lands.
+            const token = (this._proxySettingSeq = (this._proxySettingSeq || 0) + 1);
+            this._proxySettingIntents = { ...(this._proxySettingIntents || {}), [key]: { value, token } };
+            this._syncSettingsPanelControls();
+            try {
+                const result = await this._queueProjectMutation({
+                    key: `proxy-settings:${projectId}`, label: "Proxy settings",
+                    coalesce: false, refreshScenes: false, refreshKeysOnError: ["project"],
+                    failureMessage: "The proxy setting could not be saved.",
+                    diagnostics, intent: { projectId, field, value },
+                    run: async (intent, queuedDiagnostics) => {
+                        if (this._destroyed || this.projectDir !== projectDir) {
+                            throw new Error("The active project changed before the proxy setting saved.");
+                        }
+                        return this._runVersionedProjectMutation(
+                            `/sonder-editor/project/${encodeURIComponent(intent.projectId)}`,
+                            { method: "PUT", headers: { "Content-Type": "application/json",
+                                ...this._mutationDiagnosticHeaders(queuedDiagnostics) },
+                              body: JSON.stringify({ metadata: { [intent.field]: intent.value } }) },
+                            { projectId: intent.projectId });
+                    },
+                });
+                // The saved value, from the save itself, even if the read after fails.
+                const metadata = result?.payload?.metadata;
+                if (!this._destroyed && this.projectDir === projectDir && this._proxyOverview?.settings
+                    && metadata && typeof metadata[field] === "string") {
+                    this._proxyOverview = {
+                        ...this._proxyOverview,
+                        settings: { ...this._proxyOverview.settings, [key]: metadata[field] },
+                    };
+                }
+            } finally {
+                if (this._proxySettingIntents?.[key]?.token === token) delete this._proxySettingIntents[key];
+                if (!this._destroyed && this.projectDir === projectDir) await this._refreshProxyOverview({ force: true });
+            }
+        });
+    }
+
+    /** Settings → Regenerate Proxies… / Delete Proxies…, on fresh counts. */
+    async _openProxyMaintenance(mode) {
+        const projectId = this._projectDirName();
+        if (!projectId || this._proxyMaintenanceDialog) return;
+        const overview = await this._refreshProxyOverview({ force: true });
+        if (this._destroyed || this._projectDirName() !== projectId || this._proxyMaintenanceDialog) return;
+        if (!overview) {
+            notifyError("Proxy details could not be loaded. Try again.");
+            return;
+        }
+        this._proxyMaintenanceDialog = openProxyMaintenanceDialog({
+            mode,
+            overview,
+            keyboardConsumerId: this._keyboardConsumerId("proxy-maintenance"),
+            onConfirm: async (categories) => {
+                if (mode === "delete") await deleteProxiesByCategory(projectId, categories);
+                else await regenerateProxies(projectId, categories);
+                void this._refreshProxyOverview({ force: true });
+            },
+            onClose: () => { this._proxyMaintenanceDialog = null; },
+        });
     }
 
     /** An asset's proxy file at `rev` (proxy_client.js). */
@@ -29424,16 +29590,20 @@ export class EditorWidget {
         }
     }
 
-    _showSettingsPanel() {
-        if (this._settingsPanelHandle) return;
-        const host = this._createSettingsPanelHost();
-        const handle = mountEditorSettingsPanel(host);
-        this._settingsPanelHost = host;
-        this._settingsPanelHandle = handle;
-        this._settingsPanelEl = handle.element;
-        this._settingsPanelControls = handle.controls;
-        this._renderModelTemplateSettings = handle.renderModelTemplateSettings;
-        this._settingsPanelKeyOff = handle.unregisterKeyboard || null;
+    /** Open Settings; `section` (for example "proxies") scrolls to it, open or not. */
+    _showSettingsPanel({ section = "" } = {}) {
+        if (this._destroyed) return;
+        if (!this._settingsPanelHandle) {
+            const host = this._createSettingsPanelHost();
+            const handle = mountEditorSettingsPanel(host);
+            this._settingsPanelHost = host;
+            this._settingsPanelHandle = handle;
+            this._settingsPanelEl = handle.element;
+            this._settingsPanelControls = handle.controls;
+            this._renderModelTemplateSettings = handle.renderModelTemplateSettings;
+            this._settingsPanelKeyOff = handle.unregisterKeyboard || null;
+        }
+        if (section) this._settingsPanelHandle.scrollToSection?.(section);
     }
 
     _hideSettingsPanel() {
@@ -29458,6 +29628,9 @@ export class EditorWidget {
         if (this._destroyed) return;
         this._destroyed = true;
         this._unsubscribeProxyStore?.();
+        this._proxyMaintenanceDialog?.close();
+        this._proxyMaintenanceDialog = null;
+        clearTimeout(this._proxyOverviewTimer);
         TimelineCanvas._releaseTimelineLayerCache(this);
         this._queuedHistoryNotification?.dismiss();
         this._queuedHistoryNotification = null;

@@ -270,6 +270,10 @@ renders.
   playback resolution) are personal and live in Settings ▸ Playback.
 - Heavy scenes rebuffer adaptively: if decoding falls behind, playhead and
   audio pause together and resume in sync.
+- A clip your browser can't play (ProRes, Lossless FFV1 and the like) shows
+  its [proxy](assets-and-gallery.md#proxies). Until the proxy is ready, a band
+  across the viewport names the clip and what it waits for, such as **Proxy
+  waiting for ComfyUI** or **No proxy yet**; the other layers still show.
 
 ## Safety & recovery
 

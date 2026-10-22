@@ -189,6 +189,66 @@ built for take review.
 
 ![The same pair in Side by Side layout, where a Linked Zoom toggle appears beside the layout buttons](images/compare-side-by-side.webp)
 
+## Proxies
+
+Your browser can't play some video formats, such as ProRes and Lossless FFV1
+(RGB). For those, Sonder makes a **proxy**: a playable copy that the
+viewport, the gallery, Inspect, Compare and **Crop, Trim & Preview** show
+instead. Render, export, Add frame to guides and the graph always use the
+original file. A proxy's sound is a lossless copy of the original's.
+
+You don't add proxies yourself. When such a video arrives (an import, a take,
+a Save Bridge file, an export), Sonder builds its proxy. A take saved in one of
+those formats gets its proxy before the Save Video node finishes. Until a
+proxy is ready, the viewport shows a notice where the clip would be, and the
+first one you meet in an editor shows a toast with **Build now** and
+**Settings**.
+
+What the gallery's inspector shows next to a video's name:
+
+| Badge | Meaning |
+|---|---|
+| **Proxy** | Previews play its proxy. |
+| **Building Proxy** | The proxy is being made. |
+| **Proxy Queued** | The proxy waits its turn, or waits for ComfyUI to be idle. |
+| **Proxy Failed** | No proxy could be made. |
+| **No Preview** | No proxy, and none is built until you ask. |
+
+To build a proxy now, whatever the timing setting:
+
+- in the inspector or in Inspect, click **Build now** under the notice, or
+- right-click the video in the gallery and choose **Build Proxy Now**.
+
+Other gestures, by right-clicking a video in the gallery:
+
+- **Create Proxy** — a proxy for a video that already plays, for example a
+  large file that scrubs slowly. It follows the **Build Proxies** setting.
+- **Rebuild Proxy** — makes it again with the current proxy preset.
+- **Remove Proxy** — deletes it. A video that can't play shows the notice
+  again until you build it.
+- With several videos selected: **Create Proxies for N videos**.
+
+A toast shows the progress of builds you start, with **Cancel**; while the
+builds wait, it reads "Waiting for ComfyUI to be idle".
+
+In **Settings** (the **⚙** at the right end of the toolbar) **▸ Proxies**:
+
+- **Proxy Preset (project-wide)** — **Compatible MP4**, **High Quality MP4**
+  (default) or **Editing Master MP4**. A change applies to new proxies; to
+  redo existing ones, use **Regenerate Proxies…**.
+- **Build Proxies (project-wide)** — **When ComfyUI is idle** (default:
+  builds start once ComfyUI has had nothing to run for 30 seconds and stop
+  when a prompt starts), **Right away**, or **Only when I ask** (nothing builds
+  by itself).
+- **This Project's Proxies** shows how many proxies the project has and their
+  size, with two buttons. Each opens a dialog with a checkbox per group:
+  **Used in scenes**, **Used by References** and **Unused**.
+  - **Regenerate Proxies…** rebuilds the proxies in the checked groups and
+    builds missing ones for videos that can't play.
+  - **Delete Proxies…** deletes the proxies in the checked groups (only
+    **Unused** is checked at first). Proxies of trashed videos are always
+    deleted.
+
 ## Export timeline
 
 Export saves the arranged picture and sound of one scene. For the steps, see

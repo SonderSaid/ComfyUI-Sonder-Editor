@@ -11510,6 +11510,15 @@ def _proxy_error(message: str, code: str, status: int = 400) -> web.Response:
     return web.json_response({"error": message, "code": code}, status=status)
 
 
+def _proxy_queue_after(worker, project_dir: str) -> dict:
+    """The queue summary a request leaves, with an epoch minted after it acted and
+    before the summary is read (like every read): an event built from older state
+    carries an older epoch, so the page's progress never ends on a summary that
+    predates its own builds."""
+    epoch = worker.next_epoch()
+    return {**worker.queue_summary(project_dir), "epoch": epoch}
+
+
 def _proxy_asset_ids(value) -> list[str]:
     if not isinstance(value, list) or not value or len(value) > _PROXY_MAX_IDS:
         _mutation_error(f"asset_ids must be a list of 1 to {_PROXY_MAX_IDS} ids", 400, "invalid_asset_ids")
@@ -13793,7 +13802,7 @@ if routes is not None:
         worker = proxy_media.worker()
         reason = proxy_media.REASON_NOW if mode == "now" else proxy_media.REASON_USER
         queued = worker.enqueue(project.project_dir, ids, reason=reason, rebuild=rebuild, force=True)
-        return web.json_response({"queued": queued, "queue": worker.queue_summary(project.project_dir)})
+        return web.json_response({"queued": queued, "queue": _proxy_queue_after(worker, project.project_dir)})
 
     @routes.post("/sonder-editor/project/{project_id}/proxies/regenerate")
     async def api_regenerate_proxies(request: web.Request) -> web.Response:
@@ -13817,7 +13826,9 @@ if routes is not None:
         ]
         worker = proxy_media.worker()
         queued = worker.enqueue(project.project_dir, ids, reason=proxy_media.REASON_USER, rebuild=True) if ids else 0
-        return web.json_response({"queued": queued, "queue": worker.queue_summary(project.project_dir)})
+        # The ids let the page say what became of each one when its progress ends.
+        return web.json_response({"queued": queued, "asset_ids": ids,
+                                  "queue": _proxy_queue_after(worker, project.project_dir)})
 
     @routes.post("/sonder-editor/project/{project_id}/proxies/delete")
     async def api_delete_proxies(request: web.Request) -> web.Response:
@@ -13853,7 +13864,7 @@ if routes is not None:
             return _proxy_error("Project not found", "project_not_found", 404)
         worker = proxy_media.worker()
         cancelled = await asyncio.to_thread(worker.cancel, project_dir, user_only=True)
-        return web.json_response({"cancelled": cancelled, "queue": worker.queue_summary(project_dir)})
+        return web.json_response({"cancelled": cancelled, "queue": _proxy_queue_after(worker, project_dir)})
 
     @routes.post("/sonder-editor/project/{project_id}/proxies/demand")
     async def api_proxy_demand(request: web.Request) -> web.Response:
