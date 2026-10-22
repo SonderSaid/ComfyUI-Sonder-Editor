@@ -600,10 +600,6 @@ class ProxyWorker:
         self._event_timers: dict[str, threading.Timer] = {}
         self._last_flush: dict[str, float] = {}
         self._dirs: dict[str, str] = {}    # project key -> project_dir
-        # The epoch of the last event sent per asset. Every read reports at least it, so
-        # a read made after an event is never older than that event, and a read made
-        # before one is (the frontend merges by epoch).
-        self._asset_epochs: "OrderedDict[tuple[str, str], int]" = OrderedDict()
         # Packet counts read the whole source: kept per (path, signature) across requeues.
         self._packet_counts: "OrderedDict[tuple[str, str], int]" = OrderedDict()
         comfy_idle.add_busy_listener(self._on_busy)
@@ -780,9 +776,13 @@ class ProxyWorker:
         listing = _listing(root) if root else None
         pkey = self.project_key(project_dir)
         result: dict[str, dict] = {}
+        # A read's epoch is minted before it looks at anything, so it is newer than
+        # every event built from older state, and older than every event built after
+        # it (the frontend merges by epoch). Epochs follow the wall clock, so this
+        # holds across a server restart too.
+        read_epoch = self.next_epoch()
         with self.condition:
             overlays = {asset_id: self._overlay(pkey, asset_id) for asset_id, _inline, _ext in assets}
-            emitted = {asset_id: self._asset_epochs.get((pkey, asset_id), 0) for asset_id, _i, _e in assets}
         for asset_id, inline, extension in assets:
             sidecar = read_sidecar(root, asset_id, listing.sidecars[asset_id]) \
                 if listing is not None and asset_id in listing.sidecars else {}
@@ -793,7 +793,7 @@ class ProxyWorker:
                 "decision": decision,
                 "state": STATE_NONE,
                 "rev": "",
-                "epoch": max(int(sidecar.get("epoch") or 0), emitted.get(asset_id, 0)),
+                "epoch": read_epoch,
             }
             ready = _ready_file(sidecar, listing)
             if ready:
@@ -866,21 +866,19 @@ class ProxyWorker:
         except Exception:
             logger.debug("proxy_status state read failed", exc_info=True)
             return
-        epoch = self.next_epoch()
+        # The epoch of the read the items come from: minted before their state was read,
+        # like every read's, so lists and events order by when their state was taken.
+        epoch = max((int(state.get("epoch") or 0) for state in computed.values()), default=0) \
+            or self.next_epoch()
         items = []
-        with self.condition:
-            for asset_id in ids:
-                state = computed.get(asset_id) or {}
-                item = {"asset_id": asset_id, "decision": state.get("decision", DECISION_PENDING),
-                        "state": state.get("state", STATE_NONE), "rev": state.get("rev", ""), "epoch": epoch}
-                for key in ("waiting_since", "error_code", "rebuilding"):
-                    if state.get(key):
-                        item[key] = state[key]
-                items.append(item)
-                self._asset_epochs[(pkey, asset_id)] = epoch
-                self._asset_epochs.move_to_end((pkey, asset_id))
-            while len(self._asset_epochs) > 20000:
-                self._asset_epochs.popitem(last=False)
+        for asset_id in ids:
+            state = computed.get(asset_id) or {}
+            item = {"asset_id": asset_id, "decision": state.get("decision", DECISION_PENDING),
+                    "state": state.get("state", STATE_NONE), "rev": state.get("rev", ""), "epoch": epoch}
+            for key in ("waiting_since", "error_code", "rebuilding"):
+                if state.get(key):
+                    item[key] = state[key]
+            items.append(item)
         event = {"type": "proxy_status", "epoch": epoch, "items": items,
                  "queue": self.queue_summary(project_dir)}
         emit = self._emit_event or _schedule_event

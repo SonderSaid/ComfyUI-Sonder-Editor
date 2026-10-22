@@ -155,7 +155,13 @@ createInterface({ input: child.stdout }).on('line', (line) => {
 const nextAnswer = () => new Promise((resolve) => {
   if (answers.length) resolve(answers.shift()); else waiting.push(resolve);
 });
-const ask = async (request) => { child.stdin.write(JSON.stringify(request) + '\n'); return nextAnswer(); };
+// Requests the child has not answered yet: `settle` waits for them.
+let inFlight = 0;
+const ask = async (request) => {
+  inFlight += 1;
+  try { child.stdin.write(JSON.stringify(request) + '\n'); return await nextAnswer(); }
+  finally { inFlight -= 1; }
+};
 assert.ok((await nextAnswer()).ready, 'route child did not start');
 
 // -- a minimal DOM --------------------------------------------------------------
@@ -233,7 +239,22 @@ const scripted = [];
 const held = [];
 let holdNext = 0;
 const tick = () => new Promise((r) => setTimeout(r, 0));
-const settle = async (n = 6) => { for (let i = 0; i < n; i += 1) await tick(); };
+// A child's answer takes as long as Python takes, and a garbage collection there can
+// add tens of milliseconds, so a fixed number of ticks raced it. Settle waits for every
+// request in flight, then lets the page react, until nothing new was sent. A held
+// write is not in flight: it stays held. A request the child never answers fails the
+// test after 10 s instead of hanging it.
+const settle = async (n = 6) => {
+  const deadline = Date.now() + 10_000;
+  for (let round = 0; round < 50; round += 1) {
+    for (let i = 0; i < n; i += 1) await tick();
+    if (!inFlight) return;
+    while (inFlight) {
+      if (Date.now() > deadline) throw new Error(`settle: ${inFlight} route request(s) never answered`);
+      await new Promise((r) => setTimeout(r, 1));
+    }
+  }
+};
 Object.assign(w, {
   projectDir:'project', projectId:'project', activeSceneId:'scene',
   activeScene: null, scenes: structuredClone(fixture.scenes),

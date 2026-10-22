@@ -1,4 +1,6 @@
 import { registerChangeCertificateFromEvent } from "./api_client.js";
+import { proxyStore } from "./media_display_source.js";
+import { refreshProxyStates, requestProxyReconcile } from "./proxy_client.js";
 
 const { api } = window.comfyAPI.api;
 
@@ -14,6 +16,7 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
     let reconnectTimer = null;
     let hostHeartbeatTimer = null;
     let attempt = 0;
+    let openedBefore = false;
     const encodedProjectId = encodeURIComponent(projectId || "");
     const clientId = String(options.clientId || options.hostId || options.sessionId || "").trim();
     const encodedClientId = encodeURIComponent(clientId);
@@ -45,6 +48,13 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
             // Sonder App run status, about 5 Hz while takes generate. Ordered by
             // the session's `seq`; the host drops stale snapshots (sdk_host.js).
             else if (event.type === "generation_status") handlers.onGenerationStatus?.(event);
+            // Proxy builds (server/proxy_media.py), batched per project. Every page
+            // that syncs a project keeps the shared store current, whichever mode
+            // it is; handlers only repaint.
+            else if (event.type === "proxy_status") {
+                proxyStore.ingestItems(projectId, event.items || []);
+                handlers.onProxyStatus?.(event);
+            }
             else if (event.type === "controls_changed") handlers.onControlsChanged?.(event);
             else if (event.type === "control_changes_pending") handlers.onControlChangesPending?.(event);
             else if (event.type === "controls_visibility_changed") handlers.onControlsVisibilityChanged?.(event);
@@ -105,6 +115,13 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
             emitState("open");
             subscribe();
             startHostHeartbeat();
+            // Proxy events sent while the socket was down are gone: read the state.
+            // A server restart also lost its build queue: have it reconcile.
+            if (openedBefore) {
+                void refreshProxyStates(projectId);
+                requestProxyReconcile(projectId);
+            }
+            openedBefore = true;
         };
         ws.onmessage = (message) => {
             let event = null;

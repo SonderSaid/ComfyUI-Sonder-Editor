@@ -34,6 +34,9 @@ function isAbortError(error, signal = null) {
     return !!signal?.aborted || error?.name === "AbortError";
 }
 
+// Which bytes an asset path holds: a Replace or a new probe changes it.
+export { sourceRevision as assetSourceRevision };
+
 export function _playbackSourceRevision(asset) {
     return sourceRevision(asset);
 }
@@ -42,11 +45,24 @@ export function _normalizePlaybackSourcePath(sourcePath) {
     return normalizeSourcePath(sourcePath);
 }
 
+const ORIGINAL_VARIANT = Object.freeze({ kind: "original", rev: "" });
+
+function variantKeyOf(variant) {
+    return variant.kind === "proxy" ? `proxy:${variant.rev}` : variant.kind;
+}
+
 export function createPlaybackSourceCache({
     getAssetForSourcePath = () => null,
     getLiveSourcePaths = () => [],
     getStreamingMode = () => "auto",
+    // `(path, identity) => url`. The identity says which variant: an original or a
+    // proxy (`identity.variantKind`, `identity.proxyRev`, `identity.assetId`).
     buildDirectUrl = () => null,
+    // `(asset, sourcePath) => { kind: "original" | "proxy" | "blocked", rev }`: what
+    // this path displays (media_display_source.js, pinned by the host while it
+    // plays). Originals and proxies of one path are separate entries that coexist,
+    // so a snapshot of the original never disturbs playback of the proxy.
+    getDisplayVariant = () => ORIGINAL_VARIANT,
     fetchMedia = (...args) => fetch(...args),
     createObjectUrl = (blob) => URL.createObjectURL(blob),
     revokeObjectUrl = (url) => URL.revokeObjectURL(url),
@@ -70,34 +86,61 @@ export function createPlaybackSourceCache({
         forceBlob || getStreamingMode() !== "direct" ? "blob" : "direct"
     );
 
-    function identityFor(sourcePath, { forceBlob = false, mode = "" } = {}) {
+    // `variant: "original"` asks for the original whatever the path displays (frame
+    // grabs for guides). Otherwise the path's display variant decides; a "blocked"
+    // identity means no <video> may load it, and `resolve` answers null.
+    function identityFor(sourcePath, { forceBlob = false, mode = "", variant = "display" } = {}) {
         const rawPath = String(sourcePath || "");
         const normalizedPath = normalizeSourcePath(rawPath);
         if (!normalizedPath) return null;
         const resolvedMode = mode || modeFor(forceBlob);
-        const revision = sourceRevision(assetForSourcePath(getAssetForSourcePath, rawPath, normalizedPath));
+        const asset = assetForSourcePath(getAssetForSourcePath, rawPath, normalizedPath);
+        const revision = sourceRevision(asset);
+        let display = ORIGINAL_VARIANT;
+        if (variant !== "original") {
+            const chosen = getDisplayVariant(asset, normalizedPath) || ORIGINAL_VARIANT;
+            display = chosen.kind === "proxy" && chosen.rev
+                ? { kind: "proxy", rev: String(chosen.rev) }
+                : (chosen.kind === "blocked" ? { kind: "blocked", rev: "" } : ORIGINAL_VARIANT);
+        }
+        const variantKey = variantKeyOf(display);
         return {
             sourcePath: normalizedPath,
             revision,
             mode: resolvedMode,
-            sourceIdentity: `${normalizedPath}|${revision}`,
-            cacheKey: `${resolvedMode}:${normalizedPath}|${revision}`,
+            assetId: String(asset?.asset_id || ""),
+            variantKind: display.kind,
+            variantKey,
+            proxyRev: display.rev,
+            blocked: display.kind === "blocked",
+            sourceIdentity: `${normalizedPath}|${revision}|${variantKey}`,
+            cacheKey: `${resolvedMode}:${normalizedPath}|${revision}|${variantKey}`,
         };
     }
 
+    // Per live path: its source revision, and the proxy key it displays now (if any).
     function currentLiveRevisions() {
         const revisions = new Map();
         for (const sourcePath of getLiveSourcePaths() || []) {
             const identity = identityFor(sourcePath);
-            if (identity) revisions.set(identity.sourcePath, identity.revision);
+            if (identity) {
+                revisions.set(identity.sourcePath, {
+                    revision: identity.revision,
+                    proxyKey: identity.variantKind === "proxy" ? identity.variantKey : "",
+                });
+            }
         }
         return revisions;
     }
 
+    // An original of the current revision stays live beside a proxy (a guide grab
+    // may still want it); a proxy is live only while it is the one displayed.
     function entryIsLive(entry, liveRevisions = null) {
         if (!entry) return false;
         const revisions = liveRevisions || currentLiveRevisions();
-        return revisions.get(entry.sourcePath) === entry.revision;
+        const live = revisions.get(entry.sourcePath);
+        if (!live || live.revision !== entry.revision) return false;
+        return entry.variantKind !== "proxy" || live.proxyKey === entry.variantKey;
     }
 
     function safeRecord(action, entry = null, details = {}) {
@@ -235,11 +278,16 @@ export function createPlaybackSourceCache({
         }
     }
 
+    // Per (path, variant): a new source revision retires every entry of the path; a
+    // new proxy rev retires the older proxy only, never the original beside it.
     function retireOutdatedPathEntries(identity, reason = "revision-replaced", releaseHolders = null) {
         for (const entry of Array.from(entries.values())) {
             if (entry.sourcePath !== identity.sourcePath) continue;
-            if (entry.revision === identity.revision) continue;
-            markEntryObsolete(entry, reason, releaseHolders);
+            const outdated = entry.revision !== identity.revision
+                || (identity.variantKind === "proxy" && entry.variantKind === "proxy"
+                    && entry.variantKey !== identity.variantKey);
+            if (!outdated) continue;
+            markEntryObsolete(entry, entry.revision !== identity.revision ? reason : "proxy-replaced", releaseHolders);
         }
     }
 
@@ -247,9 +295,11 @@ export function createPlaybackSourceCache({
         return identityFor(sourcePath, options)?.cacheKey || "";
     }
 
-    async function resolve(sourcePath, { forceBlob = false, releaseHolders = null, acquisitionHolder = null } = {}) {
-        const identity = identityFor(sourcePath, { forceBlob });
-        if (!identity || isDestroyed()) return null;
+    async function resolve(sourcePath, {
+        forceBlob = false, releaseHolders = null, acquisitionHolder = null, variant = "display",
+    } = {}) {
+        const identity = identityFor(sourcePath, { forceBlob, variant });
+        if (!identity || identity.blocked || isDestroyed()) return null;
         retireOutdatedPathEntries(identity, "revision-replaced", releaseHolders);
         const cached = entries.get(identity.cacheKey);
         if (cached?.promise && !cached.pendingEviction) {
@@ -259,13 +309,17 @@ export function createPlaybackSourceCache({
             safeRecord(cached.inFlight ? "cache_coalesced" : "cache_hit", cached);
             return cached.promise;
         }
-        const directUrl = buildDirectUrl(identity.sourcePath);
+        const directUrl = buildDirectUrl(identity.sourcePath, identity);
         if (!directUrl) return null;
         const entry = {
             key: identity.cacheKey,
             sourcePath: identity.sourcePath,
             sourceIdentity: identity.sourceIdentity,
             revision: identity.revision,
+            variantKind: identity.variantKind,
+            variantKey: identity.variantKey,
+            proxyRev: identity.proxyRev,
+            assetId: identity.assetId,
             mode: identity.mode,
             holders: new Set(),
             objectUrl: null,
@@ -274,7 +328,8 @@ export function createPlaybackSourceCache({
             promise: null,
             abortController: typeof AbortController === "function" ? new AbortController() : null,
             inFlight: identity.mode === "blob",
-            live: entryIsLive(identity),
+            live: entryIsLive({ sourcePath: identity.sourcePath, revision: identity.revision,
+                variantKind: identity.variantKind, variantKey: identity.variantKey }),
             pendingEviction: false,
             evicted: false,
             evictionReason: "",

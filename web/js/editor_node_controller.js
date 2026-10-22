@@ -30,6 +30,9 @@ import {
     releaseEditorSession,
 } from "./editor_session_client.js";
 import { connectProjectSync } from "./cross_tab_sync.js";
+import { blockedState, changedAssetIds, displayVideoSource, proxyStore } from "./media_display_source.js";
+import { mediaFailedToDecode } from "./media_preview_support.js";
+import { confirmAndReportDecodeFailure, proxyFileUrl, requestProxyReconcile } from "./proxy_client.js";
 import { createCanvasControlsHost } from "./controls_host_canvas.js";
 import { createCanvasControlsRelay } from "./controls_canvas_relay.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject, importFailureMessage } from "./editor_widget.js";
@@ -602,6 +605,15 @@ function isGuideTrackHidden(scene) {
     return laneHiddenInScene(scene, TRACK_TYPE.GUIDES, 0);
 }
 
+// What the dormant preview shows for a clip (media_display_source.js): a ready
+// proxy, the original, or nothing ("blocked") when the original cannot play here.
+function dormantVideoSource(projectDir, asset, sourcePath) {
+    return displayVideoSource(projectIdFromDir(projectDir), asset, {
+        original: () => buildProjectAssetViewURL(projectDir, sourcePath),
+        proxy: (entry, rev) => proxyFileUrl(projectIdFromDir(projectDir), entry?.asset_id, rev),
+    });
+}
+
 function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDimensions = {}) {
     const fallbackFrame = Math.max(0, parseInt(frame, 10) || 0);
     const frameWidth = Math.max(0, parseInt(scene?.width, 10) || parseInt(fallbackDimensions.width, 10) || 0);
@@ -675,11 +687,16 @@ function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDim
             .reverse()
             .map((clip) => {
                 const asset = assetsByPath.get(clip.source_path);
+                const source = !isMissingAsset(asset) ? dormantVideoSource(projectDir, asset, clip.source_path) : null;
                 return {
                     key: clip.clip_id || `${clip.source_path}:${clip.timeline_start_frame || 0}:${clip.track_index || 0}`,
                     clip,
                     sourcePath: clip.source_path,
-                    mediaUrl: !isMissingAsset(asset) ? buildProjectAssetViewURL(projectDir, clip.source_path) : "",
+                    asset,
+                    blocked: source?.variant === "blocked",
+                    displayVariant: source?.variant || "",
+                    displayRev: source?.rev || "",
+                    mediaUrl: source && source.variant !== "blocked" ? source.url : "",
                     posterUrl: !isMissingAsset(asset) && asset?.has_thumbnail
                         ? api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/thumbnail/${asset.asset_id}`)
                         : null,
@@ -716,15 +733,28 @@ function pickPreviewTargetForFrame(projectDir, scene, assets, frame, fallbackDim
                 subtitle: asset?.name || clip.source_path.split(/[/\\]/).pop() || "Clip",
             };
         }
+        const source = dormantVideoSource(projectDir, asset, clip.source_path);
+        if (source.variant === "blocked") {
+            const blocked = blockedState(projectIdFromDir(projectDir), asset);
+            return {
+                kind: "blocked",
+                label: blocked.title,
+                subtitle: asset?.name || clip.source_path.split(/[/\\]/).pop() || "Clip",
+                displayKey: `blocked:${blocked.state}`,
+            };
+        }
         return {
             kind: "video",
+            asset,
+            displayVariant: source.variant,
+            displayRev: source.rev,
             label: `Frame ${fallbackFrame}`,
             subtitle: asset?.name || clip.source_path.split(/[/\\]/).pop() || "Clip",
             key: clip.clip_id || `${clip.source_path}:${clip.timeline_start_frame || 0}:${clip.track_index || 0}`,
             posterUrl: asset?.has_thumbnail
                 ? api.apiURL(`/sonder-editor/project/${projectIdFromDir(projectDir)}/thumbnail/${asset.asset_id}`)
                 : null,
-            mediaUrl: buildProjectAssetViewURL(projectDir, clip.source_path),
+            mediaUrl: source.url,
             clip,
         };
     }
@@ -1927,6 +1957,8 @@ export class EditorNodeController {
             connected: () => this._syncSubscribed && this.state.syncConnectionState === "open",
         });
         this._startCanvasHostHeartbeat(projectId, hostId, sourceNodeId);
+        // Opening a project has the server decide new and changed videos for proxies.
+        requestProxyReconcile(projectId);
         this._syncConnection = connectProjectSync(projectId, {
             onProjectUpdated: (event) => this._handleProjectUpdatedFromSync(event),
             onWidgetStateChanged: (event) => this._handleWidgetStateChanged(event),
@@ -4019,13 +4051,16 @@ export class EditorNodeController {
         function targetSignature(target) {
             if (!target) return "none";
             if (target.kind === "video") {
-                return `video:${target.key || clipPlaybackKey(target.clip)}:${target.clip?.source_path || ""}`;
+                return `video:${target.key || clipPlaybackKey(target.clip)}:${target.clip?.source_path || ""}:${target.displayVariant || ""}:${target.displayRev || ""}`;
             }
             if (target.kind === "composite") {
                 const layerKey = (target.layers || [])
-                    .map((layer) => `${layer?.key || clipPlaybackKey(layer?.clip)}:${layer?.sourcePath || layer?.clip?.source_path || ""}`)
+                    .map((layer) => `${layer?.key || clipPlaybackKey(layer?.clip)}:${layer?.sourcePath || layer?.clip?.source_path || ""}:${layer?.displayVariant || ""}:${layer?.displayRev || ""}`)
                     .join(",");
                 return `composite:${layerKey}`;
+            }
+            if (target.kind === "blocked") {
+                return `blocked:${target.subtitle || ""}:${target.displayKey || ""}`;
             }
             if (target.kind === "image") {
                 return `image:${target.posterUrl || ""}`;
@@ -4053,6 +4088,9 @@ export class EditorNodeController {
                     key: target.key || clipPlaybackKey(target.clip),
                     clip: target.clip,
                     sourcePath: target.clip?.source_path || "",
+                    asset: target.asset || null,
+                    displayVariant: target.displayVariant || "",
+                    displayRev: target.displayRev || "",
                     mediaUrl: target.mediaUrl || buildProjectAssetViewURL(projectDir, target.clip?.source_path || ""),
                     posterUrl: target.posterUrl || null,
                     opacity: Math.max(0, Math.min(1, Number(target.clip?.opacity ?? 1))),
@@ -4284,10 +4322,22 @@ export class EditorNodeController {
         function ensureVideoEntry(layer) {
             const key = layer?.key || clipPlaybackKey(layer?.clip);
             if (!key || !layer?.sourcePath) return null;
+            if (layer.blocked) {
+                // Its original failed here or its proxy went away: drop the element.
+                videoEntries.get(key)?.cleanup?.();
+                videoEntries.delete(key);
+                return null;
+            }
+            const displayKey = `${layer.displayVariant || ""}:${layer.displayRev || ""}`;
             const existing = videoEntries.get(key);
-            if (existing) {
+            if (existing && existing.displayKey === displayKey) {
                 existing.layer = layer;
                 return existing;
+            }
+            // The clip now shows another variant (its proxy landed): a new element.
+            if (existing) {
+                existing.cleanup?.();
+                videoEntries.delete(key);
             }
 
             const video = document.createElement("video");
@@ -4297,6 +4347,7 @@ export class EditorNodeController {
 
             const entry = {
                 key,
+                displayKey,
                 layer,
                 el: video,
                 pendingTime: 0,
@@ -4315,8 +4366,17 @@ export class EditorNodeController {
                 requestedSeekTime: Number.NaN,
             };
 
+            let decodeReported = false;
             const onReady = () => {
                 if (destroyed) return;
+                // An original (or proxy) this browser cannot decode: confirmed (a fetch
+                // failure looks the same) and reported, which turns the clip into a
+                // notice through the proxy store.
+                if (!decodeReported && entry.layer?.asset && mediaFailedToDecode(video)) {
+                    decodeReported = true;
+                    void confirmAndReportDecodeFailure(projectIdFromDir(projectDir), entry.layer.asset, video,
+                        entry.layer.displayVariant === "proxy" ? "proxy" : "original", entry.layer.displayRev || "");
+                }
                 if ((video.readyState || 0) >= 2 && !entry.readyLogged) {
                     dormantBoundaryDebugEvent("video-ready", {
                         key: entry.key,
@@ -4539,6 +4599,10 @@ export class EditorNodeController {
                 drawDormantCanvasMessage(canvas, target.label || "No preview", target.subtitle || "");
                 return;
             }
+            if (target.kind === "blocked") {
+                drawDormantCanvasMessage(canvas, target.label || "Proxy queued", target.subtitle || "");
+                return;
+            }
             if (target.kind === "image") {
                 const image = loadDormantPreviewImage(previewImageCache, target.posterUrl, () => scheduleRender());
                 if (image && drawDormantCanvasMedia(canvas, image, dormantFitOptions(target))) {
@@ -4642,7 +4706,13 @@ export class EditorNodeController {
                     }
                 }
                 if (!drewAny) {
-                    drawDormantCanvasMessage(canvas, "Seeking frame...", target.subtitle || "");
+                    const blockedLayer = layers.find((layer) => layer.blocked);
+                    if (blockedLayer && !layers.some((layer) => !layer.blocked)) {
+                        drawDormantCanvasMessage(canvas, blockedState(projectIdFromDir(projectDir), blockedLayer.asset).title,
+                            blockedLayer.asset?.name || target.subtitle || "");
+                    } else {
+                        drawDormantCanvasMessage(canvas, "Seeking frame...", target.subtitle || "");
+                    }
                 }
                 lastCommittedVideoSignature = drewAny ? targetSignature(target) : "";
                 lastPlaybackBlockKey = "";
@@ -4849,9 +4919,19 @@ export class EditorNodeController {
 
         updateTransport();
         scheduleRender({ forceSeek: true });
+        // A proxy landed or a decision changed: a paused preview repaints with it.
+        // Only a change to a video of this scene can change the preview.
+        const sceneAssetIds = new Set((data.scene?.clips || [])
+            .map((clip) => assetsByPath.get(clip.source_path)?.asset_id).filter(Boolean));
+        const unsubscribeProxyStore = proxyStore.subscribe((changes) => {
+            if (destroyed || isPlaying) return;
+            const changed = changedAssetIds(changes, projectIdFromDir(projectDir));
+            if ([...changed].some((assetId) => sceneAssetIds.has(assetId))) scheduleRender({ forceSeek: true });
+        });
 
         return () => {
             destroyed = true;
+            unsubscribeProxyStore();
             stopPlayback({ preservePlayhead: true, shouldRender: false });
             if (renderRaf) {
                 cancelAnimationFrame(renderRaf);

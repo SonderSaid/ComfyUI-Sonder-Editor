@@ -10,11 +10,18 @@
 // Its real meaning is "safe for someone else's browser", not "shows a picture
 // in ours". It is also absent from the lean /assets payload.
 //
-// The failure being detected is SILENT: a `<video>` whose codec the browser
-// cannot decode reaches readyState 4 with `error === null`, decodes its audio,
-// and advances `currentTime` — while `videoWidth`/`videoHeight` stay 0 and no
-// frame is ever presented. Measured on Chromium 152 for ProRes and FFV1.
-// Never treat the absence of an `error` event as proof a video is playing.
+// The failure takes two forms, and both are current (Chromium 152, measured for
+// ProRes and FFV1 on 2026-10-21):
+// - LOUD, a file with no audio track: `error.code === 4` at readyState 0.
+// - SILENT, a file with an audio track: readyState 4 with `error === null`; the
+//   audio decodes and `currentTime` advances while `videoWidth`/`videoHeight`
+//   stay 0 and no frame is ever presented.
+// `mediaFailedToDecode` catches both. Never treat the absence of an `error`
+// event as proof a video is playing.
+//
+// Whether an asset needs a proxy is the server's decision (`asset.proxy`, read
+// through `media_display_source.js`); the hint below is only the fallback for a
+// payload that carries no decision yet.
 
 // Codecs Chromium ships no video decoder for. Values match what the encoder
 // records in `generation_summary.codec`.
@@ -69,4 +76,43 @@ export function videoTrackFailedToDecode(state) {
 /** True when this asset should never be handed to a `<video>` element at all. */
 export function shouldSkipVideoLoad(asset) {
     return videoPreviewHint(asset) === "undecodable";
+}
+
+// MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED: the loud form above.
+const MEDIA_ERR_SRC_NOT_SUPPORTED = 4;
+
+// Chromium names the pipeline stage that failed in `error.message`; a demuxer or
+// decoder stage means the bytes arrived and could not be read.
+const DECODE_STAGE_MESSAGE = /DEMUXER_ERROR|DECODER_ERROR|PIPELINE_ERROR_DECODE|no supported streams/i;
+
+/**
+ * Either failure form, from an element or a plain property bag
+ * `{ error: { code }, readyState, videoWidth, videoHeight }`: no picture will come.
+ * A fetch failure (404, 5xx, refused) also gives the loud form, so this alone is
+ * not a codec verdict; see `classifyMediaFailure`.
+ */
+export function mediaFailedToDecode(element) {
+    if (!element || typeof element !== "object") return false;
+    if (Number(element.error?.code) === MEDIA_ERR_SRC_NOT_SUPPORTED) return true;
+    return videoTrackFailedToDecode(element);
+}
+
+/**
+ * Whether a failure says something about the codec. "decode": these bytes never
+ * give a picture here (the silent form, a decode-stage message, or a local blob,
+ * whose bytes were fetched). "unconfirmed": the loud form with nothing to tell it
+ * from a fetch failure; only a reachable source makes it a decode failure. "": none.
+ */
+export function classifyMediaFailure(element) {
+    if (!element || typeof element !== "object") return "";
+    if (Number(element.error?.code) === MEDIA_ERR_SRC_NOT_SUPPORTED) {
+        const src = String(element.currentSrc || element.src || "");
+        if (src.startsWith("blob:") || DECODE_STAGE_MESSAGE.test(String(element.error?.message || ""))) {
+            return "decode";
+        }
+        return "unconfirmed";
+    }
+    // Aborted, network and mid-stream errors are not a verdict on the codec.
+    if (element.error) return "";
+    return videoTrackFailedToDecode(element) ? "decode" : "";
 }

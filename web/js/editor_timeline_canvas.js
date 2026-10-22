@@ -1038,6 +1038,36 @@ export function _drawClips(host, ctx, width) {
                     ctx.fillText("MD", badgeX + badgeW / 2, badgeY + badgeH - Math.round(3 * host._scaleTimeline));
                 }
 
+                // Proxy badge, bottom-left (clear of "MD" and the top-left muted
+                // overlay): filled while the clip plays its proxy, hollow while it waits
+                // for one (media_display_source.js through the host).
+                const proxyVariant = clipAsset && !isMissingClip && (x2 - x1) > 24
+                    ? host._displayVideoSource?.(clipAsset)?.variant : "";
+                if (proxyVariant === "proxy" || proxyVariant === "blocked") {
+                    const badgeSize = Math.round(11 * host._scaleTimeline);
+                    const badgeX = x1 + Math.round(4 * host._scaleTimeline);
+                    const badgeY = videoY + videoH - 4 - badgeSize - Math.round(2 * host._scaleTimeline);
+                    ctx.save();
+                    ctx.globalAlpha = baseAlpha;
+                    if (proxyVariant === "proxy") {
+                        ctx.fillStyle = COLORS.accent;
+                        ctx.fillRect(badgeX, badgeY, badgeSize, badgeSize);
+                        ctx.fillStyle = COLORS.bg;
+                    } else {
+                        ctx.fillStyle = "rgba(0, 0, 0, 0.42)";
+                        ctx.fillRect(badgeX, badgeY, badgeSize, badgeSize);
+                        ctx.strokeStyle = COLORS.accent;
+                        ctx.lineWidth = 1;
+                        ctx.strokeRect(badgeX + 0.5, badgeY + 0.5, badgeSize - 1, badgeSize - 1);
+                        ctx.fillStyle = COLORS.accent;
+                    }
+                    ctx.font = host._canvasSansFont(Math.round(8 * host._scaleTimeline), 700);
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    ctx.fillText("P", badgeX + badgeSize / 2, badgeY + badgeSize / 2 + 0.5);
+                    ctx.restore();
+                }
+
                 if (isMissingClip) {
                     ctx.save();
                     ctx.beginPath();

@@ -321,7 +321,7 @@ globalThis.IntersectionObserver = class {{
 
 let fetchCount = 0;
 let revokeCount = 0;
-globalThis.fetch = async () => {{ fetchCount += 1; return {{ blob: async () => new Blob(["video"]) }}; }};
+globalThis.fetch = async () => {{ fetchCount += 1; return {{ ok: true, status: 200, blob: async () => new Blob(["video"]) }}; }};
 const originalRevoke = URL.revokeObjectURL.bind(URL);
 URL.revokeObjectURL = (url) => {{ revokeCount += 1; originalRevoke(url); }};
 

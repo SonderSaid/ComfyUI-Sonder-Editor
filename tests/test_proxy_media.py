@@ -612,6 +612,22 @@ def test_events_are_batched_per_project_and_left_out_of_the_diagnostic_ring(tmp_
         assert any(alias == canonical for alias, _event in events)
 
 
+def test_a_read_after_a_restart_is_newer_than_every_event_before_it(tmp_path, sources, stopper):
+    # The restarted server lost its queue and its memory of what it sent: a page that
+    # refetches must still be able to replace the "building" it last heard.
+    project_dir = make_project(tmp_path, sources, ("prores.mov",))
+    events = []
+    worker = make_worker(events=events, event_interval=0.05)
+    stopper(worker)
+    worker.enqueue(project_dir, ["a0"])
+    wait_until(lambda: state(worker, project_dir, "a0")["state"] == "ready")
+    worker.flush_all_events()
+    last_event = max(event["epoch"] for _alias, event in events)
+    restarted = make_worker(events=[], event_interval=0.05)
+    stopper(restarted)
+    assert state(restarted, project_dir, "a0")["epoch"] > last_event
+
+
 # ── Save Video inline ───────────────────────────────────────────────────────
 
 def _take_project(tmp_path, sources, metadata=None):

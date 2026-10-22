@@ -13,7 +13,9 @@ import {
 } from "./editor_settings.js";
 import { register as registerKeyboardConsumer, PRIORITY as KEY_PRIORITY } from "./keyboard_ownership.js";
 import { resolveEffectiveStreamingMode } from "./media_streaming.js";
-import { shouldSkipVideoLoad, videoTrackFailedToDecode } from "./media_preview_support.js";
+import { mediaFailedToDecode } from "./media_preview_support.js";
+import { blockedState, changedAssetIds, displayVideoSource, proxyStore } from "./media_display_source.js";
+import { confirmDecodeFailure, proxyFileUrl, reportDecodeFailure } from "./proxy_client.js";
 import { notifyError, notifyInfo, notifySuccess, notifyWarning } from "./editor_notifications.js";
 import {
     cancelAutomaticThumbnailRepairs,
@@ -284,7 +286,11 @@ export function loadMediaAsBlob(url, mediaEl, { mode = "blob" } = {}) {
     let aborted = false;
     const controller = typeof AbortController === "function" ? new AbortController() : null;
     fetch(url, controller ? { signal: controller.signal } : undefined)
-        .then((resp) => resp.blob())
+        .then((resp) => {
+            // An error body must not become a blob the element then fails to decode.
+            if (!resp.ok) throw new Error(`media fetch failed: ${resp.status}`);
+            return resp.blob();
+        })
         .then((blob) => {
             if (aborted) return;
             blobUrl = URL.createObjectURL(blob);
@@ -1091,6 +1097,49 @@ export function mountSharedAssetGallery(container, options = {}) {
         return projectIdFromDir(currentProjectDir()) || "default";
     }
 
+    // What a video asset shows here (media_display_source.js): its proxy when one is
+    // ready, its original when that plays, or nothing ("blocked") with a notice.
+    function galleryVideoSource(asset) {
+        return displayVideoSource(projectIdFromDir(currentProjectDir()), asset, {
+            original: (entry) => buildAssetViewUrl(currentProjectDir(), entry?.path),
+            proxy: (entry, rev) => proxyFileUrl(projectIdFromDir(currentProjectDir()), entry?.asset_id, rev),
+        });
+    }
+
+    function videoBlocked(asset) {
+        return asset?.asset_type === "video" && galleryVideoSource(asset).variant === "blocked";
+    }
+
+    function galleryBlockedState(asset) {
+        return blockedState(projectIdFromDir(currentProjectDir()), asset);
+    }
+
+    function blockedNoticeText(asset) {
+        const blocked = galleryBlockedState(asset);
+        return `${blocked.title} — ${blocked.detail} The file is intact and exports normally.`;
+    }
+
+    // What the open overlay and the detail pane show for their videos (variant, rev,
+    // and what a notice says), recorded when each renders, so a proxy event repaints
+    // a surface only when that changes (never mid-play: see the subscription below).
+    function displaySignature(assets) {
+        return assets.filter(Boolean).map((entry) => {
+            const source = entry.asset_type === "video" ? galleryVideoSource(entry) : null;
+            if (!source) return `${entry.asset_id}:-`;
+            const notice = source.variant === "blocked" ? galleryBlockedState(entry).state : "";
+            return `${entry.asset_id}:${source.variant}:${source.rev}:${notice}`;
+        }).join("|");
+    }
+
+    function overlayWatchedAssets() {
+        const overlay = state.overlayState;
+        return [
+            currentOverlayAsset(),
+            data.assets.find((entry) => entry.asset_id === overlay.compareLeftAssetId),
+            data.assets.find((entry) => entry.asset_id === overlay.compareRightAssetId),
+        ].filter(Boolean);
+    }
+
     function thumbnailRepairOwner(assetId, kind = "row") {
         return `${thumbnailRepairOwnerBase}:${kind}:${assetId}`;
     }
@@ -1173,9 +1222,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         for (const asset of inspectAssets) enqueueThumbnailRepair(asset, "inspect");
     }
 
-    function assetMediaCacheKey(asset) {
+    function assetMediaCacheKey(asset, variantKey = "") {
         if (!asset) return "";
         return [
+            variantKey,
             currentProjectId(),
             asset.asset_id || "",
             asset.path || "",
@@ -1215,15 +1265,20 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function loadGalleryMediaAsBlob(asset, mediaEl) {
-        const url = buildAssetViewUrl(currentProjectDir(), asset?.path);
-        if (!url || !mediaEl) return { cleanup: () => {} };
-        // A codec the browser has no decoder for never reaches a picture, so do
-        // not spend the transfer discovering that — opening a 500 MB FFV1 asset
-        // used to download the whole file to display black. Only positive
-        // provenance evidence gets here; anything unknown still loads and is
-        // caught at runtime by watchVideoDecodeFailure.
-        if (asset?.asset_type === "video" && shouldSkipVideoLoad(asset)) {
+        // A video plays its ready proxy, else its original; an original that cannot
+        // play here is never loaded (opening a 500 MB FFV1 asset used to download the
+        // whole file to display black). An original nothing has judged yet still
+        // loads and is caught at runtime by watchVideoDecodeFailure.
+        const source = asset?.asset_type === "video" ? galleryVideoSource(asset) : null;
+        if (source?.variant === "blocked") {
             return { cleanup: () => {}, skippedUndecodable: true };
+        }
+        const url = source ? source.url : buildAssetViewUrl(currentProjectDir(), asset?.path);
+        if (!url || !mediaEl) return { cleanup: () => {} };
+        const variantKey = source ? `${source.variant}:${source.rev}` : "";
+        if (source) {
+            mediaEl._sonderGalleryAsset = asset;
+            mediaEl._sonderGallerySource = { variant: source.variant, rev: source.rev };
         }
         // Video-only direct-streaming branch: no fetch, no LRU entry — the
         // browser HTTP cache + Range cover overlay re-renders. Audio and
@@ -1239,7 +1294,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 if (mode === "direct") {
                     mediaEl.src = url;
                 } else {
-                    blobHandle = loadGalleryMediaViaCache(asset, url, mediaEl);
+                    blobHandle = loadGalleryMediaViaCache(asset, url, mediaEl, variantKey);
                     if (!directActive) blobHandle.cleanup();
                 }
             });
@@ -1253,8 +1308,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         return loadGalleryMediaViaCache(asset, url, mediaEl);
     }
 
-    function loadGalleryMediaViaCache(asset, url, mediaEl) {
-        const key = assetMediaCacheKey(asset);
+    function loadGalleryMediaViaCache(asset, url, mediaEl, variantKey = "") {
+        const key = assetMediaCacheKey(asset, variantKey);
         let entry = overlayMediaCache.get(key);
         if (!entry || entry.revoked) {
             const controller = typeof AbortController === "function" ? new AbortController() : null;
@@ -1330,11 +1385,22 @@ export function mountSharedAssetGallery(container, options = {}) {
             if (done) return;
             done = true;
             detach();
-            onUnavailable();
+            // The server allowed this original (or built this proxy) and the browser
+            // could not decode it: report it, so a proxy is built or rebuilt. A source
+            // that failed to load (404, server busy) is no codec verdict and is not
+            // reported; `onUnavailable({ decode })` says which it was.
+            const source = video._sonderGallerySource;
+            const projectId = projectIdFromDir(currentProjectDir());
+            void confirmDecodeFailure(video).then((decode) => {
+                if (decode && source && video._sonderGalleryAsset) {
+                    reportDecodeFailure(projectId, video._sonderGalleryAsset, source.variant, source.rev);
+                }
+                if (!state.destroyed) onUnavailable({ decode });
+            });
         };
         const check = () => {
             if (done) return;
-            if (videoTrackFailedToDecode(video)) finish();
+            if (mediaFailedToDecode(video)) finish();
         };
         const onError = () => finish();
         // Some builds settle without firing a further event once metadata is in;
@@ -5464,12 +5530,10 @@ export function mountSharedAssetGallery(container, options = {}) {
             // black rectangle this used to be. Transport is deliberately omitted -
             // the audio track decodes and currentTime advances, so a live scrub bar
             // over a frozen frame reads as a stall rather than an explanation.
-            if (shouldSkipVideoLoad(asset)) {
+            if (videoBlocked(asset)) {
                 applyThumbnailPlaceholder(stage, asset);
                 const note = style(document.createElement("div"), `margin:auto;padding:10px 14px;border-radius:8px;background:rgba(2,5,7,.78);color:${CHROME.textDim};font-size:12px;text-align:center;max-width:80%;`);
-                note.textContent = asset.has_thumbnail
-                    ? "No browser preview for this codec. The file is intact and exports normally."
-                    : "No browser preview for this codec, and no thumbnail is available yet. The file is intact and exports normally.";
+                note.textContent = blockedNoticeText(asset);
                 stage.appendChild(note);
                 content.appendChild(stage);
                 return;
@@ -5529,14 +5593,16 @@ export function mountSharedAssetGallery(container, options = {}) {
             // Imports carry no recorded codec, so the static hint cannot see them.
             // This catches the same silent failure at runtime and degrades to the
             // same presentation rather than leaving a black stage.
-            const downgradeToStill = () => {
+            const downgradeToStill = ({ decode = false } = {}) => {
                 video.pause();
                 video.style.display = "none";
                 applyThumbnailPlaceholder(stage, asset);
                 playbackRow.style.display = "none";
                 scrub.el.style.display = "none";
                 const note = style(document.createElement("div"), `margin:auto;padding:10px 14px;border-radius:8px;background:rgba(2,5,7,.78);color:${CHROME.textDim};font-size:12px;text-align:center;max-width:80%;`);
-                note.textContent = "No browser preview for this codec. The file is intact and exports normally.";
+                note.textContent = decode
+                    ? blockedNoticeText(asset)
+                    : "This video could not be loaded. Close and reopen it to try again.";
                 stage.appendChild(note);
             };
             state.overlayState.cleanupFns.push(
@@ -6074,9 +6140,13 @@ export function mountSharedAssetGallery(container, options = {}) {
                 // divider/side-by-side geometry is untouched.
                 for (const [side, sideAsset, layer, group] of [["A", compareA, layerA, contentGroupA],
                                                                ["B", compareB, layerB, contentGroupB]]) {
-                    if (shouldSkipVideoLoad(sideAsset)) {
+                    if (videoBlocked(sideAsset)) {
                         applyThumbnailPlaceholder(group, sideAsset);
                         layer.style.display = "none";
+                        layer._sonderCompareBlocked = true;
+                        const note = style(document.createElement("div"), `position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:8px 12px;border-radius:8px;background:rgba(2,5,7,.78);color:${CHROME.textDim};font-size:11px;text-align:center;max-width:70%;pointer-events:none;`);
+                        note.textContent = blockedNoticeText(sideAsset);
+                        group.appendChild(note);
                     } else {
                         // The side's previous video holds its box on its frame (paused
                         // and muted by the teardown) until the new one can show one.
@@ -6104,10 +6174,14 @@ export function mountSharedAssetGallery(container, options = {}) {
             contentGroupA.appendChild(layerA);
             contentGroupB.appendChild(layerB);
             let transport = null;
-            if (asset.asset_type === "video") {
+            // A blocked side has no media: the transport links only what can play, and
+            // with both sides blocked there is none (it used to latch on "Pause").
+            const liveCompareSides = [[layerA, compareA], [layerB, compareB]]
+                .filter(([layer]) => !layer._sonderCompareBlocked);
+            if (asset.asset_type === "video" && liveCompareSides.length) {
                 state.overlayState.videoCompareFps = assetFps(compareA);
-                transport = createLinkedMediaTransport([layerA, layerB], {
-                    fallbackDurations: [assetDurationSeconds(compareA), assetDurationSeconds(compareB)],
+                transport = createLinkedMediaTransport(liveCompareSides.map(([layer]) => layer), {
+                    fallbackDurations: liveCompareSides.map(([, sideAsset]) => assetDurationSeconds(sideAsset)),
                 });
                 state.overlayState.togglePlayback = () => transport.toggle();
                 state.overlayState.stepVideoCompare = (deltaSeconds) => transport.step(deltaSeconds);
@@ -6125,7 +6199,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                     const chip = makeCompareSideChip(label, pane);
                     sideChips.push(chip);
                     pane.append(group, chip.el);
-                    if (asset.asset_type === "video") {
+                    if (asset.asset_type === "video" && transport) {
                         state.overlayState.cleanupFns.push(attachRightClickVideoScrub(pane, transport, [layerA, layerB], { fps: assetFps(compareA) }));
                     }
                     return pane;
@@ -6201,13 +6275,13 @@ export function mountSharedAssetGallery(container, options = {}) {
                     () => window.removeEventListener("resize", handleResize),
                     attachZoomPan(stage, [contentGroupA, contentGroupB]),
                 );
-                if (asset.asset_type === "video") {
+                if (asset.asset_type === "video" && transport) {
                     state.overlayState.cleanupFns.push(attachRightClickVideoScrub(stage, transport, [layerA, layerB], { fps: assetFps(compareA) }));
                 }
                 center.appendChild(stage);
             }
 
-            if (asset.asset_type === "video") {
+            if (asset.asset_type === "video" && transport) {
                 const videoControls = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
                 const playPauseBtn = makeActionButton("subtle");
                 const playbackHint = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;`);
@@ -6260,6 +6334,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             closeInspectOverlay();
             return;
         }
+        overlay.displaySignature = displaySignature(overlayWatchedAssets());
 
         // Capture the live scrub position + play state before the teardown rebuilds the media,
         // so metadata toggles and the compare layout/monitor/cycle buttons resume where the user
@@ -6775,6 +6850,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     function renderDetail(asset) {
         state.detailMetadataRefresh = null;
         const selectedIds = selectedAssetIdsList();
+        state.detailDisplaySignature = selectedIds.length <= 1 && asset ? displaySignature([asset]) : "";
         if (selectedIds.length > 1) {
             renderMultiDetail(selectedIds);
             return;
@@ -6832,7 +6908,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         // "idle", not "failed": the file is intact and exports normally - only this
         // browser has no decoder for it. A red badge would tell users their archive
         // master is broken.
-        if (asset.asset_type === "video" && shouldSkipVideoLoad(asset)) {
+        if (videoBlocked(asset)) {
             badges.appendChild(galleryStatusPill("No Preview", "idle"));
         }
         titleRow.append(title, badges);
@@ -6867,7 +6943,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             img.alt = assetDisplayName(asset);
             state.liveMediaCleanup = configureDecodedImage(img, asset, { highPriority: true, placeholderSurface: previewSurface });
             previewSurface.appendChild(img);
-        } else if (asset.asset_type === "video" && shouldSkipVideoLoad(asset)) {
+        } else if (videoBlocked(asset)) {
             // Mirrors the Missing-asset block above: explain instead of rendering
             // a black <video> that will never show a frame. The still comes from
             // the server thumbnail, which ffmpeg produced from this same file.
@@ -6877,9 +6953,10 @@ export function mountSharedAssetGallery(container, options = {}) {
             applyThumbnailPlaceholder(previewSurface, asset);
             const noPreviewWrap = style(document.createElement("div"), `padding:14px;text-align:center;display:flex;flex-direction:column;gap:6px;align-items:center;background:rgba(2,5,7,.72);border-radius:8px;`);
             const noPreviewTitle = style(document.createElement("div"), `color:${THEME.fg1};font-size:11px;font-weight:700;`);
-            noPreviewTitle.textContent = "No Browser Preview";
+            const blocked = galleryBlockedState(asset);
+            noPreviewTitle.textContent = blocked.title;
             const noPreviewText = style(document.createElement("div"), `color:${THEME.fg2};font-size:10px;line-height:1.45;max-width:280px;`);
-            noPreviewText.textContent = "This browser has no decoder for this codec, so no picture can be shown. The file is intact and exports normally.";
+            noPreviewText.textContent = `${blocked.detail} The file is intact and exports normally.`;
             noPreviewWrap.append(noPreviewTitle, noPreviewText);
             previewSurface.appendChild(noPreviewWrap);
         } else if (asset.asset_type === "video") {
@@ -8576,9 +8653,35 @@ export function mountSharedAssetGallery(container, options = {}) {
         syncOverlayWithAssets([], { listArrival: true });
     }
 
+    // A proxy landed or a decision changed for an asset on screen. Each surface (the
+    // overlay, the detail pane) is rebuilt on its own, only when what it shows
+    // changes and nothing in it is playing: a rebuild would restart playback, so a
+    // proxy that lands mid-play shows the next time the asset opens.
+    const unsubscribeProxyStore = proxyStore.subscribe((changes) => {
+        if (state.destroyed) return;
+        const changed = changedAssetIds(changes, projectIdFromDir(currentProjectDir()));
+        if (!changed.size) return;
+        const overlay = state.overlayState;
+        if (overlay.open) {
+            const watched = overlayWatchedAssets();
+            const playing = typeof overlay.captureMediaState === "function" && overlay.captureMediaState()?.playing;
+            if (!playing && watched.some((entry) => changed.has(entry.asset_id))
+                && displaySignature(watched) !== overlay.displaySignature) {
+                renderInspectOverlay();
+            }
+        }
+        const detailAsset = !state.inspectorCollapsed && selectedAssetIdsList().length <= 1 ? selectedAsset() : null;
+        const detailPlaying = !!state.liveMedia && state.liveMedia.paused === false;
+        if (detailAsset && !detailPlaying && changed.has(detailAsset.asset_id)
+            && displaySignature([detailAsset]) !== state.detailDisplaySignature) {
+            renderDetail(detailAsset);
+        }
+    });
+
     function destroy() {
         if (state.destroyed) return;
         state.destroyed = true;
+        unsubscribeProxyStore();
         galleryKeyOff();
         document.removeEventListener("mousedown", documentMouseDownClear, true);
         unsubscribeSettings();

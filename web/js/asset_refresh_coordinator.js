@@ -5,6 +5,8 @@ import {
     postProjectJsonWithReconcile,
     resetProjectVersion,
 } from "./api_client.js";
+import { proxyStore } from "./media_display_source.js";
+import { requestProxyReconcile } from "./proxy_client.js";
 
 const RETRY_DELAYS_MS = [250, 1000, 4000];
 const EXHAUSTED_WAVE_TTL_MS = 60_000;
@@ -204,6 +206,12 @@ async function defaultRequest(demand) {
             { projectId: demand.projectId },
         )
         : await fetchProjectJson(url, {}, { projectId: demand.projectId });
+    // Each video's proxy state rides on the list; the store keeps the newest by epoch,
+    // so a list that was overtaken changes nothing.
+    proxyStore.ingestAssets(demand.projectId, result?.payload?.assets || []);
+    // An explicit sync (entering an editor, a manual Refresh) also has the server
+    // decide new and changed videos and sweep stale proxy files.
+    if (demand.mode === "sync") requestProxyReconcile(demand.projectId);
     return result;
 }
 

@@ -67,6 +67,9 @@ const ctx=context(), state={canvas:{width:554,height:313},compositePassSeq:1};
 const canvases=[];
 const videoScratchCache=createVideoScratchCache({createCanvas:()=>{const c={ctx:context(),getContext(){return this.ctx;}};canvases.push(c);return c;}});
 const getCanvasContext=()=>ctx, updatePlaybackPerfCounters=()=>{};
+const decodeReports=[];
+const {mediaFailedToDecode}=await import(''' + json.dumps((ROOT/'web/js/media_preview_support.js').as_uri()) + r''');
+const noteMediaDecodeFailure=(el)=>{decodeReports.push(el);return true;};
 const VIEWPORT_FIT_MODES=new Set(['fit','pad_edge','cover','stretch']);
 const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
 ''' + function('fitRect') + '\n' + function('drawEdgePadBars') + '\n' + draw + r'''
@@ -102,6 +105,13 @@ lost=false;canvases[0].ctx.drawImage=originalDraw;ctx.calls=[];
 drawImageLike(video,{allowScratch:true});assert.equal(ctx.calls[0].a[0],canvases[0]);
 video.readyState=4; state.canvas.width=1920;state.canvas.height=1088;ctx.calls=[];
 drawImageLike(video,{allowScratch:true});assert.equal(ctx.calls[0].a[0],video);
+// An undecodable element (both failure forms) is never counted as drawn, and is reported.
+for (const failed of [{videoWidth:0,videoHeight:0,readyState:4,error:null},{videoWidth:0,videoHeight:0,readyState:0,error:{code:4}}]) {
+ ctx.calls=[]; assert.equal(drawImageLike(failed,{}),false); assert.equal(ctx.calls.length,0);
+ assert.equal(decodeReports.at(-1),failed);
+}
+// An image is never judged by video dimensions.
+ctx.calls=[]; assert.equal(drawImageLike({naturalWidth:10,naturalHeight:10,width:10,height:10},{}),true);
 ''')
 
 

@@ -393,7 +393,10 @@ import {
 import { REFERENCE_LANE_CAUSE, classifyReferenceChunks } from "./reference_resolution.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
 import { notifyInfo, notifySuccess, notifyWarning, notifyError, notifyProgress } from "./editor_notifications.js";
-import { shouldSkipVideoLoad } from "./media_preview_support.js";
+import { blockedState, changedAssetIds, displayVideoSource, needsProxy, proxyStore } from "./media_display_source.js";
+import {
+    confirmAndReportDecodeFailure, confirmDecodeFailure, proxyFileUrl, reportDecodeFailure, reportProxyDemand,
+} from "./proxy_client.js";
 import {
     collapseChannelsForTemplate,
     composeSectionText,
@@ -1173,6 +1176,13 @@ export class EditorWidget {
         this._audioCacheMap = {};    // source_path → HTMLAudioElement
         this._viewportImageCache = {};
         this._viewportSurface = null;
+        // Proxy state (media_display_source.js): the timeline's P badges follow it; the
+        // viewport surface repaints itself, the legacy fallback viewport here.
+        this._unsubscribeProxyStore = proxyStore.subscribe((changes) => {
+            if (this._destroyed || !changedAssetIds(changes, this._projectDirName()).size) return;
+            if (this.timelineCanvas) this._renderTimeline();
+            if (!this._viewportSurface && this._vpCanvas && !this.isPlaying) this._renderViewportFrame?.();
+        });
         this._vpCanvas = null;
         this._vpCtx = null;
         this._vpSeekDebounce = null;
@@ -4510,18 +4520,29 @@ export class EditorWidget {
         }
         this._referenceMediaEditorHandle?.destroy?.();
         const projectDir = this._projectDirName();
+        // A ready proxy plays here (with its lossless audio); with none ready and an
+        // original that cannot play, the still and a notice stand in (the original
+        // element stays for the trim's duration).
+        const source = asset.asset_type === "video" ? this._displayVideoSource(asset) : null;
+        const blocked = source?.variant === "blocked";
         let handle = null;
         handle = openReferenceMediaEditor({
             asset,
             crop: draft?.crop || null,
             sourceStartSec: draft?.source_start_sec ?? 0,
             sourceEndSec: draft?.source_end_sec ?? null,
-            mediaUrl: this._buildViewURL(asset.path),
+            mediaUrl: source?.variant === "proxy" ? source.url : this._buildViewURL(asset.path),
             // The host owns networking, so it resolves the still; the module only
             // renders it. `_referenceAssetPreviewUrl` already returns the thumbnail
             // for video assets, which is exactly the poster wanted here.
             posterUrl: asset.asset_type === "video" ? (this._referenceAssetPreviewUrl(asset) || "") : "",
-            previewUnavailable: shouldSkipVideoLoad(asset),
+            previewUnavailable: blocked,
+            previewNotice: blocked
+                ? `${blockedState(projectDir, asset).title} — ${blockedState(projectDir, asset).detail}` : "",
+            // Resolves true for a real decode failure (then reported), false for a
+            // source that failed to load.
+            onMediaDecodeFailure: (element) => confirmAndReportDecodeFailure(projectDir, asset, element,
+                source?.variant === "proxy" ? "proxy" : "original", source?.rev || ""),
             waveformUrl: projectDir && ["audio", "video"].includes(asset.asset_type)
                 ? api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectDir)}/waveform/${encodeURIComponent(asset.asset_id)}`)
                 : "",
@@ -20782,10 +20803,13 @@ export class EditorWidget {
         }
         const targetLongEdge = this._resolveGuideSnapshotTargetLongEdge(clip);
 
+        // Guides come from the original, never proxy pixels. An original this browser
+        // cannot decode goes straight to the server's extraction, without a toast.
+        const originalUnplayable = needsProxy(this._projectDirName(), sourceAsset);
         try {
             let asset = null;
             const viewportSurface = this._ensureViewportSurface();
-            if (viewportSurface?.captureSourceFrame) {
+            if (viewportSurface?.captureSourceFrame && !originalUnplayable) {
                 try {
                     const snapshot = await viewportSurface.captureSourceFrame(clip.source_path, sourceFrame, targetLongEdge);
                     if (snapshot?.blob) {
@@ -20840,7 +20864,7 @@ export class EditorWidget {
                     scene_source_frame: sourceFrame,
                     target_long_edge: targetLongEdge,
                 });
-                notifyInfo("Captured via backend (viewport snapshot unavailable)");
+                if (!originalUnplayable) notifyInfo("Captured via backend (viewport snapshot unavailable)");
             }
 
             const fields = this._seedFitDefaults({
@@ -28350,6 +28374,17 @@ export class EditorWidget {
             getSourceCacheMaxBytes: () => this._settings?.playback?.sourceCacheMaxBytes ?? null,
             notifyInfo: (message, opts) => notifyInfo(message, opts),
             notifyWarning: (message, opts) => notifyWarning(message, opts),
+            // Proxy media: a ready proxy's URL; blocked clips on screen are built first;
+            // an original or proxy that fails to decode here is reported.
+            getProjectId: () => this._projectDirName(),
+            buildProxyUrl: (assetId, rev) => this._proxyUrl(assetId, rev),
+            confirmDecodeFailure: (mediaEl) => confirmDecodeFailure(mediaEl),
+            onBlockedLayersVisible: (assets) => {
+                reportProxyDemand(this._projectDirName(), assets.map((entry) => entry.asset_id));
+            },
+            onDecodeFailure: (asset, variant, rev) => {
+                reportDecodeFailure(this._projectDirName(), asset, variant, rev);
+            },
             onFrameChange: (frame, meta = {}) => {
                 const measurePlayback = isSessionDiagEnabled() && this.isPlaying;
                 const autoScrollStartedAt = measurePlayback ? performance.now() : 0;
@@ -28528,6 +28563,23 @@ export class EditorWidget {
         return buildProjectAssetViewURL(this.projectDir, sourcePath);
     }
 
+    /** An asset's proxy file at `rev` (proxy_client.js). */
+    _proxyUrl(assetId, rev) {
+        return proxyFileUrl(this._projectDirName(), assetId, rev);
+    }
+
+    /**
+     * What a display surface shows for this video asset (media_display_source.js):
+     * `{ variant: "proxy" | "original" | "blocked", rev, url }`. Render, export and
+     * frame grabs never come through here; they always use the original.
+     */
+    _displayVideoSource(asset) {
+        return displayVideoSource(this._projectDirName(), asset, {
+            original: (entry) => this._buildViewURL(entry?.path || ""),
+            proxy: (entry, rev) => this._proxyUrl(entry?.asset_id, rev),
+        });
+    }
+
     _drawMissingViewportPlaceholder(title, subtitle = "") {
         if (!this._vpCtx || !this._vpCanvas) return;
         const ctx = this._vpCtx;
@@ -28551,7 +28603,18 @@ export class EditorWidget {
     }
 
     _getOrCreateVideo(sourcePath) {
-        if (this._videoCache[sourcePath]) return this._videoCache[sourcePath];
+        const display = this._displayVideoSource(this._getAssetForSourcePath(sourcePath));
+        if (display.variant === "blocked") return null;
+        const displayKey = `${display.variant}:${display.rev}`;
+        const cached = this._videoCache[sourcePath];
+        if (cached && cached._sonderDisplayKey === displayKey) return cached;
+        if (cached) {
+            cached.pause();
+            if (cached._blobUrl) URL.revokeObjectURL(cached._blobUrl);
+            cached.removeAttribute("src");
+            cached.load();
+            delete this._videoCache[sourcePath];
+        }
 
         // LRU eviction: max 8 cached videos (increased for multi-layer compositing)
         const keys = Object.keys(this._videoCache).filter(k => !k.startsWith("guide_"));
@@ -28566,7 +28629,7 @@ export class EditorWidget {
             delete this._videoCache[oldest];
         }
 
-        const url = this._buildViewURL(sourcePath);
+        const url = display.url || this._buildViewURL(sourcePath);
         if (!url) return null;
 
         // Legacy fallback path (only runs when viewport-surface creation
@@ -28601,6 +28664,7 @@ export class EditorWidget {
                 });
             });
 
+        video._sonderDisplayKey = displayKey;
         this._videoCache[sourcePath] = video;
         return video;
     }
@@ -29393,6 +29457,7 @@ export class EditorWidget {
     destroy() {
         if (this._destroyed) return;
         this._destroyed = true;
+        this._unsubscribeProxyStore?.();
         TimelineCanvas._releaseTimelineLayerCache(this);
         this._queuedHistoryNotification?.dismiss();
         this._queuedHistoryNotification = null;

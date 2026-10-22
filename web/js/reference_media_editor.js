@@ -13,6 +13,7 @@ import {
 import { ASPECT_RATIO_PRESETS } from "./editor_settings.js";
 import { register as registerKeyboardConsumer, PRIORITY as KEY_PRIORITY } from "./keyboard_ownership.js";
 import { mountMediaScrubBar } from "./media_scrub_bar.js";
+import { mediaFailedToDecode } from "./media_preview_support.js";
 
 export const REFERENCE_MEDIA_EDITOR_SHORTCUTS = Object.freeze([
     ["Space", "Play / Pause the active Reference Source/Result view"],
@@ -60,6 +61,11 @@ export function openReferenceMediaEditor({
     // picture is missing. Refusing to open the editor would be strictly worse.
     posterUrl = "",
     previewUnavailable = false,
+    // What the frame area says when no picture can be shown (a proxy on its way).
+    previewNotice = "",
+    // The <video> failed at runtime: `(element) => Promise<boolean>`. The host
+    // confirms it was a decode failure (then reports it, so a proxy is built).
+    onMediaDecodeFailure = () => false,
     waveformUrl = "",
     readOnly = false,
     initialViewMode = "source",
@@ -124,6 +130,19 @@ export function openReferenceMediaEditor({
     // still behind it so the frame area is not black. Crop geometry already falls
     // back to `asset.width` (see mediaNaturalWidth), so the box stays accurate.
     const posterBehindMedia = mediaType === "video" && previewUnavailable && !!posterUrl;
+    let noticeNode = null;
+    const showUnavailable = (text) => {
+        if (posterUrl) {
+            mediaFrame.style.backgroundImage = `url("${posterUrl}")`;
+            mediaFrame.style.backgroundSize = "contain";
+            mediaFrame.style.backgroundPosition = "center";
+            mediaFrame.style.backgroundRepeat = "no-repeat";
+        }
+        media.style.opacity = "0";
+        if (!text || noticeNode) return;
+        noticeNode = node("div", text, "position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);max-width:80%;padding:8px 12px;border-radius:8px;background:rgba(2,5,7,.8);color:#c7d2db;font-size:11px;text-align:center;pointer-events:none;z-index:2;");
+        mediaFrame.appendChild(noticeNode);
+    };
 
     let cropBox = null;
     const handles = new Map();
@@ -138,6 +157,26 @@ export function openReferenceMediaEditor({
             media.style.opacity = "0";
         }
         mediaFrame.appendChild(media);
+        if (mediaType === "video" && previewUnavailable) showUnavailable(previewNotice);
+        if (mediaType === "video" && !previewUnavailable) {
+            // An original nothing had judged yet (or a proxy) that this browser cannot
+            // decode: the same still and notice, and the host is told once.
+            // A source that failed to load is not a codec verdict: the host confirms.
+            let reported = false;
+            const checkDecode = () => {
+                if (reported || destroyed || !mediaFailedToDecode(media)) return;
+                reported = true;
+                void Promise.resolve(onMediaDecodeFailure(media)).then((confirmed) => {
+                    if (confirmed && !destroyed) {
+                        showUnavailable(previewNotice || "This video can't play in the browser, so it needs a playable copy.");
+                    }
+                }, () => {});
+            };
+            for (const eventName of ["error", "loadedmetadata", "loadeddata"]) {
+                media.addEventListener(eventName, checkDecode);
+                cleanup.push(() => media.removeEventListener(eventName, checkDecode));
+            }
+        }
         cropBox = node("div", "", `position:absolute;border:2px solid #72b9e6;box-shadow:0 0 0 9999px rgba(0,0,0,.58);box-sizing:border-box;touch-action:none;cursor:${readOnly ? "default" : "grab"};z-index:3;`);
         cropBox.dataset.referenceGeometryRole = "crop-box";
         cropBox.tabIndex = readOnly ? -1 : 0;

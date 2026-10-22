@@ -1,6 +1,8 @@
 import { FONT, THEME } from "./editor_theme.js";
 import { snapshotGraphPreviewDiagnostics } from "./graph_preview_ownership.js";
 import { createPlaybackSourceCache } from "./playback_source_cache.js";
+import { blockedState, changedAssetIds, displayVideoSource, proxyStore } from "./media_display_source.js";
+import { classifyMediaFailure, mediaFailedToDecode } from "./media_preview_support.js";
 import { createVideoScratchCache, videoDestDownscale, VIDEO_SCRATCH_SCALE_THRESHOLD } from "./viewport_video_scratch.js";
 
 function clamp(value, min, max) {
@@ -1425,6 +1427,10 @@ function seekMedia(mediaEl, targetTime, {
 
 export function createViewportSurface(options = {}) {
     const state = {
+        // Display variant per source path, pinned while playing: a proxy that lands
+        // mid-playback is adopted when playback stops or starts again, never by
+        // swapping a playing element's source.
+        pinnedDisplayVariants: new Map(),
         canvas: options.canvas || null,
         ctx: options.canvas?.getContext?.("2d") || null,
         destroyed: false,
@@ -1608,11 +1614,55 @@ export function createViewportSurface(options = {}) {
     // update/resolve/dismiss, or null). No-op fallback keeps the surface decoupled.
     const notifyInfo = options.notifyInfo || (() => null);
     const notifyWarning = options.notifyWarning || (() => null);
+    // Proxy media (media_display_source.js): the host builds a proxy's URL, hears
+    // about blocked clips on screen (to build them first) and about an original or a
+    // proxy that failed to decode here.
+    const buildProxyUrl = options.buildProxyUrl || (() => null);
+    const onBlockedLayersVisible = options.onBlockedLayersVisible || noop;
+    const onDecodeFailure = options.onDecodeFailure || noop;
+    // The project the store keys this surface's assets by (its folder name).
+    const getProjectId = options.getProjectId || (() => "");
+    // Whether a failed element's source really failed to decode (proxy_client.js
+    // probes the URL); without a host, only failures that prove it on their own.
+    const confirmDecodeFailure = options.confirmDecodeFailure
+        || ((mediaEl) => Promise.resolve(classifyMediaFailure(mediaEl) === "decode"));
+
+    function displayVariantFor(asset, sourcePath) {
+        if (!asset || asset.asset_type === "image" || asset.asset_type === "audio") {
+            return { kind: "original", rev: "" };
+        }
+        const projectId = getProjectId();
+        const display = displayVideoSource(projectId, asset);
+        const now = display.variant === "proxy"
+            ? { kind: "proxy", rev: display.rev }
+            : { kind: display.variant, rev: "" };
+        if (!state.isPlaying) return now;
+        const key = String(sourcePath || asset.path || "");
+        const pinned = state.pinnedDisplayVariants.get(key);
+        // A pin holds unless what it shows is gone: an original that failed to decode
+        // here, or a proxy that is no longer the ready one (rebuilt, deleted or
+        // failed: the server serves only the current rev's file).
+        const stale = !!pinned && ((pinned.kind === "original" && proxyStore.decodeFailed(projectId, asset, "original"))
+            || (pinned.kind === "proxy" && !(now.kind === "proxy" && now.rev === pinned.rev)));
+        if (pinned && !stale) return pinned;
+        state.pinnedDisplayVariants.set(key, now);
+        return now;
+    }
+
+    function layerIsBlocked(layer) {
+        if (!layer?.asset || layer.asset.missing || layer.asset.asset_type === "image") return false;
+        return displayVariantFor(layer.asset, String(layer.clip?.source_path || "").replace(/\\/g, "/")
+            .replace(/^\.\//, "")).kind === "blocked";
+    }
+
     const sourceCache = createPlaybackSourceCache({
         getAssetForSourcePath,
         getLiveSourcePaths: currentSceneSourcePaths,
         getStreamingMode,
-        buildDirectUrl: buildViewUrl,
+        getDisplayVariant: displayVariantFor,
+        buildDirectUrl: (sourcePath, identity) => (identity?.variantKind === "proxy"
+            ? buildProxyUrl(identity.assetId, identity.proxyRev)
+            : buildViewUrl(sourcePath)),
         isDestroyed: () => state.destroyed,
         isDiagnosticsEnabled: playbackPerfActive,
         recordEvent: recordSourceCacheEvent,
@@ -2640,7 +2690,12 @@ export function createViewportSurface(options = {}) {
         const guide = getGuideAtFrame(frame);
         const guideAsset = guide ? getGuideAsset(guide) : null;
         const clipLayers = getVisibleClipLayers(frame);
-        const playableClipLayers = clipLayers.filter((layer) => layer.asset && !layer.asset.missing);
+        // A blocked layer (its original cannot play here and no proxy is ready) is a
+        // notice, not a video: kept out of every playable path so it never blocks the
+        // composite, and drawn as text over the frame.
+        const blockedClipLayers = clipLayers.filter(layerIsBlocked);
+        const playableClipLayers = clipLayers.filter((layer) => layer.asset && !layer.asset.missing
+            && !blockedClipLayers.includes(layer));
         const missingClipLayers = clipLayers.filter((layer) => !layer.asset || !!layer.asset.missing);
         const snapshot = {
             frame,
@@ -2648,6 +2703,7 @@ export function createViewportSurface(options = {}) {
             guideAsset,
             clipLayers,
             playableClipLayers,
+            blockedClipLayers,
             missingClipLayers,
             audioLayers: getVisibleAudioLayers(frame),
         };
@@ -2694,10 +2750,85 @@ export function createViewportSurface(options = {}) {
         }
     }
 
+    // The notice for blocked layers: a band across the frame naming what the top
+    // blocked clip waits for. Drawn over whatever else drew, so other layers stay.
+    function blockedNoticeFor(snapshot) {
+        const layers = snapshot?.blockedClipLayers || [];
+        if (!layers.length) return null;
+        const top = layers[layers.length - 1];
+        const blocked = blockedState(getProjectId(), top.asset);
+        const name = top.asset?.name || String(top.clip?.source_path || "").split(/[/\\]/).pop() || "";
+        const more = layers.length > 1 ? ` (+${layers.length - 1} more)` : "";
+        return { title: blocked.title, detail: `${name}${more}`, state: blocked.state };
+    }
+
+    function drawBlockedNotice(notice) {
+        if (!notice) return;
+        const ctx = getCanvasContext();
+        if (!ctx || !state.canvas) return;
+        const width = state.canvas.width;
+        const height = state.canvas.height;
+        const bandHeight = Math.max(44, Math.round(height / 5));
+        const top = Math.round((height - bandHeight) / 2);
+        ctx.save();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = "rgba(0, 0, 0, 0.62)";
+        ctx.fillRect(0, top, width, bandHeight);
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = notice.state === "failed" ? "#dfb1b1" : THEME.fg1;
+        ctx.font = `500 ${Math.max(13, Math.round(bandHeight / 4))}px ${FONT.sans}`;
+        ctx.fillText(notice.title, width / 2, top + bandHeight * 0.4);
+        if (notice.detail) {
+            ctx.fillStyle = THEME.fg2;
+            ctx.font = `400 ${Math.max(10, Math.round(bandHeight / 6.5))}px ${FONT.sans}`;
+            ctx.fillText(notice.detail, width / 2, top + bandHeight * 0.72, width - 24);
+        }
+        ctx.restore();
+    }
+
+    function reportBlockedLayers(snapshot) {
+        const assets = (snapshot?.blockedClipLayers || []).map((layer) => layer.asset).filter(Boolean);
+        if (assets.length) {
+            try { onBlockedLayersVisible(assets); } catch (_) {}
+        }
+    }
+
+    // A <video> of this surface failed to decode: tell the host (which records it,
+    // so the layer turns into a notice, and reports it to the server) and repaint.
+    function isVideoElement(mediaEl) {
+        return !!mediaEl && typeof mediaEl.videoWidth === "number";
+    }
+
+    function noteMediaDecodeFailure(mediaEl) {
+        const display = mediaEl?._sonderDisplay;
+        if (!display || display.reported || !isVideoElement(mediaEl) || !mediaFailedToDecode(mediaEl)) return false;
+        display.reported = true;
+        const asset = getAssetForSourcePath(display.sourcePath);
+        if (!asset) return false;
+        const projectId = getProjectId();
+        // A fetch failure looks the same as a codec the browser lacks: only a
+        // confirmed one is recorded (the layer turns into a notice whatever the host
+        // does) and reported by the host to the server.
+        void Promise.resolve(confirmDecodeFailure(mediaEl)).then((confirmed) => {
+            if (!confirmed || state.destroyed) return;
+            const recorded = proxyStore.noteDecodeFailure(projectId, asset, display.variant, display.rev);
+            try { onDecodeFailure(asset, display.variant, display.rev); } catch (_) {}
+            // Repaint once, and only when the layer can now change.
+            if (recorded && !state.isPlaying) renderFrame();
+        }, () => {});
+        return true;
+    }
+
     function drawImageLike(element, { opacity = 1, fitMode = "pad_edge", cropPosition = "center", allowScratch = false } = {}) {
         state.lastVideoScratchDraw = false;
         const ctx = getCanvasContext();
         if (!ctx || !state.canvas || !element) return false;
+        // drawImage of an undecodable <video> is a silent no-op; it must not count as drawn.
+        if (typeof element.videoWidth === "number" && mediaFailedToDecode(element)) {
+            noteMediaDecodeFailure(element);
+            return false;
+        }
         const canvasW = state.canvas.width;
         const canvasH = state.canvas.height;
         const width = element.videoWidth || element.naturalWidth || element.width || canvasW;
@@ -2878,8 +3009,8 @@ export function createViewportSurface(options = {}) {
         return null;
     }
 
-    function mediaSourceCacheKey(sourcePath, { forceBlob = false } = {}) {
-        return sourceCache.cacheKeyFor(sourcePath, { forceBlob });
+    function mediaSourceCacheKey(sourcePath, { forceBlob = false, variant = "display" } = {}) {
+        return sourceCache.cacheKeyFor(sourcePath, { forceBlob, variant });
     }
 
     function maybeReleaseSourceCacheEntry(cacheKey) {
@@ -2914,21 +3045,41 @@ export function createViewportSurface(options = {}) {
     // streaming mode (guide-snapshot capture is a frame-accuracy correctness
     // path). Surface auto/blob loads and forced-blob loads share `blob:...`;
     // explicit direct opt-in gets its own `direct:...` entry.
-    async function resolveMediaSourceUrl(sourcePath, { forceBlob = false } = {}) {
+    async function resolveMediaSourceUrl(sourcePath, { forceBlob = false, variant = "display" } = {}) {
         // Each awaiting consumer owns a temporary holder until it either adopts
         // the URL into its element or abandons it. Coalesced consumers are independent.
         const holder = {};
-        const cacheKey = sourceCache.cacheKeyFor(sourcePath, { forceBlob });
+        const identity = sourceCache.identityFor(sourcePath, { forceBlob, variant });
+        const cacheKey = identity?.cacheKey || "";
         const releaseAcquisition = () => sourceCache.releaseHolder(cacheKey, holder);
         holder._sonderReleaseSourceRef = releaseAcquisition;
         try {
             const resolved = await sourceCache.resolve(sourcePath, {
-                forceBlob, acquisitionHolder: holder,
+                forceBlob, variant, acquisitionHolder: holder,
                 releaseHolders: (mediaEl) => removeMediaSource(mediaEl),
             });
             if (!resolved) { releaseAcquisition(); return null; }
-            return { ...resolved, releaseAcquisition };
+            const display = identity ? {
+                sourcePath: identity.sourcePath,
+                variant: identity.variantKind,
+                rev: identity.proxyRev,
+            } : null;
+            return { ...resolved, display, releaseAcquisition };
         } catch (error) { releaseAcquisition(); throw error; }
+    }
+
+    // Remember which asset variant an element shows, and watch it for a decode failure.
+    function markMediaDisplay(mediaEl, display) {
+        if (!isVideoElement(mediaEl) || !display) return;
+        const current = mediaEl._sonderDisplay;
+        if (current && current.sourcePath === display.sourcePath && current.variant === display.variant
+            && current.rev === display.rev) return;
+        mediaEl._sonderDisplay = { ...display, reported: false };
+        if (!mediaEl._sonderDecodeWatch && typeof mediaEl.addEventListener === "function") {
+            mediaEl._sonderDecodeWatch = true;
+            const check = () => noteMediaDecodeFailure(mediaEl);
+            for (const eventName of ["error", "loadeddata", "loadedmetadata"]) mediaEl.addEventListener(eventName, check);
+        }
     }
 
     function getOrCreateVideo(layer) {
@@ -3346,12 +3497,12 @@ export function createViewportSurface(options = {}) {
         }
     }
 
-    async function ensureMediaElementSource(mediaEl, sourcePath, { forceBlob = false } = {}) {
+    async function ensureMediaElementSource(mediaEl, sourcePath, { forceBlob = false, variant = "display" } = {}) {
         if (!mediaEl || !sourcePath) return null;
         const requestToken = (Number(mediaEl._sonderSourceRequestToken) || 0) + 1;
         mediaEl._sonderSourceRequestToken = requestToken;
-        const requestedCacheKey = mediaSourceCacheKey(sourcePath, { forceBlob });
-        const resolved = await resolveMediaSourceUrl(sourcePath, { forceBlob });
+        const requestedCacheKey = mediaSourceCacheKey(sourcePath, { forceBlob, variant });
+        const resolved = await resolveMediaSourceUrl(sourcePath, { forceBlob, variant });
         const cacheKey = resolved?.cacheKey || requestedCacheKey;
         if (!resolved?.url || state.destroyed || mediaEl._sonderSourceRequestToken !== requestToken) {
             resolved?.releaseAcquisition();
@@ -3362,7 +3513,13 @@ export function createViewportSurface(options = {}) {
         try { acquired = acquireMediaElementSource(mediaEl, cacheKey, resolved.url); }
         finally { resolved.releaseAcquisition(); }
         if (!acquired) return null;
-        return await waitForMediaReady(mediaEl, 1);
+        markMediaDisplay(mediaEl, resolved.display);
+        const ready = await waitForMediaReady(mediaEl, 1);
+        if (isVideoElement(mediaEl) && mediaFailedToDecode(mediaEl)) {
+            noteMediaDecodeFailure(mediaEl);
+            return null;
+        }
+        return ready;
     }
 
     async function captureSourceFrame(sourcePath, sourceFrame, targetLongEdge) {
@@ -3388,7 +3545,8 @@ export function createViewportSurface(options = {}) {
             state.videoCache[cacheKey] = video;
         }
         const prepared = await guideDecodeLimiter.run(DECODE_PRIORITY_HIGH, async () => {
-            const loaded = await ensureMediaElementSource(video, sourcePath, { forceBlob: true });
+            // Guides are grabbed from the original, never from proxy pixels.
+            const loaded = await ensureMediaElementSource(video, sourcePath, { forceBlob: true, variant: "original" });
             if (!loaded || state.destroyed) return null;
             await waitForMediaReady(video, 2, 1500);
             const sought = await seekMedia(video, targetTime, {
@@ -3472,6 +3630,7 @@ export function createViewportSurface(options = {}) {
             maybeReleaseSourceCacheEntry(sourceCacheKey);
             return null;
         }
+        markMediaDisplay(video, resolved.display);
         const prepared = await playbackDecodeLimiter.run(entry.decodePriority || DECODE_PRIORITY_LOW, async () => {
             if (!stillRelevant()) return null;
             await waitForMediaReady(video, 2, 1500, { signal });
@@ -5811,9 +5970,11 @@ export function createViewportSurface(options = {}) {
                 drewAny = true;
             }
         }
-        if (!drewAny) {
+        const notice = blockedNoticeFor(snapshot);
+        if (!drewAny && !notice) {
             drawViewportText("Preview unavailable", "Click Load Preview for live media.");
         }
+        drawBlockedNotice(notice);
         drawSceneOutline();
     }
 
@@ -6582,6 +6743,8 @@ export function createViewportSurface(options = {}) {
         } else {
             parts.push("guide:none");
         }
+        // A blocked layer shows as a notice: its presence changes the painted frame.
+        for (const layer of snapshot?.blockedClipLayers || []) parts.push(`blocked:${layer.key || ""}`);
         for (const [index, layer] of (snapshot?.playableClipLayers || []).entries()) {
             if ((Number(layer.opacity ?? 1) || 0) <= 0) continue;
             const clip = layer.clip || {};
@@ -6920,6 +7083,10 @@ export function createViewportSurface(options = {}) {
         const element = await ensureMediaElementSource(video, layer.clip.source_path);
         if (!element) return null;
         await waitForMediaReady(element, 2);
+        if (isVideoElement(element) && mediaFailedToDecode(element)) {
+            noteMediaDecodeFailure(element);
+            return null;
+        }
         const sought = await seekMedia(element, clipSourceTime(layer, frame), {
             requireTarget: true,
             waitForFrame: true,
@@ -6957,9 +7124,11 @@ export function createViewportSurface(options = {}) {
                 drewAny = true;
             }
         }
-        if (!drewAny) {
+        const notice = blockedNoticeFor(snapshot);
+        if (!drewAny && !notice) {
             drawViewportText("Loading preview...", "");
         }
+        drawBlockedNotice(notice);
         drawSceneOutline();
     }
 
@@ -7079,7 +7248,7 @@ export function createViewportSurface(options = {}) {
                 // files are small, and whole-file blob avoids network under-buffer
                 // stalls and drift that direct streaming introduces (matches the
                 // gallery's video-only-direct policy).
-                ensureMediaElementSource(audio, layer.track.source_path, { forceBlob: true })
+                ensureMediaElementSource(audio, layer.track.source_path, { forceBlob: true, variant: "original" })
                     .then((element) => waitForMediaReady(element, 1))
                     .then((element) => {
                         const current = state.activePlaybackAudios.get(layer.key);
@@ -7377,6 +7546,7 @@ export function createViewportSurface(options = {}) {
                 recordPlaybackTelemetry("playback_slow_video_draw", { frame, ...drawTelemetry });
             }
         }
+        drawBlockedNotice(state.playbackBlockedNotice);
         const outlineStartedAt = telemetry ? performance.now() : 0;
         drawSceneOutline();
         if (telemetry) result.outlineMs = performance.now() - outlineStartedAt;
@@ -7472,6 +7642,7 @@ export function createViewportSurface(options = {}) {
     }
 
     function drawPlaybackComposite(snapshot, renderTiming = null) {
+        state.playbackBlockedNotice = blockedNoticeFor(snapshot);
         const telemetryActive = playbackTelemetryActive();
         const compositeStartedAt = telemetryActive ? performance.now() : 0;
         const preflight = preflightPlaybackComposite(snapshot);
@@ -7694,10 +7865,17 @@ export function createViewportSurface(options = {}) {
         const frame = currentFrame();
         const snapshot = buildFrameSnapshot(frame);
         const renderToken = ++state.renderToken;
+        reportBlockedLayers(snapshot);
 
         if (!snapshot.playableClipLayers.length && !snapshot.missingClipLayers.length && !snapshot.guide) {
             if (state.isPlaying) resetPlaybackCompositeState();
-            drawViewportText(`Frame ${frame}`);
+            const notice = blockedNoticeFor(snapshot);
+            if (notice) {
+                drawBlack();
+                drawBlockedNotice(notice);
+            } else {
+                drawViewportText(`Frame ${frame}`);
+            }
             drawSceneOutline();
             return;
         }
@@ -8353,6 +8531,8 @@ export function createViewportSurface(options = {}) {
             applyFrame(state.playbackSessionStartFrame, { reason: "playback-stop-return" });
         }
         state.playbackLoopRange = null;
+        // Proxies that landed while playing are adopted now.
+        state.pinnedDisplayVariants.clear();
         renderFrame();
     }
 
@@ -8371,6 +8551,7 @@ export function createViewportSurface(options = {}) {
         state.playbackSessionStartFrame = startFrame;
         state.playbackLoopRange = loopRange;
         state.playbackSessionId += 1;
+        state.pinnedDisplayVariants.clear();
         invalidateAsyncPreviewRenders();
         clearPlaybackDecisionLogs();
         resetPlaybackCompositeState();
@@ -8442,10 +8623,27 @@ export function createViewportSurface(options = {}) {
         renderFrame();
     }
 
+    // A proxy became ready, or a decision changed: a paused frame repaints with it
+    // (the paused composite waits for the new element to seek and decode before it
+    // draws). While playing, variants stay pinned until playback stops.
+    const unsubscribeProxyStore = proxyStore.subscribe((changes) => {
+        if (state.destroyed || state.isPlaying) return;
+        // Only a change to a video of this scene can change the frame.
+        const changed = changedAssetIds(changes, getProjectId());
+        if (!changed.size) return;
+        const sceneAssetIds = currentSceneSourcePaths()
+            .map((sourcePath) => getAssetForSourcePath(sourcePath)?.asset_id)
+            .filter(Boolean);
+        if (!sceneAssetIds.some((assetId) => changed.has(assetId))) return;
+        sourceCache.reconcile("proxy-state", { releaseHolders: (mediaEl) => removeMediaSource(mediaEl) });
+        renderFrame();
+    });
+
     function destroy() {
         if (state.destroyed) return;
         if (state.playbackRunId) finishPlaybackPerfRun("destroy");
         state.destroyed = true;
+        unsubscribeProxyStore();
         if (state.playbackRAF) {
             cancelAnimationFrame(state.playbackRAF);
             state.playbackRAF = null;
