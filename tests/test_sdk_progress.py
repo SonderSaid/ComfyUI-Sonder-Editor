@@ -78,3 +78,14 @@ def test_capture_contains_only_watched_messages(tmp_path, monkeypatch):
     captured = [json.loads(line) for line in path.read_text().splitlines()]
     assert len(captured) == 1 and captured[0]["at"] > 0
     assert captured[0]["data"]["prompt_id"] == "p"
+
+def test_other_observers_ride_the_one_wrap_after_the_original():
+    calls, seen = [], []
+    server = SimpleNamespace(send_sync=lambda *a, **kw: (calls.append(a[0]), "sent")[1])
+    assert p.install(server)
+    p.add_observer(lambda event, data: seen.append((event, len(calls))))
+    p.add_observer(lambda event, data: (_ for _ in ()).throw(RuntimeError("bad run observer")))
+    assert server.send_sync("executed", {"prompt_id": "x", "node": "3"}, "client") == "sent"
+    assert server.send_sync("status", {}, None) == "sent"
+    # Seen once, after ComfyUI sent it; a failing observer changes nothing; other events are not dispatched.
+    assert seen == [("executed", 1)] and calls == ["executed", "status"]

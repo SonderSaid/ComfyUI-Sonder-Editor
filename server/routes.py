@@ -15967,6 +15967,14 @@ if routes is not None:
         project = await run_project_io(load_project, project_dir)
         return sum(1 for job in project.generation_queue if (job.status or "pending").lower() == "pending")
 
+    # Run registration and observed run outputs (Output Views plumbing).
+    try:
+        from .run_output_routes import register_run_output_routes
+
+        register_run_output_routes(routes)
+    except Exception:
+        logger.exception("Run output routes unavailable")
+
     # Optional feature: an import failure in the SDK modules must not take the
     # editor's other routes down with it.
     try:

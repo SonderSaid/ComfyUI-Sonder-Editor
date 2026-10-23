@@ -200,6 +200,16 @@ def _save_generated_project(project, base_modified_at: str = "", created_ids=Non
     return committed
 
 
+def _note_saved_to_project(run_key, committed) -> None:
+    """Tell the run's open record its output reached the project, and at which version.
+
+    The version lets a later reader tell the run's own commit from edits made
+    after it. Silent without a trusted key.
+    """
+    if run_key:
+        sdk_runs.note_saved_to_project(run_key, str(getattr(committed, "modified_at", "") or ""))
+
+
 EDITOR_EXPORT_SCHEMA_VERSION = "1.0"
 
 
@@ -1192,6 +1202,91 @@ def _release_prompt_run(prompt_key: str, status) -> None:
     })
 
 
+def _roots_from_queue_get_result(result):
+    """``outputs_to_execute`` (item[4]): the output nodes ComfyUI will run."""
+    if isinstance(result, tuple) and result and isinstance(result[0], (tuple, list)) and len(result[0]) >= 5:
+        roots = result[0][4]
+        if isinstance(roots, (list, tuple, set, frozenset)):
+            return roots
+    return None
+
+
+def _bind_queued_item(item) -> None:
+    """Bind a queued prompt's run registrations to the id ComfyUI queued it under."""
+    if not isinstance(item, (tuple, list)) or len(item) < 5:
+        return
+    prompt_id, prompt, extra_data, roots = item[1], item[2], item[3], item[4]
+    extra_data = extra_data if isinstance(extra_data, dict) else {}
+    pnginfo = extra_data.get("extra_pnginfo")
+    workflow = pnginfo.get("workflow") if isinstance(pnginfo, dict) else None
+    workflow_id = workflow.get("id") if isinstance(workflow, dict) else ""
+    sdk_runs.bind_queued(prompt_id, prompt, roots,
+                         workflow_id=str(workflow_id or ""), client_id=str(extra_data.get("client_id") or ""))
+
+
+_RUN_REAP_INTERVAL_SEC = 15.0
+_last_run_reap = 0.0
+
+
+def _reap_removed_runs(prompt_queue) -> None:
+    """Every so often at ``put``, end bound runs removed from the queue unrun.
+
+    Reads reap too; this catches the ones nobody reads. Runs before the
+    original ``put``, so the prompt being queued (just bound) is inside the grace.
+    """
+    global _last_run_reap
+    now = time.monotonic()
+    if now - _last_run_reap < _RUN_REAP_INTERVAL_SEC:
+        return
+    _last_run_reap = now
+    from ..server import run_outputs
+    run_outputs.reap_removed(run_outputs.queued_prompt_ids(prompt_queue))
+
+
+def _finish_observed_run(prompt_key: str, args, kwargs) -> None:
+    from ..server import run_outputs
+    record = sdk_runs.record_snapshot(prompt_key)
+    prompt_id = (record or {}).get("prompt_id", "")
+    if not prompt_id:
+        return
+    history_result = kwargs.get("history_result") if isinstance(kwargs, dict) else None
+    if history_result is None and len(args) >= 2:
+        history_result = args[1]
+    outcome, _note, _detail = _run_outcome(_status_from_task_done_call(args, kwargs))
+    run_outputs.finish(prompt_key, prompt_id, history_result, outcome)
+
+
+_RUN_OUTPUT_HINTS_INSTALLED = False
+
+
+def _install_run_output_hints(run_outputs) -> None:
+    """Announce new results on the project socket; hosts fetch them with their session.
+
+    The hint names the run and its owners' host or run ids, never media: those
+    ids are already public presence data.
+    """
+    global _RUN_OUTPUT_HINTS_INSTALLED
+    if _RUN_OUTPUT_HINTS_INSTALLED:
+        return
+    _RUN_OUTPUT_HINTS_INSTALLED = True
+
+    def announce(hint):
+        host_ids = [owner[2] for owner in hint["owners"] if owner and owner[0] == "host" and len(owner) > 2]
+        run_ids = [owner[1] for owner in hint["owners"] if owner and owner[0] == "sdk" and len(owner) > 1]
+        for alias in hint["project_ids"]:
+            schedule_project_event(alias, {
+                "type": "outputs_changed",
+                "project_id": alias,
+                "prompt_id": hint["prompt_id"],
+                "seq": hint["seq"],
+                "finished": hint["finished"],
+                "host_ids": host_ids,
+                "run_ids": run_ids,
+            })
+
+    run_outputs.add_listener(announce)
+
+
 def _install_bridge_prompt_queue_hooks() -> bool:
     global _BRIDGE_HOOKED_PROMPT_QUEUE_ID
 
@@ -1224,7 +1319,7 @@ def _install_bridge_prompt_queue_hooks() -> bool:
                     _set_bridge_prompt_key_for_object(prompt_key, prompt)
                     if prompt_key:
                         prompt_id = _prompt_id_from_queue_get_result(result)
-                        sdk_runs.open_release(prompt_key, prompt_id, prompt)
+                        sdk_runs.open_release(prompt_key, prompt_id, prompt, _roots_from_queue_get_result(result))
                         # A run may start before the proxy acknowledges submit.
                         # Only registered SDK tokens can opt into observation.
                         for node in (prompt or {}).values():
@@ -1254,6 +1349,12 @@ def _install_bridge_prompt_queue_hooks() -> bool:
                             _finalize_prompt_bridges(prompt_key, source="task_done")
                         except Exception:
                             logger.exception("Bridge finalization failed from prompt queue task_done for %s", prompt_key)
+                        # Before the release closes: the observer reads the run's
+                        # scope and take note from the still-open record.
+                        try:
+                            _finish_observed_run(prompt_key, args, kwargs)
+                        except Exception:
+                            logger.exception("Run output observation failed to finish for %s", prompt_key)
                         # After finalization, never before: a bridge completes its
                         # job inside finalization, and only then may a still-running
                         # leased job be returned to pending.
@@ -1264,6 +1365,30 @@ def _install_bridge_prompt_queue_hooks() -> bool:
 
             wrapped_task_done._sonder_bridge_wrapped = True
             setattr(prompt_queue, "task_done", wrapped_task_done)
+
+        original_put = getattr(prompt_queue, "put", None)
+        if callable(original_put) and not getattr(original_put, "_sonder_bridge_wrapped", False):
+            def wrapped_put(item, *args, **kwargs):
+                # ``put`` is ComfyUI's only enqueue and runs before the /prompt
+                # reply, so a registration bound here is known even to a run
+                # that finishes before its submitter hears back. Bind first:
+                # the worker can take the item the moment it is in the queue.
+                try:
+                    _bind_queued_item(item)
+                    _reap_removed_runs(prompt_queue)
+                except Exception:
+                    logger.exception("Binding a queued prompt to its run registration failed")
+                return original_put(item, *args, **kwargs)
+
+            wrapped_put._sonder_bridge_wrapped = True
+            setattr(prompt_queue, "put", wrapped_put)
+
+        try:
+            from ..server import run_outputs
+            sdk_progress.add_observer(run_outputs.observe)
+            _install_run_output_hints(run_outputs)
+        except Exception:
+            logger.exception("Run output observation unavailable")
 
         _BRIDGE_HOOKED_PROMPT_QUEUE_ID = current_queue_id
         return (
@@ -1686,6 +1811,7 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
     try:
         if changed:
             committed_project = _save_generated_project(project, entry.get("base_modified_at", ""), created_ids=created_ids_since(_pre_item_ids, project))
+            _note_saved_to_project(entry.get("prompt_key", ""), committed_project)
             asset_id_remap = getattr(committed_project, "_asset_id_remap", {}) if committed_project is not None else {}
             from ..server import proxy_media
             proxy_media.enqueue_after_commit(project.project_dir, [
@@ -2058,7 +2184,8 @@ class SonderSaveVideo:
             if mark_queue_complete:
                 result_asset_id = png_assets[0].asset_id if png_assets else ""
                 _mark_queue_job_completed(project, str(execution_context.get("queue_job_id") or ""), result_asset_id)
-            _save_generated_project(project, str(execution_context.get("base_modified_at") or ""), created_ids=created_ids_since(_pre_item_ids, project))
+            committed_png = _save_generated_project(project, str(execution_context.get("base_modified_at") or ""), created_ids=created_ids_since(_pre_item_ids, project))
+            _note_saved_to_project(sdk_runs.trusted_key_for_prompt(prompt), committed_png)
             preview_images = _save_preview_thumbnail(cv2.cvtColor(rgb_frames[0], cv2.COLOR_RGB2BGR), "sonder_savepng")
             logger.info("Saved PNG sequence to %s (%d frames)", output_path, len(rgb_frames))
             return {
@@ -2180,6 +2307,9 @@ class SonderSaveVideo:
             ensure_thumbnail("video", output_path, thumb_path)
 
         # --- Take mode: auto-place on timeline ---
+        # The placement is the one trusted mapping between this file's frames and
+        # scene frames; it travels with the result for Output Views.
+        scene_map = None
         if mode == "Take" and hasattr(project, '_execution_context') and project._execution_context:
             ctx = project._execution_context
             scene = project.get_scene(ctx.get("scene_id", ""))
@@ -2283,6 +2413,14 @@ class SonderSaveVideo:
                     take_metadata=dict(take_generation_params),
                 )
                 scene.clips.append(clip)
+                if timeline_end_frame > timeline_start_frame:
+                    scene_map = {
+                        "scene_id": scene.scene_id,
+                        "scene_start": timeline_start_frame,
+                        "scene_end": timeline_end_frame,
+                        "source_offset": source_in_frame,
+                        "fps": float(fps),
+                    }
                 placed_audio_track = None
                 if audio_abs_path and has_audio and encode_metadata.get("audio_sidecar_ready") and os.path.isfile(audio_abs_path):
                     audio_asset = None
@@ -2364,6 +2502,7 @@ class SonderSaveVideo:
             _mark_queue_job_completed(project, str(ctx.get("queue_job_id") or ""), asset.asset_id)
 
         committed_project = _save_generated_project(project, str(execution_context.get("base_modified_at") or ""), created_ids=created_ids_since(_pre_item_ids, project))
+        _note_saved_to_project(sdk_runs.trusted_key_for_prompt(prompt), committed_project)
         _build_take_proxy(committed_project if committed_project is not None else project, asset.asset_id)
 
         # Inline node player descriptor — the saved project media file is served via
@@ -2386,6 +2525,7 @@ class SonderSaveVideo:
                     "warnings": encode_metadata.get("warnings", []),
                     "alerts": audio_alerts,
                     "poster": poster[0] if poster else None,
+                    **({"scene_map": scene_map} if scene_map else {}),
                 }],
             },
             "result": (output_path,),

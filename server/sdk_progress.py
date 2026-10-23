@@ -22,6 +22,19 @@ _WATCHED = {}
 _LISTENERS = set()
 _WARNED = set()
 _EVENTS = {"progress", "progress_state", "executing"}
+# Other in-process observers ride this one wrap (never a second one): the run
+# output observer reads executed results. Each sees every message after ComfyUI
+# sent it and must stay cheap, since it runs on the sending thread.
+_OBSERVED_EVENTS = frozenset({"executing", "executed", "execution_start", "execution_success",
+                              "execution_error", "execution_interrupted"})
+_OBSERVERS: list = []
+
+
+def add_observer(observer):
+    """``observer(event, data)`` for each message in ``_OBSERVED_EVENTS``. Idempotent."""
+    with _LOCK:
+        if observer not in _OBSERVERS:
+            _OBSERVERS.append(observer)
 
 
 def _warn_once(key):
@@ -151,6 +164,14 @@ def install(prompt_server):
                 observe(event, data)
             except Exception:
                 _warn_once("observer")
+            if event in _OBSERVED_EVENTS:
+                with _LOCK:
+                    observers = list(_OBSERVERS)
+                for observer in observers:
+                    try:
+                        observer(event, data)
+                    except Exception:
+                        _warn_once("run observer")
             return result
         send_sync._sonder_sdk_progress = True
         prompt_server.send_sync = send_sync
@@ -163,5 +184,6 @@ def install(prompt_server):
 def reset_for_tests():
     with _LOCK:
         _WATCHED.clear()
+        _OBSERVERS.clear()
         _LISTENERS.clear()
         _WARNED.clear()

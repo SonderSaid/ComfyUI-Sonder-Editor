@@ -36,6 +36,7 @@ import { confirmAndReportDecodeFailure, proxyFileUrl, requestProxyReconcile } fr
 import { runProxyAction } from "./proxy_actions.js";
 import { createCanvasControlsHost } from "./controls_host_canvas.js";
 import { createCanvasControlsRelay } from "./controls_canvas_relay.js";
+import { createRunOutputsClient } from "./run_outputs_client.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject, importFailureMessage } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
@@ -1853,6 +1854,8 @@ export class EditorNodeController {
     _teardownProjectSync({ preserveRetry = false } = {}) {
         this._controlsRelay?.destroy();
         this._controlsRelay = null;
+        this.runOutputs?.dispose();
+        this.runOutputs = null;
         this._controlsHost?.setMountedVisible(false);
         if (!preserveRetry) {
             clearTimeout(this._syncRetryTimer);
@@ -1956,6 +1959,15 @@ export class EditorNodeController {
             host: this.getControlsHost(), api,
             identity: () => ({ projectId: this._projectId(), hostId: this._hostId(), sessionId: this._editorSessionId }),
             connected: () => this._syncSubscribed && this.state.syncConnectionState === "open",
+        });
+        // Observed outputs of the runs this canvas host registers (data only;
+        // Output Views read it). Canvas and fullscreen share this owner scope;
+        // reads name this node's workflow, so another workflow tab whose Editor
+        // has the same node id never reads these runs.
+        this.runOutputs = createRunOutputsClient({
+            mode: "canvas", label: `canvas:${hostId}`, apiURL: path => api.apiURL(path),
+            identity: () => ({ projectId: this._projectId(), hostId: this._hostId(), sessionId: this._editorSessionId,
+                               workflowId: String(this.node?.graph?.rootGraph?.id || this.node?.graph?.id || "") }),
         });
         this._startCanvasHostHeartbeat(projectId, hostId, sourceNodeId);
         // Opening a project has the server decide new and changed videos for proxies.

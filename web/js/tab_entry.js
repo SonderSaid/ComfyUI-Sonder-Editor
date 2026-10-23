@@ -6,6 +6,7 @@ import { notificationCoreConfig, subscribeEditorSettings } from "./editor_settin
 import { LAUNCHER_WINDOW_NAME } from "./sdk_setup_client.js";
 import { modelMessage } from "./launcher_view.js";
 import { createMountedControlsHost } from "./controls_host_remote.js";
+import { createRunOutputsClient } from "./run_outputs_client.js";
 
 installComfyApiShim();
 injectSonderFontFaces();
@@ -468,6 +469,14 @@ async function runSdkTab() {
     });
     editor.updateProject(projectId);
     editor.applyWidgetState(host.values);
+    // Observed outputs of this session's runs (data only; Output Views read it).
+    editor.runOutputs = createRunOutputsClient({
+        mode: "sdk", label: `sdk:${sdkSessionId}`, apiURL: path => api.apiURL(path),
+        identity: () => ({
+            projectId, sessionId: sdkSessionId, secret, tabSessionId: host.tabSessionId,
+            runIds: () => host.status.runs.map(run => run.run_id),
+        }),
+    });
     editor._enterFullscreen();
 
     // Workflow ▾ switched the session: the project, scene and timeline stay;
@@ -713,6 +722,11 @@ async function main() {
     });
     editor.updateProject(projectId);
     editor.applyWidgetState(host.values);
+    // Observed outputs of its canvas host's runs (data only; Output Views read it).
+    editor.runOutputs = createRunOutputsClient({
+        mode: "mounted", label: `mounted:${hostId}`, apiURL: path => api.apiURL(path),
+        identity: () => ({ projectId, hostId, sessionId }),
+    });
     editor._enterFullscreen();
     document.body.classList.add("ready");
     mountToastsOnce();

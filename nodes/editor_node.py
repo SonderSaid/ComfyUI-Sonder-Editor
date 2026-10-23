@@ -21,6 +21,7 @@ from ..server import external_links
 from ..server import prompt_channel_templates
 from ..server import prompt_graph
 from ..server import prompt_payload
+from ..server import run_outputs
 from ..server import sdk_runs
 from .prompt_once import run_once_per_prompt
 from ..server.editor_inputs import editor_optional_inputs
@@ -1397,6 +1398,30 @@ class SonderEditor:
                 "queue_job_ref_id": queue_job.job_id if queue_job else "",
                 "base_modified_at": execution_base_modified_at,
             }
+            # What this run actually rendered, for its observed outputs (Output
+            # Views): the queued window when a job supplied it, never live state.
+            try:
+                run_outputs.note_editor_context(prompt, unique_id, {
+                    "project_folder": os.path.basename(os.path.normpath(getattr(proj, "project_dir", "") or "")),
+                    "scene_id": scene.scene_id,
+                    "start_modified_at": execution_base_modified_at,
+                    "fps": float(proj_fps or 0.0),
+                    "generation_start": generation_start,
+                    "generation_end": generation_end,
+                    "render_start": render_start,
+                    "render_end": render_end,
+                    "actual_pre": actual_pre,
+                    "actual_post": actual_post,
+                    "frame_count": frame_count,
+                    "frame_count_padding": frame_count_padding,
+                    "source_frame_count": source_frame_count,
+                    "mask_start_frame": mask_start_pixel,
+                    "mask_end_frame": mask_end_pixel,
+                    "queue": queue_job_mode or "live",
+                    "queue_job_ref_id": queue_job.job_id if queue_job else "",
+                })
+            except Exception:
+                logger.exception("Recording the executed editor context failed")
             logger.info(
                 "execute end: scene_id=%s frames=%d duration=%.2fs",
                 scene.scene_id,

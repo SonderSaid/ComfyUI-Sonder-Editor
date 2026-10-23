@@ -24,6 +24,7 @@ import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_the
 import { mountToastStack } from "./editor_toast_stack.js";
 import { notifyProgress, notifyInfo, notifyWarning, configureNotifications } from "./editor_notifications.js";
 import { mountNodeVideoPreview, unmountNodeVideoPreview } from "./node_video_preview.js";
+import { installRunRegistration } from "./run_registration.js";
 import { applyRenderCacheSettingToNode, applyRenderCacheSettingToNodes } from "./render_cache_activation.js";
 import {
     logProjectResolutionDiagnostic,
@@ -1045,6 +1046,10 @@ function schedulePostPromptRefresh() {
 }
 
 // ── Main Extension ─────────────────────────────────────────────────────
+// Runs this page submits are registered so their outputs can be observed
+// (run_registration.js); it wraps the shared api once, before any Run.
+installRunRegistration({ api, app });
+
 app.registerExtension({
     name: "sonder.editor",
 

@@ -1,6 +1,7 @@
 import { registerChangeCertificateFromEvent } from "./api_client.js";
 import { proxyStore } from "./media_display_source.js";
 import { refreshProxyStates, requestProxyReconcile } from "./proxy_client.js";
+import { publishOutputsChanged } from "./run_outputs_client.js";
 
 const { api } = window.comfyAPI.api;
 
@@ -55,6 +56,12 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
                 proxyStore.ingestItems(projectId, event.items || []);
                 proxyStore.ingestQueue(projectId, event.queue, event.epoch);
                 handlers.onProxyStatus?.(event);
+            }
+            // Observed run outputs (server/run_outputs.py): ids only, no media.
+            // Fed to the shared hint bus; each host's client picks its own.
+            else if (event.type === "outputs_changed") {
+                publishOutputsChanged(projectId, event);
+                handlers.onOutputsChanged?.(event);
             }
             else if (event.type === "controls_changed") handlers.onControlsChanged?.(event);
             else if (event.type === "control_changes_pending") handlers.onControlChangesPending?.(event);

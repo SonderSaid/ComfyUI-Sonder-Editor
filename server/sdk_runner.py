@@ -957,7 +957,8 @@ class SdkRunner:
                 # The run exists before the submit: ComfyUI can finish (or fail) a
                 # prompt before the proxy's reply comes back, and run_finished must
                 # find it.
-                sdk_runs.register_token(token, session.aliases, session_id=session.session_id, run_id=run.run_id)
+                sdk_runs.register_token(token, session.aliases, session_id=session.session_id, run_id=run.run_id,
+                                        template_id=build["template_id"])
                 session.runs.append(run)
                 self._runs_by_token[token] = run
                 try:

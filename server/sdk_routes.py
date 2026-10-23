@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from . import control_descriptors, launcher_state, model_requirements, sdk_install, sdk_proxy, sdk_templates
+from . import control_descriptors, launcher_state, model_requirements, run_output_routes, sdk_install, sdk_proxy, sdk_templates
 from .request_locality import is_loopback_request, local_only_response
 from .sdk_install import install_state
 from .sdk_runner import SdkError, await_template_io, get_runner
@@ -426,6 +426,40 @@ def register_sdk_routes(
             expected_template_id=body.get("template_id"),
         )
         return web.json_response(result, status=202 if result.get("run_ids") else 502)
+
+    # ── Observed run outputs (shared builders in run_output_routes) ──────────
+
+    async def output_owners(request: web.Request) -> tuple[list, tuple]:
+        """The session's runs as owners, resolved now: absorbed runs follow their session."""
+        session = await runner.authorized(request.match_info.get("session_id", ""), _secret(request), _tab(request))
+        holder = ("sdk_session", session.session_id)
+        return [("sdk", run.run_id) for run in session.runs] + [holder], holder
+
+    @routes.get("/sonder-editor/sdk/session/{session_id}/runs/outputs")
+    @handle
+    async def api_sdk_run_outputs(request: web.Request) -> web.Response:
+        owners, _holder = await output_owners(request)
+        query = request.rel_url.query
+        return await run_output_routes.outputs_response(owners, query.get("workflow_id", ""), query.get("sources", ""))
+
+    @routes.post("/sonder-editor/sdk/session/{session_id}/runs/hold")
+    @handle
+    async def api_sdk_run_hold(request: web.Request) -> web.Response:
+        owners, holder = await output_owners(request)
+        return await run_output_routes.hold_response(owners, holder, await _json_body(request))
+
+    @routes.post("/sonder-editor/sdk/session/{session_id}/runs/release")
+    @handle
+    async def api_sdk_run_release(request: web.Request) -> web.Response:
+        owners, _holder = await output_owners(request)
+        return run_output_routes.release_response(owners, await _json_body(request))
+
+    @routes.get("/sonder-editor/sdk/session/{session_id}/runs/{prompt_id}")
+    @handle
+    async def api_sdk_run(request: web.Request) -> web.Response:
+        owners, _holder = await output_owners(request)
+        return await run_output_routes.run_response(owners, request.match_info.get("prompt_id", ""),
+                                                    request.rel_url.query.get("workflow_id", ""))
 
     @routes.post("/sonder-editor/sdk/session/{session_id}/cancel")
     @handle

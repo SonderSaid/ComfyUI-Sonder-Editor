@@ -998,6 +998,22 @@ async def _post_control_changes_once(project_id: str, host_id: str, session_id: 
     return result
 
 
+async def run_owner_gate(project_id: str, host_id: str, session_id: str, *, canvas_only: bool = False) -> tuple[str, tuple]:
+    """``(code, owner)`` for run observation: the canvas host's session, or its
+    active owner tab unless ``canvas_only``. ``code`` is "" when admitted.
+
+    The same gate as the Controls relay, and like it isolation rather than a
+    credential: these session ids are presence data other pages can see.
+    """
+    key, events = _host_key(project_id, host_id), []
+    async with _lock:
+        code = _controls_gate_locked(key, session_id, "canvas", events)
+        if code == "not_canvas_host" and not canvas_only:
+            code = _controls_gate_locked(key, session_id, "tab", events)
+    _schedule_events(events)
+    return code, ("host", key[0], key[1])
+
+
 async def get_control_changes(project_id: str, host_id: str, session_id: str) -> dict:
     key, events = _host_key(project_id, host_id), []
     async with _lock:
