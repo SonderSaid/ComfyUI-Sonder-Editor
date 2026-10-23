@@ -45,7 +45,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import control_descriptors, controls_snapshot, launcher_state, prompt_graph, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry
+from . import control_descriptors, controls_snapshot, launcher_state, prompt_graph, run_control, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry
+from .control_manifest import RELAY_CLASS_TYPE
 from .editor_inputs import clean_editor_value, clean_editor_values, editor_optional_inputs
 from .sdk_install import install_state, uninstall_running
 
@@ -97,7 +98,10 @@ SEED_MAX = 2 ** 64 - 1
 SUBMITTING, UNCONFIRMED = "submitting", "unconfirmed"
 QUEUED, RUNNING, FINISHING = "queued", "running", "finishing"
 LANDED, FAILED, CANCELED, ENDED = "landed", "failed", "canceled", "ended"
-FINAL_STATES = frozenset({LANDED, FAILED, CANCELED, ENDED})
+# A branch run that succeeded without a save committing a take: its output is ready.
+COMPLETED = "completed"
+FINAL_STATES = frozenset({LANDED, FAILED, CANCELED, ENDED, COMPLETED})
+PURPOSE_RUN, PURPOSE_BRANCH = "run", "branch"
 
 
 class SdkError(Exception):
@@ -143,6 +147,11 @@ class SdkRun:
     # while earlier runs are still generating.
     template_id: str = ""
     template_name: str = ""
+    # "branch": one output node and what it needs (run_branch), else a Generate.
+    purpose: str = PURPOSE_RUN
+    # A branch's own prompt id, sent with its submit: cancel can reach it before
+    # ComfyUI's reply makes it ``prompt_id``.
+    pending_prompt_id: str = ""
 
     @property
     def final(self) -> bool:
@@ -164,6 +173,7 @@ class SdkRun:
             "note": self.note,
             "template_id": self.template_id,
             "template_name": self.template_name,
+            "purpose": self.purpose,
         }
 
 
@@ -239,6 +249,40 @@ def _make_client(url: str, token: str):
             await self._http.aclose()
 
     return SonderComfyClient()
+
+
+class BranchNotSent(Exception):
+    """A branch submit that certainly never reached ComfyUI (no address, no connection)."""
+
+    def __init__(self, message: str, code: str):
+        super().__init__(message)
+        self.code = code
+
+
+async def post_prompt_locally(body: dict) -> tuple[int, dict]:
+    """POST ``/prompt`` to this ComfyUI at the address a proxy would use. ``(status, payload)``.
+
+    For branch runs only: ComfyUI's ``/prompt`` takes ``partial_execution_targets``
+    and a client-chosen ``prompt_id``, which the proxy cannot pass on. Raises
+    ``BranchNotSent`` when nothing was sent (TLS, connection refused); any other
+    failure after connecting leaves the outcome unknown.
+    """
+    import aiohttp
+    try:
+        url = sdk_proxy.own_upstream_url() + "/prompt"
+    except sdk_proxy.ProxyUnavailable as exc:
+        raise BranchNotSent(str(exc), exc.code) from exc
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), trust_env=False) as http:
+        try:
+            response = await http.post(url, json=body)
+        except aiohttp.ClientConnectorError as exc:
+            raise BranchNotSent("Sonder could not reach this ComfyUI to run the output.", "upstream_unreachable") from exc
+        async with response as resp:
+            try:
+                payload = await resp.json(content_type=None)
+            except Exception:
+                payload = {}
+            return resp.status, payload if isinstance(payload, dict) else {}
 
 
 def _default_queue():
@@ -322,7 +366,9 @@ class SdkRunner:
         # Which node classes are installed, for the missing-node refusals of Open,
         # switch and Generate; ComfyUI's registry by default.
         node_lookup: Callable[[str], Any] | None = None,
+        branch_submit: Callable[[dict], Any] = post_prompt_locally,
     ) -> None:
+        self._branch_submit = branch_submit
         self._resolve_project = resolve_project
         self._client_factory = client_factory
         self._ensure_proxy = ensure_proxy
@@ -930,6 +976,173 @@ class SdkRunner:
                 # for the provenance each saved take records (controls_snapshot).
                 "controls_delta": controls_snapshot.sdk_overlay_delta(view, prompt)}
 
+    # ── Branch runs ──────────────────────────────────────────────────────────
+
+    async def run_branch(
+        self,
+        session: SdkSession,
+        *,
+        tab_session_id: str,
+        target: Any,
+        editor_values: Any = None,
+        editor_values_seq: Any = None,
+        render_cache_max_bytes: Any = 0,
+        expected_template_id: Any = None,
+    ) -> dict:
+        """Run one output node of the session's workflow and what it needs.
+
+        Built exactly as Generate builds (template lock, ownership, epoch, the
+        unfinished cap, the session's position and Controls), seeds advanced per
+        run as native partial queueing does. The proxy cannot carry partial
+        targets, so this posts to this ComfyUI's own ``/prompt`` with its own
+        prompt id and client id (``executed`` needs one); Generate keeps the proxy.
+        """
+        epoch = session.cancel_epoch
+        template_id = session.template_id
+        self._remember_loop()
+        target = str(target or "").strip() if isinstance(target, (str, int)) and not isinstance(target, bool) else ""
+        if not target:
+            raise SdkError("Choose an output to run.", "invalid_target")
+        capability = await asyncio.to_thread(run_control.branch_capability)
+        if not capability["ok"]:
+            raise SdkError("This ComfyUI can't run one output on its own.", "unsupported", 409,
+                           reason=capability["reason"])
+        self._check_not_uninstalling()
+        self._generating += 1
+        session.generating += 1
+        try:
+            return await self._run_branch(session, template_id, expected_template_id, target, editor_values,
+                                          render_cache_max_bytes, tab_session_id, editor_values_seq, epoch)
+        finally:
+            session.generating -= 1
+            self._generating -= 1
+
+    def _class_of(self, class_type: str) -> Any:
+        lookup = self._class_lookup or control_descriptors.comfy_class_lookup
+        try:
+            return lookup(class_type)
+        except (ImportError, AttributeError):
+            return None
+
+    async def _run_branch(self, session: SdkSession, template_id: str, expected_template_id: Any, target: str,
+                          editor_values: Any, render_cache_max_bytes: Any, tab_session_id: str, editor_values_seq: Any,
+                          epoch: int) -> dict:
+        self._check_workflow(session, template_id, expected_template_id)
+        valid, render_cache_max_bytes = clean_editor_value("render_cache_max_bytes", render_cache_max_bytes)
+        if not valid:
+            render_cache_max_bytes = 0
+        writer = sdk_templates.clean_editor_writer({"tab": tab_session_id, "seq": editor_values_seq}) if editor_values is not None else None
+        async with self.template_lock(template_id):
+            await self.authorized(session.session_id, session.secret, tab_session_id)
+            self._check_workflow(session, template_id)
+            if len(session.unfinished()) + 1 > MAX_UNFINISHED_PER_SESSION:
+                raise SdkError("Too many takes are already waiting. Wait or cancel some.", "too_many_runs", 429)
+            build = await asyncio.to_thread(self._build_base, session, editor_values, render_cache_max_bytes, writer,
+                                           template_id)
+            self._check_submit_epoch(session, epoch, build)
+            prompt = build["prompt"]
+            node = prompt.get(target)
+            # Exactly an output node in what would run now: a switched-off node is
+            # not in the compiled prompt, and the Relay is never a branch.
+            node_class = await asyncio.to_thread(self._class_of, str(node.get("class_type") or "")) if isinstance(node, dict) else None
+            if (not isinstance(node, dict) or node.get("class_type") == RELAY_CLASS_TYPE
+                    or getattr(node_class, "OUTPUT_NODE", False) is not True):
+                raise SdkError("Only an output node that is switched on can run on its own.", "branch_not_output", 409,
+                               stale=build["stale"])
+            # ComfyUI refuses a missing node class anywhere in the prompt, before it
+            # narrows to the branch: name them as Generate does.
+            missing_nodes = sdk_templates.missing_node_classes(prompt, self._node_lookup)
+            if missing_nodes:
+                raise SdkError(sdk_templates.missing_nodes_message(missing_nodes), "missing_nodes", 409,
+                               missing_nodes=missing_nodes, stale=build["stale"])
+            # Controls problems (an unreadable Relay) refuse as for Generate; model
+            # files count only inside the branch, which is all that loads them.
+            refusals = sdk_templates.generate_refusals(build["view"])
+            closure = {key: prompt[key] for key in prompt_graph.upstream_set(prompt, [target])}
+            from .model_requirements import missing_models, missing_model_message
+            missing = await asyncio.to_thread(missing_models, closure, self._class_lookup, executable_only=True)
+            refusals.extend(map(missing_model_message, missing))
+            if refusals:
+                raise SdkError("This output can't run yet.", "generate_refused", 409,
+                               problems=refusals, stale=build["stale"])
+            self._check_submit_epoch(session, epoch, build)
+            return {**await self._submit_branch(session, build, target, epoch), "stale": build["stale"]}
+
+    async def _submit_branch(self, session: SdkSession, build: dict, target: str, epoch: int) -> dict:
+        seed_bindings = build["seed_bindings"]
+        seeds = {b["binding_id"]: b["seed"] for b in seed_bindings}
+        graph = await asyncio.to_thread(self._graph_for_run, build, seeds)
+        self._check_submit_epoch(session, epoch, build)
+        labels = {str(key): control_descriptors._node_title(node, str(node.get("class_type") or ""))
+                  for key, node in build["prompt"].items()}
+        token, prompt_id = secrets.token_urlsafe(24), str(uuid.uuid4())
+        run = SdkRun(
+            run_id=f"run-{uuid.uuid4().hex[:12]}", token=token, session_id=session.session_id, index=1, count=1,
+            seeds=seeds, submitted_at=self._clock(), node_labels=labels, template_id=build["template_id"],
+            template_name=build["template_name"], purpose=PURPOSE_BRANCH, pending_prompt_id=prompt_id,
+        )
+        graph[build["editor_key"]].setdefault("_meta", {})["sonder_run"] = token
+        # Registered before the submit, as Generate's: the run can finish (or fail)
+        # before ComfyUI's reply, and run_finished must find it.
+        sdk_runs.register_token(token, session.aliases, session_id=session.session_id, run_id=run.run_id,
+                                template_id=build["template_id"], purpose=PURPOSE_BRANCH)
+        session.runs.append(run)
+        self._runs_by_token[token] = run
+        seeds_used = [{cid: str(value) for cid, value in seeds.items()}]
+        body = {"prompt": graph, "prompt_id": prompt_id, "client_id": str(uuid.uuid4()),
+                "partial_execution_targets": [target]}
+        try:
+            try:
+                status, payload = await self._branch_submit(body)
+            except asyncio.CancelledError:
+                self._mark_unconfirmed(run)
+                raise
+            except BranchNotSent as exc:
+                # Nothing reached ComfyUI: no run, no seed advance, as a refusal.
+                sdk_runs.forget_token(token)
+                session.runs.remove(run)
+                self._runs_by_token.pop(token, None)
+                raise SdkError(str(exc), exc.code, 503) from exc
+            except Exception as exc:
+                status, payload = 0, {}
+                logger.warning("Branch submit outcome unknown: %s", exc)
+            if 200 <= status < 300 and payload.get("prompt_id"):
+                accepted = str(payload["prompt_id"])
+                if accepted != prompt_id:
+                    run_control.disable_branch_runs("ComfyUI replaced a preassigned prompt id")
+                run.prompt_id = accepted
+                run.accepted_at = self._clock()
+                if not run.final:
+                    sdk_progress.watch(run.prompt_id, run.token)
+                    if run.state != RUNNING:
+                        run.state = QUEUED
+                await self._advance_seeds(build["template_id"], seed_bindings)
+                if run.cancel_requested or session.cancel_epoch != epoch:
+                    await self._cancel_run(run)
+                return {"ok": True, "run_ids": [run.run_id], "seeds_used": seeds_used, "error": None,
+                        "prompt_id": run.prompt_id}
+            if 400 <= status < 500:
+                # Refused by validation: it never reached the queue.
+                sdk_runs.forget_token(token)
+                session.runs.remove(run)
+                self._runs_by_token.pop(token, None)
+                error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+                code = "prompt_no_outputs" if error.get("type") == "prompt_no_outputs" else "branch_refused"
+                node_errors = payload.get("node_errors") if isinstance(payload.get("node_errors"), dict) else {}
+                raise SdkError(str(error.get("message") or "ComfyUI refused this output."), code, 409,
+                               detail=str(error.get("details") or "")[:2000], node_errors=node_errors)
+            # A 5xx, a timeout or a dropped connection may follow an enqueue:
+            # presence adopts the prompt by its token, or fails it after a grace.
+            self._mark_unconfirmed(run)
+            await self._advance_seeds(build["template_id"], seed_bindings)
+            return {"ok": True, "run_ids": [run.run_id], "seeds_used": seeds_used,
+                    "error": SdkError("ComfyUI did not confirm this run. It will show here if it started.",
+                                      "submit_unconfirmed", 502).payload()}
+        finally:
+            self._trim_finished(session)
+            self._ensure_presence_loop()
+            self._emit(session, force=True)
+
     async def _submit_runs(self, session: SdkSession, client, build: dict, count: int, epoch: int) -> dict:
         labels = {str(key): control_descriptors._node_title(node, str(node.get("class_type") or ""))
                   for key, node in build["prompt"].items()}
@@ -1091,6 +1304,16 @@ class SdkRunner:
         return await self.cancel(session)
 
     async def _cancel_run(self, run: SdkRun) -> None:
+        if run.purpose == PURPOSE_BRANCH:
+            # Branches went to ComfyUI directly, with their own prompt id: cancel it
+            # there, even before ComfyUI's reply (the put hook deletes it on arrival).
+            prompt_id = run.prompt_id or run.pending_prompt_id
+            if not run.final and prompt_id:
+                try:
+                    await asyncio.to_thread(run_control.cancel_prompt, prompt_id)
+                except Exception as exc:  # the run still ends through run_finished or presence
+                    logger.info("Branch cancel of %s failed: %s", prompt_id, exc)
+            return
         if run.final or not run.prompt_id:
             return  # a submitting or unconfirmed run is canceled when presence adopts it
         try:
@@ -1130,6 +1353,10 @@ class SdkRunner:
             # It ran, but its job went back to pending: no take for that job.
             state = ENDED
             run.note = str(payload.get("note") or "The run finished without completing its job.")
+        elif outcome == "success" and run.purpose == PURPOSE_BRANCH and not payload.get("take_saved"):
+            # A branch that ran no save: its output is ready, but no take landed.
+            state = COMPLETED
+            run.note = "Output ready."
         elif outcome == "success":
             state = LANDED
             run.note = ""
@@ -1214,7 +1441,7 @@ class SdkRunner:
                 run.state, run.position, run.absent_since = FINISHING, None, 0.0
                 run.closed_since = run.closed_since or now
                 if now - run.closed_since > CLOSED_WITHOUT_FINISH_SEC:
-                    run.note = "The run ended, but Sonder could not confirm its take."
+                    run.note = self._unconfirmed_end_note(run)
                     self._finish(run, ENDED)
             elif where == "history":
                 # Ran, but no release record was seen (the queue hook missed it):
@@ -1222,7 +1449,7 @@ class SdkRunner:
                 run.state, run.position = FINISHING, None
                 run.history_unconfirmed_since = run.history_unconfirmed_since or now
                 if now - run.history_unconfirmed_since > UNCONFIRMED_GRACE_SEC:
-                    run.note = "The run ended, but Sonder could not confirm its take."
+                    run.note = self._unconfirmed_end_note(run)
                     self._finish(run, ENDED)
             else:
                 run.absent_since = run.absent_since or now
@@ -1235,6 +1462,13 @@ class SdkRunner:
         for session in self._sessions.values():
             if session.session_id in changed:
                 self._emit(session)
+
+    @staticmethod
+    def _unconfirmed_end_note(run: SdkRun) -> str:
+        # A branch never promised a take: say only that its outcome is unknown.
+        if run.purpose == PURPOSE_BRANCH:
+            return "The run ended, but Sonder could not confirm how."
+        return "The run ended, but Sonder could not confirm its take."
 
     # ── In-process node progress ────────────────────────────────────────────
 

@@ -52,9 +52,12 @@ function hostIdentity(controller) {
     return { projectId, hostId, sessionId };
 }
 
+
 // Pure: the stamped request data and the registrations it needs. A prompt with no
-// Editor, or none this page hosts, comes back unchanged.
-export function stampReceipts(data, rootGraph, { partial = false, mint = mintReceipt } = {}) {
+// Editor, or none this page hosts, comes back unchanged. `receiptFor(identity)`
+// may supply a receipt already registered server-side (a mounted run request);
+// that group is stamped with it and needs no registration from here.
+export function stampReceipts(data, rootGraph, { partial = false, mint = mintReceipt, receiptFor = () => "" } = {}) {
     const output = data?.output;
     if (!output || typeof output !== "object") return { data, registrations: [] };
     const groups = new Map();
@@ -63,7 +66,10 @@ export function stampReceipts(data, rootGraph, { partial = false, mint = mintRec
         const identity = hostIdentity(nodeForPromptKey(rootGraph, key)?._sonderController);
         if (!identity) continue;
         const groupKey = `${identity.projectId}\u0000${identity.hostId}`;
-        if (!groups.has(groupKey)) groups.set(groupKey, { ...identity, editors: [], receipt: mint() });
+        if (!groups.has(groupKey)) {
+            const given = receiptFor(identity) || "";
+            groups.set(groupKey, { ...identity, editors: [], receipt: given || mint(), preregistered: !!given });
+        }
         groups.get(groupKey).editors.push(key);
     }
     if (!groups.size) return { data, registrations: [] };
@@ -73,6 +79,7 @@ export function stampReceipts(data, rootGraph, { partial = false, mint = mintRec
         for (const key of group.editors) {
             stamped[key] = { ...stamped[key], _meta: { ...(stamped[key]._meta || {}), sonder_receipt: group.receipt } };
         }
+        if (group.preregistered) continue;
         registrations.push({
             receipt: group.receipt,
             project_id: group.projectId,
@@ -85,8 +92,103 @@ export function stampReceipts(data, rootGraph, { partial = false, mint = mintRec
     return { data: { ...data, output: stamped }, registrations };
 }
 
-export function installRunRegistration({ api, app, fetchImpl = globalThis.fetch?.bind(globalThis), warn = console.warn } = {}) {
+// ── Branch runs ─────────────────────────────────────────────────────────────
+//
+// `runBranch(target)` runs one output node and what it needs, through ComfyUI's
+// own Queue selected output nodes path (`app.queuePrompt` with that node), so
+// widget callbacks, native seed control and the job store behave as a native
+// partial run. `app.queuePrompt` never says which prompt it queued, so one
+// pending *intent* is matched in the `api.queuePrompt` wrapper by its targets and
+// resolved from ComfyUI's reply. While another queue is processing, the request
+// waits its turn; past BRANCH_WAIT_MS it answers `unconfirmed`, and a later submit
+// is still observed (it registers normally) but answers no caller.
+
+const RELAY_CLASS = "SonderControlRelay";
+const CAPABILITY_PATH = "/sonder-editor/runs/capability";
+export const BRANCH_WAIT_MS = 30000;
+
+let installed = null;
+let pendingIntent = null;
+let capability = null;
+
+function sameTargets(targets, intent) {
+    return Array.isArray(targets) && targets.length === 1 && String(targets[0]) === intent.target;
+}
+
+function refusalOf(error) {
+    const response = error?.response || {};
+    return {
+        state: "refused",
+        code: String(response.error?.type || error?.code || "rejected"),
+        ...(response.node_errors && typeof response.node_errors === "object" ? { node_errors: response.node_errors } : {}),
+    };
+}
+
+async function branchCapability() {
+    if (capability?.ok) return capability;
+    try {
+        const resp = await installed.fetchImpl(installed.api.apiURL(CAPABILITY_PATH));
+        const payload = await resp.json();
+        capability = payload?.branch && typeof payload.branch === "object" ? payload.branch : { ok: false, reason: "unknown" };
+    } catch (_error) {
+        return { ok: false, reason: "unreachable" };
+    }
+    return capability;
+}
+
+function defaultIsOutputNode(classType) {
+    const type = globalThis.LiteGraph?.registered_node_types?.[classType];
+    return !!(type?.nodeData?.output_node ?? type?.prototype?.constructor?.nodeData?.output_node);
+}
+
+// Resolves to {state: "queued", prompt_id} | {state: "refused", code, node_errors?} |
+// {state: "unconfirmed"} | {state: "busy"} | {state: "unsupported", code}.
+export async function runBranch(target, { receipt = "", hostId = "" } = {}) {
+    if (!installed) return { state: "unsupported", code: "not_installed" };
+    const allowed = await branchCapability();
+    if (!allowed.ok) return { state: "unsupported", code: allowed.reason || "unsupported" };
+    if (pendingIntent) return { state: "busy" };
+    target = String(target ?? "");
+    const { app, isOutputNode } = installed;
+    // Eligibility against what would be queued now: a muted, bypassed or
+    // switched-off node is not in the serialized prompt.
+    let output;
+    try {
+        ({ output } = await app.graphToPrompt());
+    } catch (_error) {
+        return { state: "refused", code: "prompt_build_failed" };
+    }
+    const node = output?.[target];
+    if (!node) return { state: "refused", code: "branch_not_in_prompt" };
+    if (node.class_type === RELAY_CLASS || !isOutputNode(node.class_type)) return { state: "refused", code: "branch_not_output" };
+    if (pendingIntent) return { state: "busy" };
+    return new Promise((resolve) => {
+        const intent = {
+            target, receipt: String(receipt || ""), hostId: String(hostId || ""), seen: false, settled: false, timer: null,
+            settle(value) {
+                if (intent.settled) return;
+                intent.settled = true;
+                clearTimeout(intent.timer);
+                if (pendingIntent === intent) pendingIntent = null;
+                resolve(value);
+            },
+        };
+        pendingIntent = intent;
+        Promise.resolve()
+            .then(() => app.queuePrompt(0, 1, [target]))
+            .then(() => {
+                // Deferred behind another queue (false), or done without our
+                // wrapper ever seeing it (another wrapper failed): wait, then stop.
+                if (!intent.settled) intent.timer = setTimeout(() => intent.settle({ state: "unconfirmed" }), BRANCH_WAIT_MS);
+            }, () => intent.settle({ state: "refused", code: "queue_failed" }));
+    });
+}
+
+export function installRunRegistration({
+    api, app, fetchImpl = globalThis.fetch?.bind(globalThis), warn = console.warn, isOutputNode = defaultIsOutputNode,
+} = {}) {
     if (!api || typeof api.queuePrompt !== "function" || api.__sonderRunRegistration) return false;
+    installed = { api, app, fetchImpl, isOutputNode };
     const original = api.queuePrompt;
     const register = (body) => {
         const controller = typeof AbortController === "function" ? new AbortController() : null;
@@ -104,9 +206,14 @@ export function installRunRegistration({ api, app, fetchImpl = globalThis.fetch?
     };
     api.queuePrompt = function sonderQueuePrompt(number, data, options, ...rest) {
         let request = data, registrations = [];
+        const targets = options?.partialExecutionTargets;
+        const intent = pendingIntent && !pendingIntent.seen && !pendingIntent.settled && sameTargets(targets, pendingIntent)
+            ? pendingIntent : null;
+        if (intent) intent.seen = true;
         try {
-            const partial = Array.isArray(options?.partialExecutionTargets) && options.partialExecutionTargets.length > 0;
-            ({ data: request, registrations } = stampReceipts(data, app?.graph || app?.rootGraph, { partial }));
+            const partial = Array.isArray(targets) && targets.length > 0;
+            const receiptFor = (identity) => (intent?.receipt && identity.hostId === intent.hostId ? intent.receipt : "");
+            ({ data: request, registrations } = stampReceipts(data, app?.graph || app?.rootGraph, { partial, receiptFor }));
         } catch (_error) {
             request = data;
             registrations = [];
@@ -116,13 +223,18 @@ export function installRunRegistration({ api, app, fetchImpl = globalThis.fetch?
         // Register only what ComfyUI accepted: a refused prompt never reaches the
         // queue, and its receipt would only hold an unbound slot. The server
         // pairs a registration that arrives after the run started (or finished).
-        if (registrations.length) {
-            Promise.resolve(result).then((response) => {
-                if (response?.prompt_id) for (const body of registrations) void register(body);
-            }, () => {});
-        }
+        Promise.resolve(result).then((response) => {
+            if (response?.prompt_id) for (const body of registrations) void register(body);
+            intent?.settle(response?.prompt_id ? { state: "queued", prompt_id: String(response.prompt_id) }
+                : { state: "refused", code: "no_prompt_id" });
+        }, (error) => intent?.settle(refusalOf(error)));
         return result;
     };
     api.__sonderRunRegistration = true;
     return true;
+}
+
+export function resetBranchRunsForTests() {
+    pendingIntent = null;
+    capability = null;
 }

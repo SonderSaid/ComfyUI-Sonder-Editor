@@ -4572,6 +4572,12 @@ export class EditorWidget {
         this._referenceMediaEditorHandle = handle;
     }
 
+    // Commit the Controls panel's in-progress edits (a focused field, a row
+    // list, a note) before a run, as Generate does. False when one was refused.
+    flushControlsPanel() {
+        return this._controlsPanelHandle?.flushPending() ?? true;
+    }
+
     // The Sonder App switched workflows: the panel and its rows, drafts and
     // last-applied preset belong to the old workflow, so it remounts on the new
     // host, keeping the sidebar's current tab.

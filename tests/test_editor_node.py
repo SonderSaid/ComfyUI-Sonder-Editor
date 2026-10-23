@@ -428,7 +428,7 @@ def test_queue_job_frame_constraint_overrides_project(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_execution_reaches_terminal_save",
-        lambda self, prompt, node_id: True,
+        lambda self, prompt, node_id, scope=None: True,
     )
     _patch_render_and_audio(editor_node, monkeypatch)
 
@@ -758,7 +758,7 @@ def test_execute_snaps_stored_off_grid_mask_offsets_from_queue_job(tmp_path, mon
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_execution_reaches_terminal_save",
-        lambda self, prompt, node_id: True,
+        lambda self, prompt, node_id, scope=None: True,
     )
     _patch_render_and_audio(editor_node, monkeypatch)
 
@@ -4171,7 +4171,7 @@ def test_queue_job_failure_never_writes_a_server_path_into_the_project(tmp_path,
     monkeypatch.setattr(editor_node, "_resolve_project_choice_dir",
                         lambda _base, _choice: created.project_dir)
     monkeypatch.setattr(editor_node.SonderEditor, "_execution_reaches_terminal_save",
-                        lambda self, prompt, unique_id: True)
+                        lambda self, prompt, unique_id, scope=None: True)
     monkeypatch.setattr(editor_node.SonderEditor, "_consume_queue_job",
                         lambda self, proj: (proj, proj.generation_queue[0]))
 
@@ -4557,7 +4557,7 @@ def test_execute_binds_the_run_before_claiming_and_leases_under_its_key(tmp_path
     monkeypatch.setattr(editor_node, "load_project", lambda _dir: loaded)
     monkeypatch.setattr(editor_node, "_resolve_project_choice_dir", lambda _base, _choice: created.project_dir)
     monkeypatch.setattr(editor_node.SonderEditor, "_execution_reaches_terminal_save",
-                        lambda self, prompt, unique_id: True)
+                        lambda self, prompt, unique_id, scope=None: True)
     monkeypatch.setattr(editor_node.SonderEditor, "_bind_run",
                         lambda self, proj, prompt, unique_id: (order.append("bind"), ("run-7", ""))[1])
 
@@ -4664,3 +4664,53 @@ def test_an_sdk_run_that_never_reached_its_editor_is_still_announced(tmp_path, m
         status_str="error", messages=[("execution_error", {"node_type": "UNETLoader"})]))
     assert sorted(alias for alias, _ in events) == ["Folder", "proj-id"]
     assert all(event["outcome"] == "error" and event["leased_job_ids"] == [] for _, event in events)
+
+
+@pytest.mark.parametrize("roots, expected", [(["3"], "peek"), (["2", "3"], "consume"), (None, "consume")])
+def test_execute_consumes_only_when_a_marked_save_runs(tmp_path, monkeypatch, roots, expected):
+    """The real execute reads the scope ComfyUI queued (outputs_to_execute) through
+    its open release record: a branch on the preview peeks, the full run consumes,
+    and unknown scope keeps the whole-prompt behaviour."""
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    from server.project_manager import create_project, load_project
+    from server.timeline_state import GenerationJob, Scene
+
+    base = tmp_path / "projects"
+    base.mkdir()
+    created = create_project("Scoped", 24.0, 64, 64, "free", str(base))
+    project = load_project(created.project_dir)
+    project.add_scene(Scene(scene_id="scene-1", name="Scene", duration_frames=8))
+    project.generation_queue = [GenerationJob(job_id="job-1", scene_id="scene-1", status="pending",
+                                              selection_start=0, selection_end=4)]
+    from server.project_manager import save_project as real_save
+    real_save(project, notify=False)
+    loaded = load_project(created.project_dir)
+    monkeypatch.setattr(editor_node, "load_project", lambda _dir: loaded)
+    monkeypatch.setattr(editor_node, "_resolve_project_choice_dir", lambda _base, _choice: created.project_dir)
+    monkeypatch.setattr(editor_node.SonderEditor, "_bind_run", lambda self, proj, prompt, unique_id: ("k", ""))
+    seen = []
+    monkeypatch.setattr(editor_node.SonderEditor, "_consume_queue_job",
+                        lambda self, proj: (seen.append("consume"), (proj, None))[1])
+    monkeypatch.setattr(editor_node.SonderEditor, "_peek_queue_job",
+                        staticmethod(lambda proj: seen.append("peek")))
+
+    def stop(*_args, **_kwargs):
+        raise RuntimeError("stop after the queue decision")
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_render_scene_frames", stop)
+    prompt = {
+        "1": {"class_type": "SonderEditor", "inputs": {}},
+        "2": {"class_type": "SonderSaveVideo", "inputs": {"project": ["1", 0], "frames": ["1", 1], "mark_queue_complete": True}},
+        "3": {"class_type": "PreviewImage", "inputs": {"images": ["1", 1]}},
+    }
+    runs, scope = editor_node.sdk_runs, editor_node.run_scope
+    runs.reset_for_tests()
+    scope.reset_for_tests({"SonderEditor": False, "SonderSaveVideo": False, "PreviewImage": False})
+    runs.open_release("k", "p1", prompt, roots)
+    with pytest.raises(Exception):
+        editor_node.SonderEditor().execute(project="Scoped", project_name="Scoped", fps=24.0, width=64, height=64,
+                                           scene_id="scene-1", selection_start=0, selection_end=4,
+                                           render_queue_active=True, prompt=prompt, unique_id="1")
+    runs.reset_for_tests()
+    scope.reset_for_tests()
+    assert seen[:1] == [expected]

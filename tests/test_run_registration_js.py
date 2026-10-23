@@ -107,13 +107,13 @@ const seen = [];
 canvas.onOutputsChanged(e => seen.push(["canvas", e.seq]));
 const stop = sdk.onOutputsChanged(e => seen.push(["sdk", e.seq]));
 const hint = (seq, extra) => ({{ type: "outputs_changed", seq, host_ids: [], run_ids: [], ...extra }});
-mod.publishOutputsChanged("P", hint(1, {{ host_ids: ["h1"] }}));
-mod.publishOutputsChanged("Q", hint(2, {{ host_ids: ["h1"] }}));
+mod.publishRunEvent("P", hint(1, {{ host_ids: ["h1"] }}));
+mod.publishRunEvent("Q", hint(2, {{ host_ids: ["h1"] }}));
 runIds = ["r1"];
-mod.publishOutputsChanged("P", hint(3, {{ run_ids: ["r2"] }}));
-mod.publishOutputsChanged("P", hint(4, {{ run_ids: ["r1"] }}));
+mod.publishRunEvent("P", hint(3, {{ run_ids: ["r2"] }}));
+mod.publishRunEvent("P", hint(4, {{ run_ids: ["r1"] }}));
 stop();
-mod.publishOutputsChanged("P", hint(5, {{ run_ids: ["r1"], host_ids: ["h2"] }}));
+mod.publishRunEvent("P", hint(5, {{ run_ids: ["r1"], host_ids: ["h2"] }}));
 await canvas.readOutputs(["a", "b"], {{ workflowId: "wf" }});
 await sdk.readRun("p 1");
 console.log("RESULT=" + JSON.stringify({{ seen, urls }}));
@@ -149,3 +149,138 @@ out.push({ refused, before, after: posts.length });
 """)
     # The caller still sees ComfyUI's refusal; only an accepted prompt registers.
     assert result == {"refused": "rejected", "before": 0, "after": 1}
+
+
+def _branch(body: str):
+    return _run("""
+const capPosts = [];
+const fetchImpl = (url, init) => {
+    if (String(url).includes("/runs/capability")) return Promise.resolve({ ok: true, json: async () => ({ branch: { ok: true, reason: "" } }) });
+    capPosts.push({ url, body: JSON.parse(init.body) });
+    return Promise.resolve({ ok: true });
+};
+const output = {
+    "1": { class_type: "SonderEditor", inputs: {} },
+    "4": { class_type: "PreviewImage", inputs: {} },
+    "8": { class_type: "KSampler", inputs: {} },
+    "9": { class_type: "SonderControlRelay", inputs: {} },
+};
+let reply = (data, options) => Promise.resolve({ prompt_id: "pid-" + options.partialExecutionTargets.join(",") });
+const api = { apiURL: (p) => p, queuePrompt: (n, data, options) => reply(data, options) };
+let deferred = null;
+const app = {
+    graph: root,
+    graphToPrompt: async () => ({ output, workflow: { id: "wf" } }),
+    // Native app.queuePrompt: with another queue processing it returns false at once
+    // and submits later; otherwise it submits and returns true.
+    queuePrompt: async (n, b, ids) => {
+        const submit = () => api.queuePrompt(n, { output: { ...output } }, { partialExecutionTargets: ids }).catch(() => {});
+        if (deferred) { deferred.push(submit); return false; }
+        await submit();
+        return true;
+    },
+};
+mod.resetBranchRunsForTests();
+mod.installRunRegistration({ api, app, fetchImpl, isOutputNode: (c) => c === "PreviewImage" || c === "SonderControlRelay" });
+""" + body)
+
+
+def test_run_branch_matches_its_queued_prompt_and_refusals():
+    (result,) = _branch("""
+const queued = await mod.runBranch("4", { hostId: "page:1" });
+const notOutput = await mod.runBranch("8");
+const relay = await mod.runBranch("9");
+const missing = await mod.runBranch("77");
+reply = () => Promise.reject(Object.assign(new Error("bad"), { response: { error: { type: "prompt_outputs_failed_validation" }, node_errors: { "4": { errors: [] } } } }));
+const refused = await mod.runBranch("4");
+await new Promise((r) => setTimeout(r, 10));
+out.push({ queued, notOutput, relay, missing, refused, posts: capPosts.map(p => [p.body.purpose, p.body.editors]) });
+""")
+    assert result["queued"] == {"state": "queued", "prompt_id": "pid-4"}
+    assert result["notOutput"] == {"state": "refused", "code": "branch_not_output"}
+    assert result["relay"] == {"state": "refused", "code": "branch_not_output"}
+    assert result["missing"] == {"state": "refused", "code": "branch_not_in_prompt"}
+    assert result["refused"] == {"state": "refused", "code": "prompt_outputs_failed_validation", "node_errors": {"4": {"errors": []}}}
+    # Only the accepted branch registered, as a branch.
+    assert result["posts"] == [["branch", ["1"]]]
+
+
+def test_run_branch_waits_behind_another_queue_then_gives_up_unconfirmed():
+    (result,) = _branch("""
+deferred = [];
+const first = mod.runBranch("4");
+await new Promise((r) => setTimeout(r, 20));
+const busy = await mod.runBranch("4");
+// The queue frees up: the deferred submit runs and answers the waiting caller.
+await deferred.shift()();
+const answered = await first;
+// Deferred again, never submitted within the wait: unconfirmed, and the slot frees.
+const realTimeout = globalThis.setTimeout;
+globalThis.setTimeout = (fn, ms) => realTimeout(fn, ms >= 30000 ? 5 : ms);
+const second = await mod.runBranch("4");
+globalThis.setTimeout = realTimeout;
+const late = deferred.shift();
+deferred = null;
+await late();
+await new Promise((r) => setTimeout(r, 10));
+const after = await mod.runBranch("4");
+out.push({ busy, answered, second, after, purposes: capPosts.map(p => p.body.purpose) });
+""")
+    assert result["busy"] == {"state": "busy"}
+    assert result["answered"] == {"state": "queued", "prompt_id": "pid-4"}
+    assert result["second"] == {"state": "unconfirmed"}
+    assert result["after"] == {"state": "queued", "prompt_id": "pid-4"}
+    # The late submit still registered (observed), answering no caller.
+    assert result["purposes"] == ["branch", "branch", "branch"]
+
+
+def test_a_mounted_request_runs_under_its_preregistered_receipt():
+    (result,) = _branch("""
+let stamped = null;
+reply = (data, options) => { stamped = data.output["1"]._meta.sonder_receipt; return Promise.resolve({ prompt_id: "p" }); };
+const outcome = await mod.runBranch("4", { receipt: "rrrrrrrr-0000-4000-8000-000000000001", hostId: "page:1" });
+await new Promise((r) => setTimeout(r, 10));
+out.push({ outcome, stamped, posts: capPosts.length });
+""")
+    assert result["outcome"] == {"state": "queued", "prompt_id": "p"}
+    assert result["stamped"] == "rrrrrrrr-0000-4000-8000-000000000001"
+    assert result["posts"] == 0  # registered server-side at claim
+
+
+def test_a_mounted_branch_request_flushes_first_and_reuses_one_id():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for browser module tests")
+    url = (ROOT / "web" / "js" / "run_outputs_client.js").as_uri()
+    script = f"""
+const mod = await import({json.dumps(url)});
+const order = [], bodies = [];
+let answers = [];
+const fetchImpl = async (u, init) => {{
+    const body = JSON.parse(init.body);
+    bodies.push(body);
+    order.push("post");
+    const answer = answers.shift() || {{ ok: true, state: "pending" }};
+    return {{ ok: !!answer.ok, status: answer.ok ? 200 : 409, json: async () => answer }};
+}};
+const make = (flush) => mod.createRunRequestClient({{
+    identity: () => ({{ projectId: "P", hostId: "h", sessionId: "tab" }}), apiURL: p => p, fetchImpl,
+    flush, pollMs: 1, waitMs: 2000, mint: () => "id-" + bodies.length,
+}});
+const unsaved = await make(async () => false).runBranch("4");
+answers = [{{ ok: true, state: "pending" }}, {{ ok: true, state: "claimed" }}, {{ ok: true, state: "queued", prompt_id: "p1", request_id: "x" }}];
+const queued = await make(async () => {{ order.push("flush"); return true; }}).runBranch("4");
+const ids = new Set(bodies.map(b => b.request_id));
+answers = [{{ ok: false, code: "not_owner" }}];
+const refused = await make(async () => true).runBranch("4");
+console.log("RESULT=" + JSON.stringify({{ unsaved, queued, ids: [...ids], order, refused, first: bodies[0] }}));
+"""
+    result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    out = json.loads(next(l for l in result.stdout.splitlines() if l.startswith("RESULT="))[len("RESULT="):])
+    assert out["unsaved"] == {"state": "refused", "code": "controls_unsaved"}
+    assert out["queued"] == {"state": "queued", "prompt_id": "p1"}
+    assert out["order"][:4] == ["flush", "post", "post", "post"]
+    assert out["ids"] == ["id-0"]  # the queued request posted three times under one id
+    assert out["first"] == {"host_id": "h", "session_id": "tab", "request_id": "id-0", "target": "4"}
+    assert out["refused"] == {"state": "refused", "code": "not_owner"}

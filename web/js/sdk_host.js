@@ -420,7 +420,23 @@ export class SdkWidgetHost {
         }
     }
 
-    async _generate(count, { renderCacheMaxBytes, signal, cancelEpoch, templateId }) {
+    // Run one output node and what it needs (Output Views); the same position,
+    // Controls flush and ordering as Generate. Resolves like generate().
+    async runBranch(target, { renderCacheMaxBytes = 0, signal = null, templateId: clicked = null } = {}) {
+        const cancelEpoch = this._cancelEpoch;
+        const templateId = clicked ?? this.templateId;
+        if (this._switching) {
+            return { ok: false, status: 409, payload: { code: "workflow_switching", error: "Wait for the workflow switch to finish." } };
+        }
+        this._setGenerating(1);
+        try {
+            return await this._generate(1, { renderCacheMaxBytes, signal, cancelEpoch, templateId, branchTarget: String(target ?? "") });
+        } finally {
+            this._setGenerating(-1);
+        }
+    }
+
+    async _generate(count, { renderCacheMaxBytes, signal, cancelEpoch, templateId, branchTarget = null }) {
         if (this.flushControlsPanel && !await this.flushControlsPanel()) {
             return { ok: false, status: 409, payload: { code: "controls_not_saved", error: "A control edit was not saved." } };
         }
@@ -441,11 +457,11 @@ export class SdkWidgetHost {
         const dirty = this._takeDirty();
         let result;
         try {
-            result = await readResponse(await this._fetch(this._sessionPath("generate"), {
+            result = await readResponse(await this._fetch(this._sessionPath(branchTarget === null ? "generate" : "branch"), {
                 method: "POST",
                 headers: this.headers(),
                 body: JSON.stringify({
-                    count: n,
+                    ...(branchTarget === null ? { count: n } : { target: branchTarget }),
                     editor_values: { ...this.values },
                     editor_values_seq: ++this._seq,
                     template_id: templateId,
@@ -458,6 +474,9 @@ export class SdkWidgetHost {
         }
         const saved = result.ok
             || result.payload.code === "generate_refused"
+            || result.payload.code === "branch_not_output"
+            || result.payload.code === "branch_refused"
+            || result.payload.code === "prompt_no_outputs"
             || result.payload.code === "canceled_before_submit"
             || Array.isArray(result.payload.run_ids);
         // Retried shortly unless another tab owns the session, it has ended, or

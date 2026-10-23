@@ -3,6 +3,7 @@ import copy
 import hmac
 import logging
 import os
+import re
 import time
 import uuid
 from collections import defaultdict, deque
@@ -1012,6 +1013,133 @@ async def run_owner_gate(project_id: str, host_id: str, session_id: str, *, canv
             code = _controls_gate_locked(key, session_id, "tab", events)
     _schedule_events(events)
     return code, ("host", key[0], key[1])
+
+
+# ── Run requests (mounted tab → its canvas host) ───────────────────────────
+#
+# The mounted tab cannot queue: only the canvas page holds the graph. It posts a
+# request with its own id; the canvas claims it once and runs the branch with
+# that id as the run's receipt, registered here at claim, so ComfyUI's ``put``
+# binds the run to this host even if the canvas reloads before reporting. A
+# retry with the same id answers the stored outcome; a claimed request is never
+# handed out again. Same gate and bounds style as the Controls relay, its own
+# lane: no view, descriptors or prompt hash.
+
+RUN_REQUESTS_MAX_PENDING = 4
+RUN_REQUESTS_RETENTION_SEC = 10 * 60
+RUN_REQUEST_CLAIM_GRACE_SEC = 60.0
+_run_requests: dict[HostKey, dict[str, dict[str, Any]]] = {}
+_RUN_REQUEST_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_RUN_TARGET_MAX_CHARS = 200
+
+
+def _prune_run_requests_locked(key: HostKey, now: float) -> dict[str, dict[str, Any]]:
+    requests = _run_requests.get(key, {})
+    for rid, request in list(requests.items()):
+        if now - request["created"] > RUN_REQUESTS_RETENTION_SEC:
+            del requests[rid]
+    return requests
+
+
+def _run_request_answer(request: dict[str, Any], now: float) -> dict[str, Any]:
+    from . import sdk_runs
+    if request["outcome"] is not None:
+        return {"ok": True, "request_id": request["request_id"], **request["outcome"]}
+    if request["state"] == "pending":
+        return {"ok": True, "request_id": request["request_id"], "state": "pending"}
+    receipt = sdk_runs.receipt_state(request["request_id"]) or {}
+    if receipt.get("prompt_id"):
+        # Bound at put: queued, whether or not the canvas lived to report it.
+        return {"ok": True, "request_id": request["request_id"], "state": "queued", "prompt_id": receipt["prompt_id"]}
+    if now - request["claimed_at"] > RUN_REQUEST_CLAIM_GRACE_SEC:
+        # Claimed, never queued, never reported: the canvas went away with it.
+        return {"ok": True, "request_id": request["request_id"], "state": "unknown"}
+    return {"ok": True, "request_id": request["request_id"], "state": "claimed"}
+
+
+async def post_run_request(project_id: str, host_id: str, session_id: str, request_id: Any, target: Any) -> dict:
+    """The owner tab asks its canvas host to run one output branch (idempotent by id)."""
+    if not isinstance(request_id, str) or not _RUN_REQUEST_ID.match(request_id):
+        return {"ok": False, "code": "invalid_request"}
+    if not isinstance(target, str) or not target or len(target) > _RUN_TARGET_MAX_CHARS:
+        return {"ok": False, "code": "invalid_target"}
+    key, events = _host_key(project_id, host_id), []
+    now = time.time()
+    async with _lock:
+        code = _controls_gate_locked(key, session_id, "tab", events)
+        if code:
+            result = {"ok": False, "code": code}
+        else:
+            requests = _prune_run_requests_locked(key, now)
+            existing = requests.get(request_id)
+            if existing is not None:
+                result = (_run_request_answer(existing, now) if existing["target"] == target
+                          else {"ok": False, "code": "request_conflict"})
+            elif sum(1 for r in requests.values() if r["state"] == "pending") >= RUN_REQUESTS_MAX_PENDING:
+                result = {"ok": False, "code": "queue_full"}
+            else:
+                requests[request_id] = {"request_id": request_id, "target": target, "state": "pending",
+                                        "outcome": None, "created": now, "claimed_at": 0.0, "session_id": session_id}
+                _run_requests[key] = requests
+                result = {"ok": True, "request_id": request_id, "state": "pending"}
+                events.append((key[0], {"type": "run_requests_pending", "project_id": key[0], "host_id": key[1]}))
+    _schedule_events(events)
+    return result
+
+
+async def claim_run_requests(project_id: str, host_id: str, session_id: str) -> dict:
+    """The canvas host takes the oldest pending request, once; its id becomes a registered receipt.
+
+    One at a time: the canvas runs requests in turn, and a claim's grace for
+    reading ``unknown`` must start when that request starts, not while it waits
+    behind others. The canvas claims again after each one.
+    """
+    from . import sdk_runs
+    key, events = _host_key(project_id, host_id), []
+    now = time.time()
+    async with _lock:
+        code = _controls_gate_locked(key, session_id, "canvas", events)
+        claimed = []
+        if not code:
+            for request in _prune_run_requests_locked(key, now).values():
+                if request["state"] != "pending":
+                    continue
+                registered, _prompt = sdk_runs.register_receipt(request["request_id"], ("host", key[0], key[1]),
+                                                                 purpose="branch")
+                if registered != sdk_runs.REGISTER_OK:
+                    request["state"] = "done"
+                    request["outcome"] = {"state": "refused", "code": registered}
+                    continue
+                request["state"], request["claimed_at"] = "claimed", now
+                claimed.append({"request_id": request["request_id"], "target": request["target"]})
+                break
+    _schedule_events(events)
+    return {"ok": False, "code": code} if code else {"ok": True, "requests": claimed}
+
+
+async def report_run_request(project_id: str, host_id: str, session_id: str, request_id: Any, outcome: Any) -> dict:
+    """The canvas host says what became of a claimed request."""
+    key, events = _host_key(project_id, host_id), []
+    if not isinstance(outcome, dict) or outcome.get("state") not in {"queued", "refused", "unconfirmed"}:
+        return {"ok": False, "code": "invalid_outcome"}
+    clean = {"state": outcome["state"]}
+    for name in ("prompt_id", "code"):
+        if isinstance(outcome.get(name), str):
+            clean[name] = outcome[name][:200]
+    async with _lock:
+        code = _controls_gate_locked(key, session_id, "canvas", events)
+        request = _run_requests.get(key, {}).get(str(request_id or ""))
+        if code:
+            result = {"ok": False, "code": code}
+        elif request is None or request["state"] != "claimed":
+            result = {"ok": False, "code": "unknown_request"}
+        else:
+            request["state"], request["outcome"] = "done", clean
+            result = {"ok": True}
+            events.append((key[0], {"type": "run_request_changed", "project_id": key[0], "host_id": key[1],
+                                   "request_id": request["request_id"]}))
+    _schedule_events(events)
+    return result
 
 
 async def get_control_changes(project_id: str, host_id: str, session_id: str) -> dict:

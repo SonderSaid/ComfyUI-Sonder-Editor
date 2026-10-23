@@ -366,6 +366,17 @@ export function createMountedControlsHost({
                     });
             });
         },
+        // A run this tab asks for must not overtake its own Controls edits: wait
+        // until every posted change is sent and the canvas answered it. False
+        // when some are still unanswered at the deadline.
+        async flush({ timeoutMs = 10000 } = {}) {
+            const deadline = Date.now() + timeoutMs;
+            await postTail;
+            while (waiting.size && !destroyed && Date.now() < deadline) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            return !waiting.size;
+        },
         destroy() {
             destroyed = true;
             epoch++;

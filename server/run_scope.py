@@ -74,6 +74,17 @@ def compute(prompt: Any, roots: Any) -> frozenset | None:
     return frozenset(upstream_set(prompt, roots))
 
 
+def for_prompt(prompt: Any) -> frozenset | None:
+    """The execution scope of the prompt ComfyUI is running now, or None (unknown).
+
+    Read through the prompt's open release record, so it needs no registration:
+    any prompt, from any client, gets it. Unknown means the whole prompt.
+    """
+    from . import sdk_runs
+    key = sdk_runs.trusted_key_for_prompt(prompt)
+    return sdk_runs.execution_scope(key, compute) if key else None
+
+
 def reset_for_tests(known: dict[str, bool] | None = None) -> None:
     with _LOCK:
         _EXPANDER_BY_CLASS.clear()

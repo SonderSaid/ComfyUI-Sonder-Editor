@@ -19,7 +19,8 @@ import { EDITOR_COLORS as COLORS, FONT, TYPE, setButtonDisabled } from "./editor
 export const GENERATE_MAX_COUNT = 8;
 export const GENERATE_MAX_UNFINISHED = 16;
 
-const FINAL_STATES = new Set(["landed", "failed", "canceled", "ended"]);
+// "completed": a branch run whose output is ready but which landed no take.
+const FINAL_STATES = new Set(["landed", "failed", "canceled", "ended", "completed"]);
 const UNFINISHED_STATES = new Set(["submitting", "unconfirmed", "queued", "running", "finishing"]);
 
 export function clampGenerateCount(value) {
@@ -45,9 +46,11 @@ export function describeBatchProgress(batchRuns, completedTrimmed = 0) {
     const current = runs.find((run) => run?.state === "running")
         || runs.find((run) => UNFINISHED_STATES.has(String(run?.state || "")));
     const index = Math.min(total, done + 1);
+    // A branch run (one output node) promises no take.
+    const branch = current?.purpose === "branch";
     let suffix = "";
     if (current?.state === "queued") suffix = " · waiting in ComfyUI's queue";
-    else if (current?.state === "finishing") suffix = " · saving the take";
+    else if (current?.state === "finishing") suffix = branch ? " · finishing" : " · saving the take";
     else if (current?.state === "submitting" || current?.state === "unconfirmed") suffix = " · sending";
     let progress = null;
     if (current?.state === "running" && current.progress_node) {
@@ -58,7 +61,8 @@ export function describeBatchProgress(batchRuns, completedTrimmed = 0) {
             progress = count.value / count.max;
         }
     }
-    return { message: `Generating ${index} of ${total}${suffix}`, progress, detail: current?.template_name || null };
+    const verb = branch ? "Running output" : "Generating";
+    return { message: `${verb} ${index} of ${total}${suffix}`, progress, detail: current?.template_name || null };
 }
 
 // Pure: the toast for a run that just became final, or null. Messages carry no
@@ -66,6 +70,7 @@ export function describeBatchProgress(batchRuns, completedTrimmed = 0) {
 // would otherwise show only the last index.
 export function outcomeToast(run, detail = "") {
     const note = String(run?.note || "").trim();
+    if (run?.purpose === "branch" && run?.state !== "landed") return branchOutcomeToast(run, note, detail);
     switch (run?.state) {
         case "landed":
             return { tier: "success", message: "Take landed on the timeline", source: "sdk-generate-landed" };
@@ -75,6 +80,23 @@ export function outcomeToast(run, detail = "") {
             return { tier: "warning", message: "Take canceled", detail: note || null, source: "sdk-generate-canceled" };
         case "ended":
             return { tier: "warning", message: "Take ended without landing", detail: note || null, source: "sdk-generate-ended" };
+        default:
+            return null;
+    }
+}
+
+// A branch run's outcome: its output, never a take (one that saved a take lands
+// as "Take landed", above).
+function branchOutcomeToast(run, note, detail) {
+    switch (run.state) {
+        case "completed":
+            return { tier: "success", message: "Output ready", source: "sdk-branch-completed" };
+        case "failed":
+            return { tier: "error", message: "Output failed", detail: [note, detail].filter(Boolean).join("\n\n") || null, source: "sdk-branch-failed" };
+        case "canceled":
+            return { tier: "warning", message: "Output canceled", detail: note || null, source: "sdk-branch-canceled" };
+        case "ended":
+            return { tier: "warning", message: "Output run ended", detail: note || null, source: "sdk-branch-ended" };
         default:
             return null;
     }

@@ -1,0 +1,302 @@
+"""Sonder App branch runs: one output node, posted to this ComfyUI with its own prompt id."""
+
+import asyncio
+import types
+
+import pytest
+
+from server import model_requirements, run_control, sdk_runs, sdk_templates
+from server.sdk_runner import CANCELED, COMPLETED, LANDED, QUEUED, UNCONFIRMED, SdkError
+from test_sdk_runner import World, editor_values, stored_seed, user_dir  # noqa: F401 - fixtures
+
+OUTPUTS = {"SonderSaveVideo"}
+
+
+class Branch:
+    """What /prompt answered; records every body posted."""
+
+    def __init__(self, world):
+        self.bodies, self.reply, self.on_post = [], None, None
+        world.runner._branch_submit = self.post
+        world.runner._class_lookup = lambda name: types.SimpleNamespace(OUTPUT_NODE=name in OUTPUTS)
+
+    async def post(self, body):
+        self.bodies.append(body)
+        if self.on_post:
+            self.on_post(body)
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply or (200, {"prompt_id": body["prompt_id"], "number": 1, "node_errors": {}})
+
+
+@pytest.fixture
+def world(monkeypatch):
+    run_control.reset_for_tests()
+    monkeypatch.setattr(run_control, "branch_capability", lambda: {"ok": True, "reason": ""})
+    world = World()
+    world.branch = Branch(world)
+    yield world
+    world.runner.close()
+    run_control.reset_for_tests()
+
+
+def branch(world, session, target="2", **kwargs):
+    return world.runner.run_branch(session, tab_session_id="tab-1", target=target, **kwargs)
+
+
+def test_a_branch_posts_its_own_ids_and_targets_and_advances_seeds(world):
+    sdk_templates.update_control_values(world.template_id, lambda d: d["bindings"].update(
+        {"abcd1234": stored_seed(seed_mode="increment")}))
+
+    async def go():
+        session = await world.open()
+        first = await branch(world, session, editor_values=editor_values(), editor_values_seq=1)
+        second = await branch(world, session)
+        return session, first, second
+
+    session, first, second = asyncio.run(go())
+    body = world.branch.bodies[0]
+    assert body["partial_execution_targets"] == ["2"]
+    assert body["prompt_id"] == first["prompt_id"] and body["client_id"] and body["client_id"] != body["prompt_id"]
+    assert body["prompt"]["1"]["inputs"]["scene_id"] == "scene-a"
+    token = body["prompt"]["1"]["_meta"]["sonder_run"]
+    assert sdk_runs.token_state(token)["purpose"] == "branch"
+    # Seeds advance per run, as native partial queueing does.
+    assert [b["prompt"]["5"]["inputs"]["seed"] for b in world.branch.bodies] == [10, 11]
+    run = session.runs[0]
+    assert (run.purpose, run.state, run.prompt_id) == ("branch", QUEUED, first["prompt_id"])
+    assert run.public()["purpose"] == "branch"
+    assert world.client.submitted == []  # never through the proxy
+
+
+@pytest.mark.parametrize("target", ["5", "9", "", None])
+def test_only_an_output_node_in_the_compiled_prompt_can_run(world, target):
+    async def go():
+        session = await world.open()
+        with pytest.raises(SdkError) as raised:
+            await branch(world, session, target=target)
+        return raised.value
+
+    error = asyncio.run(go())
+    assert error.code in {"branch_not_output", "invalid_target"} and world.branch.bodies == []
+
+
+def test_missing_models_count_only_inside_the_branch(world, monkeypatch):
+    seen = []
+    monkeypatch.setattr(model_requirements, "missing_models",
+                        lambda prompt, lookup=None, **kw: seen.append(sorted(prompt)) or [
+                            {"file": "x.safetensors", "folder": "checkpoints", "relative": None, "node": "n",
+                             "node_id": "1", "input": "ckpt"}])
+
+    async def go():
+        session = await world.open()
+        with pytest.raises(SdkError) as raised:
+            await branch(world, session)
+        return raised.value
+
+    error = asyncio.run(go())
+    assert error.code == "generate_refused" and seen == [["1", "2"]]  # not the unrelated KSampler
+
+
+def test_a_refused_branch_forgets_its_token_and_keeps_no_run(world):
+    world.branch.reply = (400, {"error": {"type": "prompt_no_outputs", "message": "Prompt has no outputs"},
+                                "node_errors": {}})
+
+    async def go():
+        session = await world.open()
+        with pytest.raises(SdkError) as raised:
+            await branch(world, session)
+        return session, raised.value
+
+    session, error = asyncio.run(go())
+    assert error.code == "prompt_no_outputs" and session.runs == []
+    token = world.branch.bodies[0]["prompt"]["1"]["_meta"]["sonder_run"]
+    assert sdk_runs.token_state(token) is None
+
+
+def test_an_unknown_submit_outcome_waits_unconfirmed_and_is_never_retried(world):
+    world.branch.reply = ConnectionError("dropped")
+
+    async def go():
+        session = await world.open()
+        result = await branch(world, session)
+        return session, result
+
+    session, result = asyncio.run(go())
+    assert result["error"]["code"] == "submit_unconfirmed" and len(world.branch.bodies) == 1
+    assert session.runs[0].state == UNCONFIRMED and session.runs[0].prompt_id == ""
+
+
+def test_a_changed_prompt_id_turns_branch_runs_off(world):
+    world.branch.reply = (200, {"prompt_id": "something-else"})
+
+    async def go():
+        session = await world.open()
+        result = await branch(world, session)
+        return session, result
+
+    session, result = asyncio.run(go())
+    # The run is tracked under the id ComfyUI used; later branches are refused.
+    assert result["prompt_id"] == "something-else" and session.runs[0].prompt_id == "something-else"
+    assert run_control._DISABLED_REASON == "ComfyUI replaced a preassigned prompt id"
+
+
+def test_the_capability_gate_reads_version_queue_and_validate_prompt(monkeypatch):
+    import sys
+    run_control.reset_for_tests()
+
+    async def validate_prompt(prompt_id, prompt, partial_execution_list):
+        return None
+
+    queue = types.SimpleNamespace(interrupt_if_running=lambda pid: False, delete_queue_item=lambda fn: False)
+    monkeypatch.setattr(run_control, "_prompt_queue", lambda: queue)
+    monkeypatch.setitem(sys.modules, "execution", types.SimpleNamespace(validate_prompt=validate_prompt))
+    from server import sdk_proxy
+    monkeypatch.setattr(sdk_proxy, "own_upstream_url", lambda *_a: "http://127.0.0.1:8188")
+    for version, expected in (("0.42.0", True), ("0.43.1", True), ("0.41.9", False)):
+        monkeypatch.setitem(sys.modules, "comfyui_version", types.SimpleNamespace(__version__=version))
+        assert run_control.branch_capability()["ok"] is expected, version
+    monkeypatch.setitem(sys.modules, "comfyui_version", types.SimpleNamespace(__version__="0.42.0"))
+    monkeypatch.setattr(run_control, "_prompt_queue", lambda: types.SimpleNamespace(delete_queue_item=lambda fn: False))
+    assert run_control.branch_capability() == {"ok": False, "reason": "no_atomic_cancel"}
+    monkeypatch.setattr(run_control, "_prompt_queue", lambda: queue)
+
+    async def old_validate(prompt_id, prompt):
+        return None
+
+    monkeypatch.setitem(sys.modules, "execution", types.SimpleNamespace(validate_prompt=old_validate))
+    assert run_control.branch_capability() == {"ok": False, "reason": "no_partial_execution"}
+    run_control.disable_branch_runs("x")
+    assert run_control.branch_capability() == {"ok": False, "reason": "x"}
+    run_control.reset_for_tests()
+
+
+def test_an_unsupported_comfyui_refuses_with_no_fallback(world, monkeypatch):
+    monkeypatch.setattr(run_control, "branch_capability", lambda: {"ok": False, "reason": "comfyui_too_old"})
+
+    async def go():
+        session = await world.open()
+        with pytest.raises(SdkError) as raised:
+            await branch(world, session)
+        return raised.value
+
+    error = asyncio.run(go())
+    assert error.code == "unsupported" and error.details["reason"] == "comfyui_too_old" and world.branch.bodies == []
+
+
+@pytest.mark.parametrize("take_saved, state", [(False, COMPLETED), (True, LANDED)])
+def test_a_branch_completes_or_lands_by_whether_a_take_was_saved(world, take_saved, state):
+    async def go():
+        session = await world.open()
+        await branch(world, session)
+        run = session.runs[0]
+        world.runner.apply_run_finished({"run_token": run.token, "prompt_id": run.prompt_id, "outcome": "success",
+                                         "leased_job_ids": [], "returned_job_ids": [], "take_saved": take_saved})
+        await world.runner.generate(session, tab_session_id="tab-1")
+        generate = session.runs[1]
+        world.runner.apply_run_finished({"run_token": generate.token, "prompt_id": generate.prompt_id,
+                                         "outcome": "success", "leased_job_ids": [], "returned_job_ids": []})
+        return run, generate
+
+    run, generate = asyncio.run(go())
+    assert run.state == state and (run.note == "Output ready.") is (state == COMPLETED)
+    assert generate.state == LANDED  # a Generate is unchanged
+
+
+def test_cancel_reaches_a_branch_before_comfyuis_reply(world, monkeypatch):
+    cancelled = []
+    monkeypatch.setattr(run_control, "cancel_prompt", lambda prompt_id, queue=None: cancelled.append(prompt_id) or "flagged")
+
+    async def go():
+        session = await world.open()
+        world.branch.on_post = lambda body: asyncio.get_event_loop().create_task(world.runner.cancel(session))
+        result = await branch(world, session)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return session, result
+
+    session, result = asyncio.run(go())
+    # Canceled while its submit was in flight, by its own preassigned id, then again once accepted.
+    assert cancelled and set(cancelled) == {result["prompt_id"]}
+    assert session.runs[0].cancel_requested
+    world.runner.apply_run_finished({"run_token": session.runs[0].token, "prompt_id": result["prompt_id"],
+                                     "outcome": "interrupted", "leased_job_ids": [], "returned_job_ids": []})
+    assert session.runs[0].state == CANCELED
+
+
+def test_a_branch_that_ends_unconfirmed_is_not_told_it_lost_a_take(world):
+    async def go():
+        session = await world.open()
+        await branch(world, session)
+        run = session.runs[0]
+        sdk_runs.open_release("k", run.prompt_id, {}, None)
+        sdk_runs.close_release("k")
+        await world.runner.presence_tick()
+        world.now[0] += 1000
+        await world.runner.presence_tick()
+        return run
+
+    run = asyncio.run(go())
+    assert "take" not in run.note and "could not confirm" in run.note
+
+
+def test_a_submit_that_never_left_refuses_with_no_run_and_no_seed(world):
+    from server.sdk_runner import BranchNotSent
+
+    sdk_templates.update_control_values(world.template_id, lambda d: d["bindings"].update(
+        {"abcd1234": stored_seed(seed_mode="increment")}))
+    world.branch.reply = BranchNotSent("Sonder App does not support ComfyUI over HTTPS yet.", "tls_unsupported")
+
+    async def go():
+        session = await world.open()
+        with pytest.raises(SdkError) as raised:
+            await branch(world, session)
+        return session, raised.value
+
+    session, error = asyncio.run(go())
+    assert (error.code, error.status) == ("tls_unsupported", 503) and session.runs == []
+    token = world.branch.bodies[0]["prompt"]["1"]["_meta"]["sonder_run"]
+    assert sdk_runs.token_state(token) is None
+    assert sdk_templates.read_control_values(world.template_id)["bindings"]["abcd1234"].get("value") in (None, 10)
+
+
+def test_missing_nodes_anywhere_and_an_unreadable_relay_refuse_as_for_generate(world):
+    async def go(missing=(), relay=None):
+        world.missing_classes = set()
+        session = await world.open()
+        # Missing since the session opened (a Replace, an uninstall).
+        world.missing_classes = set(missing)
+        if relay:
+            world.relay = relay
+        with pytest.raises(SdkError) as raised:
+            await branch(world, session)
+        return raised.value
+
+    # The KSampler is outside the branch, but ComfyUI refuses any missing class.
+    missing = asyncio.run(go(missing=["KSampler"]))
+    assert missing.code == "missing_nodes" and missing.details["missing_nodes"]
+    relay = asyncio.run(go(relay={"status": "error", "key": "9", "error": "Two Relays."}))
+    assert relay.code == "generate_refused" and world.branch.bodies == []
+
+
+def test_the_capability_gate_refuses_a_tls_comfyui(monkeypatch):
+    import sys
+    from server import sdk_proxy
+
+    run_control.reset_for_tests()
+
+    async def validate_prompt(prompt_id, prompt, partial_execution_list):
+        return None
+
+    queue = types.SimpleNamespace(interrupt_if_running=lambda pid: False, delete_queue_item=lambda fn: False)
+    monkeypatch.setattr(run_control, "_prompt_queue", lambda: queue)
+    monkeypatch.setitem(sys.modules, "execution", types.SimpleNamespace(validate_prompt=validate_prompt))
+    monkeypatch.setitem(sys.modules, "comfyui_version", types.SimpleNamespace(__version__="0.42.0"))
+
+    def tls(*_args):
+        raise sdk_proxy.ProxyUnavailable("HTTPS", "tls_unsupported")
+
+    monkeypatch.setattr(sdk_proxy, "own_upstream_url", tls)
+    assert run_control.branch_capability() == {"ok": False, "reason": "tls_unsupported"}
+    monkeypatch.setattr(sdk_proxy, "own_upstream_url", lambda *_a: "http://127.0.0.1:8188")
+    assert run_control.branch_capability() == {"ok": True, "reason": ""}

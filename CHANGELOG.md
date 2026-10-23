@@ -59,6 +59,7 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup counts a chip as attached to an item under MiniMax H3 when it cites one of the item's members, directly or through a Subject.
 
 ### Fixed
+- **Queue selected output nodes** no longer takes a Render Queue job for a Save that doesn't run. With Queue Active on, running only a preview leaves the next job pending.
 - A ProRes or FFV1 clip no longer paints the viewport black, latches Compare's play button on Pause, or leaves Crop, Trim & Preview black: each shows its proxy, or a notice saying what the clip waits for.
 - Sonder App takes no longer fail with "This run's SDK session has ended" when ComfyUI runs with `--cache-none` or is short of memory, and in that case the Editor no longer renders twice in one run. Save Video no longer saves a second take, and Save Bridge no longer misses files its saver already wrote. When a Sonder App take is refused, the message now says why: the take already ran, it belongs to another project, or it expired.
 - Prompt: Attach and the Mention menu no longer offer a "Subject: <Reference>" row for a Reference that has no Subject yet. Choosing it made the run fail. A chip already bound that way still says it needs a new source.

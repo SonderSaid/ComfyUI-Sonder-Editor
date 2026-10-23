@@ -37,6 +37,7 @@ import { runProxyAction } from "./proxy_actions.js";
 import { createCanvasControlsHost } from "./controls_host_canvas.js";
 import { createCanvasControlsRelay } from "./controls_canvas_relay.js";
 import { createRunOutputsClient } from "./run_outputs_client.js";
+import { BRANCH_WAIT_MS, runBranch } from "./run_registration.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject, importFailureMessage } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
@@ -1977,8 +1978,13 @@ export class EditorNodeController {
             onWidgetStateChanged: (event) => this._handleWidgetStateChanged(event),
             onSessionChanged: (event) => this._handleSessionChanged(event),
             onHostPresenceChanged: (event) => this._handleHostPresenceChanged(event),
-            onSubscribed: (event) => { this._handleSyncSubscribed(event); void this._controlsRelay?.cycle(); },
+            onSubscribed: (event) => {
+                this._handleSyncSubscribed(event);
+                void this._controlsRelay?.cycle();
+                void this._drainRunRequests();  // requests made while this page was away
+            },
             onRunFinished: (event) => this._handleRunFinished(event),
+            onRunRequestsPending: (event) => { if (event.host_id === this._hostId()) void this._drainRunRequests(); },
             onControlChangesPending: (event) => { if (event.host_id === this._hostId()) void this._controlsRelay?.cycle(); },
             onControlsVisibilityChanged: (event) => { if (event.host_id === this._hostId()) void this._controlsRelay?.cycle(); },
             onConnectionState: (state, details = {}) => {
@@ -2868,6 +2874,59 @@ export class EditorNodeController {
         this._applyOwnerState(claim.owner || null, "claim_fullscreen");
         this._seedWidgetState(this._currentWidgetStateValues(), { seed: true });
         this._startSessionHeartbeat();
+    }
+
+    // Run one output branch from this page (canvas or fullscreen); see
+    // run_registration.js for the outcome shapes.
+    async runBranch(target) {
+        // An open fullscreen editor commits its Controls panel's focused edits
+        // first, as Generate does; they write to this canvas graph.
+        if ((await this.fullscreenSession?.editor?.flushControlsPanel?.()) === false) {
+            return { state: "refused", code: "controls_unsaved" };
+        }
+        return runBranch(target, { hostId: this._hostId() });
+    }
+
+    // The mounted tab's run lane: claim its requests once, run each in turn under
+    // the request id (registered at claim as the run's receipt), report the outcome.
+    async _drainRunRequests() {
+        if (this._destroyed || !this._projectId() || !this._syncSubscribed) return;
+        if (this._drainingRunRequests) {
+            this._runRequestsAgain = true;
+            return;
+        }
+        this._drainingRunRequests = true;
+        const projectId = this._projectId(), hostId = this._hostId(), sessionId = this._editorSessionId;
+        const lane = path => api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectId)}/runs/requests${path}`);
+        const post = (path, body) => fetch(lane(path), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ host_id: hostId, session_id: sessionId, ...body }),
+        }).then(resp => resp.json()).catch(() => ({ ok: false }));
+        try {
+            // One claim per request: the server's claim grace starts when it runs.
+            let claimed = true;
+            while ((claimed || this._runRequestsAgain) && !this._destroyed) {
+                this._runRequestsAgain = false;
+                const claim = await post("/claim", {});
+                const request = claim.ok ? (claim.requests || [])[0] : null;
+                claimed = !!request;
+                if (!request) continue;
+                let result = await runBranch(request.target, { receipt: request.request_id, hostId });
+                // This page's own branch is still waiting for ComfyUI: wait for it
+                // rather than refuse the tab's request.
+                for (let waited = 0; result.state === "busy" && waited < BRANCH_WAIT_MS && !this._destroyed; waited += 500) {
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                    result = await runBranch(request.target, { receipt: request.request_id, hostId });
+                }
+                const outcome = result.state === "queued" ? { state: "queued", prompt_id: result.prompt_id }
+                    : result.state === "unconfirmed" ? { state: "unconfirmed" }
+                        : { state: "refused", code: result.code || result.state };
+                await post(`/${encodeURIComponent(request.request_id)}/report`, { outcome });
+            }
+        } finally {
+            this._drainingRunRequests = false;
+        }
     }
 
     async mountFullscreenInTab() {

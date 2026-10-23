@@ -423,6 +423,12 @@ out.progress = {
     empty: gc.describeBatchProgress([]),
     named: gc.describeBatchProgress([{ state: "landed", template_name: "Upscale" }, { state: "running", template_name: "LTX Edit" }]),
 };
+out.branch_progress = {
+    finishing: gc.describeBatchProgress([{ state: "finishing", purpose: "branch" }]),
+    done: gc.describeBatchProgress([{ state: "completed", purpose: "branch" }, { state: "queued", purpose: "branch" }]),
+};
+out.branch_toasts = ["completed", "landed", "failed", "canceled", "ended"].map((state) =>
+    gc.outcomeToast({ state, purpose: "branch", note: "Why." }));
 out.toasts_pure = ["landed", "failed", "canceled", "ended", "running"].map((state) =>
     gc.outcomeToast({ state, index: 2, count: 3, note: state === "landed" ? "" : "Because." }));
 out.notices = {
@@ -1064,3 +1070,15 @@ def test_generate_and_cancel_are_independent_with_capacity_feedback(results):
 def test_cancel_invalidates_generate_during_each_client_barrier(results):
     assert results["cancel_during_host_drain"] == {"code": "canceled_before_submit", "methods": ["POST", "PUT"], "generated": False, "saved": 42}
     assert results["cancel_before_host"] == {"methods": ["POST", "PUT"], "generated": False, "saved": 43}
+
+
+def test_a_branch_run_reads_as_an_output_never_a_take(results):
+    progress = results["branch_progress"]
+    assert progress["finishing"]["message"] == "Running output 1 of 1 · finishing"
+    # A completed branch counts as done.
+    assert progress["done"]["message"] == "Running output 2 of 2 · waiting in ComfyUI's queue"
+    completed, landed, failed, canceled, ended = results["branch_toasts"]
+    assert completed == {"tier": "success", "message": "Output ready", "source": "sdk-branch-completed"}
+    assert landed["message"] == "Take landed on the timeline"  # a branch that saved a take
+    assert failed == {"tier": "error", "message": "Output failed", "detail": "Why.", "source": "sdk-branch-failed"}
+    assert canceled["message"] == "Output canceled" and ended["message"] == "Output run ended"

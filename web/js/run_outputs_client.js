@@ -10,15 +10,19 @@ const SDK_SECRET_HEADER = "X-Sonder-SDK-Session";
 const SDK_TAB_HEADER = "X-Sonder-Tab-Session";
 const DIAG_HINTS = 32;
 
-// Every page that syncs a project feeds its `outputs_changed` events here
-// (cross_tab_sync.js), whichever mode it is; clients pick their own.
+// Every page that syncs a project feeds its `outputs_changed` and
+// `run_request_changed` events here (cross_tab_sync.js), whichever mode it is;
+// clients pick their own.
+const RUN_EVENTS = new Set(["outputs_changed", "run_request_changed"]);
 const hintListeners = new Set();
 const diag = { clients: new Map(), hints: [] };
 
-export function publishOutputsChanged(projectId, event) {
-    if (event?.type !== "outputs_changed") return;
-    diag.hints.push({ at: Date.now(), project_id: String(projectId || ""), ...event });
-    if (diag.hints.length > DIAG_HINTS) diag.hints.shift();
+export function publishRunEvent(projectId, event) {
+    if (!RUN_EVENTS.has(event?.type)) return;
+    if (event.type === "outputs_changed") {
+        diag.hints.push({ at: Date.now(), project_id: String(projectId || ""), ...event });
+        if (diag.hints.length > DIAG_HINTS) diag.hints.shift();
+    }
     for (const listener of [...hintListeners]) {
         try {
             listener(String(projectId || ""), event);
@@ -110,6 +114,73 @@ export function createRunOutputsClient({ mode, identity, apiURL, fetchImpl = glo
     diag.clients.set(client, label || mode);
     installDiagnostics();
     return client;
+}
+
+// ── Mounted run requests ───────────────────────────────────────────────────
+//
+// The mounted tab cannot queue; it asks its canvas host through the run lane
+// (session_registry). Its pending Controls writes go first, as Generate's do, so
+// the branch runs with them. A request id is minted once and every retry reuses
+// it: the server answers the stored outcome and never dispatches it twice.
+
+const REQUEST_TERMINAL = new Set(["queued", "refused", "unconfirmed", "unknown"]);
+export const REQUEST_WAIT_MS = 60000;
+
+function mintId() {
+    return globalThis.crypto.randomUUID();
+}
+
+export function createRunRequestClient({
+    identity, apiURL, flush = async () => true, fetchImpl = globalThis.fetch?.bind(globalThis),
+    waitMs = REQUEST_WAIT_MS, pollMs = 1000, mint = mintId,
+}) {
+    const post = async (body) => {
+        const id = identity() || {};
+        try {
+            const resp = await fetchImpl(apiURL(`/sonder-editor/project/${encodeURIComponent(id.projectId || "")}/runs/requests`), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ host_id: id.hostId || "", session_id: id.sessionId || "", ...body }),
+            });
+            return await json(resp);
+        } catch (_error) {
+            return { ok: false, code: "unreachable" };
+        }
+    };
+    return {
+        // Resolves to {state: "queued", prompt_id} | {state: "refused", code} |
+        // {state: "unconfirmed" | "unknown" | "pending" | "claimed"} (the last two: still waiting at the deadline).
+        async runBranch(target) {
+            if ((await flush()) === false) return { state: "refused", code: "controls_unsaved" };
+            const body = { request_id: mint(), target: String(target ?? "") };
+            const deadline = Date.now() + waitMs;
+            let answer = await post(body);
+            if (!answer.ok && answer.code !== "unreachable") return { state: "refused", code: answer.code || "refused" };
+            let wake = null;
+            const stop = (() => {
+                const relay = (projectId, event) => {
+                    if (event?.type === "run_request_changed" && event.request_id === body.request_id) wake?.();
+                };
+                hintListeners.add(relay);
+                return () => hintListeners.delete(relay);
+            })();
+            try {
+                while (!(answer.ok && REQUEST_TERMINAL.has(answer.state)) && Date.now() < deadline) {
+                    await new Promise((resolve) => {
+                        wake = resolve;
+                        setTimeout(resolve, pollMs);
+                    });
+                    answer = await post(body);  // same id: answers, never re-dispatches
+                    if (!answer.ok && answer.code !== "unreachable") return { state: "refused", code: answer.code || "refused" };
+                }
+            } finally {
+                stop();
+            }
+            if (!answer.ok) return { state: "unknown", code: answer.code || "unreachable" };
+            const { ok: _ok, http_ok: _h, status: _s, request_id: _r, ...outcome } = answer;
+            return outcome;
+        },
+    };
 }
 
 function sessionDiagnosticsOn() {

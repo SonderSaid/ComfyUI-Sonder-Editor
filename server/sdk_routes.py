@@ -427,6 +427,23 @@ def register_sdk_routes(
         )
         return web.json_response(result, status=202 if result.get("run_ids") else 502)
 
+    @routes.post("/sonder-editor/sdk/session/{session_id}/branch")
+    @handle
+    async def api_sdk_branch(request: web.Request) -> web.Response:
+        """Run one output node of the session's workflow (Output Views)."""
+        session = await runner.authorized(request.match_info.get("session_id", ""), _secret(request), _tab(request))
+        body = await _json_body(request)
+        result = await runner.run_branch(
+            session,
+            target=body.get("target"),
+            editor_values=body.get("editor_values"),
+            tab_session_id=_tab(request),
+            editor_values_seq=body.get("editor_values_seq"),
+            render_cache_max_bytes=body.get("render_cache_max_bytes", 0),
+            expected_template_id=body.get("template_id"),
+        )
+        return web.json_response(result, status=202 if result.get("run_ids") else 502)
+
     # ── Observed run outputs (shared builders in run_output_routes) ──────────
 
     async def output_owners(request: web.Request) -> tuple[list, tuple]:

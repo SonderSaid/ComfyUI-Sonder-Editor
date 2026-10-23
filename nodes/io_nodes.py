@@ -56,6 +56,7 @@ from ..server.color_correction import (
 from ..server.guide_collision import check_frame_count_excess
 from ..server.session_registry import record_diag_event, schedule_project_event
 from ..server import sdk_runs
+from ..server import run_scope
 from ..server.media_helpers import (
     CUSTOM_AUDIO_CODEC_OPTIONS,
     CUSTOM_CONTAINER_OPTIONS,
@@ -366,8 +367,11 @@ def _bridge_generation_params(project, context: dict, prompt=None, consumer_uniq
     # its outputs, directly or through other nodes, not the Bridge itself:
     # Controls relevance starts from all of them. Files are registered without
     # saying which save wrote them, so several saves give every file the union.
+    # Only the saves this execution runs: a partial run leaves the others out.
     bridge_key = str(consumer_unique_id or "")
-    controls_consumers = [bridge_key, *sorted(downstream_set(prompt, bridge_key))] if bridge_key else []
+    scope = run_scope.for_prompt(prompt)
+    downstream = sorted(key for key in downstream_set(prompt, bridge_key) if scope is None or key in scope)
+    controls_consumers = [bridge_key, *downstream] if bridge_key else []
     return {
         "scene_id": str((context or {}).get("scene_id") or ""),
         "scene_name": str((context or {}).get("scene_name") or ""),
@@ -1162,6 +1166,7 @@ def _release_prompt_run(prompt_key: str, status) -> None:
         logger.info("Run %s ended %s; returned leased job(s) %s to pending", prompt_key, outcome, returned)
     announced = set()
     run_token = sdk_runs.run_token_of(record)
+    take_saved = bool(record.get("saved_to_project"))
 
     def announce(alias, job_ids):
         announced.add(alias)
@@ -1173,6 +1178,7 @@ def _release_prompt_run(prompt_key: str, status) -> None:
             "leased_job_ids": job_ids,
             "returned_job_ids": [job_id for job_id in returned if job_id in job_ids],
             "run_token": run_token,
+            "take_saved": take_saved,
         })
 
     try:
@@ -1199,6 +1205,9 @@ def _release_prompt_run(prompt_key: str, status) -> None:
         "claimed_job_id": record.get("claimed_job_id", ""),
         "returned_job_ids": returned,
         "run_token": run_token,
+        # A save node of this run committed its output to the project: a branch
+        # run that ends without one completed, but landed no take.
+        "take_saved": take_saved,
     })
 
 
@@ -1254,6 +1263,12 @@ def _finish_observed_run(prompt_key: str, args, kwargs) -> None:
         history_result = args[1]
     outcome, _note, _detail = _run_outcome(_status_from_task_done_call(args, kwargs))
     run_outputs.finish(prompt_key, prompt_id, history_result, outcome)
+
+
+def _run_control_observer(event, data) -> None:
+    """Re-interrupt a cancelled prompt after ComfyUI resets its interrupt flag."""
+    from ..server import run_control
+    run_control.observe(event, data)
 
 
 _RUN_OUTPUT_HINTS_INSTALLED = False
@@ -1378,14 +1393,23 @@ def _install_bridge_prompt_queue_hooks() -> bool:
                     _reap_removed_runs(prompt_queue)
                 except Exception:
                     logger.exception("Binding a queued prompt to its run registration failed")
-                return original_put(item, *args, **kwargs)
+                result = original_put(item, *args, **kwargs)
+                # A cancel that arrived while the prompt was still in validation
+                # (a client-chosen id) takes it straight back off the queue.
+                try:
+                    from ..server import run_control
+                    run_control.after_put(item, prompt_queue)
+                except Exception:
+                    logger.exception("Applying an early cancel to a queued prompt failed")
+                return result
 
             wrapped_put._sonder_bridge_wrapped = True
             setattr(prompt_queue, "put", wrapped_put)
 
         try:
-            from ..server import run_outputs
+            from ..server import run_control, run_outputs
             sdk_progress.add_observer(run_outputs.observe)
+            sdk_progress.add_observer(_run_control_observer)
             _install_run_output_hints(run_outputs)
         except Exception:
             logger.exception("Run output observation unavailable")

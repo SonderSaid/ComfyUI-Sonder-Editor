@@ -6,7 +6,7 @@ import { notificationCoreConfig, subscribeEditorSettings } from "./editor_settin
 import { LAUNCHER_WINDOW_NAME } from "./sdk_setup_client.js";
 import { modelMessage } from "./launcher_view.js";
 import { createMountedControlsHost } from "./controls_host_remote.js";
-import { createRunOutputsClient } from "./run_outputs_client.js";
+import { createRunOutputsClient, createRunRequestClient } from "./run_outputs_client.js";
 
 installComfyApiShim();
 injectSonderFontFaces();
@@ -477,6 +477,7 @@ async function runSdkTab() {
             runIds: () => host.status.runs.map(run => run.run_id),
         }),
     });
+    editor.runBranch = target => host.runBranch(target);
     editor._enterFullscreen();
 
     // Workflow ▾ switched the session: the project, scene and timeline stay;
@@ -722,11 +723,18 @@ async function main() {
     });
     editor.updateProject(projectId);
     editor.applyWidgetState(host.values);
-    // Observed outputs of its canvas host's runs (data only; Output Views read it).
+    // Observed outputs of its canvas host's runs (data only; Output Views read it),
+    // and branch runs through the canvas host's run lane.
     editor.runOutputs = createRunOutputsClient({
         mode: "mounted", label: `mounted:${hostId}`, apiURL: path => api.apiURL(path),
         identity: () => ({ projectId, hostId, sessionId }),
     });
+    const runRequests = createRunRequestClient({
+        apiURL: path => api.apiURL(path), identity: () => ({ projectId, hostId, sessionId }),
+        // The panel's focused edits first, then the posted writes, as Generate.
+        flush: async () => (await editor.flushControlsPanel()) !== false && controlsHost.flush(),
+    });
+    editor.runBranch = target => runRequests.runBranch(target);
     editor._enterFullscreen();
     document.body.classList.add("ready");
     mountToastsOnce();

@@ -580,6 +580,7 @@ def bind_queued(prompt_id: Any, prompt: Any, roots: Any = None, workflow_id: str
             "roots": _clean_roots(roots), "prompt_ref": prompt, "scope": _SCOPE_UNSET, "prompt_keys": None,
             "state": BOUND_QUEUED, "outcome": "", "opened_at": now, "provisional_until": 0.0,
             "finished_at": 0.0, "graph_rev": "", "saved_to_project": False, "committed_modified_at": "",
+            "cancel_requested": prompt_id in _CANCELS,
         }
         seqs = []
         for token in tokens:
@@ -635,7 +636,7 @@ def _bound_public(bound: dict[str, Any]) -> dict[str, Any]:
         "scope": None if bound["scope"] is _SCOPE_UNSET else bound["scope"],
         "scope_known": bound["scope"] is not _SCOPE_UNSET, "prompt_keys": bound["prompt_keys"],
         "graph_rev": bound["graph_rev"], "saved_to_project": bound["saved_to_project"],
-        "committed_modified_at": bound["committed_modified_at"],
+        "committed_modified_at": bound["committed_modified_at"], "cancel_requested": bound["cancel_requested"],
     }
 
 
@@ -834,8 +835,40 @@ def _evict_bound_locked(now: float) -> None:
         })
 
 
+# --- Cancel flags ---------------------------------------------------------------------
+#
+# A cancel names a prompt id that may not be queued yet (a client-chosen id still
+# in validation) or may have just been taken off the queue. The flag outlives
+# both windows; ``run_control`` acts on it at ``put`` and at ``execution_start``.
+
+CANCEL_FLAG_TTL_SEC = 30 * 60
+MAX_CANCEL_FLAGS = 1024
+_CANCELS: "collections.OrderedDict[str, float]" = collections.OrderedDict()
+
+
+def request_cancel(prompt_id: Any) -> None:
+    prompt_id = _key(prompt_id)
+    if not prompt_id:
+        return
+    now = time.time()
+    with _LOCK:
+        _CANCELS.pop(prompt_id, None)
+        _CANCELS[prompt_id] = now
+        while len(_CANCELS) > MAX_CANCEL_FLAGS or (_CANCELS and now - next(iter(_CANCELS.values())) > CANCEL_FLAG_TTL_SEC):
+            _CANCELS.popitem(last=False)
+        bound = _BOUND.get(prompt_id)
+        if bound is not None:
+            bound["cancel_requested"] = True
+
+
+def cancel_requested(prompt_id: Any) -> bool:
+    with _LOCK:
+        return _key(prompt_id) in _CANCELS
+
+
 def reset_for_tests() -> None:
     with _LOCK:
+        _CANCELS.clear()
         _RELEASES.clear()
         _KEY_BY_PROMPT_OBJECT.clear()
         _TOKENS.clear()

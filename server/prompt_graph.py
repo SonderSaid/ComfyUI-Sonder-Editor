@@ -207,9 +207,13 @@ def project_editor(prompt: Any, node_id: Any) -> str | None:
     return None
 
 
-def nodes_reaching(prompt: Any, editor_id: Any, class_types: Any) -> list[str]:
+def nodes_reaching(prompt: Any, editor_id: Any, class_types: Any, scope: Any = None) -> list[str]:
     """Prompt keys of nodes of the given class types whose ``project`` input
-    takes its project from this editor."""
+    takes its project from this editor.
+
+    ``scope`` (the keys this execution runs) leaves out nodes that will not
+    run; None means the whole prompt.
+    """
     if not isinstance(prompt, dict) or editor_id in {None, ""}:
         return []
     wanted = frozenset(class_types or ())
@@ -218,22 +222,26 @@ def nodes_reaching(prompt: Any, editor_id: Any, class_types: Any) -> list[str]:
     for key, node in prompt.items():
         if not isinstance(node, dict) or node.get("class_type") not in wanted:
             continue
+        if scope is not None and str(key) not in scope:
+            continue
         project_source = linked_node_id(node_inputs(prompt, key).get("project"))
         if upstream_reaches(prompt, project_source, target_id):
             found.append(str(key))
     return found
 
 
-def execution_reaches_save_with_mark(prompt: Any, editor_id: Any, expected_mark_queue_complete: bool) -> bool:
+def execution_reaches_save_with_mark(prompt: Any, editor_id: Any, expected_mark_queue_complete: bool,
+                                     scope: Any = None) -> bool:
     """Whether a Sonder save whose ``mark_queue_complete`` equals the expected value
-    takes its project from this editor.
+    takes its project from this editor, among the nodes this execution runs.
 
     A mark fed by a core Primitive reads as that node's value. Any other link
-    is unknown until execution and reads as unmarked.
+    is unknown until execution and reads as unmarked. A Save Bridge is not an
+    output node: it is in ``scope`` only when an output downstream of it is.
     """
     if not isinstance(prompt, dict) or editor_id in {None, ""}:
         return False
-    for key in nodes_reaching(prompt, editor_id, SONDER_SAVE_CLASS_TYPES):
+    for key in nodes_reaching(prompt, editor_id, SONDER_SAVE_CLASS_TYPES, scope):
         mark = resolve_literal(prompt, node_inputs(prompt, key).get("mark_queue_complete"))
         if prompt_bool(mark) is expected_mark_queue_complete:
             return True

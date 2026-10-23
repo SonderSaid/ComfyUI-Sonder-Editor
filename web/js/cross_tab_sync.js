@@ -1,7 +1,7 @@
 import { registerChangeCertificateFromEvent } from "./api_client.js";
 import { proxyStore } from "./media_display_source.js";
 import { refreshProxyStates, requestProxyReconcile } from "./proxy_client.js";
-import { publishOutputsChanged } from "./run_outputs_client.js";
+import { publishRunEvent } from "./run_outputs_client.js";
 
 const { api } = window.comfyAPI.api;
 
@@ -60,8 +60,15 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
             // Observed run outputs (server/run_outputs.py): ids only, no media.
             // Fed to the shared hint bus; each host's client picks its own.
             else if (event.type === "outputs_changed") {
-                publishOutputsChanged(projectId, event);
+                publishRunEvent(projectId, event);
                 handlers.onOutputsChanged?.(event);
+            }
+            // Mounted run lane (session_registry): the canvas claims, the tab
+            // rereads its request's outcome.
+            else if (event.type === "run_requests_pending") handlers.onRunRequestsPending?.(event);
+            else if (event.type === "run_request_changed") {
+                publishRunEvent(projectId, event);
+                handlers.onRunRequestChanged?.(event);
             }
             else if (event.type === "controls_changed") handlers.onControlsChanged?.(event);
             else if (event.type === "control_changes_pending") handlers.onControlChangesPending?.(event);

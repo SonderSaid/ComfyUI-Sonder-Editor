@@ -19,7 +19,7 @@ from typing import Any, Iterable
 
 from aiohttp import web
 
-from . import run_outputs, sdk_runs, session_registry
+from . import run_control, run_outputs, sdk_runs, session_registry
 
 logger = logging.getLogger("sonder_editor")
 
@@ -153,6 +153,18 @@ async def hold_response(owners: list, owner: tuple, body: dict) -> web.Response:
     return web.json_response({"ok": True, "hold_id": hold_id})
 
 
+async def cancel_response(owners: list, prompt_id: str) -> web.Response:
+    prompt_id = str(prompt_id or "")
+    owned = any(bound["prompt_id"] == prompt_id for bound in await asyncio.to_thread(sdk_runs.visible_bound, owners))
+    if not owned:
+        return web.json_response({"ok": False, "code": "unknown_run"}, status=404)
+    how = await asyncio.to_thread(run_control.cancel_prompt, prompt_id)
+    if how == run_control.CANCEL_UNSUPPORTED:
+        return web.json_response({"ok": False, "code": "unsupported"}, status=409)
+    logger.info("Run %s cancel requested by its owner: %s", prompt_id, how)
+    return web.json_response({"ok": True, "cancel": how})
+
+
 def release_response(owners: list, body: dict) -> web.Response:
     released = run_outputs.release(owners, str(body.get("hold_id") or ""))
     return web.json_response({"ok": released}, status=200 if released else 404)
@@ -215,6 +227,46 @@ def register_run_output_routes(routes) -> None:
         if code:
             return refused(code)
         return release_response([owner], body)
+
+    @routes.get("/sonder-editor/runs/capability")
+    async def api_run_capability(_request: web.Request) -> web.Response:
+        """Whether this ComfyUI can run one output branch (``partial_execution_targets``)."""
+        return web.json_response({"ok": True, "branch": await asyncio.to_thread(run_control.branch_capability)})
+
+    # Mounted run lane: the owner tab posts, its canvas host claims and reports.
+    @routes.post("/sonder-editor/project/{project_id}/runs/requests")
+    async def api_run_request(request: web.Request) -> web.Response:
+        body = await body_of(request)
+        project_id, host_id, session_id = (_clean_id(request.match_info.get("project_id")), _clean_id(body.get("host_id")),
+                                           _clean_id(body.get("session_id")))
+        result = await session_registry.post_run_request(project_id, host_id, session_id,
+                                                         body.get("request_id"), body.get("target"))
+        return web.json_response(result, status=200 if result.get("ok") else (
+            403 if result.get("code") in {"not_owner", "not_canvas_host"} else 409))
+
+    @routes.post("/sonder-editor/project/{project_id}/runs/requests/claim")
+    async def api_run_request_claim(request: web.Request) -> web.Response:
+        body = await body_of(request)
+        result = await session_registry.claim_run_requests(
+            _clean_id(request.match_info.get("project_id")), _clean_id(body.get("host_id")), _clean_id(body.get("session_id")))
+        return web.json_response(result, status=200 if result.get("ok") else 403)
+
+    @routes.post("/sonder-editor/project/{project_id}/runs/requests/{request_id}/report")
+    async def api_run_request_report(request: web.Request) -> web.Response:
+        body = await body_of(request)
+        result = await session_registry.report_run_request(
+            _clean_id(request.match_info.get("project_id")), _clean_id(body.get("host_id")), _clean_id(body.get("session_id")),
+            request.match_info.get("request_id", ""), body.get("outcome"))
+        return web.json_response(result, status=200 if result.get("ok") else 409)
+
+    @routes.post("/sonder-editor/project/{project_id}/runs/{prompt_id}/cancel")
+    async def api_run_cancel(request: web.Request) -> web.Response:
+        """Cancel a prompt this host owns: ComfyUI parity (any page can cancel any job)."""
+        body = await body_of(request)
+        code, owner = await gate(request.match_info.get("project_id"), body.get("host_id"), body.get("session_id"))
+        if code:
+            return refused(code)
+        return await cancel_response([owner], request.match_info.get("prompt_id", ""))
 
     # Wildcard id after the named subresources above.
     @routes.get("/sonder-editor/project/{project_id}/runs/{prompt_id}")

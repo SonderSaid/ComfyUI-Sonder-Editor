@@ -22,6 +22,7 @@ from ..server import prompt_channel_templates
 from ..server import prompt_graph
 from ..server import prompt_payload
 from ..server import run_outputs
+from ..server import run_scope
 from ..server import sdk_runs
 from .prompt_once import run_once_per_prompt
 from ..server.editor_inputs import editor_optional_inputs
@@ -434,12 +435,13 @@ class SonderEditor:
         return prompt_graph.node_inputs(prompt, node_id)
 
     @classmethod
-    def _referenced_output_slots(cls, prompt, unique_id):
+    def _referenced_output_slots(cls, prompt, unique_id, scope=None):
         """Return directly referenced zero-based output slots, or None when unsafe.
 
         Comfy prompt links are exact ``[upstream_node_id, output_slot]`` pairs.
         Unknown or malformed demand deliberately fails open so legacy execution
-        remains the compatibility fallback.
+        remains the compatibility fallback. ``scope`` (what this execution runs)
+        leaves out consumers that will not run; None means the whole prompt.
         """
         if not isinstance(prompt, dict) or unique_id in {None, ""}:
             return None
@@ -456,8 +458,10 @@ class SonderEditor:
 
         referenced = set()
         output_count = len(cls.RETURN_NAMES)
-        for node in prompt.values():
+        for node_id, node in prompt.items():
             if not isinstance(node, dict):
+                continue
+            if scope is not None and str(node_id) not in scope:
                 continue
             inputs = node.get("inputs", {})
             if not isinstance(inputs, dict):
@@ -489,12 +493,14 @@ class SonderEditor:
         return prompt_graph.upstream_reaches(prompt, source_id, editor_id)
 
     @classmethod
-    def _execution_reaches_color_correcting_save_video(cls, prompt, unique_id) -> bool:
-        """Whether this editor feeds a Save Video that may use its drift stash."""
+    def _execution_reaches_color_correcting_save_video(cls, prompt, unique_id, scope=None) -> bool:
+        """Whether this editor feeds a Save Video that may use its drift stash and will run."""
         if not isinstance(prompt, dict) or unique_id in {None, ""}:
             return False
-        for node in prompt.values():
+        for node_id, node in prompt.items():
             if not isinstance(node, dict) or node.get("class_type") != "SonderSaveVideo":
+                continue
+            if scope is not None and str(node_id) not in scope:
                 continue
             inputs = node.get("inputs", {})
             if not isinstance(inputs, dict):
@@ -547,16 +553,16 @@ class SonderEditor:
         )
 
     @classmethod
-    def _execution_reaches_save_with_mark(cls, prompt, unique_id, expected_mark_queue_complete: bool) -> bool:
-        return prompt_graph.execution_reaches_save_with_mark(prompt, unique_id, expected_mark_queue_complete)
+    def _execution_reaches_save_with_mark(cls, prompt, unique_id, expected_mark_queue_complete: bool, scope=None) -> bool:
+        return prompt_graph.execution_reaches_save_with_mark(prompt, unique_id, expected_mark_queue_complete, scope)
 
     @classmethod
-    def _execution_reaches_terminal_save(cls, prompt, unique_id) -> bool:
-        return cls._execution_reaches_save_with_mark(prompt, unique_id, True)
+    def _execution_reaches_terminal_save(cls, prompt, unique_id, scope=None) -> bool:
+        return cls._execution_reaches_save_with_mark(prompt, unique_id, True, scope)
 
     @classmethod
-    def _execution_targets_unmarked_save(cls, prompt, unique_id) -> bool:
-        return cls._execution_reaches_save_with_mark(prompt, unique_id, False)
+    def _execution_targets_unmarked_save(cls, prompt, unique_id, scope=None) -> bool:
+        return cls._execution_reaches_save_with_mark(prompt, unique_id, False, scope)
 
     @staticmethod
     def _peek_queue_job(proj: TimelineProject):
@@ -769,7 +775,11 @@ class SonderEditor:
         render_cache_active = render_cache_max_bytes != 0
         render_cache_budget = None if render_cache_max_bytes == -1 else render_cache_max_bytes
         render_queue_active = self._coerce_bool(render_queue_active, True)
-        demanded_output_slots = self._referenced_output_slots(prompt, unique_id)
+        # What this execution runs (ComfyUI's queued output nodes and their
+        # inputs). A partial run that leaves out a save peeks rather than takes a
+        # queue job no save will complete. None (unknown) is the whole prompt.
+        execution_scope = run_scope.for_prompt(prompt)
+        demanded_output_slots = self._referenced_output_slots(prompt, unique_id, execution_scope)
         demand_unknown = demanded_output_slots is None
         render_explicitly_needed = (
             demand_unknown
@@ -787,7 +797,7 @@ class SonderEditor:
         prompt_needed = (not demand_unknown
                          and self.OUTPUT_SLOTS["prompt"] in demanded_output_slots)
         color_correcting_save_reached = self._execution_reaches_color_correcting_save_video(
-            prompt, unique_id
+            prompt, unique_id, execution_scope
         )
         proj = None
         queue_job = None
@@ -812,8 +822,8 @@ class SonderEditor:
             execution_base_modified_at = getattr(proj, "modified_at", "")
 
             run_key, run_token = self._bind_run(proj, prompt, unique_id)
-            terminal_save_reached = self._execution_reaches_terminal_save(prompt, unique_id)
-            unmarked_save_reached = self._execution_targets_unmarked_save(prompt, unique_id)
+            terminal_save_reached = self._execution_reaches_terminal_save(prompt, unique_id, execution_scope)
+            unmarked_save_reached = self._execution_targets_unmarked_save(prompt, unique_id, execution_scope)
             queue_length = len(getattr(proj, "generation_queue", []) or [])
             queue_job_mode = ""
             if render_queue_active and terminal_save_reached:
