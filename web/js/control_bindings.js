@@ -241,6 +241,7 @@ export function editManifest(text, mutate) {
         if (!isPlainObject(entry)) continue;
         for (const key of EXECUTION_EXPORT_KEYS) delete entry[key];
     }
+    if (ours) delete manifest.execution.routing; // export-only, like each switch's facts
     mutate(manifest);
     manifest.v = MANIFEST_VERSION;
     return JSON.stringify(manifest);
@@ -850,6 +851,19 @@ export function groupMembers(group, nodes) {
 // A switch acts on nodes that run: a subgraph host counts (frontend 1.53.10
 // reports isVirtualNode on it), a reroute or note does not.
 const switchable = node => !!node && (isHost(node) || !node.isVirtualNode);
+
+// The infrastructure classes a node is or holds: an instance whose definition
+// (at any depth) has the Editor or the Relay would switch them off too.
+function infrastructureOf(node, seen = new Set()) {
+    const found = new Set(INFRASTRUCTURE_CLASSES.has(nodeType(node)) ? [nodeType(node)] : []);
+    const graph = node?.subgraph;
+    if (graph && !seen.has(graph)) {
+        seen.add(graph);
+        for (const inner of nodesOf(graph)) for (const type of infrastructureOf(inner, seen)) found.add(type);
+    }
+    return found;
+}
+const holdsInfrastructure = node => infrastructureOf(node).size > 0;
 const rootGroups = root => root?.groups || root?._groups || [];
 
 // A switch's default label (control_execution.default_label): its group's or
@@ -878,7 +892,7 @@ function resolveSwitch(root, entry, hits) {
         const base = { kind, group, title: String(group.title || "Group"), member_count: nodes.length,
             members: nodes.slice(0, MAX_EXECUTION_MEMBERS).map(switchMember) };
         if (!nodes.length) return { ...base, status: "unsupported", problem: "empty" };
-        if (nodes.some(node => INFRASTRUCTURE_CLASSES.has(nodeType(node)))) return { ...base, status: "unsupported", problem: "infrastructure" };
+        if (nodes.some(holdsInfrastructure)) return { ...base, status: "unsupported", problem: "infrastructure" };
         if (nodes.length > MAX_EXECUTION_MEMBERS) return { ...base, status: "unsupported", problem: "too_many" };
         return { ...base, status: "ok", mode: combinedMode(base.members) };
     }
@@ -887,7 +901,7 @@ function resolveSwitch(root, entry, hits) {
     const node = hits[0], member = switchMember(node);
     const base = { kind, node, title: member.title, member_count: 1, members: [member] };
     if ((kind === "instance") !== isHost(node)) return { ...base, status: "unsupported", problem: "kind" };
-    if (INFRASTRUCTURE_CLASSES.has(nodeType(node))) return { ...base, status: "unsupported", problem: "infrastructure" };
+    if (holdsInfrastructure(node)) return { ...base, status: "unsupported", problem: "infrastructure" };
     if (!switchable(node)) return { ...base, status: "unsupported", problem: "virtual" };
     return { ...base, status: "ok", mode: member.mode };
 }
@@ -916,13 +930,13 @@ export function resolveExecution(root, manifest) {
 function nodeCandidate(node, known) {
     const owner = readExecutionAnchor(node);
     return { kind: isHost(node) ? "instance" : "node", path: String(node.id), title: String(node.title || nodeType(node)),
-        classes: [nodeType(node)], member_count: 1, anchored_by: owner && (!known || known.has(owner)) ? owner : null };
+        classes: [...new Set([nodeType(node), ...infrastructureOf(node)])], member_count: 1, anchored_by: owner && (!known || known.has(owner)) ? owner : null };
 }
 
 function groupCandidate(root, group) {
     const members = groupMembers(group, nodesOf(root)).filter(switchable);
     // Infrastructure first: the server's cap must never cut it off.
-    const classes = [...new Set(members.map(nodeType))]
+    const classes = [...new Set(members.flatMap(node => [nodeType(node), ...infrastructureOf(node)]))]
         .sort((a, b) => Number(INFRASTRUCTURE_CLASSES.has(b)) - Number(INFRASTRUCTURE_CLASSES.has(a)))
         .slice(0, MAX_EXECUTION_MEMBERS + 1);
     return { kind: "group", group_id: group.id, title: String(group?.title || "Group"), classes, member_count: members.length, anchored_by: null };
@@ -1027,6 +1041,216 @@ export function inactiveBodies(resolvedBindings) {
     return bodies;
 }
 
+// ── Routing capsule (Phase 1B) ───────────────────────────────────────────────
+// An API export holds only the nodes that ran, links already resolved, so the
+// Sonder App can't tell what a muted or bypassed node would change. The export
+// carries this capsule beside it (server/control_routing.py compiles it): each
+// switch member's ports, where each of its inputs resolves, and every input of
+// every serialized node whose resolution first reaches a member's output.
+// Resolution mirrors ExecutableNodeDTO.resolveInput/resolveOutput (frontend
+// 1.57.1) over the live graph and its current modes, stopping at a member's
+// output, where the app's chosen mode decides.
+export const MAX_ROUTING_NODES = 512;
+export const MAX_ROUTING_EDGES = 2048;
+export const MAX_ROUTING_BYTES = 48 * 1024;
+const ROUTING_VERSION = 1;
+
+class RoutingUnsupported extends Error {}
+
+// LiteGraph.isValidConnection without the EVENT/ACTION pair
+// (control_routing.is_valid_connection mirrors it).
+export function isValidConnection(a, b) {
+    const wild = t => t == null || t === "" || t === "*" || t === 0 || t === false;
+    if (wild(a) || wild(b) || a === b) return true;
+    const x = String(a).toLowerCase(), y = String(b).toLowerCase();
+    if (!x.includes(",") && !y.includes(",")) return x === y;
+    return x.split(",").some(p => y.split(",").some(q => isValidConnection(p, q)));
+}
+
+// ExecutableNodeDTO._getBypassSlotIndex (control_routing.bypass_index).
+export function bypassIndex(inputTypes, outputType, slot, type) {
+    if (type === "*" || type === "") return inputTypes.length > slot ? slot : 0;
+    if (slot < inputTypes.length && isValidConnection(inputTypes[slot], outputType) && isValidConnection(inputTypes[slot], type)) return slot;
+    const exact = inputTypes.findIndex(t => t === type);
+    if (exact !== -1) return exact;
+    return inputTypes.findIndex(t => isValidConnection(t, outputType) && isValidConnection(t, type));
+}
+
+const slotType = type => (type == null ? null : String(type));
+
+// A DTO here is {node, hosts}: hosts are the subgraph instances from the root
+// down to the one holding `node`, so its execution id is their ids then its own.
+function routingResolver(root, members) {
+    const graphOf = dto => dto.node.graph || dto.hosts.at(-1)?.subgraph || root;
+    const execId = dto => [...dto.hosts.map(h => h.id), dto.node.id].join(":");
+    const visit = (visited, key) => {
+        if (visited.has(key)) throw new RoutingUnsupported("loop");
+        visited.add(key);
+    };
+    function resolveInput(dto, slot, visited, type) {
+        const host = dto.hosts.at(-1);
+        visit(visited, `${host?.subgraph?.id}:${dto.node.id}[I]${slot}`);
+        const input = dto.node.inputs?.[slot];
+        if (!input) throw new RoutingUnsupported("slot");
+        if (input.link == null) return null;
+        const link = getGraphLink(graphOf(dto), input.link);
+        if (!link) throw new RoutingUnsupported("link");
+        if (host && (link.originIsIoNode || String(link.origin_id) === String(SUBGRAPH_INPUT_ID))) {
+            const hostInput = host.inputs?.[link.origin_slot];
+            if (!hostInput) throw new RoutingUnsupported("slot");
+            if (hostInput.link == null) {
+                // The host's promoted widget value; nothing without a widget.
+                const widget = host.getWidgetFromSlot?.(hostInput);
+                return widget ? { w: widget.value } : null;
+            }
+            // Up and out of the subgraph: the host's input, with its own type.
+            return resolveInput({ node: host, hosts: dto.hosts.slice(0, -1) }, link.origin_slot, visited);
+        }
+        const origin = getGraphNode(graphOf(dto), link.origin_id);
+        if (!origin) throw new RoutingUnsupported("node");
+        return resolveOutput({ node: origin, hosts: dto.hosts }, link.origin_slot, type ?? input.type, visited);
+    }
+    function resolveOutput(dto, slot, type, visited) {
+        visit(visited, `${dto.hosts.at(-1)?.subgraph?.id}:${dto.node.id}[O]${slot}`);
+        if (!dto.hosts.length && members.has(String(dto.node.id))) return { m: [String(dto.node.id), slot, slotType(type)] };
+        if (dto.node.mode === MUTED) return null;
+        if (dto.node.mode === BYPASS) {
+            const output = dto.node.outputs?.[slot];
+            if (!output) throw new RoutingUnsupported("slot");
+            const index = bypassIndex((dto.node.inputs || []).map(i => i?.type), output.type, slot, type);
+            return index === -1 ? null : resolveInput(dto, index, visited);
+        }
+        if (isHost(dto.node)) return resolveSubgraphOutput(dto, slot, type, visited);
+        if (dto.node.isVirtualNode) {
+            const source = dto.node.resolveVirtualOutput?.(slot);
+            if (source) {
+                const graph = source.node?.graph;
+                const hosts = graph === graphOf(dto) ? dto.hosts : graph === root ? [] : null;
+                if (!hosts) throw new RoutingUnsupported("virtual");
+                return resolveOutput({ node: source.node, hosts }, source.slot, type, visited);
+            }
+            // getInputLink may be another node's link (KJNodes' GetNode returns its
+            // SetNode's): native resolves on the link's target, as here.
+            const link = dto.node.getInputLink?.(slot);
+            if (!link) return null;
+            const target = getGraphNode(graphOf(dto), link.target_id);
+            if (!target) throw new RoutingUnsupported("virtual");
+            return resolveInput({ node: target, hosts: dto.hosts }, link.target_slot, visited, type);
+        }
+        return { a: [execId(dto), slot] };
+    }
+    function resolveSubgraphOutput(dto, slot, type, visited) {
+        if (!dto.node.outputs?.[slot]) throw new RoutingUnsupported("slot");
+        const inner = dto.node.resolveSubgraphOutputLink?.(slot);
+        if (!inner) return null;
+        if (!inner.outputNode) throw new RoutingUnsupported("passthrough");
+        return resolveOutput({ node: inner.outputNode, hosts: [...dto.hosts, dto.node] }, inner.link.origin_slot, type, visited);
+    }
+    // A member host's output as one asking type resolves it (a bypass inside
+    // picks its input by that type). A route native would refuse is marked and
+    // refused only if a run reaches it.
+    function hostOutput(dto, slot, type) {
+        try {
+            return resolveSubgraphOutput(dto, slot, type, new Set());
+        } catch (error) {
+            if (error instanceof RoutingUnsupported) return { x: 1 };
+            throw error;
+        }
+    }
+    return { resolveInput, hostOutput, execId };
+}
+
+// The nodes graphToPrompt writes: root nodes and, inside an instance that
+// runs, every inner node (instances nested in it are always expanded).
+function* serializedNodes(root) {
+    const runs = node => node.mode !== MUTED && node.mode !== BYPASS;
+    function* inner(host, hosts) {
+        for (const node of nodesOf(host.subgraph)) {
+            if (isHost(node)) yield* inner(node, [...hosts, host]);
+            else if (!node.isVirtualNode && runs(node)) yield { node, hosts: [...hosts, host] };
+        }
+    }
+    for (const node of nodesOf(root)) {
+        if (isHost(node)) {
+            if (runs(node)) yield* inner(node, []);
+        } else if (!node.isVirtualNode && runs(node)) yield { node, hosts: [] };
+    }
+}
+
+// What graphToPrompt leaves in an input that resolves to nothing: the value of
+// the widget of the same name, boxed as it boxes it.
+function fallbackOf(node, name) {
+    const widget = (node.widgets || []).findLast(w => w?.name === name && w.options?.serialize !== false);
+    if (!widget) return undefined;
+    const value = widget.value;
+    if (widget.type === "curve" && value != null) return { __type__: "CURVE", __value__: value };
+    return Array.isArray(value) ? { __value__: value } : value;
+}
+
+export function exportRouting(root, memberPaths) {
+    const members = new Set(memberPaths);
+    try {
+        if (!members.size) return { v: ROUTING_VERSION, nodes: {}, edges: [] };
+        const { resolveInput, hostOutput, execId } = routingResolver(root, members);
+        const nodes = {}, hosts = new Map();
+        // Each (host, output, type) a hop asks for; resolved after every asker is known.
+        const asked = new Map(), pending = [];
+        const ask = hop => {
+            if (!hop?.m || !hosts.has(hop.m[0])) return;
+            const key = JSON.stringify(hop.m);
+            if (!asked.has(key)) { asked.set(key, null); pending.push(hop.m); }
+        };
+        for (const node of nodesOf(root)) {
+            const path = String(node?.id);
+            if (!members.has(path)) continue;
+            if (isHost(node)) hosts.set(path, node);
+            nodes[path] = {
+                i: (node.inputs || []).map((input, slot) => [String(input?.name ?? ""), slotType(input?.type),
+                    resolveInput({ node, hosts: [] }, slot, new Set())]),
+            };
+        }
+        if (Object.keys(nodes).length > MAX_ROUTING_NODES) return { v: ROUTING_VERSION, error: "budget" };
+        for (const node of Object.values(nodes)) for (const port of node.i) ask(port[2]);
+        const edges = [];
+        for (const dto of serializedNodes(root)) {
+            for (const [slot, input] of (dto.node.inputs || []).entries()) {
+                if (input?.link == null) continue;
+                const hop = resolveInput(dto, slot, new Set());
+                if (!hop?.m) continue;
+                if (edges.length >= MAX_ROUTING_EDGES) return { v: ROUTING_VERSION, error: "budget" };
+                const fallback = fallbackOf(dto.node, input.name);
+                edges.push([execId(dto), String(input.name), ...hop.m, ...(fallback === undefined ? [] : [fallback])]);
+                ask(hop);
+            }
+        }
+        while (pending.length) {
+            const [path, slot, type] = pending.pop();
+            const hop = hostOutput({ node: hosts.get(path), hosts: [] }, slot, type);
+            asked.set(JSON.stringify([path, slot, type]), hop);
+            ask(hop);
+        }
+        for (const [path, node] of Object.entries(nodes)) {
+            const live = hosts.get(path) || nodesOf(root).find(n => String(n?.id) === path);
+            node.o = (live.outputs || []).map((output, slot) => {
+                if (!hosts.has(path)) return [slotType(output?.type)];
+                const answers = [...asked].map(([key, hop]) => [JSON.parse(key), hop])
+                    .filter(([[p, s]]) => p === path && s === slot).map(([[, , type], hop]) => [type, hop]);
+                return [slotType(output?.type), answers];
+            });
+        }
+        return { v: ROUTING_VERSION, nodes, edges };
+    } catch {
+        return { v: ROUTING_VERSION, error: "unsupported" };
+    }
+}
+
+// The capsule as export text, or its budget refusal.
+export function routingText(root, memberPaths) {
+    let text = JSON.stringify(exportRouting(root, memberPaths));
+    if (utf8Bytes(text) > MAX_ROUTING_BYTES) text = JSON.stringify({ v: ROUTING_VERSION, error: "budget" });
+    return text;
+}
+
 // The export form of each switch: saved presentation plus its state.
 // The exported members are bounded apart from the saved manifest: they travel
 // in every export, which the server caps at 128 KiB. A switch past the budget
@@ -1039,6 +1263,7 @@ function exportExecution(saved, root, manifest) {
     if (error || !isPlainObject(saved) || !isPlainObject(saved.controls)) return saved;
     const out = { ...saved, controls: {} };
     let exported = 0;
+    const routed = new Set();
     for (const [id, entry] of Object.entries(saved.controls)) {
         const resolved = controls[id];
         // An entry the reader skips is exported exactly as saved.
@@ -1057,7 +1282,13 @@ function exportExecution(saved, root, manifest) {
             member_count: resolved.member_count ?? resolved.members.length,
             members: overBudget ? [] : members,
         };
+        // Only a switch whose nodes all run now can be switched in the Sonder
+        // App: an off node is not in this export to switch back on.
+        if (!overBudget && resolved.status === "ok" && members.every(m => m.mode === "enabled")) {
+            for (const member of members) routed.add(member.path);
+        }
     }
+    out.routing = routingText(root, [...routed]);
     return out;
 }
 
@@ -1101,7 +1332,15 @@ export function exportManifest(text, root) {
         }
         out.suggestions = suggestions.map(s => ({ binding_id: s.binding_id, targets: publicTargets(s.targets) }));
         if (manifest.execution !== undefined) out.execution = exportExecution(manifest.execution, root, manifest);
-        return JSON.stringify(out);
+        let exported = JSON.stringify(out);
+        // The capsule shares the server's 128 KiB cap with everything else, and
+        // a graph edit alone can grow it: past the cap it gives way, never the
+        // Relay (its switches then read "too large" in the Sonder App).
+        if (utf8Bytes(exported) > MAX_MANIFEST_BYTES && typeof out.execution?.routing === "string") {
+            out.execution = { ...out.execution, routing: JSON.stringify({ v: ROUTING_VERSION, error: "budget" }) };
+            exported = JSON.stringify(out);
+        }
+        return exported;
     } catch (error) {
         return JSON.stringify({ ...manifest, error: String(error?.message || error || "Controls export failed.") });
     }

@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import control_manifest as cm
+from . import control_routing
 
 SOURCE = "execution"
 MIXED = "mixed"
@@ -37,12 +38,31 @@ REASONS = {
     "unsupported": "This can't be switched from Controls.",
 }
 SDK_REASON = "Switch these on the canvas for now."
+# What keeps a switch from working in the Sonder App.
+SDK_STRUCTURAL_REASON = "Add, remove and rebind node switches on the canvas."
+OFF_AT_EXPORT_REASON = ("Its nodes were off when this workflow was exported. "
+                        "Enable them on the canvas and export again to switch it here.")
+REEXPORT_REASON = "Export this workflow again from the canvas with this version of Sonder to switch it here."
+ROUTING_REASONS = {
+    "missing": REEXPORT_REASON,
+    "budget": control_routing.ERRORS["budget"] + " Switch it on the canvas.",
+    "unsupported": control_routing.ERRORS["unsupported"] + " Switch it on the canvas.",
+}
 MODE_LABELS = {"enabled": "Enabled", "muted": "Muted", "bypassed": "Bypassed"}
 
 
 def _instance_present(prompt: dict, path: str) -> bool:
     prefix = f"{path}:"
     return any(isinstance(key, str) and key.startswith(prefix) for key in prompt)
+
+
+def _holds_infrastructure(prompt: dict, member: dict) -> bool:
+    """An instance whose inner nodes include the Editor or the Relay."""
+    if member.get("kind") != "instance":
+        return False
+    prefix = f"{member['path']}:"
+    return any(isinstance(key, str) and key.startswith(prefix) and isinstance(node, dict)
+               and node.get("class_type") in INFRASTRUCTURE_CLASSES for key, node in prompt.items())
 
 
 def _member_consistent(prompt: dict, member: dict) -> bool:
@@ -80,6 +100,8 @@ def describe_one(prompt: dict, identity: str, entry: dict) -> dict:
         "execution_id": identity,
         "origin": "authored",
         "label": entry["label"] or default_label(entry),
+        # What an emptied app label falls back to.
+        "default_label": default_label(entry),
         "group": entry["group"],
         "order": entry["order"],
         "advanced": entry["advanced"],
@@ -102,7 +124,7 @@ def describe_one(prompt: dict, identity: str, entry: dict) -> dict:
             status, problem = "unsupported", "too_many"
         elif kind != "group" and len(members) != 1:
             status, problem = "missing", "stale"
-        elif any(m["class_type"] in INFRASTRUCTURE_CLASSES for m in members):
+        elif any(m["class_type"] in INFRASTRUCTURE_CLASSES or _holds_infrastructure(prompt, m) for m in members):
             status, problem = "unsupported", "infrastructure"
         elif kind != "group" and members[0].get("kind", "node") != kind:
             status, problem = "unsupported", "kind"
@@ -128,15 +150,77 @@ def describe_execution(prompt: dict, manifest: dict) -> tuple[list[dict], str | 
     return rows, manifest.get("execution_error")
 
 
-def sdk_read_only(descriptors: list[dict]) -> None:
-    """1A interim: the Sonder App shows authored switches without switching them."""
+# ── The Sonder App ───────────────────────────────────────────────────────────
+
+def stored_node_modes(stored: dict) -> dict:
+    """The sidecar's ``node_modes``: ``{root path: {mode: muted|bypassed,
+    class_type}}``. Enabled is absence. The class is the node's identity, as a
+    stored value's signature is: after a re-import renumbers nodes, a mode
+    never lands on another kind of node. Anything else is preserved on disk
+    and ignored here."""
+    raw = stored.get("node_modes") if isinstance(stored, dict) else None
+    return {path: (entry["mode"], entry["class_type"]) for path, entry in (raw.items() if isinstance(raw, dict) else [])
+            if cm._root_path(path) is not None and isinstance(entry, dict)
+            and entry.get("mode") in control_routing.OFF_MODES and isinstance(entry.get("class_type"), str)}
+
+
+def apply_sdk_state(view: dict, prompt: dict, stored: dict, hidden: set) -> dict:
+    """Make the app's switches match its sidecar; return the node modes a run
+    applies. A switch is switchable only when the export ran every one of its
+    nodes and its routing capsule covers them: the API file has no other way
+    to bring a node back or to know what bypassing it routes. A hidden
+    switch's stored modes are skipped (the workflow's own state runs), unless
+    another visible switch covers the same node; the last action wins, as
+    node modes on the canvas do."""
+    manifest = cm.find_relay(prompt)["manifest"]
+    routing, problem = control_routing.read_routing(manifest.get("execution_routing"))
+    stored_modes = stored_node_modes(stored)
+    descriptors = view.get("execution", []) or []
+    effective, switchable = {}, []
     for descriptor in descriptors:
-        descriptor["read_only"] = True
-        if descriptor["status"] == "ok":
-            off = any(m["mode"] != "enabled" for m in descriptor["members"])
-            descriptor["reason"] = (
-                "Its nodes were off when this workflow was exported. Enable them on the canvas and export again."
-                if off else SDK_REASON)
+        descriptor["hidden"] = f"execution:{descriptor['execution_id']}" in hidden
+        if descriptor["status"] != "ok":
+            descriptor["read_only"] = True
+            continue
+        paths = [m["path"] for m in descriptor["members"]]
+        if any(m["mode"] != "enabled" for m in descriptor["members"]):
+            descriptor.update(read_only=True, reason=OFF_AT_EXPORT_REASON)
+        elif routing is None or not control_routing.covers(routing, paths):
+            descriptor.update(read_only=True, reason=ROUTING_REASONS.get(problem, REEXPORT_REASON))
+        else:
+            descriptor["read_only"] = False
+            switchable.append(descriptor)
+            if not descriptor["hidden"]:
+                effective.update({m["path"]: stored_modes[m["path"]][0] for m in descriptor["members"]
+                                  if stored_modes.get(m["path"], (None, None))[1] == m["class_type"]})
+    for descriptor in switchable:
+        for member in descriptor["members"]:
+            member["mode"] = effective.get(member["path"], "enabled")
+        descriptor["mode"] = descriptor["value"] = combined_mode(descriptor["members"])
+    view["_node_modes"], view["_routing"] = effective, routing
+    _mark_participation(view, effective)
+    return effective
+
+
+def _mark_participation(view: dict, off: dict) -> None:
+    """A setting on a node the app switched off: ``inactive`` (``partial`` when
+    only some of its targets are), with the canvas's reason shape."""
+    if not off:
+        return
+    titles = {m["path"]: m.get("title") or m.get("class_type") or m["path"]
+              for d in view.get("execution", []) or [] for m in d.get("members", [])}
+    for descriptor in view.get("bindings", []):
+        reasons = []
+        for target in descriptor.get("targets", []):
+            path = str(target.get("path", ""))
+            root = path.split(":", 1)[0]
+            if path in off:
+                reasons.append({"mode": off[path], "by": "self", "label": titles.get(path, path)})
+            elif root in off:
+                reasons.append({"mode": off[root], "by": "parent", "label": titles.get(root, root)})
+        if reasons:
+            descriptor["participation"] = "inactive" if len(reasons) == len(descriptor.get("targets", [])) else "partial"
+            descriptor["inactive_reason"] = reasons[0]
 
 
 # ── Validation ───────────────────────────────────────────────────────────────
@@ -269,7 +353,7 @@ def validate_structural(view: dict, inventory: list[dict] | None, identity: str,
     from .control_descriptors import ControlValueError, PANEL_LABEL_MAX_CHARS
 
     if mode == "sdk":
-        raise ControlValueError(SDK_REASON)
+        raise ControlValueError(SDK_STRUCTURAL_REASON)
     if mode not in ("canvas", "relay"):
         raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
     if view.get("execution_error"):

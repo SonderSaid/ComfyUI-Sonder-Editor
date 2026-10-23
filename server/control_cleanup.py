@@ -54,8 +54,8 @@ def inventory(view, *, stored=None, definition_anchors=()):
             if bid not in bindings or bid in removable:
                 result["preset_members"].append({"preset_id": pid, "binding_id": bid,
                     **({"requires_binding": bid} if bid in bindings else {})})
-        if sdk:
-            continue
+        # The app never removes a switch, but a preset member whose switch is
+        # gone (an app export leaves hidden ones out) is still repairable here.
         for eid in preset.get("execution") or {}:
             if eid not in switches or eid in gone:
                 result["preset_members"].append({"preset_id": pid, "execution_id": eid,

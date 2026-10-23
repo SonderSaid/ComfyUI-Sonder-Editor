@@ -37,7 +37,9 @@ def _drifted(descriptor, member):
 
 
 def _execution_unavailable(view, descriptor, member):
-    return (descriptor.get("status") != "ok" or descriptor.get("read_only") or bool(view.get("execution_error"))
+    # A hidden switch's modes never run in the app, like a hidden setting's value.
+    return (descriptor.get("status") != "ok" or descriptor.get("read_only") or descriptor.get("hidden")
+            or bool(view.get("execution_error"))
             or ("modes" in member) != (descriptor.get("kind") == "group") or _drifted(descriptor, member))
 
 
@@ -169,7 +171,7 @@ def _capture_execution(view, identities, previous=None):
         if not isinstance(eid, str) or not cm.ID_RE.fullmatch(eid) or eid in cm.FORBIDDEN_KEYS:
             raise cd.ControlValueError("A preset member id is invalid.")
         descriptor = switches.get(eid, {})
-        if descriptor.get("status") != "ok" or descriptor.get("read_only"):
+        if descriptor.get("status") != "ok" or descriptor.get("read_only") or descriptor.get("hidden"):
             if previous and eid in (previous.get("execution") or {}):
                 result[eid] = copy.deepcopy(previous["execution"][eid])
                 continue

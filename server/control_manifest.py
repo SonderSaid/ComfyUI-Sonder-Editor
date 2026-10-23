@@ -121,7 +121,7 @@ def clean_group(value: Any) -> str:
 
 def empty_manifest() -> dict:
     return {"v": MANIFEST_VERSION, "bindings": {}, "notes": {}, "groups": {}, "suggestions": [], "description": "", "presets": {},
-            "execution": {}, "execution_error": None}
+            "execution": {}, "execution_error": None, "execution_routing": None}
 
 
 def _check_shape(value: Any, depth: int = 1) -> None:
@@ -427,6 +427,11 @@ def parse_manifest(text: Any) -> dict:
     manifest = empty_manifest()
     manifest["presets"] = read_presets(raw.get("presets"))
     manifest["execution"], manifest["execution_error"] = read_execution(raw.get("execution"))
+    # The export-only routing capsule (control_routing reads it), only beside a
+    # section this version reads.
+    section = raw.get("execution")
+    if isinstance(section, dict) and not manifest["execution_error"]:
+        manifest["execution_routing"] = section.get("routing")
     manifest["description"] = _text(raw.get("description"), DESCRIPTION_MAX, "description")
     for binding_id, entry in bindings_raw.items():
         manifest["bindings"][_check_id(binding_id)] = _binding(entry)

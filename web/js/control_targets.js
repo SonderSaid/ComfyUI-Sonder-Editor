@@ -43,7 +43,7 @@ export function parseTarget(target) {
 export const STRUCTURAL_OPS = {
     binding: BINDING_STRUCTURAL_OPS, note: new Set(["create", "remove", "hide", "unhide"]),
     group: GROUP_OPS, preset: new Set(["create", "capture", "apply"]), workflow: new Set(["cleanup", "restore"]),
-    execution: new Set(["expose", "remove", "rebind"]),
+    execution: new Set(["expose", "remove", "rebind", "hide", "unhide"]),
 };
 
 export function isStructuralTarget(target) {

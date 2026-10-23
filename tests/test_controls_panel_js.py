@@ -925,6 +925,18 @@ if(SCENARIO==='markdown'){
         assert.equal(seg('muted').attributes['aria-checked'],'false');
         seg('muted').dispatch('click');await settle();
         assert.deepEqual(calls.at(-1),{'execution:x:mode':'muted'});
+        // The clicked button keeps focus; a mode set elsewhere (a preset, Undo)
+        // still shows, since a switch holds no draft.
+        seg('muted').focus();
+        publish({...view, bindings:[...view.bindings], execution:[{source:'execution',execution_id:'x',label:'First pass',kind:'group',status:'ok',mode:'enabled',value:'enabled',
+            members:[{path:'3',mode:'enabled'},{path:'4',mode:'enabled'}],member_count:2,order:5,group:'',advanced:false,note:''}]});
+        await settle();
+        assert.equal(seg('enabled').attributes['aria-checked'],'true');
+        publish({...view, bindings:[...view.bindings, {source:'binding',binding_id:'off',label:'Pass 2 steps',kind:'INT',value:'8',status:'ok',
+            order:4,group:'',section:'workflow',note:'',participation:'inactive',inactive_reason:{mode:'muted',by:'self',label:'Pass 2'}}],
+            execution:[{source:'execution',execution_id:'x',label:'First pass',kind:'group',status:'ok',mode:'muted',value:'muted',
+                members:[{path:'3',mode:'muted'},{path:'4',mode:'muted'}],member_count:2,order:5,group:'',advanced:false,note:''}]});
+        await settle();
         // Generate and preset capture flush every row editor; a switch holds nothing to flush.
         assert.equal(await panel.flushPending(),true);
         // A muted setting keeps its row, says why and stays editable.

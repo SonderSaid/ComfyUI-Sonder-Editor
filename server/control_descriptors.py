@@ -317,7 +317,7 @@ BINDING_STRUCTURAL_OPS = frozenset({"expose", "remove", "rebind", "hide", "unhid
 GROUP_OPS = frozenset({"create", "rename", "ungroup", "move"})
 STRUCTURAL_OPS = {"binding": BINDING_STRUCTURAL_OPS, "note": frozenset({"create", "remove", "hide", "unhide"}),
                   "group": GROUP_OPS, "preset": frozenset({"create", "capture", "apply"}), "workflow": frozenset({"cleanup", "restore"}),
-                  "execution": frozenset({"expose", "remove", "rebind"})}
+                  "execution": frozenset({"expose", "remove", "rebind", "hide", "unhide"})}
 
 
 def parse_target(target: Any) -> tuple[str, str, str] | None:
@@ -1341,8 +1341,10 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
             descriptor, field = table[target]
             if descriptor.get("source") == "execution" and (field in ("mode", "modes") or descriptor.get("read_only")):
                 from . import control_execution
-                if descriptor.get("read_only") or structural == "sdk":
-                    raise ControlValueError(control_execution.SDK_REASON)
+                # The Sonder App switches only what its export can route
+                # (control_execution.apply_sdk_state); the reason says why not.
+                if descriptor.get("read_only"):
+                    raise ControlValueError(descriptor.get("reason") or control_execution.SDK_REASON)
                 value = control_execution.coerce_mode(descriptor, field, raw, expanded=expanded) if field in ("mode", "modes") else raw
                 # A node a group and its own switch both set must get one mode.
                 for path, mode in control_execution.effects_of(descriptor, field, value).items():
@@ -1575,6 +1577,9 @@ class _StructuralBatch:
             return self._note(identity, op, raw)
         if source == "execution":
             from . import control_execution
+            if op in ("hide", "unhide"):  # app-only, like a setting's
+                existing = next((d for d in self.view.get("execution") or [] if d.get("execution_id") == identity), None)
+                return self._hide(existing, op, raw)
             return control_execution.validate_structural(self.view, self.execution_inventory, identity, op, raw,
                                                          self.mode, self.execution_state, self._order)
         existing = self.bindings.get(identity)
@@ -1770,7 +1775,9 @@ def json_safe(view: dict) -> dict:
             return [copy(item) for item in value]
         return value
 
-    return copy({key: value for key, value in view.items() if not key.startswith("_presets")})
+    # Underscored keys (``_presets``, the app's ``_node_modes``/``_routing``)
+    # are server-side state, never sent.
+    return copy({key: value for key, value in view.items() if not key.startswith("_")})
 
 
 # ── Seeds ────────────────────────────────────────────────────────────────────

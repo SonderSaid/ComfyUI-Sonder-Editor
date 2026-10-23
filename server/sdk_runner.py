@@ -45,7 +45,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import control_descriptors, controls_snapshot, launcher_state, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry
+from . import control_descriptors, controls_snapshot, launcher_state, prompt_graph, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry
 from .editor_inputs import clean_editor_value, clean_editor_values, editor_optional_inputs
 from .sdk_install import install_state, uninstall_running
 
@@ -837,6 +837,9 @@ class SdkRunner:
                 raise SdkError(sdk_templates.missing_nodes_message(missing_nodes), "missing_nodes", 409,
                                missing_nodes=missing_nodes, stale=build["stale"])
             refusals = sdk_templates.generate_refusals(build["view"])
+            if not prompt_graph.nodes_reaching(build["prompt"], build["editor_key"], prompt_graph.SONDER_SAVE_CLASS_TYPES):
+                refusals.append("The current node switches turn off every Sonder Save Video and Save Bridge "
+                                "that takes its project from the editor, so takes would not land. Switch one on.")
             from .model_requirements import missing_models, missing_model_message
             missing = await asyncio.to_thread(missing_models, build["prompt"], executable_only=True)
             refusals.extend(map(missing_model_message, missing))
@@ -890,21 +893,30 @@ class SdkRunner:
         editor_inputs["render_cache_max_bytes"] = render_cache_max_bytes
         view = sdk_templates.apply_stored_values(
             prompt, sdk_templates.describe_stored(prompt, stored, self._describe), stored, describe=self._describe)
+        # The switches' node modes, compiled as ComfyUI's serializer would: a
+        # switched-off node is not in what runs.
+        prompt = sdk_templates.run_prompt(prompt, view)
+        # The session's own Editor inputs stand whatever the switches compiled.
+        if editors[0] in prompt:
+            prompt[editors[0]]["inputs"].update({name: editor_inputs[name] for name in (
+                *sdk_templates.EDITOR_STATE_FIELDS, "project", "render_cache_max_bytes")})
         # Seeds are keyed by binding; each target (one per consumer of a
         # promoted seed) is only the address a run writes. A hidden seed is
-        # not exposed: the workflow's own value runs and nothing advances.
+        # not exposed: the workflow's own value runs and nothing advances. A
+        # seed whose nodes are all switched off does not run, so it neither
+        # advances nor is recorded; a partly off one writes the targets that run.
         seed_bindings = []
         for binding in view.get("bindings", []):
             if binding.get("kind") != "SEED" or binding.get("status") != control_descriptors.STATUS_OK:
                 continue
-            if binding.get("hidden"):
+            if binding.get("hidden") or binding.get("participation") == "inactive":
                 continue
             seed = binding.get("value")
             if isinstance(seed, bool) or not isinstance(seed, int):
                 seed = 0
             seed_bindings.append({
                 "binding_id": binding["binding_id"],
-                "targets": [(t["path"], t["input"]) for t in binding.get("targets", [])],
+                "targets": [(t["path"], t["input"]) for t in binding.get("targets", []) if t["path"] in prompt],
                 "sig": control_descriptors.binding_signature(binding),
                 "seed": seed,
                 "mode": binding["seed_mode"],

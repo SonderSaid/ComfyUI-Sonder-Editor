@@ -66,8 +66,13 @@ reverts the switch.
   last one you click decides.
 - On the canvas, the **Sonder Control Relay** node shows each switch's state
   (*Muted — switch in Controls*).
-- In the Sonder App, switches show their state but can't be switched yet;
-  switch them on the canvas.
+- In the Sonder App, switches work the same way, and **Generate** runs the
+  workflow as ComfyUI would with those nodes off. A switch works there only if
+  every node it covers was on when you used **Export (API)**; otherwise it is
+  greyed out and says how to fix it. To hide a switch you don't need, click
+  **Manage**, then **Hide** on its row.
+- If your switches turn off every **Sonder Save Video** and **Save Bridge**,
+  **Generate** says so instead of running: no take could land.
 
 To add one, see [Manage](#manage).
 
@@ -174,7 +179,9 @@ lists.
 - **From the Sonder App:** in the Launcher, open the workflow's **⋮** menu and
   click **Export as API**. The file carries current values, seed modes, labels,
   notes, group order, **Advanced** flags, the description and active app-only
-  Controls. Hidden entries are left out; disabled Controls stay disabled. If a
+  Controls. Hidden entries are left out; disabled Controls stay disabled.
+  Every switch's nodes stay on in the file, so your current switch choices are
+  not in it: save them in a preset first if you want to keep them. If a
   Relay can't be read or the file would be too large to import, Export says so
   instead of downloading.
 

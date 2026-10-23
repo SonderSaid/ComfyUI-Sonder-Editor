@@ -294,15 +294,19 @@ def test_structural_switch_targets():
     assert any(c.get("reason") for c in with_reason)
 
 
-def test_the_sonder_app_shows_switches_read_only_for_now():
-    view = switches_view(switch_prompt())
-    ce.sdk_read_only(view["execution"])
-    assert all(d["read_only"] for d in view["execution"])
+def test_the_sonder_app_cannot_switch_an_export_without_routing():
+    # An export made before routing capsules: the app can't know what a
+    # bypass routes, so its switches stay read-only with how to fix it.
+    prompt = switch_prompt()
+    view = switches_view(prompt)
+    ce.apply_sdk_state(view, prompt, {}, set())
+    assert all(d["read_only"] and d["reason"] == ce.REEXPORT_REASON for d in view["execution"])
     _, rejected = cd.validate_binding_changes(view, {"execution:a:mode": "muted"}, structural="sdk")
-    assert rejected and rejected[0]["reason"] == ce.SDK_REASON
+    assert rejected and rejected[0]["reason"] == ce.REEXPORT_REASON
     assert cd.validate_binding_changes(view, {"execution:a:label": "x"}, structural="sdk")[1]
-    assert cd.validate_binding_changes(view, {"execution:new:expose": {"candidate": {"kind": "node", "path": "7"}}},
-                                       structural="sdk")[1]
+    _, structural = cd.validate_binding_changes(view, {"execution:new:expose": {"candidate": {"kind": "node", "path": "7"}}},
+                                                structural="sdk")
+    assert structural[0]["reason"] == ce.SDK_STRUCTURAL_REASON
 
 
 # ── Presets with modes ────────────────────────────────────────────────────────
@@ -378,9 +382,9 @@ def test_effects_budget_counts_distinct_nodes():
                                           prompt=prompt, structural="canvas")[1]
 
 
-def test_sonder_app_presets_with_switches_read_unavailable():
+def test_sonder_app_presets_with_unroutable_switches_read_unavailable():
     view, prompt = preset_view({"p": skip_preset()})
-    ce.sdk_read_only(view["execution"])
+    ce.apply_sdk_state(view, prompt, {}, set())  # no routing in this export
     rows = cd.preset_states(view, view["_presets"], prompt=prompt)
     assert rows[0]["state"] == "unavailable"
 
@@ -433,8 +437,10 @@ def test_launcher_warns_about_switches_off_at_export():
     manifest["execution"]["controls"]["g"]["members"][1]["mode"] = "muted"
     prompt["9"] = _node("SonderControlRelay", {"manifest": json.dumps(manifest)})
     del prompt["8"]
-    _, warnings = sdk_templates.controls_summary_of(describe(prompt))
-    assert any("had nodes off when this workflow was exported" in w for w in warnings)
+    view = describe(prompt)
+    ce.apply_sdk_state(view, prompt, {}, set())
+    _, warnings = sdk_templates.controls_summary_of(view)
+    assert any("can't be switched here: Its nodes were off when this workflow was exported" in w for w in warnings)
 
 
 # ── Describe route ────────────────────────────────────────────────────────────

@@ -39,7 +39,7 @@ import secrets
 import time
 from typing import Any, Callable
 
-from . import control_descriptors, control_rows, prompt_graph, model_requirements
+from . import control_descriptors, control_execution, control_rows, prompt_graph, model_requirements
 from .external_links import WINDOWS_RESERVED_BASENAMES
 from .editor_inputs import clean_editor_values
 from .path_security import PathSecurityError, safe_route_token
@@ -196,6 +196,8 @@ def validate_template(
     controls_summary: list[dict] = []
     if not errors and not missing:
         described = describe(prompt)
+        # What the app can switch: an export's off nodes and its routing decide.
+        control_execution.apply_sdk_state(described, prompt, {}, set())
         blocking.extend(generate_refusals(described))
         controls_summary, control_warnings = controls_summary_of(described)
         warnings.extend(control_warnings)
@@ -316,10 +318,12 @@ def controls_summary_of(view: dict) -> tuple[list[dict], list[str]]:
         if binding.get("status") != control_descriptors.STATUS_OK:
             warnings.append(f"“{label}” is off: {binding.get('reason') or 'it cannot be set.'}")
     for switch in view.get("execution", []) or []:
-        # Its off nodes are not in the file, so no run here can switch them on.
-        if any(member.get("mode") != "enabled" for member in switch.get("members", [])):
-            warnings.append(f"“{switch.get('label') or 'A node switch'}” had nodes off when this workflow was "
-                            "exported. Enable them on the canvas and export again.")
+        # Off nodes are not in the file, and an export without routing can't
+        # say what bypassing one routes: the app can't switch either.
+        if switch.get("hidden") or switch.get("status") != control_descriptors.STATUS_OK or not switch.get("read_only"):
+            continue
+        warnings.append(f"“{switch.get('label') or 'A node switch'}” can't be switched here: "
+                        f"{switch.get('reason') or control_execution.REEXPORT_REASON}")
     if not has_seed:
         warnings.append(
             "No seed exposed: every Generate of the same job uses the workflow's fixed seed. "
@@ -409,7 +413,8 @@ def list_templates(*, requirements: bool = False) -> list[dict]:
                     # A stored binding value (a checkpoint, say) changes which
                     # model files the run needs.
                     if _has_curation(stored):
-                        apply_stored_values(prompt, describe_stored(prompt, stored), stored)
+                        prompt = run_prompt(prompt, apply_stored_values(prompt, describe_stored(prompt, stored), stored),
+                                            fallback=True)
                     meta["missing_models"] = model_requirements.missing_models(prompt, input_cache=input_cache)
             except Exception:  # one workflow's problem must not hide the whole list
                 logger.warning("Model requirements failed for workflow %s", meta.get("template_id"), exc_info=True)
@@ -425,7 +430,7 @@ _summary_cache: dict[str, tuple] = {}
 def _has_curation(stored: dict) -> bool:
     # Notes and layout count too: the summary carries groups and Advanced.
     return any(stored.get(name) for name in ("bindings", "local", "local_notes", "hidden", "labels",
-                                             "notes", "layout", "presets")) or "description" in stored
+                                             "notes", "layout", "presets", "node_modes")) or "description" in stored
 
 
 def _overlay_summary(meta: dict) -> None:
@@ -464,7 +469,7 @@ def template_requirements(template_id: str) -> dict:
         prompt, _ = load_template(template_id)
         stored = read_control_values(template_id)
         if _has_curation(stored):
-            apply_stored_values(prompt, describe_stored(prompt, stored), stored)
+            prompt = run_prompt(prompt, apply_stored_values(prompt, describe_stored(prompt, stored), stored), fallback=True)
         return {"ok": True, "template_id": template_id, "missing_models": model_requirements.missing_models(prompt)}
 
 
@@ -656,9 +661,48 @@ def _curated_manifest(prompt, relay, stored, view):
         entry = copy.deepcopy((saved.get("notes") or {}).get(identity, {}))
         entry.update({key: descriptor.get(key, default) for key, default in (("text", ""), ("group", ""), ("order", 0))})
         manifest["notes"][identity] = entry
+    _curated_execution(manifest, saved, stored, view)
     for key in ("status", "suggestions", "error"):
         manifest.pop(key, None)
     return manifest
+
+
+def _curated_execution(manifest, saved, stored, view):
+    """The export's switch section as this app presents it. Its facts and the
+    routing capsule stay the export's: the template is exported unchanged,
+    every switch node enabled. The app's node modes are not exported; a preset
+    keeps a switched-off setup."""
+    section = saved.get("execution")
+    if view.get("execution_error") or not isinstance(section, dict) or not isinstance(section.get("controls"), dict):
+        return
+    # A hidden switch is left out, so presets may not name it either; one
+    # left holding nothing is left out too.
+    hidden = {d["execution_id"] for d in view.get("execution", []) or [] if d.get("hidden")}
+    if hidden:
+        presets = copy.deepcopy(manifest.get("presets") or {})
+        for identity in list(presets):
+            execution = {eid: member for eid, member in (presets[identity].get("execution") or {}).items()
+                         if eid not in hidden}
+            presets[identity].pop("execution", None)
+            if execution:
+                presets[identity]["execution"] = execution
+            elif not presets[identity].get("members"):
+                del presets[identity]
+        manifest["presets"] = presets
+    section = copy.deepcopy(section)
+    labels = stored.get("labels") if isinstance(stored.get("labels"), dict) else {}
+    for descriptor in view.get("execution", []) or []:
+        identity = descriptor["execution_id"]
+        entry = section["controls"].get(identity)
+        if not isinstance(entry, dict):
+            continue
+        if descriptor.get("hidden"):
+            del section["controls"][identity]
+            continue
+        entry.update({key: descriptor.get(key, entry.get(key)) for key in ("note", "order", "group", "advanced")})
+        label = labels.get(f"execution:{identity}", entry.get("label", ""))
+        entry["label"] = label.strip()[:control_descriptors.control_manifest.LABEL_MAX] if isinstance(label, str) else ""
+    manifest["execution"] = section
 
 def _read_bytes(path: str) -> bytes | None:
     try:
@@ -741,7 +785,7 @@ def _write_bytes_atomic(path: str, data: bytes) -> None:
 def _normalized_controls(data: dict, presentation_hash: str) -> dict:
     data = dict(data)
     data["version"] = CONTROLS_VERSION
-    for name in ("bindings", "labels", "notes", "layout", "local", "local_notes", "hidden", "presets"):
+    for name in ("bindings", "labels", "notes", "layout", "local", "local_notes", "hidden", "presets", "node_modes"):
         if not isinstance(data.get(name), dict):
             data[name] = {}
     if data.get("presentation_hash") != presentation_hash:
@@ -782,6 +826,22 @@ def update_control_values(template_id: str, mutate: Callable[[dict], None]) -> d
         data["seq"] += 1
         write_json_atomic(controls_path, data)
         return data
+
+
+def run_prompt(prompt: dict, view: dict, *, fallback: bool = False) -> dict:
+    """What a run submits: ``prompt`` (stored values applied) with the app's
+    switch modes compiled the way ComfyUI's serializer would export them
+    (control_routing). Refuses a route the capsule can't replay; ``fallback``
+    (a model check) reads the uncompiled prompt instead."""
+    modes = view.get("_node_modes") or {}
+    if not modes:
+        return prompt
+    try:
+        return control_execution.control_routing.compile_modes(prompt, view["_routing"], modes)
+    except control_execution.control_routing.RoutingError as exc:
+        if fallback:
+            return prompt
+        raise TemplateError(str(exc), "invalid_controls", 409) from None
 
 
 def describe_stored(prompt: dict, stored: dict, describe=None) -> dict:
@@ -869,6 +929,7 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
     for descriptors, prefix, identity_key, text_key in (
         (view.get("bindings", []), "binding", "binding_id", "note"),
         (view.get("notes", []), "note", "note_id", "text"),
+        (view.get("execution", []) or [], "execution", "execution_id", "note"),
     ):
         for descriptor in descriptors:
             base = f"{prefix}:{descriptor.get(identity_key)}"
@@ -886,7 +947,7 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
                         pass
                 if isinstance(layout.get("group"), str):
                     descriptor["group"] = cd.control_manifest.clean_group(layout["group"])
-                if prefix == "binding" and isinstance(layout.get("advanced"), bool):
+                if prefix in ("binding", "execution") and isinstance(layout.get("advanced"), bool):
                     descriptor["advanced"] = layout["advanced"]
             text = notes.get(base)
             if isinstance(text, str):
@@ -896,13 +957,15 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
                 descriptor["label"] = (label.strip()[:cd.PANEL_LABEL_MAX_CHARS]
                                        or cd._default_label(prompt, descriptor.get("targets") or [],
                                                          descriptor.get("group_name")))
+            elif prefix == "execution" and isinstance(label, str):
+                descriptor["label"] = label.strip()[:cd.PANEL_LABEL_MAX_CHARS] or descriptor.get("default_label", "")
     description = stored.get("description")
     if isinstance(description, str) and len(description) <= cd.control_manifest.DESCRIPTION_MAX:
         view["description"] = description
-    # Phase 1A interim: the app shows the workflow's node switches without
-    # switching them, so a preset holding one reads unavailable here.
-    from .control_execution import sdk_read_only
-    sdk_read_only(view.get("execution", []) or [])
+    # The app's switches: what its export can route, set from node_modes, and
+    # the settings they turn off marked inactive. Validation still reads the
+    # full template; a run submits run_prompt's compiled copy.
+    control_execution.apply_sdk_state(view, prompt, stored, hidden)
     if "relay" in view and not view.get("error"):
         view["groups"] = _overlay_groups(view.get("groups"), layouts)
         view["group_order"] = cd.group_order(view)  # the overlays may regroup
@@ -963,6 +1026,7 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                 "class_type": target.get("class_type") or _class_of(prompt, target["path"])}
 
     authored_groups = set(control_manifest_of(prompt).get("groups") or {})
+    switches = {d.get("execution_id"): d for d in view.get("execution", []) or []}
 
     def mutate(data):
         # Ephemeral batch projection: later group expansion sees earlier member
@@ -972,6 +1036,17 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
             source, identity, field = control_descriptors.parse_target(target)
             base = f"{source}:{identity}"
             if isinstance(value, dict) and value.get("noop"):
+                continue
+            if source == "execution" and field in ("mode", "modes"):
+                # Node state, as on the canvas: a node two switches share takes
+                # the last mode set. Enabled is the export's own state.
+                for member in switches.get(identity, {}).get("members", []):
+                    path = member["path"]
+                    mode = value.get(path) if field == "modes" else value
+                    if mode in control_execution.control_routing.OFF_MODES:
+                        data["node_modes"][path] = {"mode": mode, "class_type": member["class_type"]}
+                    else:
+                        data["node_modes"].pop(path, None)
                 continue
             if source == "preset":
                 authored = control_manifest_of(prompt).get("presets", {})
@@ -1040,7 +1115,8 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                         rows.append({"note_id": identity, "origin": "local", **data["local_notes"][identity]})
                 continue
             if field in ("group", "order"):
-                rows, key = ("bindings", "binding_id") if source == "binding" else ("notes", "note_id")
+                rows, key = {"binding": ("bindings", "binding_id"), "execution": ("execution", "execution_id")}.get(
+                    source, ("notes", "note_id"))
                 for descriptor in current.get(rows, []):
                     if descriptor.get(key) == identity:
                         descriptor[field] = value
@@ -1106,7 +1182,8 @@ def _store_group(data: dict, view: dict, authored_groups: set, name: str, plan: 
     def regroup(old: str, new: str) -> None:
         for kind, rows, identity_key, local_table in (
                 ("binding", view.get("bindings", []), "binding_id", "local"),
-                ("note", view.get("notes", []), "note_id", "local_notes")):
+                ("note", view.get("notes", []), "note_id", "local_notes"),
+                ("execution", view.get("execution", []) or [], "execution_id", None)):
             for descriptor in rows:
                 if descriptor.get("group") != old:
                     continue

@@ -699,8 +699,11 @@ export function mountControlsPanel(container, host) {
         row.actionsKey = key;
         const items = [];
         if (spec.read_only) {
-            // The workflow's node switches are switched and arranged on the canvas for now.
-            box.replaceChildren(marker("Canvas only", "Switch and arrange node switches on the canvas."));
+            // A switch this app can't route is switched and arranged on the
+            // canvas; one hidden earlier can still be shown again.
+            const unhide = spec.hidden && caps.hide ? smallButton("Unhide") : null;
+            unhide?.addEventListener("click", () => void structural({ [`${baseOf(spec)}:unhide`]: true }, unhide));
+            box.replaceChildren(marker("Canvas only", "Switch and arrange node switches on the canvas."), ...(unhide ? [unhide] : []));
             return;
         }
         if (local) items.push(marker("App only", "Added in the Sonder App; not part of the workflow file."));
@@ -944,7 +947,7 @@ export function mountControlsPanel(container, host) {
                 if (!on) render();
             };
             if (row.editorKind === "execution") {
-                row.editor = mountExecutionRow({ commit: (next, before) => commit(row, row.target, next, before), onEditing });
+                row.editor = mountExecutionRow({ commit: (next, before) => commit(row, row.target, next, before) });
             } else if (row.editorKind === "rows") {
                 // A row list edits as a whole; each edit carries the list it was made from.
                 row.editor = mountRowsEditor({

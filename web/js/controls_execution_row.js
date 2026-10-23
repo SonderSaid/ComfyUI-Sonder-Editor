@@ -36,7 +36,10 @@ export function switchScope(spec) {
     return spec?.kind === "instance" ? "Subgraph" : "Node";
 }
 
-export function mountExecutionRow({ commit, onEditing = () => {} }) {
+// A choice commits at once, so there is no draft to protect: a focused button
+// never holds the row back from showing a mode set elsewhere (a preset, Undo,
+// another tab). Unlike the other row editors it takes no onEditing.
+export function mountExecutionRow({ commit }) {
     const el = make("div");
     el.setAttribute("role", "radiogroup");
     el.style.cssText = `display:flex;flex-direction:column;gap:2px;min-width:0;width:100%;align-items:flex-end;`;
@@ -50,8 +53,6 @@ export function mountExecutionRow({ commit, onEditing = () => {} }) {
         const button = smallButton(MODE_LABELS[mode]);
         button.dataset.executionMode = mode;
         button.setAttribute("role", "radio");
-        button.addEventListener("focus", () => onEditing(true));
-        button.addEventListener("blur", () => onEditing(false));
         button.addEventListener("click", () => {
             if (!editable || mode === value) return;
             const before = value;
