@@ -11857,7 +11857,7 @@ if routes is not None:
         body = await _control_relay_body(request)
         payload = await set_controls_visibility(project_id, str(body.get("host_id") or ""),
                                                str(body.get("session_id") or ""), body.get("visible"), body.get("seen"),
-                                               body.get("manage"), body.get("filter"))
+                                               body.get("manage"), body.get("filter"), body.get("views"))
         return await _control_relay_response(payload)
 
     @routes.get("/sonder-editor/project/{project_id}/widget_state")

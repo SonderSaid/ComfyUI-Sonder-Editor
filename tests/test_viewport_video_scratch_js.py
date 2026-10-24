@@ -72,7 +72,7 @@ const {mediaFailedToDecode}=await import(''' + json.dumps((ROOT/'web/js/media_pr
 const noteMediaDecodeFailure=(el)=>{decodeReports.push(el);return true;};
 const VIEWPORT_FIT_MODES=new Set(['fit','pad_edge','cover','stretch']);
 const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
-''' + function('fitRect') + '\n' + function('drawEdgePadBars') + '\n' + draw + r'''
+''' + function('fitRect') + '\n' + function('drawEdgePadBars') + '\n' + function('drawFitted') + '\n' + draw + r'''
 const video={videoWidth:1920,videoHeight:1088,readyState:4};
 for (const mode of VIEWPORT_FIT_MODES) {
  ctx.calls=[];

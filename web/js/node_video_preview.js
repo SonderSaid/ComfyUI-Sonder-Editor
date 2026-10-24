@@ -25,6 +25,7 @@
 import { THEME, RADIUS } from "./editor_theme.js";
 import { renderDormantMediaScrubBar, buttonStyle } from "./editor_node_controller.js";
 import { loadMediaAsBlob } from "./shared_asset_gallery.js";
+import { viewUrl } from "./comfy_view_url.js";
 import {
     registerGraphPreviewDiagnostic,
     subscribeGraphPreviewSuppression,
@@ -44,24 +45,8 @@ function getNodeAutoplay(node) {
     return widget ? widget.value === true : false;
 }
 
-function comfyApi() {
-    return window.comfyAPI?.api?.api || null;
-}
-
 function comfyApp() {
     return window.comfyAPI?.app?.app || null;
-}
-
-function viewUrl(descriptor) {
-    if (!descriptor || !descriptor.filename) return "";
-    const params = new URLSearchParams({
-        filename: String(descriptor.filename),
-        subfolder: String(descriptor.subfolder || ""),
-        type: String(descriptor.type || "output"),
-    });
-    const path = `/view?${params.toString()}`;
-    const api = comfyApi();
-    return api?.apiURL ? api.apiURL(path) : path;
 }
 
 function videoAspect(node) {

@@ -310,14 +310,16 @@ def coerce_panel_layout(field: str, raw: Any):
 # control_bindings.js ``parseTarget``): ``binding:<id>:<field>``,
 # ``note:<id>:<field>``, ``group:<name>:<op>`` (a name holds no ``:``) and the
 # two-part ``workflow:description``.
-_TARGET_RE = re.compile(r"^(?:(binding|note|preset|execution):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$")
+_TARGET_RE = re.compile(r"^(?:(binding|note|preset|execution|view):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$")
 # Manage's structural targets: the validator returns an internal write plan,
 # and the mounted relay forwards the original intent for the canvas to recheck.
 BINDING_STRUCTURAL_OPS = frozenset({"expose", "remove", "rebind", "hide", "unhide", "create"})
 GROUP_OPS = frozenset({"create", "rename", "ungroup", "move"})
 STRUCTURAL_OPS = {"binding": BINDING_STRUCTURAL_OPS, "note": frozenset({"create", "remove", "hide", "unhide"}),
                   "group": GROUP_OPS, "preset": frozenset({"create", "capture", "apply"}), "workflow": frozenset({"cleanup", "restore"}),
-                  "execution": frozenset({"expose", "remove", "rebind", "hide", "unhide"})}
+                  "execution": frozenset({"expose", "remove", "rebind", "hide", "unhide"}),
+                  # An Output View: label and order are presentation.
+                  "view": frozenset({"create", "remove"})}
 
 
 def parse_target(target: Any) -> tuple[str, str, str] | None:
@@ -956,6 +958,9 @@ def describe_bindings(
     view["execution"], execution_error = control_execution.describe_execution(executable, manifest)
     if execution_error:
         view["execution_error"] = execution_error
+    # Output Views and the outputs that could be one, in every host.
+    from . import control_views
+    control_views.add_to_view(view, executable, manifest, authoring=authoring, class_lookup=class_lookup)
     if host_editor is SOLE_EDITOR:
         host_editor = view["editors"][0] if len(view["editors"]) == 1 else None
     for descriptor in view["bindings"]:
@@ -1235,8 +1240,9 @@ def _target_table(view: dict) -> dict:
         if isinstance(identity, str) and identity and note.get("status") == STATUS_OK:
             for field in ("text", "order", "group"):
                 table[f"note:{identity}:{field}"] = (note, field)
-    from . import control_execution
+    from . import control_execution, control_views
     table.update(control_execution.table_entries(view))
+    table.update(control_views.table_entries(view))
     return table
 
 
@@ -1339,6 +1345,10 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
             if target not in table:
                 raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
             descriptor, field = table[target]
+            if descriptor.get("source") == "view":
+                from . import control_views
+                cleaned[target] = control_views.coerce_presentation(descriptor, field, raw, structural)
+                continue
             if descriptor.get("source") == "execution" and (field in ("mode", "modes") or descriptor.get("read_only")):
                 from . import control_execution
                 # The Sonder App switches only what its export can route
@@ -1432,6 +1442,7 @@ class _StructuralBatch:
                  execution_inventory: list[dict] | None = None):
         self.view, self.mode = view, mode
         self.execution_inventory, self.execution_state = execution_inventory, {}
+        self.view_state: dict = {}
         self.bindings = {d.get("binding_id"): d for d in view.get("bindings", [])}
         self.notes = {d.get("note_id"): d for d in view.get("notes", [])}
         self.suggestions = {s.get("binding_id"): s for s in view.get("suggestions", [])}
@@ -1575,6 +1586,9 @@ class _StructuralBatch:
         self._require_relay()
         if source == "note":
             return self._note(identity, op, raw)
+        if source == "view":
+            from . import control_views
+            return control_views.validate_structural(self.view, identity, op, raw, self.mode, self.view_state, self._order)
         if source == "execution":
             from . import control_execution
             if op in ("hide", "unhide"):  # app-only, like a setting's

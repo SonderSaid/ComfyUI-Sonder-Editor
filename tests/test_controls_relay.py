@@ -588,3 +588,26 @@ def test_a_published_view_keeps_picker_hints_for_the_mounted_panel():
     assert hints == {'lane': {'kind': 'driver_lane', 'source': 'host'},
                      'folder': {'kind': 'asset_folder', 'source': 'other'}}
     assert next(d for d in view['bindings'] if d['binding_id'] == 'lane')['value'] == '1'
+
+
+def test_views_demand_flag_and_view_publication_shape():
+    """Output Views 3A: the tab's panes keep the canvas describing; Views pass the shape check."""
+    async def run():
+        await setup()
+        assert (await sr.set_controls_visibility(PID, HID, TAB, False, views=True))['controls_views'] is True
+        assert (await sr.set_controls_visibility(PID, HID, TAB, False, views='yes'))['code'] == 'invalid_visibility'
+        state = await pending()
+        assert state['controls_views'] is True and state['controls_visible'] is False
+        body = publication()
+        body['view'] = {**body['view'], 'views': [{'view_id': 'a', 'status': 'ok', 'label': 'Preview', 'path': '9'}],
+                        'view_candidates': [{'path': '12:7', 'class_type': 'SaveVideo'}], 'views_error': None}
+        assert (await publish(body))['ok']
+        stored = await sr.get_controls_view(PID, HID)
+        assert stored['view']['views'][0]['view_id'] == 'a' and stored['view']['view_candidates'][0]['path'] == '12:7'
+        for bad in ({'views': {'a': 1}}, {'views': [{'status': 'ok'}]}, {'views_error': 5},
+                    {'view_candidates': [{}] * 129}, {'views': [{'view_id': 'x', 'status': 'ok'}] * 33}):
+            broken = publication(seq=2)
+            broken['view'] = {**broken['view'], **bad}
+            assert not (await publish(broken))['ok'], bad
+        assert (await sr.set_controls_visibility(PID, HID, TAB, False, views=False))['controls_views'] is False
+    asyncio.run(run())

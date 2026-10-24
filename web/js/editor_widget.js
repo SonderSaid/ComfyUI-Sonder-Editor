@@ -627,6 +627,11 @@ import {
     isSelectionDurationWithinRecommendation,
     resolveSelectionExecutionWindow,
 } from "./selection_constraints.js";
+import { createAudioOwnership } from "./audio_ownership.js";
+import { createOutputMediaCache } from "./output_media_cache.js";
+import { createViewsCoordinator } from "./views_coordinator.js";
+import { mountViewPanes } from "./view_panes.js";
+import { viewUrl } from "./comfy_view_url.js";
 
 function describeKeyboardDebugElement(element) {
     if (!element) return "null";
@@ -944,7 +949,42 @@ function chromeOverlayPanelCss({ width = "90%", maxWidth = "520px", maxHeight = 
 }
 
 // ── Editor Widget Class ────────────────────────────────────────────────
+// Playhead writes that move it continuously: everything else (a seek, a step,
+// a scene switch, a clamp, a loop wrap) is a discontinuity a follower jumps for.
+const CONTINUOUS_PLAYHEAD_REASONS = new Set(["playback", "playback-first-commit-hold", "playback-rebuffer-hold"]);
+// Writes that only restate or clamp the playhead: unless the frame moved they
+// are no jump, so a following pane does not hard-seek (a widget-state echo
+// during playback in a mounted tab, say). A scene switch to the same frame is
+// still one: the scene changed.
+const PASSIVE_PLAYHEAD_REASONS = new Set(["widget-state", "duration-clamp", "external", "init", "open"]);
+
 export class EditorWidget {
+    // The scene clock's playhead. Every write goes through `_setPlayhead`, the
+    // one funnel Output View followers subscribe to; a plain assignment (from
+    // another module) is routed there too.
+    get playhead() {
+        return this._playhead ?? 0;
+    }
+
+    set playhead(value) {
+        this._setPlayhead(value, "external");
+    }
+
+    _setPlayhead(frame, reason = "seek") {
+        const previous = this._playhead;
+        this._playhead = frame;
+        if (!this._clockSubscribers?.size) return;
+        const discontinuity = !CONTINUOUS_PLAYHEAD_REASONS.has(reason);
+        if (previous === frame && (!discontinuity || PASSIVE_PLAYHEAD_REASONS.has(reason))) return;
+        this._emitClock({ type: "frame", frame, reason, discontinuity });
+    }
+
+    _emitClock(event) {
+        for (const listener of [...(this._clockSubscribers || [])]) {
+            try { listener(event); } catch (error) { console.warn("[Sonder] clock listener failed:", error); }
+        }
+    }
+
     constructor(node, options = {}) {
         this.node = node;
         this.options = options;
@@ -963,6 +1003,8 @@ export class EditorWidget {
         this.onWidgetStateApplied = options.onWidgetStateApplied || null;
         this.widgetHost = options.host || this._createNodeWidgetHost(node);
         this._controlsHost = options.controlsHost || this.widgetHost.getControlsHost?.() || node?._sonderController?.getControlsHost?.() || null;
+        // Output Views: this mode's host adapter (views_hosts.js), or one set later.
+        this._viewsHostAdapter = options.viewsHost || null;
         this._controlsPanelHandle = null;
         if (this._generationHost) this._generationHost.flushControlsPanel = () => this._controlsPanelHandle?.flushPending() ?? true;
         this.projectDir = "";
@@ -1000,7 +1042,7 @@ export class EditorWidget {
         // window will output (used) vs dropped by the boundary threshold.
         this._promptUsedSections = new Set();
         this._promptDroppedSections = new Set();
-        this.playhead = 0;
+        this._setPlayhead(0, "init");
         this.scrollX = 0;
         this.scrollY = 0;
         this.pixelsPerFrame = this._settings.layout.timelinePixelsPerFrame;
@@ -1471,7 +1513,7 @@ export class EditorWidget {
             this.renderQueueActive = coerceBoolean(nextValues.render_queue_active, true);
         }
         this.selectionStart = Math.min(this.selectionStart, this.selectionEnd);
-        this.playhead = Math.max(0, Math.min(this.playhead, this.totalFrames));
+        this._setPlayhead(Math.max(0, Math.min(this.playhead, this.totalFrames)), "widget-state");
         this._refreshContextInputs();
         this._refreshSelectionInputs();
         this._updateToolbar();
@@ -1712,6 +1754,8 @@ export class EditorWidget {
             getProjectDir: () => this.projectDir,
             initialData: { assets: [], folders: [] },
             getCurrentSceneAssetIds: () => this._currentSceneAssetIdsForGallery(),
+            // Inspect plays its own media: a pane that has the sound goes quiet meanwhile.
+            onInspectOpenChange: (open) => this._audioOwnership?.suspend(open),
             formatReferenceTag: (tag) => this._formatReferenceTag(tag),
             onFoldersChanged: () => this._controlsPickerSources?.foldersChanged(),
             onImportFiles: async (files, folder) => {
@@ -2049,7 +2093,7 @@ export class EditorWidget {
             if (!preservePendingFrameSelection) {
                 this.selectionStart = storedSelection?.start ?? 0;
                 this.selectionEnd = storedSelection?.end ?? 0;
-                this.playhead = this.selectionStart < this.selectionEnd ? this.selectionStart : 0;
+                this._setPlayhead(this.selectionStart < this.selectionEnd ? this.selectionStart : 0, "scene-switch");
                 this._setWidgetValue("selection_start", this.selectionStart);
                 this._setWidgetValue("selection_end", this.selectionEnd);
             }
@@ -2132,7 +2176,7 @@ export class EditorWidget {
 
     _clampTimelineStateToDuration() {
         const maxFrame = Math.max(0, this.totalFrames);
-        this.playhead = Math.min(this.playhead, maxFrame);
+        this._setPlayhead(Math.min(this.playhead, maxFrame), "duration-clamp");
         this.selectionStart = Math.min(this.selectionStart, maxFrame);
         this.selectionEnd = Math.min(this.selectionEnd, maxFrame);
         this._setWidgetValue("selection_start", this.selectionStart);
@@ -2272,7 +2316,7 @@ export class EditorWidget {
             if (!handled || result?.payload?.scene?.scene_id !== sceneId || this.activeSceneId !== sceneId) {
                 return handled;
             }
-            this.playhead = Math.round(previousState.playhead * scale);
+            this._setPlayhead(Math.round(previousState.playhead * scale), "fps-rescale");
             this.selectionStart = Math.round(previousState.selectionStart * scale);
             this.selectionEnd = Math.round(previousState.selectionEnd * scale);
             this.scrollX = Math.round(previousState.scrollX * scale);
@@ -4591,6 +4635,9 @@ export class EditorWidget {
         this._setControlsVisible(false);
         this._controlsHost = controlsHost || null;
         if (mounted) this._showFullscreenSidebarContent(this._settings?.layout?.fullscreenSidebarContent, { persist: false });
+        // Views belong to the workflow too: the panes follow the new one.
+        this._bindViewsControls();
+        this._viewsCoordinator?.hostChanged();
     }
 
     // Controls visibility drives the host's reads and the pickers' reads alike.
@@ -4618,6 +4665,163 @@ export class EditorWidget {
             getFolders: () => this._assetGallery?.getFolders?.() || [],
         });
         return this._controlsPickerSources;
+    }
+
+    // ── Output Views ─────────────────────────────────────────────────────
+    // The viewport's panes (view_panes.js) and their state (views_coordinator.js)
+    // through this mode's host adapter (views_hosts.js). Fullscreen receives it
+    // at construction; the mounted tab and the Sonder App set it once their run
+    // clients exist.
+
+    setViewsHost(host) {
+        this._viewsHostAdapter = host || null;
+        this._viewsCoordinator?.hostChanged();
+    }
+
+    get viewsHost() {
+        return this._viewsHostAdapter || null;
+    }
+
+    // The scene clock as Output View followers read it: the surface's clock
+    // with the funnel's playhead, and the funnel's frame and clock events.
+    _viewsClock() {
+        if (this._viewsClockApi) return this._viewsClockApi;
+        this._viewsClockApi = {
+            get: () => ({
+                ...(this._viewportSurface?.getClock?.() || {
+                    playing: false, hold: null, fps: this._effectiveFps, totalFrames: this.totalFrames, sessionId: 0, anchor: {},
+                }),
+                frame: this.playhead,
+            }),
+            subscribe: (listener) => {
+                (this._clockSubscribers ||= new Set()).add(listener);
+                return () => this._clockSubscribers?.delete(listener);
+            },
+        };
+        return this._viewsClockApi;
+    }
+
+    // What the Guides and Driver panes read: the editor's own scene and media.
+    _viewsSourceHost() {
+        if (this._viewsSourceHostApi) return this._viewsSourceHostApi;
+        const driverCount = () => Math.max(0, Number(this.activeScene?.motion_driver_lane_count) || 0);
+        this._viewsSourceHostApi = {
+            getScene: () => this.activeScene,
+            frame: () => this.playhead,
+            totalFrames: () => this.totalFrames,
+            fps: () => this._effectiveFps,
+            sceneAspect: () => (this._effectiveSceneWidth > 0 && this._effectiveSceneHeight > 0
+                ? this._effectiveSceneWidth / this._effectiveSceneHeight : 16 / 9),
+            isGuideTrackHidden: () => this._isGuideTrackHidden(),
+            getGuideAsset: (guide) => this._getGuideAsset(guide),
+            buildViewUrl: (sourcePath) => this._buildViewURL(sourcePath),
+            isDriverLaneHidden: (index) => this._isLaneHidden(TRACK_TYPE.MOTION_DRIVER, index),
+            getAssetForSourcePath: (sourcePath) => this._getAssetForSourcePath(sourcePath),
+            projectId: () => this._projectDirName(),
+            acquireSceneSource: (sourcePath, options) => this._ensureViewportSurface()?.acquireSceneSource?.(sourcePath, options)
+                || { ready: Promise.resolve(null), release() {} },
+            clock: this._viewsClock(),
+            driverLanes: () => Array.from({ length: driverCount() }, (_, index) => ({ index, label: `Driver ${index + 1}` })),
+            driverLabel: (index) => `Driver ${index + 1}`,
+        };
+        return this._viewsSourceHostApi;
+    }
+
+    // The Controls view the panes read Views from, followed across a Sonder
+    // App workflow switch (replaceControlsHost).
+    _subscribeViewsControls(listener) {
+        (this._viewsControlsListeners ||= new Set()).add(listener);
+        this._bindViewsControls();
+        return () => this._viewsControlsListeners?.delete(listener);
+    }
+
+    _bindViewsControls() {
+        if (this._viewsControlsBound === this._controlsHost) return;
+        this._viewsControlsUnsubscribe?.();
+        this._viewsControlsBound = this._controlsHost;
+        this._viewsControlsUnsubscribe = this._controlsHost?.subscribe?.((view) => {
+            for (const listener of [...(this._viewsControlsListeners || [])]) listener(view);
+        }) || null;
+    }
+
+    _ensureViewsCoordinator() {
+        if (this._viewsCoordinator || this._destroyed) return this._viewsCoordinator;
+        this._audioOwnership = createAudioOwnership({
+            setTimelineMuted: (muted) => this._viewportSurface?.setTimelineAudioMuted?.(muted),
+        });
+        this._outputMediaCache = createOutputMediaCache({ urlFor: (file) => viewUrl(file, (path) => api.apiURL(path)) });
+        this._viewsCoordinator = createViewsCoordinator({
+            host: () => this._viewsHostAdapter,
+            controls: {
+                getView: () => this._controlsHost?.getView?.() || {},
+                subscribe: (listener) => this._subscribeViewsControls(listener),
+                applyChanges: (changes) => this._controlsHost?.applyChanges?.(changes),
+                refresh: (force) => this._controlsHost?.refresh?.(force),
+            },
+            layoutStore: {
+                read: (key) => this._settings?.views?.layoutByWorkflow?.[key] || null,
+                write: (key, record) => this._updateSettings({ views: { layoutByWorkflow: { [key]: record } } }),
+            },
+            audio: this._audioOwnership,
+            cache: this._outputMediaCache,
+            onChange: () => this._viewPanes?.update(),
+            notify: (message) => notifyWarning(message, { source: "output-views" }),
+        });
+        this._viewsCoordinator.start();
+        return this._viewsCoordinator;
+    }
+
+    // The Composite's canvas sits in one pane at most; with none it is parked
+    // off-screen at its last size and keeps rendering (playback holds and the
+    // audio gate depend on it).
+    _placeComposite(body, { restore = false } = {}) {
+        const canvas = this._vpCanvas;
+        if (!canvas || !this._fsViewportContent) return;
+        if (!this._vpCompositePark) {
+            this._vpCompositePark = document.createElement("div");
+            this._vpCompositePark.setAttribute("aria-hidden", "true");
+            this._vpCompositePark.style.cssText = "position:fixed;left:-100000px;top:0;overflow:hidden;pointer-events:none;";
+        }
+        const park = this._vpCompositePark;
+        const target = body || (restore ? this._fsViewportContent : park);
+        if (!body && !restore) {
+            park.style.width = canvas.style.width || `${canvas.width}px`;
+            park.style.height = canvas.style.height || `${canvas.height}px`;
+            if (!park.isConnected) document.body.appendChild(park);
+        } else park.remove();
+        for (const el of [canvas, this._vpFrameLabel]) {
+            if (!el) continue;
+            el.dataset.sonderComposite = "true";
+            if (el.parentElement !== target) target.appendChild(el);
+        }
+        canvas.style.alignSelf = "center";
+        canvas.style.margin = "auto";
+        const cell = body || (restore ? this._fsViewportContent : null);
+        if (this._vpCompositeCell === cell) return;
+        this._vpCompositeCell = cell;
+        if (this._vpResizeObserver) {
+            this._vpResizeObserver.disconnect();
+            if (cell) this._vpResizeObserver.observe(cell);
+        }
+        if (cell) requestAnimationFrame(() => this._resizeViewportCanvas());
+    }
+
+    _mountViewPanes() {
+        if (this._viewPanes || !this._fsViewportContent || !this._vpHeaderEl) return;
+        const coordinator = this._ensureViewsCoordinator();
+        if (!coordinator) return;
+        this._viewPanes = mountViewPanes({
+            root: this._fsViewportContent, header: this._vpHeaderEl, coordinator, cache: this._outputMediaCache,
+            audio: this._audioOwnership, sourceHost: this._viewsSourceHost(),
+            placeComposite: (body, options) => this._placeComposite(body, options),
+        });
+        coordinator.setVisible(true);
+    }
+
+    _unmountViewPanes() {
+        this._viewsCoordinator?.setVisible(false);
+        this._viewPanes?.destroy();
+        this._viewPanes = null;
     }
 
     _ensureControlsPanelMounted() {
@@ -10525,6 +10729,8 @@ export class EditorWidget {
         const marginsChanged = prevMarginSignature !== nextMarginSignature;
         this._settings = nextSettings;
         this._controlsPanelHandle?.render();
+        // A newer pane layout from this workflow's other editor tab.
+        this._viewsCoordinator?.storedLayoutChanged();
         this._syncTakePlacementModeWidget(nextSettings);
         const resolvedTemplateId = getTemplateById(this._templateId, nextSettings).id;
         const templateChanged = resolvedTemplateId !== this._templateId;
@@ -11769,7 +11975,7 @@ export class EditorWidget {
 
             if (y < Math.round(RULER_HEIGHT * this._scaleTimeline)) {
                 // Click on ruler = move playhead
-                this.playhead = this._snapPlayheadFrame(frame);
+                this._setPlayhead(this._snapPlayheadFrame(frame), "ruler");
                 this.isDragging = true;
                 this.dragType = "playhead";
                 if (this.isPlaying) this._stopPlayback();
@@ -12105,7 +12311,7 @@ export class EditorWidget {
             const frame = Math.max(0, Math.min(this.totalFrames, this._xToFrame(x)));
 
             if (this.dragType === "playhead") {
-                this.playhead = this._snapPlayheadFrame(frame);
+                this._setPlayhead(this._snapPlayheadFrame(frame), "scrub");
                 this._renderViewportFrame();
             } else if (this.dragType === "trimEdge" && this._trimItem) {
                 canvas.style.cursor = "ew-resize";
@@ -23533,6 +23739,7 @@ export class EditorWidget {
         this._vpHeaderText = document.createElement("span");
         this._updateViewportHeader();
         vpHeader.appendChild(this._vpHeaderText);
+        this._vpHeaderEl = vpHeader;
 
         // Viewport content area — canvas for video preview
         this._fsViewportContent = document.createElement("div");
@@ -23596,7 +23803,7 @@ export class EditorWidget {
         progressWrap.addEventListener("click", (e) => {
             const rect = progressWrap.getBoundingClientRect();
             const pct = (e.clientX - rect.left) / rect.width;
-            this.playhead = Math.round(pct * this.totalFrames);
+            this._setPlayhead(Math.round(pct * this.totalFrames), "progress-bar");
             this._onPlayheadChange();
         });
 
@@ -23794,6 +24001,8 @@ export class EditorWidget {
 
         // Set fullscreen state + recalc
         this.isFullscreen = true;
+        // The viewport's panes, after the overlay is visible so cells measure.
+        this._mountViewPanes();
         this._setControlsVisible(this._settings?.layout?.fullscreenSidebarContent === "controls");
         EditorWidget._activeFullscreen = this;
         // Initial entry and project load share a wave; explicit events do not.
@@ -23848,6 +24057,8 @@ export class EditorWidget {
 
         // Stop playback before exiting
         this._stopPlayback();
+        // Panes end their holds, sound and media with fullscreen.
+        this._unmountViewPanes();
         this._clearVideoCache();
 
         // Remove placeholder
@@ -24017,25 +24228,25 @@ export class EditorWidget {
             // ── Arrow keys: frame navigation ──
             if (key === "ArrowLeft") {
                 const step = shift ? 10 : 1;
-                this.playhead = Math.max(0, this.playhead - step);
+                this._setPlayhead(Math.max(0, this.playhead - step), "step");
                 this._onPlayheadChange();
                 return true;
             }
             if (key === "ArrowRight") {
                 const step = shift ? 10 : 1;
-                this.playhead = Math.min(this.totalFrames, this.playhead + step);
+                this._setPlayhead(Math.min(this.totalFrames, this.playhead + step), "step");
                 this._onPlayheadChange();
                 return true;
             }
 
             // ── Home / End ──
             if (key === "Home") {
-                this.playhead = 0;
+                this._setPlayhead(0, "home");
                 this._onPlayheadChange();
                 return true;
             }
             if (key === "End") {
-                this.playhead = this.totalFrames;
+                this._setPlayhead(this.totalFrames, "end");
                 this._onPlayheadChange();
                 return true;
             }
@@ -28082,6 +28293,8 @@ export class EditorWidget {
     updateProject(projectDir) {
         if (projectDir === this.projectDir) return;
         this._controlsPickerSources?.contextChanged();
+        // Holds and results belong to the project's runs: they end before its sync goes.
+        this._viewsCoordinator?.projectChanged();
         this._clearStaleReplayState();
         this._assetGallery?.cancelThumbnailRepairs?.();
         cancelThumbnailRepairOwner(this._thumbnailRepairOwnerId);
@@ -28379,8 +28592,8 @@ export class EditorWidget {
             imageCache: this._viewportImageCache,
             getScene: () => this.activeScene,
             getFrame: () => this.playhead,
-            setFrame: (frame) => {
-                this.playhead = Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0)));
+            setFrame: (frame, meta = {}) => {
+                this._setPlayhead(Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0))), meta.reason || "surface");
             },
             getTotalFrames: () => this.totalFrames,
             getFps: () => this._effectiveFps,
@@ -28416,7 +28629,7 @@ export class EditorWidget {
             onFrameChange: (frame, meta = {}) => {
                 const measurePlayback = isSessionDiagEnabled() && this.isPlaying;
                 const autoScrollStartedAt = measurePlayback ? performance.now() : 0;
-                this.playhead = Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0)));
+                // setFrame wrote this same clamped frame through the funnel just before.
                 if (meta.reason === "playback" || meta.reason === "playback-loop" || meta.reason === "playback-stop-return") {
                     this._maybeAutoScrollToPlayhead();
                 }
@@ -28429,6 +28642,8 @@ export class EditorWidget {
                 };
             },
             onTransportUpdate: () => this._updateTransportUI(),
+            // Play, stop and clock holds, for Output View followers.
+            onClockChange: (clock) => this._emitClock({ type: "clock", clock }),
             onPlaybackStateChange: (isPlaying) => {
                 this.isPlaying = !!isPlaying;
                 if (this._vpPlayBtn) {
@@ -28483,7 +28698,10 @@ export class EditorWidget {
 
     _resizeViewportCanvas() {
         if (!this._vpCanvas || !this._fsViewportContent) return;
-        const rect = this._fsViewportContent.getBoundingClientRect();
+        // The Composite pane's cell; parked (no pane shows it), it keeps its size.
+        const host = this._viewPanes ? this._vpCompositeCell : this._fsViewportContent;
+        if (!host) return;
+        const rect = host.getBoundingClientRect();
         const containerW = rect.width;
         const containerH = rect.height;
         if (containerW <= 0 || containerH <= 0) return;
@@ -28877,6 +29095,8 @@ export class EditorWidget {
 
     _renderViewportFrame() {
         const viewportSurface = this._ensureViewportSurface();
+        // Guides and Driver panes read the same scene state (coalesced per frame).
+        this._viewPanes?.update();
         if (viewportSurface) {
             viewportSurface.renderFrame();
             return;
@@ -29336,7 +29556,7 @@ export class EditorWidget {
 
     _restartPlaybackLoop(timestamp) {
         if (!this._playbackLoopRange) return;
-        this.playhead = this._playbackLoopRange.start;
+        this._setPlayhead(this._playbackLoopRange.start, "playback-loop");
         this._playbackStartTime = timestamp;
         this._playbackStartFrame = this.playhead;
         this._maybeAutoScrollToPlayhead();
@@ -29355,7 +29575,7 @@ export class EditorWidget {
         if (this.isPlaying) return;
         const loopRange = this._resolvePlaybackLoopRange();
         if (loopRange && (this.playhead < loopRange.start || this.playhead >= loopRange.end)) {
-            this.playhead = loopRange.start;
+            this._setPlayhead(loopRange.start, "playback-start-align");
         }
         this.isPlaying = true;
         if (this._vpPlayBtn) this._vpPlayBtn.textContent = "Pause";
@@ -29391,7 +29611,7 @@ export class EditorWidget {
                 this._restartPlaybackLoop(timestamp);
                 return;
             }
-            this.playhead = this.totalFrames;
+            this._setPlayhead(this.totalFrames, "playback-end");
             this._stopPlayback();
             return;
         }
@@ -29402,7 +29622,7 @@ export class EditorWidget {
         }
 
         const prevFrame = this.playhead;
-        this.playhead = newFrame;
+        this._setPlayhead(newFrame, "playback");
         this._maybeAutoScrollToPlayhead();
 
         // Detect clip boundary crossing (multi-layer aware)
@@ -29460,7 +29680,7 @@ export class EditorWidget {
 
         this._clearActivePlaybackMedia();
         if (!preservePlayhead && this._settings?.playback?.returnToPlaybackStart) {
-            this.playhead = this._playbackSessionStartFrame;
+            this._setPlayhead(this._playbackSessionStartFrame, "playback-stop-return");
             this._maybeAutoScrollToPlayhead();
         }
         this._playbackLoopRange = null;
@@ -29678,6 +29898,14 @@ export class EditorWidget {
             this._vpResizeObserver.disconnect();
             this._vpResizeObserver = null;
         }
+        this._unmountViewPanes();
+        this._viewsCoordinator?.destroy();
+        this._viewsCoordinator = null;
+        this._viewsControlsUnsubscribe?.();
+        this._viewsControlsUnsubscribe = null;
+        this._audioOwnership?.destroy();
+        this._outputMediaCache?.destroy();
+        this._vpCompositePark?.remove();
         if (this._windowResizeHandler) {
             window.removeEventListener("resize", this._windowResizeHandler);
             this._windowResizeHandler = null;

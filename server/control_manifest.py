@@ -8,7 +8,8 @@ Saved in a workflow it holds presentation only, keyed by ``binding_id``:
      "notes": {"<id>": {"text", "group", "order"}},
      "groups": {"<name>": {"order"}},
      "execution": {"v": 1, "controls": {"<id>": {"label", "group", "order", "advanced", "note",
-                                                "target": {"kind": "node"|"instance"|"group", "group_id"?}}}}}
+                                                "target": {"kind": "node"|"instance"|"group", "group_id"?}}}},
+     "views": {"v": 1, "items": {"<id>": {"label", "order"}}}}
 
 A node or instance target is located by ``node.properties.sonderExecution`` on a
 root node (as a binding is by its anchor); a group by its root ``group.id``.
@@ -81,6 +82,27 @@ EXECUTION_PROBLEMS = frozenset({"infrastructure", "too_many", "empty", "kind", "
 # Root execution ids (litegraph node ids); a member is never inside a subgraph.
 _ROOT_PATH_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+# Output Views: named inspection sources, one per output node. Versioned apart
+# from the manifest like execution: another version turns off this section
+# only. A View is located by ``node.properties.sonderViews = {rel: id}`` on a
+# root node (``""``) or on the root subgraph instance holding the output
+# (``rel``, its path inside the instance); the manifest holds presentation.
+# web/js/control_bindings.js mirrors it.
+VIEWS_VERSION = 1
+MAX_VIEWS = 32
+VIEW_STATUSES = frozenset({"ok", "missing", "duplicate", "kind", "unsupported"})
+# An execution path: 1-8 ``:``-joined node ids (MAX_NESTING), the grammar
+# ComfyUI gives an expanded subgraph node.
+MAX_PATH_SEGMENTS = 8
+_PATH_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}(?::[A-Za-z0-9_-]{1,64}){0,7}$")
+
+
+def clean_path(value: Any) -> str | None:
+    """An execution path (root id or ``host:inner:...``), or None."""
+    if not isinstance(value, str) or not _PATH_RE.match(value):
+        return None
+    return None if any(part in FORBIDDEN_KEYS for part in value.split(":")) else value
+
 
 class ManifestError(ValueError):
     """A manifest the Relay cannot use. The message is shown to the user."""
@@ -121,7 +143,7 @@ def clean_group(value: Any) -> str:
 
 def empty_manifest() -> dict:
     return {"v": MANIFEST_VERSION, "bindings": {}, "notes": {}, "groups": {}, "suggestions": [], "description": "", "presets": {},
-            "execution": {}, "execution_error": None, "execution_routing": None}
+            "execution": {}, "execution_error": None, "execution_routing": None, "views": {}, "views_error": None}
 
 
 def _check_shape(value: Any, depth: int = 1) -> None:
@@ -308,6 +330,79 @@ def read_execution(raw: Any) -> tuple[dict, str | None]:
     return result, None
 
 
+def _view_entry(raw: Any) -> dict:
+    """One View: its presentation and, exported, its source's facts."""
+    if not isinstance(raw, dict):
+        raise ManifestError("A View must be an object.")
+    order = raw.get("order")
+    # JavaScript reads 5.0 as 5 (readViews): a whole float is that whole number here too.
+    if isinstance(order, float) and order.is_integer():
+        order = int(order)
+    entry = {"label": _text(raw.get("label"), LABEL_MAX, "label").strip(), "order": _order(order)}
+    # Export-only facts, read tolerantly: the server rechecks them.
+    status = raw.get("status")
+    if status is not None:
+        entry["status"] = status if status in VIEW_STATUSES else "missing"
+    path = clean_path(raw.get("path"))
+    if path is not None:
+        entry["path"] = path
+    for key, limit in (("class_type", 256), ("title", LABEL_MAX)):
+        value = raw.get(key)
+        if isinstance(value, str):
+            entry[key] = value[:limit]
+    participation = raw.get("participation")
+    if participation in ("active", "inactive"):
+        entry["participation"] = participation
+        reason = raw.get("inactive_reason")
+        if isinstance(reason, dict) and reason.get("mode") in INACTIVE_MODES and reason.get("by") in ("self", "parent"):
+            label = reason.get("label")
+            entry["inactive_reason"] = {"mode": reason["mode"], "by": reason["by"],
+                                        "label": label[:LABEL_MAX] if isinstance(label, str) else ""}
+    return entry
+
+
+def _js_key_order(items: dict) -> list:
+    """``items``' keys in JavaScript's object order (``Object.entries``): array
+    index keys ("0", "12", no leading zero, below 2**32 - 1) ascending, then
+    the rest as written. A reader capped at ``MAX_VIEWS`` keeps the same Views
+    as readViews this way."""
+    def index(key: Any) -> int | None:
+        if isinstance(key, str) and key.isascii() and key.isdecimal() and (key == "0" or not key.startswith("0")):
+            value = int(key)
+            return value if value < 2 ** 32 - 1 else None
+        return None
+    keys = list(items)
+    indexed = sorted((k for k in keys if index(k) is not None), key=index)
+    return indexed + [k for k in keys if index(k) is None]
+
+
+def read_views(raw: Any) -> tuple[dict, str | None]:
+    """The Views section, or why it is off. Never raises and never hides the
+    workflow's Controls; tolerant like ``read_execution`` (an invalid entry is
+    skipped and preserved, at most ``MAX_VIEWS`` are read, and only another
+    section version turns it off). web/js/control_bindings.js ``readViews``
+    mirrors it."""
+    if not isinstance(raw, dict):
+        return {}, None
+    version = raw.get("v", VIEWS_VERSION)
+    if isinstance(version, bool) or not isinstance(version, (int, float)) or version != VIEWS_VERSION:
+        return {}, "This workflow's Views come from another Sonder version, so they are off."
+    items = raw.get("items")
+    if not isinstance(items, dict):
+        return {}, None
+    result = {}
+    for identity in _js_key_order(items):
+        if len(result) >= MAX_VIEWS:
+            break
+        if identity in FORBIDDEN_KEYS:
+            continue
+        try:
+            result[_check_id(identity, "View")] = _view_entry(items[identity])
+        except ManifestError:
+            continue
+    return result, None
+
+
 def _execution_member(member: Any) -> dict | None:
     """A preset's execution member: a node's mode and identity, or a group's
     exact member modes. None when malformed."""
@@ -427,6 +522,7 @@ def parse_manifest(text: Any) -> dict:
     manifest = empty_manifest()
     manifest["presets"] = read_presets(raw.get("presets"))
     manifest["execution"], manifest["execution_error"] = read_execution(raw.get("execution"))
+    manifest["views"], manifest["views_error"] = read_views(raw.get("views"))
     # The export-only routing capsule (control_routing reads it), only beside a
     # section this version reads.
     section = raw.get("execution")

@@ -194,10 +194,14 @@ def _capture_preset(view, members, previous=None, execution=()):
             or len(set(members)) != len(members) or len(set(execution)) != len(execution)):
         raise cd.ControlValueError("Choose at least one Control, without duplicates.")
     bindings = {d["binding_id"]: d for d in view.get("bindings", [])}
+    # A View is inspection only: never a preset member (control_views).
+    views = {d.get("view_id") for d in view.get("views", []) or []}
     result = {}
     for bid in members:
         if not isinstance(bid, str) or not cm.ID_RE.fullmatch(bid) or bid in cm.FORBIDDEN_KEYS:
             raise cd.ControlValueError("A preset member id is invalid.")
+        if bid in views and bid not in bindings:
+            raise cd.ControlValueError("A View can't be part of a preset.")
         descriptor = bindings.get(bid, {})
         if descriptor.get("status") != "ok" or descriptor.get("hidden"):
             if previous and bid in previous["members"]:

@@ -379,15 +379,20 @@ def release(owners: Iterable[tuple], hold_id: str) -> bool:
         return True
 
 
-def holds_for(owners: Iterable[tuple]) -> list[dict]:
+def holds_for(owners: Iterable[tuple], keep: Iterable[str] | None = None) -> list[dict]:
+    """The owner's live holds. A read refreshes only the holds its page still
+    shows (``keep``); the others, a closed page's, age out after
+    ``HOLD_IDLE_SEC``. ``keep=None`` refreshes every hold."""
     owners = {item for item in owners if isinstance(item, tuple)}
+    kept = None if keep is None else {str(hold_id) for hold_id in keep}
     now = time.time()
     with _LOCK:
         _expire_holds_locked(now)
         found = []
         for hold_id, item in _HOLDS.items():
             if item["owner"] in owners:
-                item["seen"] = now
+                if kept is None or hold_id in kept:
+                    item["seen"] = now
                 found.append({"hold_id": hold_id, **{k: v for k, v in item.items() if k != "seen"}})
         return found
 

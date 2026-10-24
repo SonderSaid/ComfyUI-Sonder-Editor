@@ -65,9 +65,18 @@ def file_stat(file: dict | None) -> tuple[int, int] | None:
     return (info.st_size, info.st_mtime_ns) if os.path.isfile(path) else None
 
 
+def _revision(stat: tuple | None) -> str:
+    """``size:mtime_ns`` as text (a nanosecond time is past 2^53 for JavaScript):
+    a browser cache keyed by file and revision never shows changed bytes as
+    the old file, and reuses a blob a cached rerun names again."""
+    return f"{stat[0]}:{stat[1]}" if stat else ""
+
+
 def _mark_available(entries: Iterable[dict]) -> None:
     for entry in entries:
-        entry["available"] = entry.get("file") is not None and file_stat(entry.get("file")) is not None
+        stat = file_stat(entry.get("file")) if entry.get("file") is not None else None
+        entry["available"] = stat is not None
+        entry["revision"] = _revision(stat)
 
 
 def _reap_removed_runs() -> None:
@@ -75,7 +84,7 @@ def _reap_removed_runs() -> None:
     run_outputs.reap_removed(run_outputs.queued_prompt_ids())
 
 
-def _build_outputs(owners: list, workflow_id: str, sources: list[str]) -> dict:
+def _build_outputs(owners: list, workflow_id: str, sources: list[str], keep_holds: list[str] | None = None) -> dict:
     _reap_removed_runs()
     answer = run_outputs.read_outputs(owners, workflow_id, sources)
     for item in answer["sources"].values():
@@ -91,12 +100,13 @@ def _build_outputs(owners: list, workflow_id: str, sources: list[str]) -> dict:
         elif not any(entry["available"] for entry in entries):
             item["state"] = "missing_file"
     holds = []
-    for hold in run_outputs.holds_for(owners):
+    for hold in run_outputs.holds_for(owners, keep_holds):
         stat = file_stat(hold["entry"].get("file"))
+        same = stat is not None and tuple(stat) == tuple(hold["stat"])
         holds.append({
             "hold_id": hold["hold_id"], "prompt_id": hold["prompt_id"], "source": hold["source"],
-            "index": hold["index"], "entry": hold["entry"], "run": hold["run"],
-            "state": "ok" if stat is not None and tuple(stat) == tuple(hold["stat"]) else "unavailable",
+            "index": hold["index"], "entry": {**hold["entry"], "revision": _revision(hold["stat"])}, "run": hold["run"],
+            "state": "ok" if same else "unavailable",
         })
     answer["holds"] = holds
     return {"ok": True, **answer}
@@ -130,8 +140,17 @@ def _sources(value: str) -> list[str]:
     return [item for item in (part.strip() for part in str(value or "").split(",")) if item][:run_outputs.MAX_SOURCES_PER_READ]
 
 
-async def outputs_response(owners: list, workflow_id: str, sources: str) -> web.Response:
-    return web.json_response(await asyncio.to_thread(_build_outputs, owners, str(workflow_id or ""), _sources(sources)))
+def _hold_ids(value: Any) -> list[str] | None:
+    """The holds a page still shows (``keep_holds``); None when it names none at all."""
+    if value is None:
+        return None
+    items = value if isinstance(value, list) else str(value).split(",")
+    return [_clean_id(item) for item in items if _clean_id(item)][:run_outputs.MAX_HOLDS_PER_OWNER * 4]
+
+
+async def outputs_response(owners: list, workflow_id: str, sources: str, keep_holds: Any = None) -> web.Response:
+    return web.json_response(await asyncio.to_thread(_build_outputs, owners, str(workflow_id or ""), _sources(sources),
+                                                     _hold_ids(keep_holds)))
 
 
 async def run_response(owners: list, prompt_id: str, workflow_id: str = "") -> web.Response:
@@ -166,6 +185,10 @@ async def cancel_response(owners: list, prompt_id: str) -> web.Response:
 
 
 def release_response(owners: list, body: dict) -> web.Response:
+    """Release one hold, or the page's holds at once (``hold_ids``, on pagehide)."""
+    if isinstance(body.get("hold_ids"), list):
+        released = sum(run_outputs.release(owners, hold_id) for hold_id in _hold_ids(body["hold_ids"]) or [])
+        return web.json_response({"ok": True, "released": released})
     released = run_outputs.release(owners, str(body.get("hold_id") or ""))
     return web.json_response({"ok": released}, status=200 if released else 404)
 
@@ -210,7 +233,7 @@ def register_run_output_routes(routes) -> None:
         code, owner = await gate(request.match_info.get("project_id"), query.get("host_id"), query.get("session_id"))
         if code:
             return refused(code)
-        return await outputs_response([owner], query.get("workflow_id", ""), query.get("sources", ""))
+        return await outputs_response([owner], query.get("workflow_id", ""), query.get("sources", ""), query.get("keep_holds"))
 
     @routes.post("/sonder-editor/project/{project_id}/runs/hold")
     async def api_run_hold(request: web.Request) -> web.Response:

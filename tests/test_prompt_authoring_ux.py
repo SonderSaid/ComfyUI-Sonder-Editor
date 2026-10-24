@@ -7046,6 +7046,7 @@ class Harness {{
     this.selectionStart=0; this.selectionEnd=10; this.playhead=0; this.totalFrames=10;
     this._undoStack=[]; this._redoStack=[]; this._maxUndoSteps=20; }}
   _setHostValueLocal(name,value) {{ this.hostWrites.push([name,value]); }}
+  _setPlayhead(frame) {{ this.playhead=frame; }}
   _setActiveScene(scene) {{ this.activeSceneId=scene.scene_id; this.activeScene=scene; }}
   _refreshContextInputs() {{}} _refreshSelectionInputs() {{}} _updateToolbar() {{}}
   _renderTimeline() {{}} _renderQueuePanel() {{}}

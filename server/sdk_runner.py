@@ -81,6 +81,9 @@ MAX_SESSIONS = 8
 MAX_COUNT = 8
 MAX_UNFINISHED_PER_SESSION = 16
 FINISHED_RUNS_KEPT = 24
+# Run ids a session's Output Views still read after their runs left `runs`
+# (the canvas keeps 256 finished runs too).
+OBSERVED_RUNS_KEPT = 256
 ABSENT_GRACE_SEC = 5.0
 UNCONFIRMED_GRACE_SEC = 60.0
 UNCONFIRMED_SUBMIT_GRACE_SEC = 10.0
@@ -188,6 +191,9 @@ class SdkSession:
     created: float
     last_activity: float
     runs: list = field(default_factory=list)
+    # Ids of finished runs trimmed from `runs`, newest last: their observed
+    # outputs stay readable (Output Views) as on the canvas.
+    observed: list = field(default_factory=list)
     seq: int = 0
     last_emit: float = 0.0
     emit_scheduled: bool = False
@@ -202,6 +208,10 @@ class SdkSession:
 
     def unfinished(self) -> list:
         return [run for run in self.runs if not run.final]
+
+    def observed_run_ids(self) -> list:
+        """Every run id whose outputs this session reads, kept runs first."""
+        return [run.run_id for run in self.runs] + [rid for rid in self.observed if rid not in {r.run_id for r in self.runs}]
 
     def public(self, template_name: str = "") -> dict:
         return {
@@ -1275,6 +1285,8 @@ class SdkRunner:
         for run in finished[:-FINISHED_RUNS_KEPT] if len(finished) > FINISHED_RUNS_KEPT else []:
             session.runs.remove(run)
             self._runs_by_token.pop(run.token, None)
+            session.observed.append(run.run_id)
+        del session.observed[:-OBSERVED_RUNS_KEPT]
 
     # ── Cancel ───────────────────────────────────────────────────────────────
 
@@ -1291,6 +1303,20 @@ class SdkRunner:
             await self._cancel_run(run)
         self._ensure_presence_loop()
         return {"ok": True, "canceling": [run.run_id for run in pending]}
+
+    async def cancel_run(self, session: SdkSession, run_id: Any) -> dict:
+        """Cancel one unfinished run of this session (an Output View's own run),
+        by its run id; a run of another session is unknown here."""
+        run = next((r for r in session.runs if r.run_id == str(run_id or "")), None)
+        if run is None:
+            raise SdkError("This run is not in this session.", "unknown_run", 404)
+        if run.final:
+            return {"ok": True, "canceling": []}
+        run.cancel_requested = True
+        self._emit(session, force=True)
+        await self._cancel_run(run)
+        self._ensure_presence_loop()
+        return {"ok": True, "canceling": [run.run_id]}
 
     async def cancel_by_secret(self, session_id: str, secret: str) -> dict:
         """Launcher departure cancellation: a secret never displaces a live tab."""

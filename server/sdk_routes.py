@@ -450,14 +450,15 @@ def register_sdk_routes(
         """The session's runs as owners, resolved now: absorbed runs follow their session."""
         session = await runner.authorized(request.match_info.get("session_id", ""), _secret(request), _tab(request))
         holder = ("sdk_session", session.session_id)
-        return [("sdk", run.run_id) for run in session.runs] + [holder], holder
+        return [("sdk", run_id) for run_id in session.observed_run_ids()] + [holder], holder
 
     @routes.get("/sonder-editor/sdk/session/{session_id}/runs/outputs")
     @handle
     async def api_sdk_run_outputs(request: web.Request) -> web.Response:
         owners, _holder = await output_owners(request)
         query = request.rel_url.query
-        return await run_output_routes.outputs_response(owners, query.get("workflow_id", ""), query.get("sources", ""))
+        return await run_output_routes.outputs_response(owners, query.get("workflow_id", ""), query.get("sources", ""),
+                                                        query.get("keep_holds"))
 
     @routes.post("/sonder-editor/sdk/session/{session_id}/runs/hold")
     @handle
@@ -470,6 +471,13 @@ def register_sdk_routes(
     async def api_sdk_run_release(request: web.Request) -> web.Response:
         owners, _holder = await output_owners(request)
         return run_output_routes.release_response(owners, await _json_body(request))
+
+    @routes.post("/sonder-editor/sdk/session/{session_id}/runs/{run_id}/cancel")
+    @handle
+    async def api_sdk_run_cancel(request: web.Request) -> web.Response:
+        """Cancel one unfinished run of this session (an Output View's own run)."""
+        session = await runner.authorized(request.match_info.get("session_id", ""), _secret(request), _tab(request))
+        return web.json_response(await runner.cancel_run(session, request.match_info.get("run_id", "")))
 
     @routes.get("/sonder-editor/sdk/session/{session_id}/runs/{prompt_id}")
     @handle

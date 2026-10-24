@@ -125,6 +125,11 @@ Click **Manage** at the top right of the Controls tab. Click **Done** to leave.
 - **Workflow description:** up to 1,000 characters of Markdown, with a
   preview. **Ctrl+Enter** saves, **Esc** cancels. The Sonder App Launcher shows
   it beside the workflow.
+- **Views:** type over a View's name to rename it (leave it empty for the
+  node's title), click **↑** / **↓** to reorder, and **Delete** to remove the
+  View (the node stays in the workflow). In the Sonder App, **Reset** brings a
+  View you changed back to the workflow's own. You add Views from a viewport
+  pane: see [Panes and Output Views](editor-basics.md#panes-and-output-views).
 - **Clean up unavailable…** lists what no longer resolves in this workflow (a
   setting whose node was deleted, saved app values from an older version,
   preset members pointing at those). It removes only what you leave ticked.

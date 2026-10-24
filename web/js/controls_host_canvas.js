@@ -5,6 +5,8 @@ import {
     executionCandidatesFor, inactiveBodies, isStructuralTarget, listCandidates, listExecutionCandidates, nodesOf, parseManifest, parseTarget, readAnchors,
     readExecution, readExecutionAnchor, relayCensus, resolveBindings, resolveCandidate, resolveExecution, resolveExecutionCandidate,
     planRestore, restoreAnchors, restoreDynamicPrompts, restoreExecutionAnchor, setAnchor, setExecutionAnchor,
+    VIEWS_VERSION, dropViewAnchors, inactiveOutputs, isOutputNodeOf, nodeType, readViewAnchors, readViews, resolveExecPath, resolveViews,
+    restoreViewAnchors, setViewAnchor, viewAnchorSnapshot,
 } from "./control_bindings.js";
 import { syncRelayRows } from "./control_relay_rows.js";
 import { canonical, readRows, writeRows } from "./control_rows.js";
@@ -55,7 +57,9 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         throw new TypeError("Canvas Controls needs an injected app and editor node getter.");
     }
     let view = {state: "idle", bindings: [], notes: [], error: null};
-    let visible = false, mountedVisible = false, destroyed = false, listening = false;
+    // viewsDemand: a View pane or the pane picker shows in this page, so the
+    // describe runs for its Views even while the Controls panel is hidden.
+    let visible = false, mountedVisible = false, viewsDemand = false, destroyed = false, listening = false;
     let epoch = 0, timer = null, active = null, trailing = false, lastHash = null;
     let writeTail = Promise.resolve();
     // Manage is open in this page's panel (local) or a mounted tab (mounted);
@@ -65,7 +69,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         : visible && manage.local.on ? manage.local : null);
     const subscribers = new Set();
     const rootGraph = () => app.rootGraph || app.graph;
-    const needed = () => visible || mountedVisible;
+    const needed = () => visible || mountedVisible || viewsDemand;
     const notify = () => { for (const cb of subscribers) cb(view); };
     const identity = () => ({root: rootGraph(), editor: getEditorNode()});
     const sameGraph = id => !destroyed && id.root === rootGraph() && id.editor === getEditorNode() && !app.configuringGraph;
@@ -88,15 +92,22 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         const listing = activeManage();
         // Graph identity is independent of the ephemeral Manage query. Anchors
         // and census still guard writes, including Restore after Relay deletion.
-        const anchors = graphsOf(id.root).map(graph => nodesOf(graph).map(node => [node?.id, readAnchors(node), readExecutionAnchor(node)]));
+        const anchors = graphsOf(id.root).map(graph => nodesOf(graph).map(node => [node?.id, readAnchors(node), readExecutionAnchor(node), readViewAnchors(node)]));
         // Muted and bypassed target nodes are not in the export, so their
         // bodies, and each switch's members and modes, join the fingerprint:
         // an edit to either between validation and write refuses the write.
         const manifest = savedManifest(id.root);
-        const inactive = manifest ? inactiveBodies(resolveBindings(id.root, manifest).bindings) : {};
+        // A View's own muted source first, then every other muted output: the
+        // server lists those as Views and candidates that are off.
+        const views = manifest ? resolveViews(id.root, manifest).views : {};
+        const viewSources = Object.values(views).filter(v => v.inactiveReason && v.node)
+            .map(v => ({ node: v.node, path: v.path, inactive: v.inactiveReason }));
+        const inactive = inactiveBodies(manifest ? resolveBindings(id.root, manifest).bindings : {},
+            { first: viewSources, last: inactiveOutputs(id.root) });
         const switches = manifest ? Object.entries(resolveExecution(id.root, manifest).controls)
             .map(([sid, r]) => [sid, r.status, r.members.map(m => [m.path, m.mode])]) : [];
-        const graphHash = JSON.stringify([key, output, anchors, relayCensus(id.root).census, inactive, switches]);
+        const viewStates = Object.entries(views).map(([vid, v]) => [vid, v.status, v.path || null, v.participation || null]);
+        const graphHash = JSON.stringify([key, output, anchors, relayCensus(id.root).census, inactive, switches, viewStates]);
         return {prompt: output, inactive, editor_key: key, graphHash, hash: JSON.stringify([graphHash, listing])};
     };
     const describe = async (shot, changes, extra = {}) => {
@@ -186,7 +197,9 @@ export function createCanvasControlsHost({app, api, getEditorNode,
     }
     function visibility(which, value) {
         const was = needed();
-        if (which === "local") visible = !!value; else mountedVisible = !!value;
+        if (which === "local") visible = !!value;
+        else if (which === "views") viewsDemand = !!value;
+        else mountedVisible = !!value;
         syncListeners();
         if (!needed()) { epoch++; clearTimeout(timer); timer = null; trailing = false; }
         else if (!was) { lastHash = null; void refresh(true); }
@@ -232,7 +245,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         // A first expose, note, group or switch may add the Relay; everything else needs the one Relay.
         const addsRelay = !active.length && !census.muted && !census.bypassed && !census.nested
             && (structural.length > 0 || "workflow:description" in changes)
-            && structural.every(([target]) => { const p = parseTarget(target); return ["binding", "note", "group", "execution"].includes(p.source) && ["expose", "create"].includes(p.field); });
+            && structural.every(([target]) => { const p = parseTarget(target); return ["binding", "note", "group", "execution", "view"].includes(p.source) && ["expose", "create"].includes(p.field); });
         if (!structural.length && Object.values(changes).every(value => value?.noop)) return {writes: [], anchors: [], modes: []};
         if (active.length !== 1 && !addsRelay) throw new Error("Keep exactly one active Sonder Control Relay in the workflow.");
         const relay = active[0] || null;
@@ -241,6 +254,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         const saved = typeof manifestWidget?.value === "string" ? manifestWidget.value : "";
         const {bindings, suggestions} = resolveBindings(root, parseManifest(saved));
         const switches = resolveExecution(root, parseManifest(saved));
+        const views = resolveViews(root, parseManifest(saved));
         const byWidget = new Map(), anchors = [], manifestOps = [], byNode = new Map();
         const add = (node, widget, value, target) => {
             const existing = byWidget.get(widget);
@@ -262,6 +276,10 @@ export function createCanvasControlsHost({app, api, getEditorNode,
             }
             if (source === "execution") {
                 if (!value?.noop) executionOp(root, {id, field, value}, raw, {switches, anchors, manifestOps, setMode});
+                continue;
+            }
+            if (source === "view") {
+                if (!value?.noop) viewOp(root, {id, field, value}, {views, anchors, manifestOps});
                 continue;
             }
             if (source === "workflow") {
@@ -431,6 +449,47 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         });
     }
 
+    // One View target. The server validated it against this graph's export; the
+    // live graph must still hold that output where the anchor goes.
+    function viewOp(root, {id, field, value}, {views, anchors, manifestOps}) {
+        if (views.error) throw new Error(views.error);
+        // An absent or damaged section is replaced only by an explicit edit;
+        // another version's section is never rewritten.
+        const table = m => {
+            if (!m.views || typeof m.views !== "object" || Array.isArray(m.views)) m.views = {v: VIEWS_VERSION, items: {}};
+            const {error} = readViews(m.views);
+            if (error) throw new Error(error);
+            if (!m.views.items || typeof m.views.items !== "object" || Array.isArray(m.views.items)) m.views.items = {};
+            return m.views.items;
+        };
+        if (field === "remove") {
+            manifestOps.push(m => { delete table(m)[id]; });
+            anchors.push(() => dropViewAnchors(root, id));
+            return;
+        }
+        if (field === "create") {
+            if (views.items[id]) throw new Error("This View id is already in use.");
+            const {path, class_type: classType, host, rel = ""} = value.candidate || {};
+            const hostNode = nodesOf(root).find(n => String(n?.id) === String(host));
+            const live = resolveExecPath(root, path);
+            const anchoredOn = live ? (rel ? live.hosts[0] : live.node) : null;
+            if (!hostNode || !live || anchoredOn !== hostNode || nodeType(live.node) !== classType || !isOutputNodeOf(live.node)) {
+                throw new Error("This output moved. Refresh the Controls panel.");
+            }
+            const owner = readViewAnchors(hostNode)[rel];
+            if (owner && owner !== id && views.items[owner]) throw new Error("This output already has a View.");
+            manifestOps.push(m => { table(m)[id] = {label: value.label || "", order: value.order ?? 0}; });
+            anchors.push(() => { setViewAnchor(hostNode, rel, id); return [hostNode]; });
+            return;
+        }
+        if (field !== "label" && field !== "order") throw new Error("This View change is unavailable.");
+        manifestOps.push(m => {
+            const entry = table(m)[id];
+            if (!entry || typeof entry !== "object") throw new Error("This View is no longer in the workflow.");
+            entry[field] = value;
+        });
+    }
+
     // Anchor and manifest edits for one structural target. The server already
     // validated it against this graph's export; the live graph must agree.
     function structuralOp(root, {source, id, field, value}, {bindings, suggestions, anchors, manifestOps}) {
@@ -506,7 +565,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
             try {
                 // Anchors first, so the export a created Relay makes sees them.
                 if (anchors.length) for (const graph of graphsOf(id.root)) for (const node of nodesOf(graph))
-                    touched.set(node, [anchorSnapshot(node), executionAnchorSnapshot(node)]);
+                    touched.set(node, [anchorSnapshot(node), executionAnchorSnapshot(node), viewAnchorSnapshot(node)]);
                 for (const apply of anchors) apply();
                 for (const write of writes) {
                     if (write.createRelay) {
@@ -564,9 +623,10 @@ export function createCanvasControlsHost({app, api, getEditorNode,
                     widget.value = value;
                 }
                 modes.forEach(({node}, i) => { node.mode = modesBefore[i]; });
-                for (const [node, [snap, executionSnap]] of touched) {
+                for (const [node, [snap, executionSnap, viewSnap]] of touched) {
                     restoreAnchors(node, snap);
                     restoreExecutionAnchor(node, executionSnap);
+                    restoreViewAnchors(node, viewSnap);
                 }
                 if (created) id.root.remove?.(created);
                 id.root.setDirtyCanvas?.(true, true);
@@ -583,6 +643,8 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         subscribe(cb) { subscribers.add(cb); return () => subscribers.delete(cb); },
         setVisible: value => visibility("local", value),
         setMountedVisible: value => visibility("mounted", value),
+        // A View pane or the pane picker shows: keep its Views current.
+        setViewsDemand: value => visibility("views", value),
         setManage: (on, filter) => setManage("local", on, filter),
         setMountedManage: (on, filter) => setManage("mounted", on, filter),
         // The workflow owns its Controls here: remove, never hide.

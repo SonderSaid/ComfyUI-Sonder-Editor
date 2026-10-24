@@ -1,0 +1,94 @@
+[
+ {
+  "label": "attached",
+  "zoom": 1,
+  "panX": 0,
+  "panY": 0,
+  "transform": "translate(0px, 0px) scale(1)",
+  "cursor": "grab"
+ },
+ {
+  "label": "zoom in at right",
+  "zoom": 1.12,
+  "panX": -12,
+  "panY": 9.6,
+  "transform": "translate(-12.00000000000001px, 9.600000000000009px) scale(1.12)",
+  "cursor": "grab"
+ },
+ {
+  "label": "zoom in at left",
+  "zoom": 1.2544,
+  "panX": 6,
+  "panY": -2.4,
+  "transform": "translate(6.0000000000000036px, -2.400000000000002px) scale(1.2544000000000002)",
+  "cursor": "grab"
+ },
+ {
+  "label": "below drag threshold",
+  "zoom": 1.2544,
+  "panX": 6,
+  "panY": -2.4,
+  "transform": "translate(6.0000000000000036px, -2.400000000000002px) scale(1.2544000000000002)",
+  "cursor": "grabbing"
+ },
+ {
+  "label": "dragged",
+  "zoom": 1.2544,
+  "panX": 36,
+  "panY": 7.6,
+  "transform": "translate(36px, 7.599999999999998px) scale(1.2544000000000002)",
+  "cursor": "grabbing"
+ },
+ {
+  "label": "released",
+  "zoom": 1.2544,
+  "panX": 36,
+  "panY": 7.6,
+  "transform": "translate(36px, 7.599999999999998px) scale(1.2544000000000002)",
+  "cursor": "grab"
+ },
+ {
+  "label": "zoom out",
+  "zoom": 1.12,
+  "panX": 16.981132,
+  "panY": 3.584906,
+  "transform": "translate(16.9811320754717px, 3.584905660377358px) scale(1.12)",
+  "cursor": "grab"
+ },
+ {
+  "label": "dblclick right after drag (ignored)",
+  "zoom": 1.12,
+  "panX": 16.981132,
+  "panY": 3.584906,
+  "transform": "translate(16.9811320754717px, 3.584905660377358px) scale(1.12)",
+  "cursor": "grab"
+ },
+ {
+  "label": "dblclick reset",
+  "zoom": 1,
+  "panX": 0,
+  "panY": 0,
+  "transform": "translate(0px, 0px) scale(1)",
+  "cursor": "grab"
+ },
+ {
+  "label": "zoom clamps",
+  "zoom": 16,
+  "panX": 0,
+  "panY": 0,
+  "transform": "translate(0px, 0px) scale(16)",
+  "cursor": "grab"
+ },
+ {
+  "label": "cleaned",
+  "zoom": 16,
+  "panX": 0,
+  "panY": 0,
+  "transform": "translate(0px, 0px) scale(16)",
+  "cursor": ""
+ },
+ {
+  "label": "listeners left",
+  "count": 0
+ }
+]

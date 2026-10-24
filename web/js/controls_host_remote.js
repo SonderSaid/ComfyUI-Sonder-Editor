@@ -11,6 +11,8 @@ export function createSdkControlsHost(owner) {
     let view = idle(),
         destroyed = false,
         visible = false,
+        // A View pane or the pane picker shows: read on show, like the panel.
+        viewsDemand = false,
         epoch = 0,
         seq = -1,
         read = null,
@@ -46,7 +48,7 @@ export function createSdkControlsHost(owner) {
         return result;
     };
     async function refresh() {
-        if (destroyed || !visible) return view;
+        if (destroyed || (!visible && !viewsDemand)) return view;
         if (read) {
             reread = true; // a Manage change during a read needs a fresh one
             return read;
@@ -100,6 +102,11 @@ export function createSdkControlsHost(owner) {
         setVisible(value) {
             visible = !!value;
             if (visible) void refresh();
+        },
+        setViewsDemand(value) {
+            if (viewsDemand === !!value) return;
+            viewsDemand = !!value;
+            if (viewsDemand) void refresh();
         },
         refresh,
         applyChanges(changes) {
@@ -163,6 +170,8 @@ export function createMountedControlsHost({
 }) {
     let view = idle(),
         visible = false,
+        // A View pane or the pane picker shows here: the canvas keeps describing.
+        viewsDemand = false,
         manage = { on: false, filter: "" },
         destroyed = false,
         seq = -1,
@@ -209,6 +218,7 @@ export function createMountedControlsHost({
                         seen: receipts,
                         manage: manage.on,
                         filter: manage.filter,
+                        views: viewsDemand,
                     });
                     if (!result.ok) {
                         reportRequested = true;
@@ -228,7 +238,7 @@ export function createMountedControlsHost({
         }
     }
     async function refresh(force = false) {
-        if (destroyed || (!visible && !waiting.size && !force)) return view;
+        if (destroyed || (!visible && !viewsDemand && !waiting.size && !force)) return view;
         if (read) return read;
         const stamp = epoch;
         read = (async () => {
@@ -297,6 +307,12 @@ export function createMountedControlsHost({
             void report();
             if (visible) void refresh(true);
         },
+        setViewsDemand(value) {
+            if (viewsDemand === !!value) return;
+            viewsDemand = !!value;
+            void report();
+            if (viewsDemand) void refresh(true);
+        },
         // The canvas lists candidates, filtered, while Manage is open here.
         capabilities: { hide: false, removeAuthored: true },
         setManage(on, filter = "") {
@@ -320,10 +336,11 @@ export function createMountedControlsHost({
                 void refresh(true);
             }
             if (payload.controls_visible !== undefined && payload.controls_visible !== visible) void report();
+            if (payload.controls_views !== undefined && payload.controls_views !== viewsDemand) void report();
             if (
                 payload.controls_view_seq !== undefined &&
                 payload.controls_view_seq !== seq &&
-                (visible || waiting.size)
+                (visible || viewsDemand || waiting.size)
             ) {
                 void refresh();
             }

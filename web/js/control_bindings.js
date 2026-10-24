@@ -18,6 +18,11 @@ export const ANCHOR_PROPERTY = "sonderBindings";
 // A node switch's anchor: `node.properties.sonderExecution = "<id>"` on a root
 // node or subgraph host (one per node). A group is named by its root group.id.
 export const EXECUTION_ANCHOR = "sonderExecution";
+// An Output View's anchor: `node.properties.sonderViews = {rel: "<id>"}` on a
+// root output node (rel "") or on the root subgraph instance holding the
+// output (rel = its path inside, "12:7"). The instance owns the identity, so a
+// definition shared by two instances is never ambiguous.
+export const VIEWS_ANCHOR = "sonderViews";
 export const MANIFEST_VERSION = 1;
 // Mirrors server/control_manifest.py EXECUTION_* (parity-tested).
 export const EXECUTION_VERSION = 1;
@@ -28,6 +33,14 @@ export const EXECUTION_MODES = ["enabled", "muted", "bypassed"];
 // Never a switch, and never inside a group that is one: switching them off
 // would turn off the Controls that switch them back.
 export const INFRASTRUCTURE_CLASSES = new Set(["SonderEditor", "SonderControlRelay"]);
+// Mirrors server/control_manifest.py VIEWS_* (parity-tested).
+export const VIEWS_VERSION = 1;
+export const MAX_VIEWS = 32;
+export const VIEW_STATUSES = ["ok", "missing", "duplicate", "kind", "unsupported"];
+const PATH_RE = /^[A-Za-z0-9_-]{1,64}(?::[A-Za-z0-9_-]{1,64}){0,7}$/;
+// An execution path (control_manifest.clean_path), or null.
+export const cleanPath = value => (typeof value === "string" && PATH_RE.test(value)
+    && !value.split(":").some(part => FORBIDDEN_KEYS.has(part)) ? value : null);
 // Mirrors server/control_manifest.py (Phase 0 P10 hygiene).
 export const MAX_MANIFEST_BYTES = 128 * 1024;
 export const MAX_BINDINGS = 256;
@@ -166,6 +179,7 @@ export function installAnchorCopyRule(node, isConfiguring) {
         if (!isConfiguring()) {
             if (hasAnchors(this)) delete this.properties[ANCHOR_PROPERTY];
             if (this.properties && Object.hasOwn(this.properties, EXECUTION_ANCHOR)) delete this.properties[EXECUTION_ANCHOR];
+            if (this.properties && Object.hasOwn(this.properties, VIEWS_ANCHOR)) delete this.properties[VIEWS_ANCHOR];
         }
         return result;
     };
@@ -242,6 +256,11 @@ export function editManifest(text, mutate) {
         for (const key of EXECUTION_EXPORT_KEYS) delete entry[key];
     }
     if (ours) delete manifest.execution.routing; // export-only, like each switch's facts
+    if (isOurViewsSection(manifest.views) && isPlainObject(manifest.views.items)) {
+        for (const entry of Object.values(manifest.views.items)) {
+            if (isPlainObject(entry)) for (const key of VIEW_EXPORT_KEYS) delete entry[key];
+        }
+    }
     mutate(manifest);
     manifest.v = MANIFEST_VERSION;
     return JSON.stringify(manifest);
@@ -260,6 +279,8 @@ function rowListShapeOk(value) {
 
 // Export-only facts of a node switch (control_manifest._execution_entry).
 const EXECUTION_EXPORT_KEYS = ["status", "problem", "title", "member_count", "members"];
+// Export-only facts of a View (control_manifest._view_entry).
+const VIEW_EXPORT_KEYS = ["status", "path", "class_type", "title", "participation", "inactive_reason"];
 const ROOT_PATH_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const rootPath = value => (typeof value === "string" && ROOT_PATH_RE.test(value) && !FORBIDDEN_KEYS.has(value) ? value : null);
 
@@ -319,6 +340,23 @@ export function readExecution(raw) {
     return {controls: result, error: null};
 }
 
+// The saved Views, tolerant like control_manifest.read_views (parity-tested).
+export const isOurViewsSection = raw => isPlainObject(raw) && (!Object.hasOwn(raw, "v") || raw.v === VIEWS_VERSION);
+export function readViews(raw) {
+    if (!isPlainObject(raw)) return {items: {}, error: null};
+    if (!isOurViewsSection(raw)) return {items: {}, error: "This workflow's Views come from another Sonder version, so they are off."};
+    if (!isPlainObject(raw.items)) return {items: {}, error: null};
+    const result = {};
+    for (const [id, entry] of Object.entries(raw.items)) {
+        if (Object.keys(result).length >= MAX_VIEWS) break;
+        if (!ID_RE.test(id) || FORBIDDEN_KEYS.has(id) || !isPlainObject(entry)
+            || !(entry.label == null || (typeof entry.label === "string" && [...entry.label].length <= LABEL_MAX))
+            || !validOrder(entry.order ?? undefined)) continue;
+        result[id] = {...entry, label: String(entry.label ?? "").trim(), order: entry.order ?? 0};
+    }
+    return {items: result, error: null};
+}
+
 // Mirrors control_manifest.read_presets; reads never rewrite saved metadata.
 export function readPresets(raw) {
     const result = {};
@@ -361,6 +399,10 @@ export function readPresets(raw) {
 export function applyPresetEdit(manifest, id, field, value) {
     if (!isPlainObject(manifest.presets)) manifest.presets = {};
     const presets = manifest.presets;
+    // A View is inspection only: never a preset member (server _capture_preset).
+    const views = readViews(manifest.views).items;
+    if ((field === "create" || field === "capture") && Object.keys(value?.members || {}).some(member => Object.hasOwn(views, member)))
+        throw new Error("A View can't be part of a preset.");
     if (field === "create" || field === "capture") presets[id] = structuredClone(value);
     else if (field === "remove") delete presets[id];
     else if (field === "name" || field === "description") {
@@ -1020,10 +1062,23 @@ export function inactiveBody(node, inactive, path = String(node?.id), promoted =
 export const MAX_INACTIVE_BODIES = 256;
 
 // Bodies for every inactive node a binding targets, keyed by execution path.
-// A body whose values cannot be serialized is left out: its setting then reads
-// missing instead of turning the whole Controls view into an error.
-export function inactiveBodies(resolvedBindings) {
+// `first` and `last` add other nodes ({node, path, inactive}): a View's own
+// source before the settings, every other muted output after them, so a long
+// list of muted outputs never crowds out a setting's body. A body whose values
+// cannot be serialized is left out: its setting then reads missing instead of
+// turning the whole Controls view into an error.
+export function inactiveBodies(resolvedBindings, { first = [], last = [] } = {}) {
     const bodies = {};
+    const addExtra = list => {
+        for (const { node, path, inactive } of list || []) {
+            if (!node || !inactive || Object.hasOwn(bodies, path)) continue;
+            if (Object.keys(bodies).length >= MAX_INACTIVE_BODIES) return;
+            const body = inactiveBody(node, inactive, path);
+            try { JSON.stringify(body); } catch { continue; }
+            bodies[path] = body;
+        }
+    };
+    addExtra(first);
     for (const resolved of Object.values(resolvedBindings || {})) {
         // A root target's node is its anchor's; a promoted target names its own,
         // and its value is the host's widget (a promoted input).
@@ -1038,7 +1093,166 @@ export function inactiveBodies(resolvedBindings) {
             bodies[target.path] = body;
         }
     }
+    addExtra(last);
     return bodies;
+}
+
+// ── Output Views ─────────────────────────────────────────────────────────────
+
+// Valid anchors only: `{rel: id}`, rel "" or an execution path inside the
+// instance, ids by the manifest's rule.
+export function readViewAnchors(node) {
+    const raw = node?.properties?.[VIEWS_ANCHOR];
+    const anchors = {};
+    if (!isPlainObject(raw)) return anchors;
+    for (const [rel, id] of Object.entries(raw)) {
+        if (rel !== "" && !cleanPath(rel)) continue;
+        if (typeof id === "string" && ID_RE.test(id) && !FORBIDDEN_KEYS.has(id)) anchors[rel] = id;
+    }
+    return anchors;
+}
+
+export function setViewAnchor(node, rel, id) {
+    node.properties ||= {};
+    const raw = isPlainObject(node.properties[VIEWS_ANCHOR]) ? node.properties[VIEWS_ANCHOR] : {};
+    node.properties[VIEWS_ANCHOR] = { ...raw, [rel]: id };
+}
+
+// A JSON copy of the raw property, for an exact rollback (Nodes 2.0 proxies
+// refuse structuredClone).
+export const viewAnchorSnapshot = node => (node?.properties && Object.hasOwn(node.properties, VIEWS_ANCHOR)
+    ? { value: JSON.parse(JSON.stringify(node.properties[VIEWS_ANCHOR] ?? null)) } : undefined);
+
+export function restoreViewAnchors(node, snapshot) {
+    if (snapshot === undefined) {
+        if (node.properties) delete node.properties[VIEWS_ANCHOR];
+    } else {
+        node.properties ||= {};
+        node.properties[VIEWS_ANCHOR] = snapshot.value;
+    }
+}
+
+// Removes every View anchor carrying `id`, inside subgraph definitions too;
+// returns the nodes changed.
+export function dropViewAnchors(root, id) {
+    const changed = [];
+    for (const node of graphsOf(root).flatMap(nodesOf)) {
+        const raw = node?.properties?.[VIEWS_ANCHOR];
+        if (!isPlainObject(raw) || !Object.values(raw).includes(id)) continue;
+        const next = Object.fromEntries(Object.entries(raw).filter(([, value]) => value !== id));
+        if (Object.keys(next).length) node.properties[VIEWS_ANCHOR] = next;
+        else delete node.properties[VIEWS_ANCHOR];
+        changed.push(node);
+    }
+    return changed;
+}
+
+// The node an execution path names on the live graph, with the subgraph
+// instances on the way (`hosts`, root first). Null when any step is missing.
+export function resolveExecPath(root, path) {
+    const parts = String(cleanPath(path) || "").split(":").filter(Boolean);
+    if (!parts.length) return null;
+    let graph = root, node = null;
+    const hosts = [];
+    for (const [index, part] of parts.entries()) {
+        node = nodesOf(graph).find(n => String(n?.id) === part) || null;
+        if (!node) return null;
+        if (index < parts.length - 1) {
+            if (!isHost(node)) return null;
+            hosts.push(node);
+            graph = node.subgraph;
+        }
+    }
+    return { node, hosts };
+}
+
+// Whether a node's class is an output node (LiteGraph nodeData.output_node).
+export function isOutputNodeOf(node) {
+    const data = node?.constructor?.nodeData ?? globalThis.LiteGraph?.registered_node_types?.[nodeType(node)]?.nodeData;
+    return data?.output_node === true;
+}
+
+// Why the node on a path does not run: itself, or an instance on the way.
+function pathOffReason(node, hosts) {
+    for (const host of hosts) if (isOff(host)) return { mode: modeName(host), by: "parent", label: String(host.title || nodeType(host)) };
+    return offReason(node, null);
+}
+
+// Every View of a manifest on the live graph: {status, path, class_type,
+// title, node, host, rel, participation, inactiveReason}. An anchor naming no
+// View (a deleted Relay's, an Undo's) is ignored. Never writes.
+export function resolveViews(root, manifest, { isOutputNode = isOutputNodeOf } = {}) {
+    const { items, error } = readViews(manifest?.views);
+    const hits = new Map();
+    for (const node of nodesOf(root)) {
+        for (const [rel, id] of Object.entries(readViewAnchors(node))) {
+            if (!Object.hasOwn(items, id)) continue;
+            if (!hits.has(id)) hits.set(id, []);
+            hits.get(id).push({ host: node, rel });
+        }
+    }
+    const views = Object.create(null);
+    for (const id of Object.keys(items)) {
+        const found = hits.get(id) || [];
+        if (found.length > 1) { views[id] = { status: "duplicate" }; continue; }
+        if (!found.length) { views[id] = { status: "missing" }; continue; }
+        const { host, rel } = found[0];
+        const path = rel ? `${host.id}:${rel}` : String(host.id);
+        const live = resolveExecPath(root, path);
+        if (!live) { views[id] = { status: "missing", host, rel }; continue; }
+        const { node, hosts } = live;
+        const base = { path, class_type: nodeType(node), title: String(node.title || nodeType(node)), node, host, rel };
+        if (INFRASTRUCTURE_CLASSES.has(nodeType(node)) || (!isHost(node) && node.isVirtualNode)) { views[id] = { ...base, status: "unsupported" }; continue; }
+        if (isHost(node) || !isOutputNode(node)) { views[id] = { ...base, status: "kind" }; continue; }
+        const inactive = pathOffReason(node, hosts);
+        views[id] = { ...base, status: "ok", participation: inactive ? "inactive" : "active", ...(inactive ? { inactiveReason: inactive } : {}) };
+    }
+    return { views, items, error };
+}
+
+// The View anchors of the whole graph, for the writer's fingerprint.
+export const viewAnchorList = root => nodesOf(root).map(node => [node?.id, readViewAnchors(node)]);
+
+// The export form of the Views section: saved presentation plus each View's
+// source facts; an entry the reader skips, or another version's section, is
+// exported exactly as saved.
+function exportViews(saved, root, manifest) {
+    const { views, items, error } = resolveViews(root, manifest);
+    if (error || !isPlainObject(saved) || !isPlainObject(saved.items)) return saved;
+    const out = { ...saved, items: {} };
+    for (const [id, entry] of Object.entries(saved.items)) {
+        const resolved = views[id];
+        if (!resolved || !items[id] || !isPlainObject(entry)) { out.items[id] = entry; continue; }
+        const clean = { ...entry };
+        for (const key of VIEW_EXPORT_KEYS) delete clean[key];
+        out.items[id] = {
+            ...clean, status: resolved.status,
+            ...(resolved.path ? { path: resolved.path, class_type: resolved.class_type, title: resolved.title.slice(0, EXPORT_TITLE_MAX) } : {}),
+            ...(resolved.participation ? { participation: resolved.participation } : {}),
+            ...(resolved.inactiveReason ? { inactive_reason: resolved.inactiveReason } : {}),
+        };
+    }
+    return out;
+}
+
+// Muted and bypassed output nodes, root and inside instances, with their
+// path and reason: the server lists them as View candidates that are off.
+export function inactiveOutputs(root, { isOutputNode = isOutputNodeOf, limit = MAX_INACTIVE_BODIES } = {}) {
+    const found = [];
+    const walk = (graph, prefix, parent, depth) => {
+        if (depth > MAX_NESTING) return;
+        for (const node of nodesOf(graph)) {
+            if (found.length >= limit) return;
+            const path = prefix ? `${prefix}:${node?.id}` : String(node?.id);
+            if (!cleanPath(path)) continue;
+            const own = isOff(node) ? { mode: modeName(node), by: "self", label: String(node.title || nodeType(node)) } : null;
+            if (isHost(node)) { walk(node.subgraph, path, parent || (own ? { ...own, by: "parent" } : null), depth + 1); continue; }
+            const reason = parent || own;
+            if (reason && !node.isVirtualNode && isOutputNode(node) && !INFRASTRUCTURE_CLASSES.has(nodeType(node))) found.push({ node, path, inactive: reason });
+        }
+    };
+    walk(root, "", null, 0);
+    return found;
 }
 
 // ── Routing capsule (Phase 1B) ───────────────────────────────────────────────
@@ -1332,6 +1546,7 @@ export function exportManifest(text, root) {
         }
         out.suggestions = suggestions.map(s => ({ binding_id: s.binding_id, targets: publicTargets(s.targets) }));
         if (manifest.execution !== undefined) out.execution = exportExecution(manifest.execution, root, manifest);
+        if (manifest.views !== undefined) out.views = exportViews(manifest.views, root, manifest);
         let exported = JSON.stringify(out);
         // The capsule shares the server's 128 KiB cap with everything else, and
         // a graph edit alone can grow it: past the cap it gives way, never the

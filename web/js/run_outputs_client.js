@@ -60,10 +60,11 @@ export function createRunOutputsClient({ mode, identity, apiURL, fetchImpl = glo
         const query = new URLSearchParams({ ...hostFields(), ...params });
         return fetchImpl(apiURL(`${base()}${path}?${query}`), { headers: headers() }).then(json);
     };
-    const post = (path, body) => fetchImpl(apiURL(`${base()}${path}`), {
+    const post = (path, body, { keepalive = false } = {}) => fetchImpl(apiURL(`${base()}${path}`), {
         method: "POST",
         headers: headers({ "Content-Type": "application/json" }),
         body: JSON.stringify({ ...hostFields(), ...body }),
+        ...(keepalive ? { keepalive: true } : {}),
     }).then(json);
 
     // Whether an `outputs_changed` event concerns this host. The Sonder App
@@ -82,10 +83,13 @@ export function createRunOutputsClient({ mode, identity, apiURL, fetchImpl = glo
 
     const client = {
         mode,
-        // `workflowId` defaults to the host's own (canvas); empty reads every
-        // workflow of the owner (mounted, Sonder App session).
-        readOutputs(sources, { workflowId = (identity() || {}).workflowId || "" } = {}) {
-            return get("/outputs", { sources: [...sources].join(","), workflow_id: workflowId });
+        // `workflowId` defaults to the host's own: the canvas node's workflow,
+        // the mounted tab's canvas workflow, the Sonder App's template. Empty
+        // reads every workflow of the owner. `keepHolds` names the holds this
+        // page still shows; only those are refreshed, the others age out.
+        readOutputs(sources, { workflowId = (identity() || {}).workflowId || "", keepHolds = null } = {}) {
+            return get("/outputs", { sources: [...sources].join(","), workflow_id: workflowId,
+                ...(keepHolds ? { keep_holds: [...keepHolds].join(",") } : {}) });
         },
         readRun(promptId, { workflowId = (identity() || {}).workflowId || "" } = {}) {
             return get(`/${encodeURIComponent(promptId)}`, workflowId ? { workflow_id: workflowId } : {});
@@ -95,6 +99,18 @@ export function createRunOutputsClient({ mode, identity, apiURL, fetchImpl = glo
         },
         release(holdId) {
             return post("/release", { hold_id: holdId });
+        },
+        // Every hold of a closing page at once; `keepalive` lets it outlive the
+        // page (the Sonder App's secret headers rule out sendBeacon).
+        releaseAll(holdIds, { keepalive = false } = {}) {
+            return post("/release", { hold_ids: [...holdIds] }, { keepalive });
+        },
+        // Cancel this host's own run: a prompt id (canvas, mounted) or a run id
+        // (the Sonder App, whose runs are its session's).
+        cancel({ promptId = "", runId = "" } = {}) {
+            return sdk
+                ? post(`/${encodeURIComponent(runId)}/cancel`, {})
+                : post(`/${encodeURIComponent(promptId)}/cancel`, {});
         },
         isOwnHint,
         // `listener(event)` for each hint about this host's runs. Returns cleanup.

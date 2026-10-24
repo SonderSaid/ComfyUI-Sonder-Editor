@@ -27,8 +27,8 @@ export function groupNameError(name) {
 export const cleanGroup = value => (typeof value === "string" && !groupNameError(value) ? value.trim() : "");
 
 // `binding:<id>:<field>`, `note:<id>:<field>`, `execution:<id>:<field>`,
-// `group:<name>:<op>` and `workflow:description`.
-const TARGET_RE = /^(?:(binding|note|preset|execution):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$/;
+// `view:<id>:<field>`, `group:<name>:<op>` and `workflow:description`.
+const TARGET_RE = /^(?:(binding|note|preset|execution|view):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$/;
 export const BINDING_STRUCTURAL_OPS = new Set(["expose", "remove", "rebind", "hide", "unhide", "create"]);
 export const GROUP_OPS = new Set(["create", "rename", "ungroup", "move"]);
 
@@ -44,6 +44,8 @@ export const STRUCTURAL_OPS = {
     binding: BINDING_STRUCTURAL_OPS, note: new Set(["create", "remove", "hide", "unhide"]),
     group: GROUP_OPS, preset: new Set(["create", "capture", "apply"]), workflow: new Set(["cleanup", "restore"]),
     execution: new Set(["expose", "remove", "rebind", "hide", "unhide"]),
+    // An Output View: label and order are presentation. It never changes a run.
+    view: new Set(["create", "remove"]),
 };
 
 export function isStructuralTarget(target) {

@@ -7,6 +7,7 @@ import { LAUNCHER_WINDOW_NAME } from "./sdk_setup_client.js";
 import { modelMessage } from "./launcher_view.js";
 import { createMountedControlsHost } from "./controls_host_remote.js";
 import { createRunOutputsClient, createRunRequestClient } from "./run_outputs_client.js";
+import { createMountedViewsHost, createSdkViewsHost } from "./views_hosts.js";
 
 installComfyApiShim();
 injectSonderFontFaces();
@@ -63,6 +64,9 @@ const handoffToken = params.get("handoff") || "";
 const hostId = params.get("host_id") || "";
 const sourceNodeId = params.get("source_node_id") || "";
 const sessionWindowName = params.get("session_name") || "";
+// The canvas workflow this mounted tab edits (`rootGraph.id`): its run reads
+// and Output Views layout are keyed by it. Empty from an older handoff link.
+const canvasWorkflowId = params.get("workflow_id") || "";
 // Sonder App (SDK mode): `?mode=sdk&session=<sdk session id>`; its secret is in sessionStorage.
 const tabMode = params.get("mode") || "";
 const sdkSessionId = params.get("session") || "";
@@ -475,9 +479,13 @@ async function runSdkTab() {
         identity: () => ({
             projectId, sessionId: sdkSessionId, secret, tabSessionId: host.tabSessionId,
             runIds: () => host.status.runs.map(run => run.run_id),
+            // Only the current workflow's runs (a switch replaces what the panes read).
+            workflowId: host.templateId,
         }),
     });
     editor.runBranch = target => host.runBranch(target);
+    const viewsHost = createSdkViewsHost({ host, runOutputs: () => editor.runOutputs, apiURL: path => api.apiURL(path) });
+    editor.setViewsHost(viewsHost);
     editor._enterFullscreen();
 
     // Workflow ▾ switched the session: the project, scene and timeline stay;
@@ -565,6 +573,9 @@ async function runSdkTab() {
         onChange: (state, previous) => {
             tabDiagRecord("sdk_owner_state", { previous, state });
             if (state === "ended") sdk.forgetSdkSecret(sdkSessionId);
+            // Output Views stop reading while this tab does not own the session.
+            if (state === "active") viewsHost.restored();
+            else if (["ended", "displaced", "orphaned"].includes(state)) viewsHost.lost();
             render();
         },
         onReclaimed: () => void host.refreshStatus(),
@@ -727,7 +738,8 @@ async function main() {
     // and branch runs through the canvas host's run lane.
     editor.runOutputs = createRunOutputsClient({
         mode: "mounted", label: `mounted:${hostId}`, apiURL: path => api.apiURL(path),
-        identity: () => ({ projectId, hostId, sessionId }),
+        // The canvas workflow's runs only, as the canvas page reads them.
+        identity: () => ({ projectId, hostId, sessionId, workflowId: canvasWorkflowId }),
     });
     const runRequests = createRunRequestClient({
         apiURL: path => api.apiURL(path), identity: () => ({ projectId, hostId, sessionId }),
@@ -735,6 +747,11 @@ async function main() {
         flush: async () => (await editor.flushControlsPanel()) !== false && controlsHost.flush(),
     });
     editor.runBranch = target => runRequests.runBranch(target);
+    const viewsHost = createMountedViewsHost({
+        workflowId: canvasWorkflowId, runOutputs: () => editor.runOutputs, runRequests: () => runRequests,
+        controlsHost: () => controlsHost, apiURL: path => api.apiURL(path),
+    });
+    editor.setViewsHost(viewsHost);
     editor._enterFullscreen();
     document.body.classList.add("ready");
     mountToastsOnce();
@@ -789,7 +806,11 @@ async function main() {
         } else if (host.sessionStatus !== "active") {
             blockerMessage.textContent = "Session not active";
         }
-        blocker.style.display = host.canvasHostConnected && host.sessionStatus === "active" ? "none" : "flex";
+        const live = host.canvasHostConnected && host.sessionStatus === "active";
+        blocker.style.display = live ? "none" : "flex";
+        // Output Views stop reading while the tab is orphaned or its canvas is gone.
+        if (live) viewsHost.restored();
+        else viewsHost.lost();
     };
 
     const setCanvasConnected = (connected) => {

@@ -38,6 +38,7 @@ import { createCanvasControlsHost } from "./controls_host_canvas.js";
 import { createCanvasControlsRelay } from "./controls_canvas_relay.js";
 import { createRunOutputsClient } from "./run_outputs_client.js";
 import { BRANCH_WAIT_MS, runBranch } from "./run_registration.js";
+import { createCanvasViewsHost } from "./views_hosts.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject, importFailureMessage } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
@@ -816,6 +817,8 @@ class FullscreenEditorSession {
         const state = this.controller.state;
         const editor = new EditorWidget(this.controller.node, {
             controlsHost: this.controller.getControlsHost(),
+            // Output Views: this page's runs and branch runs (fullscreen has none of its own).
+            viewsHost: createCanvasViewsHost({ controller: this.controller, apiURL: path => api.apiURL(path) }),
             onFullscreenExit: () => this._handleEditorClosed(),
             onMountInTab: () => this.controller.mountFullscreenInTab(),
             onWidgetValueChange: (name, value) => this.controller.onEditorWidgetValueChange(name, value),
@@ -829,7 +832,7 @@ class FullscreenEditorSession {
         editor.activeSceneId = state.sceneId || "";
         editor.selectionStart = state.selectionStart || 0;
         editor.selectionEnd = state.selectionEnd || 0;
-        editor.playhead = state.selectionStart || 0;
+        editor._setPlayhead(state.selectionStart || 0, "open");
         this.controller._setWidgetValue("pre_context_frames", state.preContextFrames || 0);
         this.controller._setWidgetValue("post_context_frames", state.postContextFrames || 0);
         this.controller._setWidgetValue("mask_pre_offset", state.maskPreOffset || 0);
@@ -1968,7 +1971,7 @@ export class EditorNodeController {
         this.runOutputs = createRunOutputsClient({
             mode: "canvas", label: `canvas:${hostId}`, apiURL: path => api.apiURL(path),
             identity: () => ({ projectId: this._projectId(), hostId: this._hostId(), sessionId: this._editorSessionId,
-                               workflowId: String(this.node?.graph?.rootGraph?.id || this.node?.graph?.id || "") }),
+                               workflowId: this._workflowId() }),
         });
         this._startCanvasHostHeartbeat(projectId, hostId, sourceNodeId);
         // Opening a project has the server decide new and changed videos for proxies.
@@ -2001,6 +2004,7 @@ export class EditorNodeController {
             hostId,
             sourceNodeId,
             sessionId: this._editorSessionId,
+            workflowId: this._workflowId(),
             workflowLabel: document.title || "ComfyUI workflow",
         });
         this._seedWidgetState(this._currentWidgetStateValues(), { seed: true });
@@ -2876,6 +2880,12 @@ export class EditorNodeController {
         this._startSessionHeartbeat();
     }
 
+    // This node's workflow (the canvas graph's id): run reads, the mounted
+    // tab's reads and the Output Views layout are keyed by it.
+    _workflowId() {
+        return String(this.node?.graph?.rootGraph?.id || this.node?.graph?.id || "");
+    }
+
     // Run one output branch from this page (canvas or fullscreen); see
     // run_registration.js for the outcome shapes.
     async runBranch(target) {
@@ -2961,7 +2971,7 @@ export class EditorNodeController {
                 window.alert?.("The editor tab did not claim the session. Check popup blockers or try again.");
             }, 10000);
             const url = api.apiURL(
-                `/sonder-editor/tab/${encodeURIComponent(projectId)}?handoff=${encodeURIComponent(handoff.token)}&host_id=${encodeURIComponent(this._hostId())}&source_node_id=${encodeURIComponent(this._sourceNodeId())}&session_name=${encodeURIComponent(this._mountedTabWindowName)}`
+                `/sonder-editor/tab/${encodeURIComponent(projectId)}?handoff=${encodeURIComponent(handoff.token)}&host_id=${encodeURIComponent(this._hostId())}&source_node_id=${encodeURIComponent(this._sourceNodeId())}&workflow_id=${encodeURIComponent(this._workflowId())}&session_name=${encodeURIComponent(this._mountedTabWindowName)}`
             );
             opened.location.href = url;
             this._startOwnerPolling(400);

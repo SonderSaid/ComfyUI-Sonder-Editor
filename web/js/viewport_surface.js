@@ -1115,7 +1115,7 @@ function fitRect(sourceWidth, sourceHeight, targetWidth, targetHeight) {
 // so this is framing-accurate, not pixel-accurate.
 const VIEWPORT_FIT_MODES = new Set(["fit", "pad_edge", "cover", "stretch"]);
 
-function fitOptionsFor(item) {
+export function fitOptionsFor(item) {
     const mode = item?.fit_mode;
     return {
         fitMode: VIEWPORT_FIT_MODES.has(mode) ? mode : "pad_edge",
@@ -1125,6 +1125,52 @@ function fitOptionsFor(item) {
 
 // pad_edge: stretch the 1px source edge across each letterbox/pillarbox bar so the
 // framing matches `fit` but without a hard black edge (mirrors cv2 BORDER_REPLICATE).
+// Draw `source` (its size `width` x `height`) over a canvasW x canvasH canvas
+// the way a clip is fitted: stretch, cover (a source sub-rect anchored by
+// cropPosition, mirroring the backend cover crop so preview and render agree),
+// or contain centered (fit, pad_edge with edge bars). Pure; the composite and
+// the Output View panes share it.
+export function drawFitted(ctx, source, width, height, canvasW, canvasH, { fitMode = "pad_edge", cropPosition = "center" } = {}) {
+    const mode = VIEWPORT_FIT_MODES.has(fitMode) ? fitMode : "pad_edge";
+    if (mode === "stretch") {
+        ctx.drawImage(source, 0, 0, canvasW, canvasH);
+    } else if (mode === "cover") {
+        const scale = Math.max(canvasW / width, canvasH / height);
+        const srcW = Math.min(width, canvasW / scale);
+        const srcH = Math.min(height, canvasH / scale);
+        const xExtra = width - srcW;
+        const yExtra = height - srcH;
+        let sx = xExtra / 2;
+        if (cropPosition === "left") sx = 0;
+        else if (cropPosition === "right") sx = xExtra;
+        let sy = yExtra / 2;
+        if (cropPosition === "top") sy = 0;
+        else if (cropPosition === "bottom") sy = yExtra;
+        ctx.drawImage(source, sx, sy, srcW, srcH, 0, 0, canvasW, canvasH);
+    } else {
+        const rect = fitRect(width, height, canvasW, canvasH);
+        ctx.drawImage(source, rect.x, rect.y, rect.width, rect.height);
+        if (mode === "pad_edge") drawEdgePadBars(ctx, source, rect, canvasW, canvasH, width, height);
+    }
+}
+
+// The guide shown at `frame`: the latest unmuted one at or before it, a
+// frame_index of -1 meaning the scene's last frame (`lastFrame`). Pure; the
+// composite and the Guides pane share it.
+export function guideAtFrame(guides, frame, lastFrame) {
+    let best = null;
+    let bestFrame = -1;
+    for (const guide of guides || []) {
+        if (guide.muted) continue;
+        const frameIndex = guide.frame_index === -1 ? lastFrame : Math.max(0, parseInt(guide.frame_index, 10) || 0);
+        if (frameIndex <= frame && frameIndex >= bestFrame) {
+            best = guide;
+            bestFrame = frameIndex;
+        }
+    }
+    return best;
+}
+
 function drawEdgePadBars(ctx, element, rect, canvasW, canvasH, srcW, srcH) {
     const left = rect.x;
     const top = rect.y;
@@ -1148,6 +1194,10 @@ function drawEdgePadBars(ctx, element, rect, canvasW, canvasH, srcW, srcH) {
 
 function removeMediaSource(mediaEl) {
     if (!mediaEl) return;
+    // An Output View pane's follower element (acquireSceneSource) hears when its
+    // source is taken away: a clear, a scene switch, a proxy reconcile.
+    const revoked = mediaEl._sonderRevokedHook;
+    mediaEl._sonderRevokedHook = null;
     mediaEl._sonderCancelPresentationTracker?.();
     delete mediaEl._sonderTailStop;
     try {
@@ -1168,6 +1218,9 @@ function removeMediaSource(mediaEl) {
     try {
         mediaEl.load?.();
     } catch (error) {}
+    if (typeof revoked === "function") {
+        try { revoked(); } catch (error) {}
+    }
 }
 
 function clearCacheObject(cache) {
@@ -1248,7 +1301,7 @@ function videoFrameCallbackMetadataTelemetry(metadata) {
     };
 }
 
-function waitForDecodedVideoFrame(mediaEl, timeoutMs = 120, { signal = null } = {}) {
+export function waitForDecodedVideoFrame(mediaEl, timeoutMs = 120, { signal = null } = {}) {
     if (!mediaEl || typeof mediaEl.requestVideoFrameCallback !== "function") {
         return Promise.resolve(signal?.aborted ? null : mediaEl);
     }
@@ -1572,6 +1625,10 @@ export function createViewportSurface(options = {}) {
         },
         playbackPerfWindow: createPlaybackPerfCounters(),
         playbackPerfRun: createPlaybackPerfCounters(),
+        // An Output View pane owns the sound (audio_ownership): timeline audio
+        // keeps playing, muted, so taking the sound back is instant.
+        timelineAudioMuted: false,
+        lastClockSignature: "",
     };
 
     const noop = () => {};
@@ -1585,6 +1642,8 @@ export function createViewportSurface(options = {}) {
     const onFrameChange = options.onFrameChange || noop;
     const onTransportUpdate = options.onTransportUpdate || noop;
     const onPlaybackStateChange = options.onPlaybackStateChange || noop;
+    // Play, stop, a new session and clock holds, for the host's clock funnel.
+    const onClockChange = options.onClockChange || noop;
     const onPlaybackWarmStateChange = options.onPlaybackWarmStateChange || noop;
     const getAssetForSourcePath = options.getAssetForSourcePath || (() => null);
     const getGuideAsset = options.getGuideAsset || (() => null);
@@ -2600,6 +2659,62 @@ export function createViewportSurface(options = {}) {
         } finally {
             if (startedAt) recordPlaybackPerfTiming("transport", performance.now() - startedAt);
         }
+        reportClock();
+    }
+
+    // Why the clock stands still while playing: the first composite has not
+    // committed yet, or the composite is rebuffering. Followers wait with it.
+    function clockHold() {
+        if (!state.isPlaying) return null;
+        if (state.playbackRebuffering) return "rebuffer";
+        if (!state.playbackCompositeCommitted && !state.playbackFirstCommitHoldExpired) return "first-commit";
+        return null;
+    }
+
+    // The scene clock for Output View followers. `anchor` places frames in
+    // time (performance.now()): fractional time only while playing, not held.
+    function getClock() {
+        return {
+            frame: currentFrame(), playing: state.isPlaying, hold: clockHold(), fps: fps(), totalFrames: totalFrames(),
+            sessionId: state.playbackSessionId,
+            anchor: { startFrame: state.playbackStartFrame, startTimeMs: state.playbackStartTime },
+        };
+    }
+
+    function reportClock() {
+        const hold = clockHold();
+        const signature = `${state.isPlaying}|${hold}|${state.playbackSessionId}`;
+        if (signature === state.lastClockSignature) return;
+        state.lastClockSignature = signature;
+        try { onClockChange(getClock()); } catch (error) {
+            // A follower bug must not break transport.
+        }
+    }
+
+    function setTimelineAudioMuted(muted) {
+        state.timelineAudioMuted = !!muted;
+        for (const active of state.activePlaybackAudios.values()) active.audio.muted = state.timelineAudioMuted;
+        for (const audio of Object.values(state.audioCache)) if (audio) audio.muted = state.timelineAudioMuted;
+    }
+
+    // A scene source for an Output View follower's own element (`holder`),
+    // through the same cache, display-source resolver and proxies as playback,
+    // as a whole-file blob for exact seeks. It counts against the cache budget
+    // like any holder. `onRevoked` runs when the surface takes it away (clear,
+    // scene switch, proxy reconcile); the follower then acquires again.
+    function acquireSceneSource(sourcePath, { holder, onRevoked = null } = {}) {
+        if (!holder || !sourcePath || state.destroyed) return { ready: Promise.resolve(null), release() {} };
+        holder._sonderRevokedHook = onRevoked;
+        const ready = ensureMediaElementSource(holder, sourcePath, { forceBlob: true })
+            .then((element) => (element ? { url: holder._sonderSourceUrl || "" } : null))
+            .catch(() => null);
+        return {
+            ready,
+            release() {
+                holder._sonderRevokedHook = null;
+                removeMediaSource(holder);
+            },
+        };
     }
 
     function updatePlaybackState(nextValue) {
@@ -2631,18 +2746,7 @@ export function createViewportSurface(options = {}) {
         const scene = getScene();
         if (!scene?.guide_frames?.length) return null;
         if (isGuideTrackHidden()) return null;
-        const lastFrame = Math.max(0, totalFrames() - 1);
-        let best = null;
-        let bestFrame = -1;
-        for (const guide of scene.guide_frames) {
-            if (guide.muted) continue;
-            const frameIndex = guide.frame_index === -1 ? lastFrame : Math.max(0, parseInt(guide.frame_index, 10) || 0);
-            if (frameIndex <= frame && frameIndex >= bestFrame) {
-                best = guide;
-                bestFrame = frameIndex;
-            }
-        }
-        return best;
+        return guideAtFrame(scene.guide_frames, frame, Math.max(0, totalFrames() - 1));
     }
 
     function getVisibleClipLayers(frame) {
@@ -2870,31 +2974,7 @@ export function createViewportSurface(options = {}) {
         if (state.lastVideoScratchDraw) ctx.imageSmoothingQuality = "low";
         ctx.globalAlpha = clamp(Number(opacity) || 0, 0, 1);
         try {
-            if (mode === "stretch") {
-                ctx.drawImage(source, 0, 0, canvasW, canvasH);
-            } else if (mode === "cover") {
-                // Source sub-rect that fills the canvas, anchored by cropPosition.
-                // Math mirrors the backend cover crop so preview and render agree.
-                const scale = Math.max(canvasW / width, canvasH / height);
-                const srcW = Math.min(width, canvasW / scale);
-                const srcH = Math.min(height, canvasH / scale);
-                const xExtra = width - srcW;
-                const yExtra = height - srcH;
-                let sx = xExtra / 2;
-                if (cropPosition === "left") sx = 0;
-                else if (cropPosition === "right") sx = xExtra;
-                let sy = yExtra / 2;
-                if (cropPosition === "top") sy = 0;
-                else if (cropPosition === "bottom") sy = yExtra;
-                ctx.drawImage(source, sx, sy, srcW, srcH, 0, 0, canvasW, canvasH);
-            } else {
-                // fit / pad_edge: contain, centered.
-                const rect = fitRect(width, height, canvasW, canvasH);
-                ctx.drawImage(source, rect.x, rect.y, rect.width, rect.height);
-                if (mode === "pad_edge") {
-                    drawEdgePadBars(ctx, source, rect, canvasW, canvasH, width, height);
-                }
-            }
+            drawFitted(ctx, source, width, height, canvasW, canvasH, { fitMode: mode, cropPosition });
             return true;
         } catch (error) {
             return false;
@@ -3108,6 +3188,7 @@ export function createViewportSurface(options = {}) {
         if (!state.audioCache[layer.key]) {
             const audio = document.createElement("audio");
             audio.preload = "auto";
+            audio.muted = state.timelineAudioMuted;
             state.audioCache[layer.key] = audio;
         }
         return state.audioCache[layer.key];
@@ -7262,6 +7343,7 @@ export function createViewportSurface(options = {}) {
                         ) return;
                         element.currentTime = audioSourceTime(layer, snapshot.frame);
                         element.volume = clamp(Number(layer.track.volume ?? 1), 0, 1);
+                        element.muted = state.timelineAudioMuted;
                         if (audioPlaybackAllowed(snapshot)) {
                             playMediaElement(element, { mediaType: "audio", layerKey: layer.key, sourcePath });
                         }
@@ -7274,6 +7356,7 @@ export function createViewportSurface(options = {}) {
             active.layer = layer;
             const expectedTime = audioSourceTime(layer, snapshot.frame);
             active.audio.volume = clamp(Number(layer.track.volume ?? 1), 0, 1);
+            active.audio.muted = state.timelineAudioMuted;
             if (Math.abs((Number(active.audio.currentTime) || 0) - expectedTime) > 0.35) {
                 active.audio.currentTime = expectedTime;
             }
@@ -7721,6 +7804,7 @@ export function createViewportSurface(options = {}) {
         }
         recordBoundaryCoverageTelemetry(snapshot, committedVideoKeys, compositeTiming, videoDraws);
         state.playbackCompositeCommitted = true;
+        reportClock();
         state.playbackBlockedSinceMs = null;
         state.playbackBlockedSignature = "";
         state.playbackCanvasWidth = state.canvas?.width || 0;
@@ -7928,6 +8012,7 @@ export function createViewportSurface(options = {}) {
         const blockedForMs = timestamp - startedAt;
         if (blockedForMs > PLAYBACK_FIRST_COMMIT_HOLD_MS) {
             state.playbackFirstCommitHoldExpired = true;
+            reportClock();
             releaseAudioForSession("first-commit-hold-expired", {
                 frame: holdFrame,
                 nextFrame,
@@ -8183,6 +8268,7 @@ export function createViewportSurface(options = {}) {
         captureRebufferToastPressure(now);
         captureRebufferHeavyPressure(now);
         state.playbackRebuffering = true;
+        reportClock();
         clearActiveTailStops();
         abortPreRolls("rebuffer");
         // Hold at the current (runaway) frame: audio has already played to ~here, so
@@ -8247,6 +8333,7 @@ export function createViewportSurface(options = {}) {
         );
         settleRebufferToastOnRecovery(heldMs, now);
         state.playbackRebuffering = false;
+        reportClock();
         state.playbackRebufferSinceMs = null;
         state.playbackRebufferCapped = false;
         state.playbackRebufferLastExitMs = now;
@@ -8694,5 +8781,9 @@ export function createViewportSurface(options = {}) {
         setLiveMediaEnabled,
         isLiveMediaEnabled: () => state.liveMediaEnabled,
         isPlaying: () => state.isPlaying,
+        // Output Views (additive seam).
+        getClock,
+        setTimelineAudioMuted,
+        acquireSceneSource,
     };
 }

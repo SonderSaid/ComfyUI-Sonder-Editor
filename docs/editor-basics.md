@@ -275,6 +275,53 @@ renders.
   across the viewport names the clip and what it waits for, such as **Proxy
   waiting for ComfyUI** or **No proxy yet**; the other layers still show.
 
+### Panes and Output Views
+
+The viewport can show up to four things side by side. Click the buttons at
+the right of the bar above the viewport: **1** (one pane), **2** or **3**
+(side by side) or **2×2** (four).
+
+Each pane has a source button at its top left (**Composite ▾** at first).
+Click it and choose:
+
+- **Editor**: **Composite** (the scene preview described above), **Guides**
+  (the guide frame at the playhead) or **Driver 1**, **Driver 2**… (that
+  Driver lane's frame at the playhead).
+- **Views**: outputs of the workflow you have already added as Views.
+- **Add output…**: the workflow's output nodes that have no View yet
+  (**Preview Image**, **Sonder Preview Video**, **Sonder Save Video** and
+  the like, including ones inside a subgraph). Click one to add it as a View
+  and show it in this pane. On the canvas, adding a View is one Undo step.
+
+The panes and their sources are remembered for each workflow in this
+browser. Fullscreen and **Mount in Tab** share them; each workflow in the
+[Sonder App](sonder-app.md) keeps its own.
+
+A View pane shows the newest result of its output node from runs started in
+this editor (in the Sonder App, from this app workflow). Its bar has:
+
+- **Run**: runs that output node and only what it needs, not the whole
+  workflow. **Cancel** takes it off the queue or stops it while it runs
+  (**Canceling…** shows until the node stops).
+- **Hold**: keeps the result you are looking at when the output runs again.
+  **Release** follows the newest again. To compare before and after, show the
+  same View in two panes and hold one.
+- **◀ 1/3 ▶**: steps through several images.
+- **Fit** / **Fill**: shows the whole output, or fills the pane. The mouse
+  wheel zooms toward the cursor and dragging pans, as in
+  [the inspect overlay](assets-and-gallery.md#the-inspect-overlay).
+- **Unmute**: hear this pane instead of the timeline. Only one source plays
+  sound at a time; **Mute** gives the sound back to the timeline.
+
+The text beside the source button says what is happening: **No result yet**,
+**Running**, **Waiting for run**, **Last run was canceled**, **From cache**
+(ComfyUI reused an earlier result) or **Didn't run:** and the reason. **This
+View is no longer in the workflow** means its node was deleted: pick another
+source, or delete the View. In a mounted tab, panes read **Disconnected**
+while the canvas page is closed or reloading.
+
+To rename, reorder or delete Views, see [Manage](controls.md#manage).
+
 ## Safety & recovery
 
 - Asset deletes route to a **Trash** first; permanent deletion is

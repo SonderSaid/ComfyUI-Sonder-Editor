@@ -300,3 +300,89 @@ def test_the_capability_gate_refuses_a_tls_comfyui(monkeypatch):
     assert run_control.branch_capability() == {"ok": False, "reason": "tls_unsupported"}
     monkeypatch.setattr(sdk_proxy, "own_upstream_url", lambda *_a: "http://127.0.0.1:8188")
     assert run_control.branch_capability() == {"ok": True, "reason": ""}
+
+
+def test_cancel_run_cancels_one_run_of_this_session_only(world, monkeypatch):
+    """Output Views: a pane cancels its own run by run id (D5)."""
+    cancelled = []
+    monkeypatch.setattr(run_control, "cancel_prompt", lambda prompt_id, queue=None: cancelled.append(prompt_id) or "deleted")
+
+    async def go():
+        session = await world.open()
+        first = await branch(world, session)
+        second = await branch(world, session)
+        one = await world.runner.cancel_run(session, first["run_ids"][0])
+        with pytest.raises(SdkError) as unknown:
+            await world.runner.cancel_run(session, "run-nope")
+        return session, first, second, one, unknown.value
+
+    session, first, second, one, unknown = asyncio.run(go())
+    assert one == {"ok": True, "canceling": first["run_ids"]}
+    assert cancelled == [first["prompt_id"]]  # the other run is left alone
+    runs = {run.run_id: run for run in session.runs}
+    assert runs[first["run_ids"][0]].cancel_requested and not runs[second["run_ids"][0]].cancel_requested
+    assert (unknown.code, unknown.status) == ("unknown_run", 404)
+    world.runner.apply_run_finished({"run_token": runs[first["run_ids"][0]].token, "prompt_id": first["prompt_id"],
+                                     "outcome": "interrupted", "leased_job_ids": [], "returned_job_ids": []})
+
+    async def again():
+        return await world.runner.cancel_run(session, first["run_ids"][0])
+    assert asyncio.run(again()) == {"ok": True, "canceling": []}  # a finished run: nothing to do
+
+
+def test_observed_run_ids_outlive_the_24_kept_runs(world):
+    from server import sdk_runner
+
+    async def go():
+        session = await world.open()
+        made = []
+        for _ in range(sdk_runner.FINISHED_RUNS_KEPT + 6):
+            result = await branch(world, session)
+            run = next(r for r in session.runs if r.run_id == result["run_ids"][0])
+            world.runner.apply_run_finished({"run_token": run.token, "prompt_id": result["prompt_id"], "outcome": "success",
+                                             "leased_job_ids": [], "returned_job_ids": []})
+            made.append(run.run_id)
+        return session, made
+
+    session, made = asyncio.run(go())
+    # Trimmed when a run is added: the kept runs, then the newest.
+    assert len(session.runs) <= sdk_runner.FINISHED_RUNS_KEPT + 1 < len(made)
+    assert set(session.observed_run_ids()) == set(made)
+    assert len(session.observed_run_ids()) == len(made) and len(set(session.observed_run_ids())) == len(made)
+
+
+def test_sdk_run_cancel_route_needs_the_session_secret_its_tab_and_its_own_run(world, monkeypatch):
+    """POST …/runs/{run_id}/cancel: the SDK headers like every session route, and
+    only a run of this session (D5)."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from server import sdk_routes
+
+    cancelled = []
+    monkeypatch.setattr(run_control, "cancel_prompt", lambda prompt_id, queue=None: cancelled.append(prompt_id) or "deleted")
+    monkeypatch.setattr(sdk_routes, "get_runner", lambda *a, **kw: world.runner)
+    routes = web.RouteTableDef()
+    sdk_routes.register_sdk_routes(routes, resolve_project=world.resolve, remember_event_loop=lambda: None, projects_dir=lambda: "")
+    app = web.Application()
+    app.add_routes(routes)
+
+    async def go():
+        session = await world.open()
+        run = await branch(world, session)
+        run_id = run["run_ids"][0]
+        mine = {sdk_routes.SECRET_HEADER: session.secret, sdk_routes.TAB_HEADER: "tab-1"}
+        base = f"/sonder-editor/sdk/session/{session.session_id}/runs"
+        async with TestClient(TestServer(app)) as http:
+            secret = await http.post(f"{base}/{run_id}/cancel", headers={**mine, sdk_routes.SECRET_HEADER: "wrong"})
+            tab = await http.post(f"{base}/{run_id}/cancel", headers={**mine, sdk_routes.TAB_HEADER: "tab-2"})
+            unknown = await http.post(f"{base}/run-elsewhere/cancel", headers=mine)
+            before = list(cancelled)
+            ok = await http.post(f"{base}/{run_id}/cancel", headers=mine)
+            return run, (secret.status, tab.status, unknown.status, before), (ok.status, await ok.json())
+
+    run, refused, (status, body) = asyncio.run(go())
+    # A wrong secret reads as no session (its existence is not told); another tab is refused;
+    # a run id this session does not have is unknown. None of them canceled anything.
+    assert refused == (404, 409, 404, [])
+    assert status == 200 and body == {"ok": True, "canceling": run["run_ids"]}
+    assert cancelled == [run["prompt_id"]]

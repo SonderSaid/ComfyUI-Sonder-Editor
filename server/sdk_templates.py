@@ -39,7 +39,7 @@ import secrets
 import time
 from typing import Any, Callable
 
-from . import control_descriptors, control_execution, control_rows, prompt_graph, model_requirements
+from . import control_descriptors, control_execution, control_rows, control_views, prompt_graph, model_requirements
 from .external_links import WINDOWS_RESERVED_BASENAMES
 from .editor_inputs import clean_editor_values
 from .path_security import PathSecurityError, safe_route_token
@@ -530,7 +530,7 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
         # Preserved app copies and newly authored presets must remain portable.
         # The check describes the workflow, which needs every node installed.
         if not validation.get("missing_nodes"):
-            _check_preset_projection(prompt, data, describe)
+            _check_manifest_projection(prompt, data, describe)
         # The file lock makes the three writes one transaction for live readers.
         # Restore exact bytes on a failed write. The hash binding below also
         # prevents old notes appearing over a new export after a process crash.
@@ -597,7 +597,8 @@ def export_curated(template_id: str) -> bytes:
             cm.parse_manifest(text)  # counts and UTF-8 cap, including unknown metadata
         except (cm.ManifestError, UnicodeError) as exc:
             raise TemplateError(str(exc), "invalid_controls") from None
-        if relay["key"] or manifest["bindings"] or manifest["notes"] or manifest["groups"] or manifest["description"] or manifest["presets"]:
+        if (relay["key"] or manifest["bindings"] or manifest["notes"] or manifest["groups"] or manifest["description"]
+                or manifest["presets"] or (manifest.get("views") or {}).get("items")):
             key = relay["key"]
             if key is None:
                 roots = [int(k) for k in prompt if k.isascii() and k.isdecimal()]
@@ -662,6 +663,7 @@ def _curated_manifest(prompt, relay, stored, view):
         entry.update({key: descriptor.get(key, default) for key, default in (("text", ""), ("group", ""), ("order", 0))})
         manifest["notes"][identity] = entry
     _curated_execution(manifest, saved, stored, view)
+    _curated_views(manifest, saved, view)
     for key in ("status", "suggestions", "error"):
         manifest.pop(key, None)
     return manifest
@@ -703,6 +705,19 @@ def _curated_execution(manifest, saved, stored, view):
         label = labels.get(f"execution:{identity}", entry.get("label", ""))
         entry["label"] = label.strip()[:control_descriptors.control_manifest.LABEL_MAX] if isinstance(label, str) else ""
     manifest["execution"] = section
+
+def _curated_views(manifest, saved, view):
+    """The export's Views as this app shows them: its copies and app-only Views
+    materialized by source, removed ones left out. A section from another
+    Sonder version stays exactly as saved."""
+    if view.get("views_error"):
+        return
+    section = control_views.curated_views(view)
+    if section is not None:
+        manifest["views"] = section
+    elif isinstance(saved.get("views"), dict):
+        manifest["views"] = {"v": control_descriptors.control_manifest.VIEWS_VERSION, "items": {}}
+
 
 def _read_bytes(path: str) -> bytes | None:
     try:
@@ -785,7 +800,7 @@ def _write_bytes_atomic(path: str, data: bytes) -> None:
 def _normalized_controls(data: dict, presentation_hash: str) -> dict:
     data = dict(data)
     data["version"] = CONTROLS_VERSION
-    for name in ("bindings", "labels", "notes", "layout", "local", "local_notes", "hidden", "presets", "node_modes"):
+    for name in ("bindings", "labels", "notes", "layout", "local", "local_notes", "hidden", "presets", "node_modes", "views"):
         if not isinstance(data.get(name), dict):
             data[name] = {}
     if data.get("presentation_hash") != presentation_hash:
@@ -966,6 +981,8 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
     # the settings they turn off marked inactive. Validation still reads the
     # full template; a run submits run_prompt's compiled copy.
     control_execution.apply_sdk_state(view, prompt, stored, hidden)
+    # The app's Views: the workflow's, its copies and its own (control_views).
+    control_views.apply_sdk_views(view, prompt, stored)
     if "relay" in view and not view.get("error"):
         view["groups"] = _overlay_groups(view.get("groups"), layouts)
         view["group_order"] = cd.group_order(view)  # the overlays may regroup
@@ -1062,6 +1079,10 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                         if key == identity or definition != before.get(key):
                             data["presets"][key] = definition
                 continue
+            if source == "view":
+                # Inspection only: the sidecar's own copy-on-write map.
+                control_views.store_sdk_change(data, current, identity, field, value)
+                continue
             if source == "workflow" and field == "restore":
                 raise TemplateError("Restore applies to canvas workflows.", "invalid_controls")
             if source == "workflow" and field == "cleanup":
@@ -1097,7 +1118,7 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                 for pid in changed:
                     data["presets"][pid] = effective.get(pid, {"removed": True})
                 if changed:
-                    _check_preset_projection(fresh_prompt, data)
+                    _check_manifest_projection(fresh_prompt, data)
                 continue
             if source == "workflow" and field == "description":
                 data["description"] = value
@@ -1144,20 +1165,28 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                     entry["sig"] = signatures.get(identity)
                 else:
                     entry[field] = value
-        if any((control_descriptors.parse_target(target) or (None,))[0] == "preset" for target in changes):
-            _check_preset_projection(prompt, data)
+        if any((control_descriptors.parse_target(target) or (None,))[0] in ("preset", "view") for target in changes):
+            _check_manifest_projection(prompt, data)
     return update_control_values(template_id, mutate)
 
 
-def _check_preset_projection(prompt, data, describe=None):
+def _check_manifest_projection(prompt, data, describe=None):
+    """Refuse a sidecar the export could not carry: presets and Views must
+    stay within the manifest's caps, so Export never starts failing."""
     cm = control_descriptors.control_manifest
     effective, _ = control_presets.effective_presets(control_manifest_of(prompt).get("presets"), data.get("presets"))
-    if not effective:
+    if not effective and not control_manifest_of(prompt).get("views") and not control_views.stored_views(data):
         return
     if len(effective) > cm.MAX_PRESETS:
         raise TemplateError("At most 32 presets fit in one workflow. Remove an app preset before replacing this workflow.", "invalid_controls")
     projected_prompt = copy.deepcopy(prompt or {})
     projected_view = apply_stored_values(projected_prompt, describe_stored(projected_prompt, data, describe), data)
+    # The Views the export would carry: the workflow's not removed here, and the app's own.
+    stored = control_views.stored_views(data)
+    removed = {identity for identity, entry in stored.items() if entry.get("removed")}
+    shown = (set(control_manifest_of(prompt).get("views") or {}) - removed) | (set(stored) - removed)
+    if len(shown) > cm.MAX_VIEWS:
+        raise TemplateError(f"At most {cm.MAX_VIEWS} Views fit in one workflow. Delete one first.", "invalid_controls")
     projected = _curated_manifest(projected_prompt, cm.find_relay(projected_prompt), data, projected_view)
     try:
         cm.parse_manifest(json.dumps(projected, ensure_ascii=False))

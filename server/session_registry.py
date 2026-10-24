@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from . import control_descriptors, control_rows
+from . import control_descriptors, control_rows, control_views
 
 logger = logging.getLogger("sonder_editor")
 
@@ -759,7 +759,7 @@ def _clear_controls_locked(key: HostKey) -> None:
 
 
 def _new_controls_state() -> dict:
-    return {"view": None, "view_seq": 0, "prompt_hash": "", "visible": False, "manage": False, "filter": "",
+    return {"view": None, "view_seq": 0, "prompt_hash": "", "visible": False, "manage": False, "filter": "", "views": False,
             "pending": [], "outcomes": [], "publication": None}
 
 
@@ -767,12 +767,15 @@ def _controls_presence_locked(key: HostKey) -> dict:
     state = _controls_relay.get(key, {})
     owner = _sessions.get(key)
     host = _canvas_hosts.get(key)
-    visible = bool(state.get("visible") and owner and owner.get("host_mode") == "tab"
-                   and owner.get("status", "active") == "active" and not _is_stale(owner)
-                   and host and not _is_host_stale(host))
+    live = bool(owner and owner.get("host_mode") == "tab" and owner.get("status", "active") == "active"
+                and not _is_stale(owner) and host and not _is_host_stale(host))
+    visible = bool(state.get("visible") and live)
     # Manage is open in the tab: the canvas lists candidates, filtered here
     # first, so a large graph never publishes every widget it has.
+    # A View pane or the pane picker shows in the tab: the canvas keeps its
+    # describe running for the Views, whatever the panel shows.
     return {"controls_view_seq": state.get("view_seq", 0), "controls_visible": visible,
+            "controls_views": bool(state.get("views") and live),
             "controls_manage": bool(visible and state.get("manage")),
             "controls_filter": state.get("filter", "") if visible and state.get("manage") else ""}
 
@@ -841,9 +844,18 @@ def _prepare_control_publication(body: Any) -> dict:
                         control_descriptors.coerce_control_value(numeric_kind, descriptor[bound])
                 if kind == control_rows.ROWS_KIND:
                     control_rows.check_publication(descriptor)
-    for name in ("suggestions", "candidates"):
+    for name in ("suggestions", "candidates", "views", "view_candidates"):
         if name in view and (not isinstance(view[name], list) or not all(isinstance(d, dict) for d in view[name])):
             raise ValueError(f"{name} must be a list.")
+    for descriptor in view.get("views") or []:
+        if not isinstance(descriptor.get("view_id"), str) or not isinstance(descriptor.get("status"), str):
+            raise ValueError("A View needs an id and a status.")
+    if len(view.get("views") or []) > control_descriptors.control_manifest.MAX_VIEWS:
+        raise ValueError("Too many Views.")
+    if len(view.get("view_candidates") or []) > control_views.MAX_CANDIDATES:
+        raise ValueError("Too many View candidates.")
+    if view.get("views_error") is not None and not isinstance(view["views_error"], str):
+        raise ValueError("The Views error must be text.")
     if len(view.get("candidates") or []) > control_descriptors.MAX_CANDIDATES:
         raise ValueError("Too many candidates.")
     if "candidates_truncated" in view and not isinstance(view["candidates_truncated"], bool):
@@ -1155,8 +1167,9 @@ async def get_control_changes(project_id: str, host_id: str, session_id: str) ->
 
 
 async def set_controls_visibility(project_id: str, host_id: str, session_id: str,
-                                  visible: Any, seen: Any = None, manage: Any = None, filter: Any = None) -> dict:
-    if not isinstance(visible, bool):
+                                  visible: Any, seen: Any = None, manage: Any = None, filter: Any = None,
+                                  views: Any = None) -> dict:
+    if not isinstance(visible, bool) or (views is not None and not isinstance(views, bool)):
         return {"ok": False, "code": "invalid_visibility"}
     if manage is not None and not isinstance(manage, bool):
         return {"ok": False, "code": "invalid_visibility"}
@@ -1182,6 +1195,8 @@ async def set_controls_visibility(project_id: str, host_id: str, session_id: str
                 state["manage"] = manage
             if filter is not None:
                 state["filter"] = filter
+            if views is not None:
+                state["views"] = views
             changed = before != _controls_presence_locked(key)
             result = {"ok": True, **_controls_presence_locked(key)}
             if changed:

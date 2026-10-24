@@ -18,6 +18,10 @@ const INVALID_VIEW = unavailableView(
 );
 
 const publicationBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
+// What a pane needs of each View, kept even when the Controls cannot fit.
+const VIEW_KEYS = ["view_id", "origin", "label", "default_label", "order", "path", "class_type", "title", "status",
+    "participation", "inactive_reason", "reason", "runnable"];
+const minimalViews = views => (views || []).map(d => Object.fromEntries(VIEW_KEYS.filter(key => key in d).map(key => [key, d[key]])));
 const shorten = (descriptor, field, limit) =>
     typeof descriptor[field] === "string" && descriptor[field].length > limit
         ? { ...descriptor, [field]: descriptor[field].slice(0, limit), note_truncated: true }
@@ -34,6 +38,12 @@ export function fitPublicationView(view, envelope) {
         delete view.candidate_labels;
     }
     const fits = candidate => publicationBytes({ ...envelope, view: candidate }) <= MAX_PUBLICATION_BYTES;
+    if (fits(view)) return view;
+    // Outputs that could become a View are for the pane picker only; they go first.
+    while (view.view_candidates?.length && !fits(view)) {
+        view = { ...view, view_candidates: view.view_candidates.slice(0, Math.floor(view.view_candidates.length / 2)),
+            view_candidates_truncated: true };
+    }
     if (fits(view)) return view;
     // Preset previews are display-only and shrink before candidate inventories.
     if (!fits(view) && view.presets?.length) view = { ...view, presets: view.presets.map(p => ({...p,
@@ -70,7 +80,10 @@ export function fitPublicationView(view, envelope) {
         };
         if (fits(trimmed)) return trimmed;
     }
-    return TOO_LARGE_VIEW;
+    // The Controls cannot be shown, but the panes keep their Views.
+    const fallback = { ...TOO_LARGE_VIEW, views: minimalViews(view.views),
+        ...(view.views_error ? { views_error: view.views_error } : {}) };
+    return fits(fallback) ? fallback : TOO_LARGE_VIEW;
 }
 
 export function createCanvasControlsRelay({ host, identity, api, connected = () => false }) {
@@ -187,7 +200,8 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
             try {
                 const queue = await request("GET", "control_changes");
                 if (!queue.ok || !current(stamp, id)) return;
-                mountedVisible = !!queue.payload.controls_visible;
+                // A View pane in the tab keeps the describe running too.
+                mountedVisible = !!queue.payload.controls_visible || !!queue.payload.controls_views;
                 host.setMountedManage?.(!!queue.payload.controls_manage, queue.payload.controls_filter || "");
                 host.setMountedVisible(mountedVisible);
                 // The GET preceded this retry. Once its ACK succeeds that pending
@@ -198,7 +212,7 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
                 }
                 const liveRequests = new Set((queue.payload.pending || []).map(r => r.request_id));
                 for (const rid of processed.keys()) if (!publication && !liveRequests.has(rid)) processed.delete(rid);
-                if (queue.payload.controls_visible) await host.refresh();
+                if (mountedVisible) await host.refresh();
                 for (const pending of queue.payload.pending || []) {
                     if (!current(stamp, id)) return;
                     if (processed.has(pending.request_id)) continue;
@@ -245,7 +259,7 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
                     }
                 }
                 if (processed.size) await host.refresh(true);
-                if (current(stamp, id) && (queue.payload.controls_visible || processed.size))
+                if (current(stamp, id) && (mountedVisible || processed.size))
                     await publish(stamp, id, queue.payload.controls_view_seq);
             } catch (_) {
                 /* State remains for event/poll retry; no graph write is replayed. */

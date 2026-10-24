@@ -509,7 +509,7 @@ export function buildEditorToolbar(widget) {
                 return;
             }
             const maxFrame = Math.max(0, widget.activeScene?.duration_frames || widget.totalFrames);
-            widget.playhead = Math.max(0, Math.min(maxFrame, Math.round(parsed)));
+            widget._setPlayhead(Math.max(0, Math.min(maxFrame, Math.round(parsed))), "frame-input");
             if (widget.isPlaying) widget._stopPlayback();
             widget._ensureFrameVisible(widget.playhead, { center: true });
             widget._renderTimeline();

@@ -8,6 +8,7 @@
 import { mountWorkflowDescription } from "./controls_workflow_description.js";
 import { mountCleanup } from "./controls_cleanup.js";
 import { mountPresetsManage } from "./controls_presets_manage.js";
+import { mountViewsManage } from "./controls_views_manage.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { groupNameError } from "./control_targets.js";
 import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, chromeInputCss, setButtonDisabled, setButtonVariant } from "./editor_theme.js";
@@ -103,6 +104,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     footer.append(addSetting, addNote, addGroup);
     const description = mountWorkflowDescription(host, { track });
     const presets = mountPresetsManage(host, {track, notify, flushPending, changed});
+    const views = mountViewsManage(host, {track, notify});
     const cleanup = mountCleanup(host, {track, notify, flushPending});
     // What Export (API) would leave out: settings and switches whose nodes are
     // off now. Advice only: Sonder never enables a node for the author.
@@ -112,7 +114,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         + `padding:${SPACE.s1 + 2}px ${SPACE.s2}px;border:1px solid ${COLORS.warningBorder};border-radius:${RADIUS.r2}px;background:${COLORS.warningSoft};`;
     // The action row comes first, so "+ Setting" opens its picker below it.
     // The note editor opens right under its button, above an open picker.
-    el.append(description.el, readiness, presets.el, footer, noteBox, heading, filterInput, banner, list, cleanup.el);
+    el.append(description.el, readiness, presets.el, views.el, footer, noteBox, heading, filterInput, banner, list, cleanup.el);
 
     function apply(changes, button) {
         return track(applyNow(changes, button), changes);
@@ -214,6 +216,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         lastView = view;
         description.render(view);
         presets.render(view);
+        views.render(view);
         cleanup.render(view);
         renderReadiness(view);
         // Rebuilt only when what it lists changes: the panel renders on every
@@ -477,7 +480,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         // An unsaved note or description draft (a preset draft asks in canLeave).
         get hasDraft() { return !!draft || !!description.dirty; },
         get presetSaving() { return presets.busy || cleanup.busy; },
-        get editing() { return !!draft || cleanup.editing || presets.editing || description.editing || document.activeElement === filterInput; },
+        get editing() { return !!draft || cleanup.editing || presets.editing || views.editing || description.editing || document.activeElement === filterInput; },
         destroy() {
             destroyed = true;
             clearTimeout(filterTimer);
@@ -485,6 +488,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
             unregister();
             description.destroy();
             presets.destroy();
+            views.destroy();
             cleanup.destroy();
             el.remove();
         },

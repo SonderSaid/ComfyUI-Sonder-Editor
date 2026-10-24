@@ -8,6 +8,7 @@ import {
     normalizePromptAttachments,
     normalizePromptDocument,
 } from "./prompt_context_chips.js";
+import { normalizeLayoutMap } from "./views_model.js";
 
 // Renamed during the Sonder pivot. No fallback read by design.
 const SETTINGS_STORAGE_KEY = "sonder-editor-settings";
@@ -483,6 +484,11 @@ export const DEFAULT_EDITOR_SETTINGS = {
     // reveals Controls their workflow marks Advanced; their values apply either way.
     // Show notes off hides the workflow's notes outside Manage and search.
     controls: { view: "rows", showAdvanced: false, showNotes: true },
+    // Output Views pane layout per workflow (`c:<graph id>` on the canvas,
+    // `a:<template id>` in the Sonder App): layout, each pane's source, item,
+    // fit and zoom. The default (one Composite pane) is never stored; the
+    // newest 64 workflows are kept. Not stored: holds, mute, who has the sound.
+    views: { layoutByWorkflow: {} },
     // Browser preferences for Reference work (Settings → References). The
     // project-wide Reference settings there are stored with the project instead.
     references: {
@@ -1639,6 +1645,9 @@ export function normalizeEditorSettings(source = null) {
                 typeof stored?.references?.openLaneSetupOnFirstStage === "boolean"
                     ? stored.references.openLaneSetupOnFirstStage
                     : defaults.references.openLaneSetupOnFirstStage,
+        },
+        views: {
+            layoutByWorkflow: normalizeLayoutMap(stored?.views?.layoutByWorkflow),
         },
     };
 }

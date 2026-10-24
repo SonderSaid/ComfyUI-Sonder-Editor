@@ -183,3 +183,57 @@ def test_reads_reap_a_bound_prompt_that_left_the_queue(monkeypatch):
     sdk_runs.bind_queued("unknown", receipt(3), ["out"])
     run_output_routes._reap_removed_runs()
     assert not sdk_runs.bound_run("unknown")["finished"]
+
+
+def test_reads_refresh_only_the_holds_a_page_still_shows(registry, monkeypatch):
+    """Output Views 3A: a closed page's holds age out; pagehide releases a page's holds at once."""
+    async def scenario():
+        await setup_hosts()
+        sdk_runs.register_receipt(RECEIPT, OWNER, ["ed"])
+        run_and_publish(prompt())
+        async with client() as http:
+            fields = {"host_id": HID, "session_id": TAB}
+            hold = lambda: http.post(f"/sonder-editor/project/{PID}/runs/hold",
+                                     json={**fields, "prompt_id": "p1", "source": "out", "index": 0})
+            mine = (await (await hold()).json())["hold_id"]
+            orphan = (await (await hold()).json())["hold_id"]
+            # The hold store's own clock only: the session registry keeps real time.
+            clock = [run_outputs.time.time()]
+            monkeypatch.setattr(run_outputs, "time", SimpleNamespace(time=lambda: clock[0]))
+            read = lambda keep: http.get(f"/sonder-editor/project/{PID}/runs/outputs",
+                                         params={**fields, "sources": "out", "keep_holds": keep})
+            for _ in range(3):  # a keepalive read every 20 minutes names only this page's hold
+                clock[0] += 20 * 60
+                payload = await (await read(mine)).json()
+            assert [h["hold_id"] for h in payload["holds"]] == [mine]
+            # Entries and holds carry the file's revision, as text (nanoseconds exceed 2^53).
+            assert payload["holds"][0]["entry"]["revision"].startswith("3:")
+            assert payload["sources"]["out"]["result"]["entries"][0]["revision"] == payload["holds"][0]["entry"]["revision"]
+            assert orphan not in {h["hold_id"] for h in payload["holds"]}
+            # Hold is not refused for the orphans: they are gone.
+            others = [(await (await hold()).json()).get("hold_id") for _ in range(run_outputs.MAX_HOLDS_PER_OWNER - 1)]
+            assert all(others)
+            # A closing page releases all of its holds in one request.
+            gone = await http.post(f"/sonder-editor/project/{PID}/runs/release", json={**fields, "hold_ids": [mine, *others, "nope"]})
+            assert (await gone.json()) == {"ok": True, "released": run_outputs.MAX_HOLDS_PER_OWNER}
+            assert (await (await read("")).json())["holds"] == []
+    run(scenario())
+
+
+def test_owner_tab_cancels_a_run_its_host_owns(registry, monkeypatch):
+    cancelled = []
+    monkeypatch.setattr(run_output_routes.run_control, "cancel_prompt", lambda pid, queue=None: cancelled.append(pid) or "deleted")
+
+    async def scenario():
+        await setup_hosts()
+        sdk_runs.register_receipt(RECEIPT, OWNER, ["ed"])
+        run_and_publish(prompt())
+        async with client() as http:
+            ok = await http.post(f"/sonder-editor/project/{PID}/runs/p1/cancel", json={"host_id": HID, "session_id": TAB})
+            assert ok.status == 200 and (await ok.json())["cancel"] == "deleted"
+            unknown = await http.post(f"/sonder-editor/project/{PID}/runs/zzz/cancel", json={"host_id": HID, "session_id": TAB})
+            assert unknown.status == 404
+            stranger = await http.post(f"/sonder-editor/project/{PID}/runs/p1/cancel", json={"host_id": HID, "session_id": "nobody"})
+            assert stranger.status == 403
+    run(scenario())
+    assert cancelled == ["p1"]
