@@ -310,8 +310,11 @@ this editor (in the Sonder App, from this app workflow). Its bar has:
 - **Fit** / **Fill**: shows the whole output, or fills the pane. The mouse
   wheel zooms toward the cursor and dragging pans, as in
   [the inspect overlay](assets-and-gallery.md#the-inspect-overlay).
-- **Unmute**: hear this pane instead of the timeline. Only one source plays
-  sound at a time; **Mute** gives the sound back to the timeline.
+- **Unmute** (**Listen** while the pane is linked): hear this pane instead of
+  the timeline. Only one source plays sound at a time; **Mute** gives the
+  sound back to the timeline.
+- **Link** / **Linked**: on video and audio outputs. See
+  [Following the timeline](#following-the-timeline).
 
 The text beside the source button says what is happening: **No result yet**,
 **Running**, **Waiting for run**, **Last run was canceled**, **From cache**
@@ -321,6 +324,44 @@ source, or delete the View. In a mounted tab, panes read **Disconnected**
 while the canvas page is closed or reloading.
 
 To rename, reorder or delete Views, see [Manage](controls.md#manage).
+
+#### Following the timeline
+
+A video or audio View pane can play and scrub with the editor instead of on
+its own, so you can compare it with the **Composite** frame by frame. The
+**Linked** button on the pane's bar turns this on (it is on by default, and
+comes back on when you pick another source); click it to read **Link** and
+play the output on its own again.
+
+While linked, the pane's own play button and scrub bar are hidden and the
+editor's **Play**, the playhead and the timeline move it. The pane knows where
+the output belongs:
+
+- **A take** from **Sonder Save Video** that was placed on the timeline
+  follows the frames its take clip covers.
+- **Any other output** follows the Timing you set for its View: open the
+  **Controls** tab, click **Manage**, and under **Views** find the View's
+  **Timing** row. Choose **Follows from the render start** (the output's
+  first frame is the first frame the Editor rendered, context included) or
+  **Follows from the generation start** (the first frame of your selection).
+  **Skip first** drops that many frames from the start of the output. Leave
+  the frame-rate box empty when the output has the scene's frame rate, or
+  type its rate. **No timing set** leaves the output unlinked.
+
+What the pane shows while linked:
+
+- **Outside generated range**: the playhead is outside the frames this output
+  was made for. The picture comes back when the playhead returns.
+- **Catching up**: the pane fell behind (slow decoding) and is catching up.
+  The editor never waits for it.
+- **Previous context**: the scene changed inside this output's range after it
+  ran, so it may no longer match what is around it. A new take never counts.
+  **Undo** of the change clears it.
+- **Unlinked:** and the reason, when the pane cannot follow: for example the
+  output was made for another scene or at another frame rate, or its View has
+  no Timing (**No timing for this output. Set it in Manage ▸ Views**).
+
+A linked pane sounds only while the editor plays inside its range.
 
 ## Safety & recovery
 

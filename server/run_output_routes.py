@@ -106,6 +106,7 @@ def _build_outputs(owners: list, workflow_id: str, sources: list[str], keep_hold
         holds.append({
             "hold_id": hold["hold_id"], "prompt_id": hold["prompt_id"], "source": hold["source"],
             "index": hold["index"], "entry": {**hold["entry"], "revision": _revision(hold["stat"])}, "run": hold["run"],
+            "editor_context": hold.get("editor_context"), "fresh": hold.get("fresh"),
             "state": "ok" if same else "unavailable",
         })
     answer["holds"] = holds

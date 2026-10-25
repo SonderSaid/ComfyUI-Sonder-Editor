@@ -1830,6 +1830,15 @@ export class EditorNodeController {
         return String(this.node?.id ?? "");
     }
 
+    // This Editor as a prompt key, for Output Views picking its executed
+    // context: its node id when it sits in the root graph; "" inside a
+    // subgraph, whose prompt key is a path this page does not derive.
+    _rootEditorKey() {
+        const graph = this.node?.graph;
+        const root = graph?.rootGraph || graph;
+        return graph && graph === root ? this._sourceNodeId() : "";
+    }
+
     _hostId() {
         const sourceNodeId = this._sourceNodeId() || "anon";
         if (!this._cachedHostId || this._cachedHostNodeId !== sourceNodeId) {
@@ -2971,7 +2980,7 @@ export class EditorNodeController {
                 window.alert?.("The editor tab did not claim the session. Check popup blockers or try again.");
             }, 10000);
             const url = api.apiURL(
-                `/sonder-editor/tab/${encodeURIComponent(projectId)}?handoff=${encodeURIComponent(handoff.token)}&host_id=${encodeURIComponent(this._hostId())}&source_node_id=${encodeURIComponent(this._sourceNodeId())}&workflow_id=${encodeURIComponent(this._workflowId())}&session_name=${encodeURIComponent(this._mountedTabWindowName)}`
+                `/sonder-editor/tab/${encodeURIComponent(projectId)}?handoff=${encodeURIComponent(handoff.token)}&host_id=${encodeURIComponent(this._hostId())}&source_node_id=${encodeURIComponent(this._sourceNodeId())}&workflow_id=${encodeURIComponent(this._workflowId())}&editor_key=${encodeURIComponent(this._rootEditorKey())}&session_name=${encodeURIComponent(this._mountedTabWindowName)}`
             );
             opened.location.href = url;
             this._startOwnerPolling(400);

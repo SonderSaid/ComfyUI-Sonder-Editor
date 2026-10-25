@@ -2,7 +2,7 @@
 //
 //   {mode, workflowKey(), capability(), runOutputs(), runBranch(path) -> Outcome,
 //    cancel(Outcome) -> {ok, code}, resolve(Outcome) -> Outcome, setViewsDemand(bool),
-//    onSessionLost(cb), onSessionRestored(cb), sessionLost()}
+//    onSessionLost(cb), onSessionRestored(cb), sessionLost(), editorKey()}
 //   Outcome = {state: "queued", promptId?, runId?} | {state: "refused"|"unsupported", code}
 //           | {state: "unconfirmed"|"busy"|"pending"}
 //
@@ -11,6 +11,12 @@
 // client a project switch disposed. Fullscreen runs and cancels through its
 // canvas controller, the mounted tab through its canvas host's run lane and the
 // owner-scoped cancel route, the Sonder App through its session.
+//
+// `editorKey()` is this editor's Sonder Editor as a prompt key, which picks its
+// executed context when several Editors fed one output (view_timing.js
+// pickContext): the canvas node's id when it is a root node (an Editor inside
+// a subgraph has a path key the page does not derive; "" then), the Sonder
+// App's sole Editor.
 import { normalizeOutcome } from "./views_model.js";
 
 const CAPABILITY_PATH = "/sonder-editor/runs/capability";
@@ -67,6 +73,11 @@ export function createCanvasViewsHost({ controller, apiURL, fetchImpl, controlsH
     const graphId = () => String(controller.node?.graph?.rootGraph?.id || controller.node?.graph?.id || "");
     return {
         mode: "canvas",
+        editorKey() {
+            const graph = controller.node?.graph;
+            const root = graph?.rootGraph || graph;
+            return graph && graph === root && controller.node?.id !== undefined ? String(controller.node.id) : "";
+        },
         workflowKey: () => (graphId() ? `c:${graphId()}` : ""),
         capability: () => branchCapability(apiURL, fetchImpl),
         runOutputs: () => controller.runOutputs || null,
@@ -84,10 +95,11 @@ export function createCanvasViewsHost({ controller, apiURL, fetchImpl, controlsH
 
 // The mounted tab: its canvas host's owner scope, filtered to the canvas
 // workflow named in the handoff URL; branch runs through the run lane.
-export function createMountedViewsHost({ workflowId = "", runOutputs, runRequests, controlsHost, apiURL, fetchImpl }) {
+export function createMountedViewsHost({ workflowId = "", editorKey = "", runOutputs, runRequests, controlsHost, apiURL, fetchImpl }) {
     const events = sessionEvents();
     return {
         mode: "mounted",
+        editorKey: () => String(editorKey || ""),
         // No workflow id means no layout record, never a shared key.
         workflowKey: () => (workflowId ? `c:${workflowId}` : ""),
         capability: () => branchCapability(apiURL, fetchImpl),
@@ -110,6 +122,10 @@ export function createSdkViewsHost({ host, runOutputs, apiURL, fetchImpl, contro
     const runOf = runId => (host.status?.runs || []).find(run => run.run_id === runId) || null;
     return {
         mode: "sdk",
+        editorKey() {
+            const editors = controlsHost()?.getView?.()?.editors;
+            return Array.isArray(editors) && editors.length === 1 ? String(editors[0]) : "";
+        },
         workflowKey: () => (host.templateId ? `a:${host.templateId}` : ""),
         capability: () => branchCapability(apiURL, fetchImpl),
         runOutputs: () => runOutputs() || null,

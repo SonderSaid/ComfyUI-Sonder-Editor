@@ -223,6 +223,12 @@ out.rollback = [r.ok, JSON.stringify(preview.properties) === before];
 relay.widgets[0].callback = () => {};
 r = await writer.applyChanges({'view:old:remove':true});
 out.removed = [r.ok, preview.properties.sonderViews ?? null, Object.keys(saved().views.items)];
+// Timing (Phase 3B) is a presentation field: set, then null removes it.
+const timing = {mode:'editor_window', anchor:'render_start', source_offset:2, fps:'editor'};
+r = await writer.applyChanges({'view:n3:timing':timing});
+out.timed = [r.ok, saved().views.items.n3.timing];
+r = await writer.applyChanges({'view:n3:timing':null});
+out.untimed = [r.ok, 'timing' in saved().views.items.n3];
 """)
     assert out["renamed"] == [True, {"label": "Preview", "order": 4}]
     assert out["moved"][0] is False and "moved" in out["moved"][1] and out["moved"][2] is None
@@ -230,6 +236,8 @@ out.removed = [r.ok, preview.properties.sonderViews ?? null, Object.keys(saved()
     assert out["stale"] == [True, {"7": "n3"}]
     assert out["rollback"] == [False, True]
     assert out["removed"] == [True, None, ["n3"]]
+    assert out["timed"] == [True, {"mode": "editor_window", "anchor": "render_start", "source_offset": 2, "fps": "editor"}]
+    assert out["untimed"] == [True, False]
 
 
 def test_writer_fingerprint_includes_view_anchors_and_sends_view_bodies():
@@ -255,7 +263,7 @@ def test_view_targets_never_change_what_a_run_submits():
         pytest.skip("node is required for browser module tests")
     script = f"""
 const t = await import({json.dumps(targets)});
-const fields = ['create', 'remove', 'label', 'order', 'reset'];
+const fields = ['create', 'remove', 'label', 'order', 'reset', 'timing'];
 console.log('RESULT=' + JSON.stringify({{
     run: fields.map(f => t.changesRun(`view:a:${{f}}`)),
     structural: fields.map(f => t.isStructuralTarget(`view:a:${{f}}`)),
@@ -265,4 +273,4 @@ console.log('RESULT=' + JSON.stringify({{
     result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert result.returncode == 0, result.stderr
     out = json.loads(next(line for line in result.stdout.splitlines() if line.startswith("RESULT="))[7:])
-    assert out == {"run": [False] * 5, "structural": [True, True, False, False, False], "binding": True}
+    assert out == {"run": [False] * 6, "structural": [True, True, False, False, False, False], "binding": True}

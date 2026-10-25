@@ -9,7 +9,7 @@ Saved in a workflow it holds presentation only, keyed by ``binding_id``:
      "groups": {"<name>": {"order"}},
      "execution": {"v": 1, "controls": {"<id>": {"label", "group", "order", "advanced", "note",
                                                 "target": {"kind": "node"|"instance"|"group", "group_id"?}}}},
-     "views": {"v": 1, "items": {"<id>": {"label", "order"}}}}
+     "views": {"v": 1, "items": {"<id>": {"label", "order", "timing"?}}}}
 
 A node or instance target is located by ``node.properties.sonderExecution`` on a
 root node (as a binding is by its anchor); a group by its root ``group.id``.
@@ -32,7 +32,7 @@ import math
 import re
 from typing import Any
 
-from . import control_rows
+from . import control_rows, view_timing
 
 RELAY_CLASS_TYPE = "SonderControlRelay"
 MANIFEST_VERSION = 1
@@ -339,6 +339,10 @@ def _view_entry(raw: Any) -> dict:
     if isinstance(order, float) and order.is_integer():
         order = int(order)
     entry = {"label": _text(raw.get("label"), LABEL_MAX, "label").strip(), "order": _order(order)}
+    # Authored timing (Phase 3B): invalid reads as none (unlinked); the entry stays.
+    timing = view_timing.clean_timing(raw.get("timing"))
+    if timing is not None:
+        entry["timing"] = timing
     # Export-only facts, read tolerantly: the server rechecks them.
     status = raw.get("status")
     if status is not None:

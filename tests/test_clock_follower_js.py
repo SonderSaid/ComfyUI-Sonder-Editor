@@ -121,11 +121,23 @@ const jumpBefore = video.seeks.length;
 emit({discontinuity: true});
 await tick(); await new Promise(r => setTimeout(r, 20)); await tick();
 out.jump = video.seeks.length - jumpBefore;
-// The clock holds (rebuffer): pause on the hold frame.
+// The clock rebuffers: pause, and leave the decoder to the editor (the
+// page budget defers the seek); it lands on the hold frame once the hold ends.
+const holdBefore = video.seeks.length;
 clockState.hold = 'rebuffer'; clockState.frame = 40;
 emit({});
 await tick(); await new Promise(r => setTimeout(r, 20)); await tick();
-out.hold = [video.paused, video.seeks.at(-1) === Math.round((40.5 - 5) / 24 * 1e4) / 1e4];
+out.hold = [video.paused, video.seeks.length - holdBefore];
+clockState.hold = null; clockState.playing = false;
+emit({});
+await tick(); await new Promise(r => setTimeout(r, 20)); await tick();
+out.afterHold = video.seeks.at(-1) === Math.round((40.5 - 5) / 24 * 1e4) / 1e4;
+// A first-commit hold (play start) seeks at once: the pane is in place when playback begins.
+const firstBefore = video.seeks.length;
+clockState.playing = true; clockState.hold = 'first-commit'; clockState.frame = 60;
+emit({});
+await tick(); await new Promise(r => setTimeout(r, 20)); await tick();
+out.firstCommit = video.seeks.length - firstBefore;
 follower.destroy();
 out.destroyed = listeners.size;
 """)
@@ -135,7 +147,9 @@ out.destroyed = listeners.size;
     assert out["drift"][0] >= 1 and out["drift"][1]
     assert out["stall"] == 1
     assert out["jump"] >= 1
-    assert out["hold"] == [True, True]
+    assert out["hold"] == [True, 0]
+    assert out["afterHold"] is True
+    assert out["firstCommit"] == 1
     assert out["destroyed"] == 0
 
 
@@ -164,7 +178,7 @@ const seeksAfterStart = video.seeks.length;
 // The element plays on time for two seconds: currentTime follows the clock.
 for (let step = 1; step <= 20; step++) {
     now = 1000 + step * 100;
-    video._t = (20 + step * 2.4 - 10 + 5) / 24;
+    video._t = (20 + step * 2.4 + 0.5 - 10 + 5) / 24; // frame centres
     flushRaf(); await tick();
 }
 out.onTime = [video.seeks.length - seeksAfterStart, video.playbackRate, follower.state()];

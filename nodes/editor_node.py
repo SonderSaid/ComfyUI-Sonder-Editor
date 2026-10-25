@@ -24,6 +24,7 @@ from ..server import prompt_payload
 from ..server import run_outputs
 from ..server import run_scope
 from ..server import sdk_runs
+from ..server import view_timing
 from .prompt_once import run_once_per_prompt
 from ..server.editor_inputs import editor_optional_inputs
 from ..server.session_registry import project_event_aliases
@@ -1429,7 +1430,16 @@ class SonderEditor:
                     "mask_end_frame": mask_end_pixel,
                     "queue": queue_job_mode or "live",
                     "queue_job_ref_id": queue_job.job_id if queue_job else "",
-                })
+                }, content=lambda: view_timing.scene_content_record(
+                    scene, fps=proj_fps, width=proj_w, height=proj_h, render_start=render_start, render_end=render_end,
+                    driver_source=driver_source, guide_frames=guide_frames, guide_track_hidden=guide_track_hidden,
+                    snapshot_window=((max(0, selection_start - pre_context_frames),
+                                      min(scene.duration_frames, selection_end + post_context_frames))
+                                     if queue_job and snapshot_version > 0 else None),
+                    # The Driver Bridge reads a queued run's lane visibility from the job.
+                    driver_configs=(list(getattr(queue_job, "driver_lane_configs", []) or [])
+                                    if queue_job and snapshot_version > 0 else None),
+                ))
             except Exception:
                 logger.exception("Recording the executed editor context failed")
             logger.info(

@@ -4,7 +4,12 @@
 // decoded). Media is muted unless the page's audio arbiter gives this pane the
 // sound. The pane owns the container; this module owns the element, its
 // listeners and its blob claim, and returns cleanup.
+//
+// Linked (Phase 3B, `setLink`): the editor's scene clock drives the element
+// through a clock follower instead of the local transport, which hides; the
+// element never loops, and outside the generated range it pauses and hides.
 import { attachZoomPan } from "./media_zoom_pan.js";
+import { createClockFollower } from "./clock_follower.js";
 import { mountMediaScrubBar } from "./media_scrub_bar.js";
 import { mediaFailedToDecode } from "./media_preview_support.js";
 import { entryPlayer } from "./views_model.js";
@@ -51,8 +56,11 @@ async function drawWaveform(canvas, url, signal) {
 
 // `entry` is a normalized output entry (server output_media). `zoom` is the
 // pane's persisted {scale, x, y}|null; `onZoom` stores a change.
+// Catching up shows only once it lasts: a quick recovery is not news.
+export const CATCHING_UP_DELAY_MS = 250;
+
 export function mountOutputMedia({ container, entry, cache, paneId, audio, fit = "contain", zoom = null, onZoom = () => {},
-    onCondition = () => {}, takeSaved = false }) {
+    onCondition = () => {}, takeSaved = false, clock = null, link = null, onDuration = () => {}, onFollowerState = () => {} }) {
     const player = entryPlayer(entry);
     const controller = new AbortController();
     let destroyed = false;
@@ -61,13 +69,26 @@ export function mountOutputMedia({ container, entry, cache, paneId, audio, fit =
     let scrub = null;
     let zoomCleanup = null;
     let unsubscribeAudio = null;
+    let currentLink = link && clock ? link : null;
+    let follower = null;
+    let reportedState = null;
+    let catchingTimer = null;
     const stage = make("div", "position:relative;flex:1 1 auto;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden;background:#000;");
     const transport = make("div", `display:none;align-items:center;gap:${SPACE.s2}px;padding:${SPACE.s1}px ${SPACE.s2}px;`);
     container.append(stage, transport);
 
-    const condition = value => { if (!destroyed) onCondition(value); };
-    if (player === "unsupported") { condition("unsupported"); return { destroy() { stage.remove(); transport.remove(); }, setFit() {} }; }
-    if (entry.available === false) { condition("missing_file"); return { destroy() { stage.remove(); transport.remove(); }, setFit() {} }; }
+    // A file that failed to decode stops its follower's seeks (it would hold a
+    // page seek slot to the timeout and make healthy panes wait).
+    let failed = false;
+    const condition = value => {
+        if (destroyed) return;
+        failed = value === "decode";
+        follower?.setUnavailable(failed);
+        onCondition(value);
+    };
+    const inert = { destroy() { stage.remove(); transport.remove(); }, setFit() {}, setLink() {}, pause() {} };
+    if (player === "unsupported") { condition("unsupported"); return inert; }
+    if (entry.available === false) { condition("missing_file"); return inert; }
 
     const applyFit = value => {
         if (!media) return;
@@ -78,6 +99,53 @@ export function mountOutputMedia({ container, entry, cache, paneId, audio, fit =
         if (!media || media.tagName === "IMG") return;
         media.muted = !audio.audible(paneId);
     };
+
+    const report = value => {
+        if (destroyed || value === reportedState) return;
+        reportedState = value;
+        try { onFollowerState(value); } catch (error) { console.warn("[Sonder] pane follower state failed:", error); }
+    };
+    // Back from outside the range, the element still holds its last frame
+    // (from before it left): it stays hidden until a seek lands a fresh one.
+    let staleFrame = false;
+    function followerState(value) {
+        clearTimeout(catchingTimer);
+        catchingTimer = null;
+        if (value === "outside") staleFrame = true;
+        else if (value === "following" || value === "idle") staleFrame = false;
+        if (media) media.style.visibility = staleFrame ? "hidden" : "";
+        if (value === "catching_up") catchingTimer = setTimeout(() => { catchingTimer = null; report("catching_up"); }, CATCHING_UP_DELAY_MS);
+        else report(value);
+    }
+    // Follow the scene clock while linked; the local transport otherwise.
+    function applyLink() {
+        if (!media || media.tagName === "IMG" || destroyed) return;
+        const linked = !!currentLink;
+        media.loop = !linked;
+        transport.style.display = linked || !scrub ? "none" : "flex";
+        if (linked && !follower) {
+            try { media.pause(); } catch (_error) { /* detached */ }
+            follower = createClockFollower({
+                clock, element: media, kind: player === "audio" ? "audio" : "video",
+                // The link is read at each use: a new run's timing needs no new follower.
+                map: c => (player === "audio" ? currentLink?.audioMap?.(c) : currentLink?.map?.(c)) || null,
+                fps: () => currentLink?.Fm || Number(entry.fps) || 24,
+                audible: () => audio.audible(paneId),
+                onState: followerState,
+            });
+            if (failed) follower.setUnavailable(true);
+            else follower.sync({ discontinuity: true });
+        } else if (!linked && follower) {
+            follower.destroy();
+            follower = null;
+            clearTimeout(catchingTimer);
+            catchingTimer = null;
+            staleFrame = false;
+            media.style.visibility = "";
+            try { media.pause(); } catch (_error) { /* detached */ }
+            report(null);
+        }
+    }
 
     function mountPlayer(url) {
         if (player === "image" || player === "animated") {
@@ -95,6 +163,7 @@ export function mountOutputMedia({ container, entry, cache, paneId, audio, fit =
             media.loop = true;
             media.addEventListener("error", () => condition("decode"), { signal: controller.signal });
             media.addEventListener("loadeddata", () => condition(mediaFailedToDecode(media) ? "decode" : null), { signal: controller.signal });
+            media.addEventListener("loadedmetadata", () => onDuration(Number(media.duration)), { signal: controller.signal });
             media.src = url;
             stage.append(media);
         } else {
@@ -107,6 +176,7 @@ export function mountOutputMedia({ container, entry, cache, paneId, audio, fit =
             media.loop = true;
             media.addEventListener("error", () => condition("decode"), { signal: controller.signal });
             media.addEventListener("loadeddata", () => condition(null), { signal: controller.signal });
+            media.addEventListener("loadedmetadata", () => onDuration(Number(media.duration)), { signal: controller.signal });
             media.src = url;
             void drawWaveform(wave, url, controller.signal);
         }
@@ -133,6 +203,7 @@ export function mountOutputMedia({ container, entry, cache, paneId, audio, fit =
             transport.style.display = "flex";
             transport.append(play, scrub.el);
         }
+        applyLink();
     }
 
     claim = cache.acquire(entry, paneId);
@@ -145,9 +216,21 @@ export function mountOutputMedia({ container, entry, cache, paneId, audio, fit =
     return {
         el: stage,
         setFit(value) { applyFit(value); },
+        // A link resolved for this entry ({map, audioMap, Fm, sig}), or null to
+        // play on the local transport. A changed mapping re-syncs the follower.
+        setLink(next) {
+            const value = next && clock ? next : null;
+            const changed = (value?.sig || null) !== (currentLink?.sig || null);
+            currentLink = value;
+            applyLink();
+            if (changed && follower) follower.sync({ discontinuity: true });
+        },
         pause() { try { media?.pause?.(); } catch (_error) { /* detached */ } },
         destroy() {
             if (destroyed) return;
+            follower?.destroy();
+            follower = null;
+            clearTimeout(catchingTimer);
             destroyed = true;
             controller.abort();
             unsubscribeAudio?.();

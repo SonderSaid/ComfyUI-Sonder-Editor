@@ -26,6 +26,7 @@ holds). The observer side runs on ComfyUI's prompt-worker thread. Stdlib only.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -145,15 +146,27 @@ def _entry_key(entry: dict) -> tuple:
     return identity if identity is not None else ("unsupported", entry.get("channel"))
 
 
-def note_editor_context(prompt: Any, unique_id: Any, context: dict[str, Any]) -> None:
-    """The Editor's executed window, recorded once per run through its trusted key."""
+def note_editor_context(prompt: Any, unique_id: Any, context: dict[str, Any],
+                        content: Callable[[], dict | None] | None = None) -> None:
+    """The Editor's executed window, recorded once per run through its trusted key.
+    ``content`` builds the run's content record (Output Views' Previous
+    context); it is called only for a run being observed."""
     key = sdk_runs.trusted_key_for_prompt(prompt)
     snapshot = sdk_runs.record_snapshot(key) if key else None
     prompt_id = str((snapshot or {}).get("prompt_id") or "")
     if not prompt_id or not sdk_runs.is_observing(prompt_id):
         return
+    context = dict(context)
+    if content is not None:
+        try:
+            record = content()
+        except Exception:
+            logger.exception("Recording the run's content digest failed")
+            record = None
+        if record is not None:
+            context["content"] = record
     with _LOCK:
-        _DATA.setdefault(prompt_id, _new_data())["editor_context"].setdefault(str(unique_id), dict(context))
+        _DATA.setdefault(prompt_id, _new_data())["editor_context"].setdefault(str(unique_id), context)
 
 
 def graph_revision(prompt: Any) -> str:
@@ -348,7 +361,8 @@ def hold(owners: Iterable[tuple], owner: tuple, prompt_id: str, source: str, ind
     found = read_run(owners, prompt_id)
     if found is None:
         return "unknown_run", ""
-    entries = (found["sources"].get(str(source)) or {}).get("entries") or []
+    found_source = found["sources"].get(str(source)) or {}
+    entries = found_source.get("entries") or []
     if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(entries):
         return "unknown_entry", ""
     entry = entries[index]
@@ -365,7 +379,10 @@ def hold(owners: Iterable[tuple], owner: tuple, prompt_id: str, source: str, ind
             return "too_many", ""
         hold_id = uuid.uuid4().hex
         _HOLDS[hold_id] = {"owner": owner, "prompt_id": found["prompt_id"], "source": str(source), "index": index,
-                           "entry": dict(entry), "stat": tuple(stat), "run": run, "created": now, "seen": now}
+                           "entry": dict(entry), "stat": tuple(stat), "run": run, "created": now, "seen": now,
+                           # A held result links like a fresh one (Phase 3B), after its run's data is pruned.
+                           "editor_context": copy.deepcopy(found_source.get("editor_context")),
+                           "fresh": found_source.get("fresh")}
         return "ok", hold_id
 
 

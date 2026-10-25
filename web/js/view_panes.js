@@ -2,8 +2,9 @@
 // Guides, a Driver lane or an output View. Owns the grid, the layout control
 // (1 / 2 / 3 / 2×2) in the viewport header and each pane's chrome: its source
 // button and picker, status chip, Hold/Release, Run/Cancel, item picker, fit
-// and sound. The coordinator (views_coordinator.js) owns state; the widget
-// owns the Composite canvas and is told where it goes (`placeComposite`).
+// and sound, and for a video or audio output its Link to the editor clock. The
+// coordinator (views_coordinator.js) owns state; the widget owns the Composite
+// canvas and is told where it goes (`placeComposite`).
 import { LAYOUTS, LAYOUT_LABELS, LAYOUT_ORDER, LAYOUT_TITLES, entryPlayer, pickerSections } from "./views_model.js";
 import { openPanePicker } from "./view_pane_picker.js";
 import { mountOutputMedia, messageEl } from "./output_pane_media.js";
@@ -103,12 +104,13 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         const actions = make("span", undefined, `display:flex;gap:${SPACE.s1}px;flex:0 0 auto;`);
         bar.append(sourceButton, chip, spacer, actions);
         el.append(bar, body);
-        cells[index] = { el, bar, body, sourceButton, chip, actions, key: null, content: null, message: null, painterStatus: null };
+        cells[index] = { index, el, bar, body, sourceButton, chip, actions, key: null, content: null, message: null, painterStatus: null };
         return cells[index];
     }
 
     function destroyContent(entry) {
         try { entry.content?.destroy(); } catch (error) { console.warn("[Sonder] pane teardown failed:", error); }
+        if (entry.index !== undefined) coordinator.setFollowerState(entry.index, null);
         entry.content = null;
         entry.painterStatus = null;
         for (const child of [...entry.body.children]) if (child.dataset.sonderComposite !== "true") child.remove();
@@ -129,6 +131,9 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
             entry.content = mountOutputMedia({
                 container: entry.body, entry: model.entry, cache, paneId: coordinator.paneId(index), audio,
                 fit: model.pane.fit, zoom: model.pane.zoom, takeSaved: !!model.result?.run?.saved_to_project,
+                clock: sourceHost.clock, link: model.linked ? model.link : null,
+                onDuration: sec => coordinator.setMediaDuration(index, fileKey(model.entry), sec),
+                onFollowerState: state => coordinator.setFollowerState(index, state),
                 onZoom: zoom => {
                     clearTimeout(zoomTimers.get(index));
                     zoomTimers.set(index, setTimeout(() => coordinator.setPaneOption(index, { zoom }), ZOOM_SAVE_MS));
@@ -170,10 +175,21 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
             });
             out.push(fit);
         }
+        // A video or audio output follows the editor clock while linked.
+        if (model.linkable) {
+            const on = !!model.pane.link;
+            const link = button(on ? "Linked" : "Link", on
+                ? "This output follows the timeline. Play it on its own instead"
+                : "Follow the timeline: this output plays and scrubs with the editor");
+            link.dataset.sonderPaneLink = String(index);
+            link.setAttribute("aria-pressed", String(on));
+            link.addEventListener("click", () => coordinator.setPaneOption(index, { link: !on }));
+            out.push(link);
+        }
         // The owner keeps its Mute whatever its media does now (missing, an
         // image, disconnected): it is the way the sound goes back to the timeline.
         if (player === "video" || player === "audio" || model.audible) {
-            const sound = button(model.audible ? "Mute" : "Unmute", model.audible ? "Give the sound back to the timeline"
+            const sound = button(model.audible ? "Mute" : model.linked ? "Listen" : "Unmute", model.audible ? "Give the sound back to the timeline"
                 : "Hear this output; the timeline and other panes go quiet");
             sound.setAttribute("aria-pressed", String(!!model.audible));
             sound.addEventListener("click", () => {
@@ -210,7 +226,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
     function actionSignature(model) {
         return JSON.stringify([model.entries?.length || 0, model.itemIndex, model.pane.fit, model.audible, model.held, model.holdPending,
             model.unavailable, model.canHold, model.cancellable, model.runnable,
-            model.entry ? entryPlayer(model.entry) : null]);
+            model.entry ? entryPlayer(model.entry) : null, !!model.linkable, !!model.pane.link, !!model.linked]);
     }
 
     function renderPane(index, single) {
@@ -221,6 +237,9 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
             destroyContent(entry);
             entry.key = key;
             mountContent(index, entry, model);
+        } else if (model.source.kind === "view") {
+            // A new run's timing, a Link toggle, a length check: no remount.
+            entry.content?.setLink?.(model.linked ? model.link : null);
         } else if (model.source.kind === "guides" || model.source.kind === "driver") {
             // The scene changed under a paused clock (a hidden track, a muted
             // clip, a new layout): the painter reads it again.

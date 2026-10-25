@@ -20,6 +20,7 @@ import copy
 from typing import Any, Callable
 
 from . import control_manifest as cm
+from . import view_timing
 
 SOURCE = "view"
 MAX_CANDIDATES = 128
@@ -140,6 +141,8 @@ def describe_one(prompt: dict, identity: str, entry: dict, *, authoring: dict | 
         "label": entry.get("label") or default_label(entry), "default_label": default_label(entry),
         "order": entry.get("order", 0), "path": path, "class_type": class_type,
         "title": entry.get("title") or class_type, "participation": None, "reason": None, "runnable": False,
+        # How the output's frames sit on the scene (Phase 3B), or None: unlinked.
+        "timing": copy.deepcopy(entry.get("timing")) if isinstance(entry.get("timing"), dict) else None,
     }
     status = entry.get("status") or "missing"
     reason_code = None
@@ -237,6 +240,9 @@ def stored_views(stored: dict) -> dict:
                 or isinstance(order, bool) or not isinstance(order, int) or abs(order) > cm.ORDER_LIMIT):
             continue
         found[identity] = {"label": label.strip(), "order": order, "source": {"path": path, "class_type": class_type}}
+        timing = view_timing.clean_timing(entry.get("timing"))
+        if timing is not None:
+            found[identity]["timing"] = timing
     return found
 
 
@@ -276,6 +282,8 @@ def _describe_stored(prompt: dict, identity: str, entry: dict, origin: str, clas
     present = isinstance(node, dict) and node.get("class_type") == class_type
     resolved = {"label": entry["label"], "order": entry["order"], "path": path, "class_type": class_type,
                 "title": _title(node) if present else class_type, "status": "ok" if present else "missing"}
+    if entry.get("timing") is not None:
+        resolved["timing"] = entry["timing"]
     # A copy of a View whose node was off at export: that node is not in this
     # prompt, and renaming or moving the View must not turn it missing.
     if (not present and not isinstance(node, dict) and isinstance(authored, dict)
@@ -295,6 +303,7 @@ def curated_views(view: dict) -> dict | None:
     return {"v": cm.VIEWS_VERSION, "items": {
         d["view_id"]: {"label": d["label"] if d["label"] != d["default_label"] else "", "order": d["order"],
                        "status": "ok", "path": d["path"], "class_type": d["class_type"], "title": d.get("title") or "",
+                       **({"timing": copy.deepcopy(d["timing"])} if d.get("timing") else {}),
                        **({"participation": "inactive", "inactive_reason": d["inactive_reason"]}
                           if d.get("participation") == "inactive" and d.get("inactive_reason") else {})}
         for d in rows}}
@@ -302,7 +311,7 @@ def curated_views(view: dict) -> dict | None:
 
 # ── Validation ───────────────────────────────────────────────────────────────
 
-PRESENTATION_FIELDS = ("label", "order")
+PRESENTATION_FIELDS = ("label", "order", "timing")
 
 
 def table_entries(view: dict) -> dict:
@@ -326,6 +335,15 @@ def coerce_presentation(descriptor: dict, field: str, raw: Any, mode: str | None
         return raw.strip()
     if field == "order":
         return coerce_panel_layout("order", raw)
+    if field == "timing":
+        # None removes it: the View follows nothing again.
+        if raw is None:
+            return None
+        timing = view_timing.clean_timing(raw)
+        if timing is None:
+            raise ControlValueError("This timing is not valid: choose where the output starts, "
+                                    "a frame offset from 0 and the Editor's frame rate or one up to 240.")
+        return timing
     if field == "reset":
         if mode != "sdk" or descriptor.get("origin") != "app_copy":
             raise ControlValueError(SDK_RESET_REASON)
@@ -415,4 +433,10 @@ def store_sdk_change(data: dict, view: dict, identity: str, field: str, value: A
         entry = views[identity] = {"label": "" if current["label"] == current["default_label"] else current["label"],
                                    "order": current["order"],
                                    "source": {"path": current["path"], "class_type": current["class_type"]}}
-    entry[field] = value
+        # The copy stands alone: it keeps the View's timing too.
+        if current.get("timing"):
+            entry["timing"] = copy.deepcopy(current["timing"])
+    if field == "timing" and value is None:
+        entry.pop("timing", None)
+    else:
+        entry[field] = value

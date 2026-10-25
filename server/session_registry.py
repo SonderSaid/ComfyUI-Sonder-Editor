@@ -850,6 +850,8 @@ def _prepare_control_publication(body: Any) -> dict:
     for descriptor in view.get("views") or []:
         if not isinstance(descriptor.get("view_id"), str) or not isinstance(descriptor.get("status"), str):
             raise ValueError("A View needs an id and a status.")
+        if descriptor.get("timing") is not None and not isinstance(descriptor["timing"], dict):
+            raise ValueError("A View's timing must be an object.")
     if len(view.get("views") or []) > control_descriptors.control_manifest.MAX_VIEWS:
         raise ValueError("Too many Views.")
     if len(view.get("view_candidates") or []) > control_views.MAX_CANDIDATES:

@@ -10,12 +10,13 @@ import {
 } from "./control_bindings.js";
 import { syncRelayRows } from "./control_relay_rows.js";
 import { canonical, readRows, writeRows } from "./control_rows.js";
+import { twoLaneHash } from "./text_hash.js";
 
 const DESCRIBE_URL = "/sonder-editor/controls/describe";
 const DEBOUNCE_MS = 400;
 // Fields this writer lands; hide/unhide are app-only targets.
 const FIELDS = new Set(["value", "seed_mode", "label", "note", "text", "order", "group", "advanced",
-    "expose", "remove", "rebind", "create", "rename", "ungroup", "move", "description", "cleanup", "restore", "mode", "modes"]);
+    "expose", "remove", "rebind", "create", "rename", "ungroup", "move", "description", "cleanup", "restore", "mode", "modes", "timing"]);
 const samePaths = (a, b) => JSON.stringify((a || []).map(m => String(m.path)).sort())
     === JSON.stringify((b || []).map(m => String(m.path)).sort());
 const sameTargets = (a, b) => JSON.stringify((a || []).map(t => [String(t.path), t.input]).sort())
@@ -30,13 +31,7 @@ async function promptHash(text) {
     }
     // HTTP LAN origins lack Web Crypto. This bounded fingerprint only detects
     // stale views; registry ownership and fresh graph comparison gate writes.
-    let a = 0x811c9dc5, b = 0x9e3779b9;
-    for (let i = 0; i < text.length; i++) {
-        const c = text.charCodeAt(i);
-        a = Math.imul(a ^ c, 0x01000193);
-        b = Math.imul(b ^ c, 0x85ebca6b);
-    }
-    return `local:${(a >>> 0).toString(16).padStart(8, "0")}${(b >>> 0).toString(16).padStart(8, "0")}`;
+    return `local:${twoLaneHash(text)}`;
 }
 
 // The first expose in a workflow without a Relay adds one at the root, beside
@@ -482,11 +477,13 @@ export function createCanvasControlsHost({app, api, getEditorNode,
             anchors.push(() => { setViewAnchor(hostNode, rel, id); return [hostNode]; });
             return;
         }
-        if (field !== "label" && field !== "order") throw new Error("This View change is unavailable.");
+        if (field !== "label" && field !== "order" && field !== "timing") throw new Error("This View change is unavailable.");
         manifestOps.push(m => {
             const entry = table(m)[id];
             if (!entry || typeof entry !== "object") throw new Error("This View is no longer in the workflow.");
-            entry[field] = value;
+            // Timing null: the View follows nothing (unlinked) again.
+            if (field === "timing" && value === null) delete entry.timing;
+            else entry[field] = value;
         });
     }
 

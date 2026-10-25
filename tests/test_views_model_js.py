@@ -43,7 +43,8 @@ out.visible = M.visiblePanes({layout:'3c'}).map(p => p.source.kind);
     junk = out["junk"]
     assert junk["layout"] == "1" and [p["source"] for p in junk["panes"]] == [
         {"kind": "composite"}, {"kind": "guides"}, {"kind": "driver", "index": 2}, {"kind": "guides"}]
-    assert junk["panes"][2] == {"source": {"kind": "driver", "index": 2}, "item": 3, "fit": "cover", "zoom": {"scale": 2, "x": 5, "y": -5}}
+    assert junk["panes"][2] == {"source": {"kind": "driver", "index": 2}, "item": 3, "fit": "cover", "zoom": {"scale": 2, "x": 5, "y": -5},
+                                "link": True}
     assert junk["panes"][3]["zoom"] is None
     assert out["kept"] == [64, False, True, False, False]
     assert out["visible"] == ["composite", "guides", "guides"]

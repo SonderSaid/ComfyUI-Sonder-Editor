@@ -237,3 +237,26 @@ def test_owner_tab_cancels_a_run_its_host_owns(registry, monkeypatch):
             assert stranger.status == 403
     run(scenario())
     assert cancelled == ["p1"]
+
+
+def test_a_hold_keeps_its_runs_editor_context_through_the_route(registry):
+    """Phase 3B: a held result links like a fresh one, even once its run's data is pruned."""
+    async def scenario():
+        await setup_hosts()
+        sdk_runs.register_receipt(RECEIPT, OWNER, ["ed"])
+        run_and_publish(prompt())
+        context = {"scene_id": "s1", "fps": 24.0, "render_start": 0, "render_end": 8, "content": {"v": 1, "digest": "d"}}
+        with run_outputs._LOCK:
+            run_outputs._DATA["p1"]["editor_context"]["ed"] = dict(context)
+        async with client() as http:
+            fields = {"host_id": HID, "session_id": TAB}
+            made = await http.post(f"/sonder-editor/project/{PID}/runs/hold",
+                                   json={**fields, "prompt_id": "p1", "source": "out", "index": 0})
+            assert made.status == 200
+            with run_outputs._LOCK:
+                run_outputs._DATA.clear()  # the run's observed data is gone
+            read = await http.get(f"/sonder-editor/project/{PID}/runs/outputs", params={**fields, "sources": "out"})
+            hold = (await read.json())["holds"][0]
+            assert hold["editor_context"] == {"ed": context}
+            assert hold["fresh"] is True
+    run(scenario())

@@ -631,6 +631,7 @@ import { createAudioOwnership } from "./audio_ownership.js";
 import { createOutputMediaCache } from "./output_media_cache.js";
 import { createViewsCoordinator } from "./views_coordinator.js";
 import { mountViewPanes } from "./view_panes.js";
+import { normalizeSource as normalizeViewSource } from "./view_timing.js";
 import { viewUrl } from "./comfy_view_url.js";
 
 function describeKeyboardDebugElement(element) {
@@ -2677,6 +2678,9 @@ export class EditorWidget {
         }
         this.assets = { video: [], image: [], audio: [], artifact: [] };
         this._pathToAsset = {};
+        // Output Views' normalized lookup is rebuilt from this list on demand.
+        this._viewsAssetIndex = null;
+        this._viewsAssetsLoaded = true;
         for (const asset of (data?.assets || [])) {
             if (this.assets[asset.asset_type]) {
                 this.assets[asset.asset_type].push(asset);
@@ -2693,6 +2697,8 @@ export class EditorWidget {
         // Reference entities are unchanged by an asset-only refresh, but their
         // names, thumbnails, Trash, and Missing presentation are asset-backed.
         this._referenceLibraryHandle?.render?.();
+        // A linked pane's Previous context reads assets (a take's audio by provenance).
+        this._viewPanes?.update();
         this._clearPlaybackWarmOverlay("assets-refresh", { render: false });
         // Asset-backed labels/missing-media pixels change even without warm state.
         this._renderTimeline();
@@ -4727,6 +4733,30 @@ export class EditorWidget {
         return this._viewsSourceHostApi;
     }
 
+    // What a linked output pane resolves against (view_timing.js): the open
+    // project and scene, its effective rate and size, and assets by the
+    // normalized source path the server's digest uses.
+    _viewsLinkScene() {
+        return {
+            projectId: () => this._projectDirName(),
+            sceneId: () => this.activeSceneId || "",
+            fps: () => this._effectiveFps,
+            size: () => ({ width: this._effectiveSceneWidth, height: this._effectiveSceneHeight }),
+            scene: () => this.activeScene || null,
+            playing: () => !!this._viewportSurface?.getClock?.()?.playing,
+            assetsLoaded: () => !!this._viewsAssetsLoaded,
+            assetForSourcePath: (sourcePath) => {
+                if (!this._viewsAssetIndex) {
+                    this._viewsAssetIndex = new Map();
+                    for (const asset of Object.values(this._pathToAsset || {})) {
+                        if (asset?.path) this._viewsAssetIndex.set(normalizeViewSource(asset.path), asset);
+                    }
+                }
+                return this._viewsAssetIndex.get(normalizeViewSource(sourcePath)) || null;
+            },
+        };
+    }
+
     // The Controls view the panes read Views from, followed across a Sonder
     // App workflow switch (replaceControlsHost).
     _subscribeViewsControls(listener) {
@@ -4764,6 +4794,7 @@ export class EditorWidget {
             },
             audio: this._audioOwnership,
             cache: this._outputMediaCache,
+            scene: this._viewsLinkScene(),
             onChange: () => this._viewPanes?.update(),
             notify: (message) => notifyWarning(message, { source: "output-views" }),
         });
@@ -28294,6 +28325,8 @@ export class EditorWidget {
         if (projectDir === this.projectDir) return;
         this._controlsPickerSources?.contextChanged();
         // Holds and results belong to the project's runs: they end before its sync goes.
+        this._viewsAssetsLoaded = false;
+        this._viewsAssetIndex = null;
         this._viewsCoordinator?.projectChanged();
         this._clearStaleReplayState();
         this._assetGallery?.cancelThumbnailRepairs?.();

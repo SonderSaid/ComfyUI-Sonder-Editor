@@ -67,6 +67,8 @@ const sessionWindowName = params.get("session_name") || "";
 // The canvas workflow this mounted tab edits (`rootGraph.id`): its run reads
 // and Output Views layout are keyed by it. Empty from an older handoff link.
 const canvasWorkflowId = params.get("workflow_id") || "";
+// The canvas Editor as a prompt key (root nodes only; "" in a subgraph).
+const rootEditorKey = params.get("editor_key") || "";
 // Sonder App (SDK mode): `?mode=sdk&session=<sdk session id>`; its secret is in sessionStorage.
 const tabMode = params.get("mode") || "";
 const sdkSessionId = params.get("session") || "";
@@ -748,7 +750,7 @@ async function main() {
     });
     editor.runBranch = target => runRequests.runBranch(target);
     const viewsHost = createMountedViewsHost({
-        workflowId: canvasWorkflowId, runOutputs: () => editor.runOutputs, runRequests: () => runRequests,
+        workflowId: canvasWorkflowId, editorKey: rootEditorKey, runOutputs: () => editor.runOutputs, runRequests: () => runRequests,
         controlsHost: () => controlsHost, apiURL: path => api.apiURL(path),
     });
     editor.setViewsHost(viewsHost);

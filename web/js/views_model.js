@@ -20,7 +20,8 @@ const MAX_ZOOM = 16;
 
 export const paneCount = layout => LAYOUTS[layout] || 1;
 // The first pane starts on the Composite, the others on the Guides.
-export const defaultPane = (index = 0) => ({ source: { kind: index === 0 ? "composite" : "guides" }, item: 0, fit: "contain", zoom: null });
+// `link`: an output follows the editor's scene clock when it can (Phase 3B).
+export const defaultPane = (index = 0) => ({ source: { kind: index === 0 ? "composite" : "guides" }, item: 0, fit: "contain", zoom: null, link: true });
 
 export function normalizeSource(raw) {
     if (!raw || typeof raw !== "object") return null;
@@ -46,6 +47,7 @@ export function normalizePane(raw, index = 0) {
     pane.item = Number.isInteger(raw.item) && raw.item >= 0 && raw.item < 256 ? raw.item : 0;
     pane.fit = FITS.includes(raw.fit) ? raw.fit : "contain";
     pane.zoom = normalizeZoom(raw.zoom);
+    pane.link = raw.link !== false;
     return pane;
 }
 
@@ -99,9 +101,9 @@ export function assignSource(record, index, source) {
     if (!clean || index < 0 || index >= MAX_PANES) return next;
     if (clean.kind === "composite") {
         const other = next.panes.findIndex((pane, i) => i !== index && pane.source.kind === "composite");
-        if (other !== -1) next.panes[other] = { ...next.panes[other], source: next.panes[index].source, item: 0, zoom: null };
+        if (other !== -1) next.panes[other] = { ...next.panes[other], source: next.panes[index].source, item: 0, zoom: null, link: true };
     }
-    next.panes[index] = { ...next.panes[index], source: clean, item: 0, zoom: null };
+    next.panes[index] = { ...next.panes[index], source: clean, item: 0, zoom: null, link: true };
     return next;
 }
 
@@ -206,7 +208,9 @@ export function viewPaneStatus({ view = null, read = null, run = null, hold = nu
     if (held) {
         if (!hold) return { message: "Holding…", chip: "Held", result: null };
         if (hold.state !== "ok") return { message: "Held result unavailable (file changed or removed)", chip: "Unavailable", result: null, unavailable: true };
-        return { message: null, chip: "Held", result: { entries: [hold.entry], run: hold.run, fixedIndex: true } };
+        return { message: null, chip: "Held", result: { entries: [hold.entry], run: hold.run, fixedIndex: true,
+            // A held result links as it did when held (its run's data may be gone).
+            editor_context: hold.editor_context || null, fresh: hold.fresh } };
     }
     if (viewsError) return { message: viewsError, chip: "Unavailable", result: null };
     if (!view) return { message: "This View is no longer in the workflow. Pick another source.", chip: "Unavailable", result: null };

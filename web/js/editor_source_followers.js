@@ -126,14 +126,14 @@ export function driverAt(scene, index, frame, { isLaneHidden }) {
     return { status: null, clip, clips };
 }
 
-// A Driver clip's timeline placement is a trusted mapping: scene frame x ->
-// source seconds, as the composite plays it (sourceFrameTime).
+// A Driver clip's timeline placement is a trusted mapping: frame centre c
+// (scene frame + 0.5) -> source seconds, as the composite plays it (sourceFrameTime).
 export function driverMapping(clip, sceneFps) {
     const start = Math.round(Number(clip?.timeline_start_frame) || 0);
     const end = Math.round(Number(clip?.timeline_end_frame) || 0);
     const sourceIn = Math.round(Number(clip?.source_in_frame) || 0);
     const rate = Number(sceneFps) > 0 ? Number(sceneFps) : 24;
-    return x => (x >= start && x < end ? { inRange: true, sourceTime: Math.max(0, (x - start + sourceIn) / rate) } : { inRange: false });
+    return c => (c - 0.5 >= start && c - 0.5 < end ? { inRange: true, sourceTime: Math.max(0, (c - start + sourceIn) / rate) } : { inRange: false });
 }
 
 // One Driver lane: its clip at the playhead, followed on the scene clock by a

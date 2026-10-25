@@ -14,27 +14,40 @@
 // releases them at once. A hold ends on Release, a source, workflow or project
 // change, its pane closing or the layout shrinking past it, fullscreen exit and
 // teardown.
+//
+// Linked playback (Phase 3B): a video or audio result whose frames sit on the
+// current scene (a take's placement, or the View's authored timing against its
+// Editor's executed window) follows the editor clock; `paneModel` resolves the
+// link (view_timing.js) and whether the scene changed in its range since
+// ("Previous context", compared against the run's recorded digest).
 import {
     MAX_PANES, assignSource, cancelAvailability, isDefaultLayout, mediaStatus, normalizeLayout, paneCount, refusalText,
     runAvailability, sameSource, viewPaneStatus,
 } from "./views_model.js";
 import { TIMELINE } from "./audio_ownership.js";
 import { mintId } from "./controls_manage.js";
+import { contentStatus, isLinkable, resolveLink } from "./view_timing.js";
+import { fileKey } from "./output_media_cache.js";
 
 export const POLL_MS = 5000;
 export const KEEPALIVE_MS = 10 * 60 * 1000;
 // A run ComfyUI never confirmed stops waiting after this.
 export const UNCONFIRMED_MS = 60000;
+// While the editor plays, Previous context is checked at most this often.
+export const PREVIOUS_CONTEXT_PLAYING_MS = 500;
 const HOLD_LIMIT_REASON = "Up to 8 results can be held at once, shared with this workflow's other editor tab. Release one first.";
 
-export function createViewsCoordinator({ host, controls, layoutStore, audio, cache, onChange = () => {}, notify = () => {},
+// `scene` is the editor's own scene for linking: {projectId(), sceneId(), fps(),
+// size() -> {width, height}, scene(), playing(), assetForSourcePath(path), assetsLoaded()}.
+export function createViewsCoordinator({ host, controls, layoutStore, audio, cache, scene = null, onChange = () => {}, notify = () => {},
     now = () => Date.now(), setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = id => clearTimeout(id),
     raf = fn => requestAnimationFrame(fn), documentRef = globalThis.document } = {}) {
     let destroyed = false;
     let visible = false;
     let key = "";
     let layout = normalizeLayout(null);
-    const panes = Array.from({ length: MAX_PANES }, () => ({ held: null, outcome: null, condition: null, released: false, creating: false }));
+    const panes = Array.from({ length: MAX_PANES }, () => ({ held: null, outcome: null, condition: null, followerState: null, previous: null, released: false, creating: false,
+        duration: null }));
     let answer = null; // the latest readOutputs answer
     let readToken = 0;
     let reading = null;
@@ -73,7 +86,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         key = next;
         layout = normalizeLayout(key ? layoutStore.read(key) : null);
         answer = null;
-        for (const pane of panes) Object.assign(pane, { held: null, outcome: null, condition: null, released: false, creating: false });
+        for (const pane of panes) Object.assign(pane, { held: null, outcome: null, condition: null, followerState: null, previous: null, released: false, creating: false });
         return true;
     }
 
@@ -327,9 +340,22 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         if (state.released && !state.held) chip = chip || "Released";
         const adapter = current();
         const busy = adapter?.mode === "canvas" && panes.some((other, i) => i !== index && other.outcome?.state === "starting");
+        const link = linkFor(index, view, status.result, entry);
+        const linked = !!link?.linked;
+        const catching = linked && state.followerState === "catching_up";
+        const outside = linked && state.followerState === "outside";
+        let linkChip = null;
+        if (linked && link.previous === "changed") linkChip = "Previous context";
+        else if (link && !linked && link.reason !== "off" && link.text) linkChip = `Unlinked: ${link.text}`;
+        if (!media?.chip) {
+            if (catching) chip = "Catching up";
+            else if (linkChip) chip = chip ? `${linkChip} · ${chip}` : linkChip;
+        }
         return {
             ...model, view, read: item, status, entries, itemIndex, entry, chip,
-            message: media?.message || status.message, unavailable: !!status.unavailable,
+            linkable: !!entry && isLinkable(entry), link, linked, outside,
+            message: media?.message || status.message || (outside ? "Outside generated range" : linked && link.pending ? "Linking…" : null),
+            unavailable: !!status.unavailable,
             result: status.result, runnable: runAvailability({ view, capability, outcome: state.outcome, busy, sessionLost }),
             cancellable: cancelAvailability(state.outcome && !state.outcome.canceling ? state.outcome : null),
             canHold: !state.held && !!entry && !!status.result?.prompt_id && !sessionLost,
@@ -338,6 +364,53 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
     }
 
     const paneId = index => `pane:${index}`;
+
+    // The pane's link: {linked: true, map, audioMap, Fm, sig, previous, ...}
+    // | {linked: false, reason, text} | null (not linkable, or no editor scene).
+    function linkFor(index, view, result, entry) {
+        if (!entry || !isLinkable(entry) || !scene) return null;
+        if (!layout.panes[index]?.link) return { linked: false, reason: "off", text: "" };
+        const state = panes[index];
+        const key = fileKey(entry);
+        const known = state.duration?.key === key;
+        const resolved = resolveLink({
+            entry, timing: view?.timing || null, contexts: result?.editor_context || null, fresh: result?.fresh,
+            editor: { projectId: scene.projectId(), sceneId: scene.sceneId(), fps: scene.fps(), editorKey: current()?.editorKey?.() || "" },
+            durationSec: known ? state.duration.sec : null,
+        });
+        if (!resolved.linked) return resolved;
+        // Until the file's metadata arrives its length is unchecked: "Linking…".
+        // A known non-finite duration links without the check.
+        resolved.pending = !known;
+        resolved.sig = [key, resolved.kind, resolved.S0, resolved.S1, resolved.Fm, resolved.required,
+            entry.scene_map?.source_offset ?? view?.timing?.source_offset ?? 0, view?.timing?.anchor || ""].join("|");
+        resolved.previous = previousFor(index, resolved.context);
+        return resolved;
+    }
+
+    // "same" | "changed" | "unknown", recomputed on every paused render and at
+    // most every PREVIOUS_CONTEXT_PLAYING_MS while playing (single slot per pane).
+    function previousFor(index, context) {
+        const content = context?.content;
+        if (!content) return "unknown";
+        const sceneObj = scene.scene?.() || null;
+        const cached = panes[index].previous;
+        const t = now();
+        if (cached && cached.digest === content.digest && cached.scene === sceneObj && scene.playing?.()
+            && t - cached.at < PREVIOUS_CONTEXT_PLAYING_MS) return cached.value;
+        const size = scene.size?.() || {};
+        let value = "unknown";
+        try {
+            value = contentStatus(sceneObj, content, {
+                fps: scene.fps(), width: size.width, height: size.height,
+                assetForSourcePath: path => scene.assetForSourcePath?.(path) || null, assetsLoaded: !!scene.assetsLoaded?.(),
+            });
+        } catch (error) {
+            console.warn("[Sonder] Previous context check failed:", error);
+        }
+        panes[index].previous = { digest: content.digest, scene: sceneObj, at: t, value };
+        return value;
+    }
 
     // Whether this ComfyUI runs one output alone. A failed ask (ComfyUI
     // restarting) is asked again on session restore and on the page showing.
@@ -360,6 +433,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
             if (panes[i].held) releasePane(i, { quiet: true });
             audio?.release(paneId(i));
             panes[i].condition = null;
+            panes[i].followerState = null;
         }
         persist();
         syncDemand();
@@ -374,7 +448,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
             if (sameSource(pane.source, before[i])) return;
             if (panes[i].held) releasePane(i, { quiet: true });
             audio?.release(paneId(i));
-            Object.assign(panes[i], { outcome: null, condition: null, released: false });
+            Object.assign(panes[i], { outcome: null, condition: null, followerState: null, previous: null, released: false });
         });
         persist();
         syncDemand();
@@ -389,7 +463,8 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         // Unchanged (a media mount reporting its zoom, say): no settings write.
         if (JSON.stringify(next.panes[index]) === JSON.stringify(pane)) return;
         layout = next;
-        if ("item" in patch) panes[index].condition = null;
+        if ("item" in patch) Object.assign(panes[index], { condition: null, followerState: null, previous: null });
+        if ("link" in patch) panes[index].followerState = null;
         persist();
         changed();
     }
@@ -438,6 +513,21 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
             panes[index].condition = condition;
             changed();
         },
+        // The shown file's duration (the link's length check needs it).
+        setMediaDuration(index, key, sec) {
+            const value = Number.isFinite(sec) && sec > 0 ? sec : null;
+            const previous = panes[index].duration;
+            if (previous?.key === key && previous.sec === value) return;
+            panes[index].duration = { key, sec: value };
+            changed();
+        },
+        // A linked pane's follower: catching_up | outside | following... or null.
+        setFollowerState(index, state) {
+            const value = state || null;
+            if (panes[index].followerState === value) return;
+            panes[index].followerState = value;
+            changed();
+        },
         run,
         cancel,
         hold,
@@ -480,7 +570,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
                 if (sameSource(pane.source, before[i]) && i < visibleCount()) return;
                 if (panes[i].held) releasePane(i, { quiet: true });
                 audio?.release(paneId(i));
-                Object.assign(panes[i], { outcome: null, condition: null, released: false, creating: false });
+                Object.assign(panes[i], { outcome: null, condition: null, followerState: null, previous: null, released: false, creating: false });
             });
             if (count !== visibleCount() || layout.panes.some((pane, i) => !sameSource(pane.source, before[i]))) {
                 syncDemand();
@@ -492,7 +582,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         projectChanged() {
             releaseAll();
             answer = null;
-            for (const pane of panes) Object.assign(pane, { outcome: null, condition: null, released: false, creating: false });
+            for (const pane of panes) Object.assign(pane, { outcome: null, condition: null, followerState: null, previous: null, released: false, creating: false });
             for (let i = 0; i < MAX_PANES; i++) audio?.release(paneId(i));
             watchHints();
             changed();

@@ -20,7 +20,7 @@ const INVALID_VIEW = unavailableView(
 const publicationBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
 // What a pane needs of each View, kept even when the Controls cannot fit.
 const VIEW_KEYS = ["view_id", "origin", "label", "default_label", "order", "path", "class_type", "title", "status",
-    "participation", "inactive_reason", "reason", "runnable"];
+    "participation", "inactive_reason", "reason", "runnable", "timing"];
 const minimalViews = views => (views || []).map(d => Object.fromEntries(VIEW_KEYS.filter(key => key in d).map(key => [key, d[key]])));
 const shorten = (descriptor, field, limit) =>
     typeof descriptor[field] === "string" && descriptor[field].length > limit
