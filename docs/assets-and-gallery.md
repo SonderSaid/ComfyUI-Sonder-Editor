@@ -83,8 +83,9 @@ card, but they render no media preview and can't be dropped on the timeline.
 
 A **take** is one generated version, saved by **Sonder Save Video** with
 **mode** set to **Take**. It lands in **Assets** under **Takes**, in a folder
-named after the scene, and on the timeline on a new Video row, with its sound
-on a linked Audio row.
+named after the scene, and on its own Video row, with its sound on a linked
+Audio row. Takes reuse an empty row after the last occupied row when it is
+unlocked and visible; otherwise they add a row.
 
 ![A generated take placed on its own linked video and audio lanes](images/take-placed.webp)
 
@@ -92,8 +93,11 @@ How takes land is set in **Settings** (the **⚙** at the right end of the
 toolbar) **▸ Render**. **Takes start muted** and **Link take video + audio**
 also appear in the **Editor** group of the [Controls](controls.md) tab:
 
-- **Take Placement Mode:** **Trimmed** places only the Selection;
-  **Untrimmed** also places the context frames, for checking seams.
+- **Take Placement Mode:** **Trimmed** places the Selection plus any context
+  you deliberately include with **Mask Pre/Post**. Automatic model alignment
+  does not extend that placement. **Untrimmed** also places the context frames,
+  for checking seams. Both modes leave model-frame padding out of the timeline;
+  the saved file still contains the complete output.
 - **Link Take Video + Audio:** picture and sound move and mute together.
 - **New Takes Start Muted:** a new take doesn't change what plays until you
   unmute it.

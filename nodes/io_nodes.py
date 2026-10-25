@@ -20,7 +20,9 @@ import folder_paths
 from PIL import Image
 
 from ..server.timeline_state import ClipReference, Asset, LaneConfig, AudioTrack, classify_asset_path
-from ..server.lane_registry import ensure_lane_index
+from ..server.lane_registry import allocate_take_lane
+from ..server.take_placement import calculate_take_placement
+from ..server.timeline_state import effective_scene_fps
 from ..server import comfy_idle, external_links
 from ..server.atomic_io import atomic_replace
 from ..server.project_manager import ProjectVersionConflict, load_project, save_project
@@ -189,9 +191,9 @@ def _build_take_proxy(committed_project, asset_id: str) -> None:
         logger.warning("Take proxy step failed; the take is saved", exc_info=True)
 
 
-def _save_generated_project(project, base_modified_at: str = "", created_ids=None):
+def _save_generated_project(project, base_modified_at: str = "", created_ids=None, auto_placement_ids=None):
     if base_modified_at:
-        committed = save_generated_project(project, str(base_modified_at), created_ids)
+        committed = save_generated_project(project, str(base_modified_at), created_ids, auto_placement_ids=auto_placement_ids)
     else:
         save_project(project)
         committed = project
@@ -2392,190 +2394,139 @@ class SonderSaveVideo:
         # The placement is the one trusted mapping between this file's frames and
         # scene frames; it travels with the result for Output Views.
         scene_map = None
+        auto_placement_ids = {"clips": set(), "audio": set()}
         if mode == "Take" and hasattr(project, '_execution_context') and project._execution_context:
             ctx = project._execution_context
             scene = project.get_scene(ctx.get("scene_id", ""))
             if scene:
                 # Organize asset into Takes folder
                 asset.folder = f"Takes/{ctx.get('scene_name', scene.name)}"
-                take_generation_params = {**_public_execution_context(ctx), **dict(asset_generation_params)}
+                take_generation_params = {
+                    **_public_execution_context(ctx), **dict(asset_generation_params),
+                    "take_placement_policy": "authored_v1",
+                    "take_keep_padding": False,
+                    "placement_fps": ctx.get("placement_fps", effective_scene_fps(project, scene)),
+                    "requested_mask_pre_offset": ctx.get("requested_mask_pre_offset", ctx.get("mask_pre_offset", 0)),
+                    "requested_mask_post_offset": ctx.get("requested_mask_post_offset", ctx.get("mask_post_offset", 0)),
+                }
                 asset.generation_params = dict(take_generation_params)
 
-                # Find next available video lane
-                existing_lanes = [c.track_index for c in scene.clips] if scene.clips else [-1]
-                new_lane = max(existing_lanes) + 1
-
-                # Ensure scene has enough lanes
-                ensure_lane_index(scene, "video", new_lane, LaneConfig)
-
-                # Determine clip placement — at original selection, not context-expanded range
-                def context_int(key, default=0):
-                    try:
-                        return int(ctx.get(key, default) or 0)
-                    except (TypeError, ValueError):
-                        return default
-
-                sel_start = context_int("selection_start", 0)
-                sel_end = context_int("selection_end", sel_start + total_frames)
-                actual_pre = max(0, context_int(
-                    "actual_pre_context_frames",
-                    context_int("pre_context_frames", context_int("context_frames", 0)),
-                ))
-                actual_post = max(0, context_int(
-                    "actual_post_context_frames",
-                    context_int("post_context_frames", context_int("context_frames", 0)),
-                ))
-                frame_count_padding = max(0, context_int("frame_count_padding", 0))
-                take_placement_mode = ctx.get("take_placement_mode", "trimmed")
-                take_placement_linked = ctx.get("take_placement_linked", True) is not False
-                take_placement_muted = bool(ctx.get("take_placement_muted", False))
-                take_fit_mode = str(ctx.get("take_fit_mode", DEFAULT_FIT_MODE) or DEFAULT_FIT_MODE).strip().lower()
-                if take_fit_mode not in FIT_MODES:
-                    take_fit_mode = DEFAULT_FIT_MODE
-                take_crop_position = str(ctx.get("take_crop_position", DEFAULT_CROP_POSITION) or DEFAULT_CROP_POSITION).strip().lower()
-                if take_crop_position not in CROP_POSITIONS:
-                    take_crop_position = DEFAULT_CROP_POSITION
-
-                mask_pre = max(0, min(actual_pre, context_int("mask_pre_offset", 0)))
-                mask_post = max(0, min(actual_post, context_int("mask_post_offset", 0)))
-
-                if take_placement_mode == "untrimmed":
-                    # DIAGNOSTIC: untrimmed mode intentionally ignores mask_pre/post_offset (Phase 1 decision).
-                    # Places the full real rendered source (pre+generation+post) on the timeline so the seam is
-                    # visible. Constraint padding is a synthetic tensor tail and must never become source media.
-                    visible_source_frames = max(0, total_frames - frame_count_padding)
-                    source_in_frame = 0
-                    source_out_frame = visible_source_frames
-                    timeline_start_frame = sel_start - actual_pre
-                    timeline_end_frame = timeline_start_frame + visible_source_frames
-                    source_origin_frame = 0
-                    clip_total_source_frames = visible_source_frames
-                else:
-                    # Trimmed (default): align the visible region with the mask region the
-                    # renderer actually denoised. mask_start_frame / mask_end_frame are the
-                    # post-snap output-tensor coords published by SonderEditor; on the LTX
-                    # 8n+1 grid they extend outward (start floors, end ceils) so the take
-                    # must mirror that extension. Defaults fall back to the un-snapped
-                    # offsets so behavior is unchanged when no template constraint applies.
-                    gen_len = max(0, sel_end - sel_start)
-                    mask_start_frame = max(0, context_int("mask_start_frame", actual_pre - mask_pre))
-                    mask_end_frame = context_int(
-                        "mask_end_frame",
-                        actual_pre + gen_len + mask_post + frame_count_padding,
+                geometry = calculate_take_placement(take_generation_params, total_frames)
+                if geometry["timeline_end_frame"] <= geometry["timeline_start_frame"]:
+                    audio_alerts.append(
+                        f"Saved {output_filename}, but its source contains no frames in the requested take range; kept in Assets"
                     )
-                    # Padding sits at the tail of the output tensor and is never user-visible
-                    # content; subtracting it preserves prior trimmed placement when snap is a
-                    # no-op while still extending the take by the snap delta when present.
-                    visible_source_end = max(mask_start_frame, min(
-                        mask_end_frame - frame_count_padding,
-                        total_frames - frame_count_padding,
-                    ))
-                    context_start_scene_frame = sel_start - actual_pre
-                    source_in_frame = mask_start_frame
-                    source_out_frame = visible_source_end
-                    timeline_start_frame = context_start_scene_frame + mask_start_frame
-                    timeline_end_frame = context_start_scene_frame + visible_source_end
-                    source_origin_frame = 0
-                    clip_total_source_frames = max(0, total_frames - frame_count_padding)
+                    discard_audio_file(audio_abs_path)
+                else:
+                    new_lane = allocate_take_lane(scene, "video", LaneConfig)
+                    source_in_frame = geometry["source_in_frame"]
+                    source_out_frame = geometry["source_out_frame"]
+                    timeline_start_frame = geometry["timeline_start_frame"]
+                    timeline_end_frame = geometry["timeline_end_frame"]
+                    source_origin_frame = geometry["source_origin_frame"]
+                    clip_total_source_frames = geometry["total_source_frames"]
+                    take_placement_mode = ctx.get("take_placement_mode", "trimmed")
+                    take_placement_linked = ctx.get("take_placement_linked", True) is not False
+                    take_placement_muted = bool(ctx.get("take_placement_muted", False))
+                    take_fit_mode = str(ctx.get("take_fit_mode", DEFAULT_FIT_MODE) or DEFAULT_FIT_MODE).strip().lower()
+                    if take_fit_mode not in FIT_MODES:
+                        take_fit_mode = DEFAULT_FIT_MODE
+                    take_crop_position = str(ctx.get("take_crop_position", DEFAULT_CROP_POSITION) or DEFAULT_CROP_POSITION).strip().lower()
+                    if take_crop_position not in CROP_POSITIONS:
+                        take_crop_position = DEFAULT_CROP_POSITION
 
-                clip = ClipReference(
-                    source_path=output_rel_path,
-                    timeline_start_frame=timeline_start_frame,
-                    timeline_end_frame=timeline_end_frame,
-                    source_in_frame=source_in_frame,
-                    source_out_frame=source_out_frame,
-                    total_source_frames=clip_total_source_frames,
-                    source_origin_frame=source_origin_frame,
-                    track_index=new_lane,
-                    muted=take_placement_muted,
-                    fit_mode=take_fit_mode,
-                    crop_position=take_crop_position,
-                    is_generated=True,
-                    generation_params=dict(take_generation_params),
-                    take_metadata=dict(take_generation_params),
-                )
-                scene.clips.append(clip)
-                if timeline_end_frame > timeline_start_frame:
-                    scene_map = {
-                        "scene_id": scene.scene_id,
-                        "scene_start": timeline_start_frame,
-                        "scene_end": timeline_end_frame,
-                        "source_offset": source_in_frame,
-                        "fps": float(fps),
-                    }
-                placed_audio_track = None
-                if audio_abs_path and has_audio and encode_metadata.get("audio_sidecar_ready") and os.path.isfile(audio_abs_path):
-                    audio_asset = None
-                    audio_lane_count = scene.audio_lane_count
-                    audio_lane_configs = list(scene.audio_lane_configs)
-                    audio_tracks = list(scene.audio_tracks)
-                    try:
-                        from ..server.audio_pipeline import mapped_float_wav
-                        with mapped_float_wav(audio_abs_path) as (sample_rate, samples):
-                            if not len(samples):
-                                raise ValueError("Prepared timeline audio is empty")
-                            audio_duration_sec = len(samples) / sample_rate
-                        audio_asset = Asset(
-                            name=f"{output_filename} (audio)",
-                            asset_type="audio",
-                            path=audio_rel_path,
-                            duration_sec=audio_duration_sec,
-                            sample_rate=sample_rate,
-                            folder=asset.folder,
-                            generation_params=dict(take_generation_params),
-                        )
-                        project.add_asset(audio_asset)
+                    clip = ClipReference(
+                        source_path=output_rel_path,
+                        timeline_start_frame=timeline_start_frame,
+                        timeline_end_frame=timeline_end_frame,
+                        source_in_frame=source_in_frame,
+                        source_out_frame=source_out_frame,
+                        total_source_frames=clip_total_source_frames,
+                        source_origin_frame=source_origin_frame,
+                        track_index=new_lane,
+                        muted=take_placement_muted,
+                        fit_mode=take_fit_mode,
+                        crop_position=take_crop_position,
+                        is_generated=True,
+                        generation_params=dict(take_generation_params),
+                        take_metadata=dict(take_generation_params),
+                    )
+                    scene.clips.append(clip)
+                    auto_placement_ids["clips"].add(clip.clip_id)
+                    if timeline_end_frame > timeline_start_frame:
+                        scene_map = {
+                            "scene_id": scene.scene_id,
+                            "scene_start": timeline_start_frame,
+                            "scene_end": timeline_end_frame,
+                            "source_offset": source_in_frame,
+                            "fps": float(fps),
+                        }
+                    placed_audio_track = None
+                    if audio_abs_path and has_audio and encode_metadata.get("audio_sidecar_ready") and os.path.isfile(audio_abs_path):
+                        audio_asset = None
+                        audio_lane_count = scene.audio_lane_count
+                        audio_lane_configs = list(scene.audio_lane_configs)
+                        audio_tracks = list(scene.audio_tracks)
+                        try:
+                            from ..server.audio_pipeline import mapped_float_wav
+                            with mapped_float_wav(audio_abs_path) as (sample_rate, samples):
+                                if not len(samples):
+                                    raise ValueError("Prepared timeline audio is empty")
+                                audio_duration_sec = len(samples) / sample_rate
+                            audio_asset = Asset(
+                                name=f"{output_filename} (audio)",
+                                asset_type="audio",
+                                path=audio_rel_path,
+                                duration_sec=audio_duration_sec,
+                                sample_rate=sample_rate,
+                                folder=asset.folder,
+                                generation_params={**take_generation_params,
+                                                   "encoded_frame_count": total_frames,
+                                                   "source_video_asset_id": asset.asset_id},
+                            )
+                            project.add_asset(audio_asset)
 
-                        audio_thumb_path = _project_thumbnail_path(project, audio_asset.asset_id, purpose="take audio thumbnail path")
-                        if audio_thumb_path:
-                            ensure_thumbnail("audio", audio_abs_path, audio_thumb_path)
+                            audio_thumb_path = _project_thumbnail_path(project, audio_asset.asset_id, purpose="take audio thumbnail path")
+                            if audio_thumb_path:
+                                ensure_thumbnail("audio", audio_abs_path, audio_thumb_path)
 
-                        existing_audio_lanes = [track.lane_index for track in scene.audio_tracks] if scene.audio_tracks else [-1]
-                        new_audio_lane = max(existing_audio_lanes) + 1
-                        ensure_lane_index(scene, "audio", new_audio_lane, LaneConfig)
+                            new_audio_lane = allocate_take_lane(scene, "audio", LaneConfig)
 
-                        visible_len = source_out_frame - source_in_frame
-                        assert (timeline_end_frame - timeline_start_frame) == visible_len, (
-                            f"audio invariant: timeline span {timeline_end_frame - timeline_start_frame} != visible_len {visible_len}"
-                        )
-                        assert clip_total_source_frames == max(0, total_frames - frame_count_padding), (
-                            f"audio invariant: total_source_frames {clip_total_source_frames} != total_frames - padding {max(0, total_frames - frame_count_padding)}"
-                        )
-
-                        placed_audio_track = AudioTrack(
-                            source_path=audio_rel_path,
-                            timeline_start_frame=timeline_start_frame,
-                            timeline_end_frame=timeline_end_frame,
-                            source_in_frame=source_in_frame,
-                            total_source_frames=clip_total_source_frames,
-                            source_origin_frame=source_origin_frame,
-                            muted=take_placement_muted,
-                            lane_index=new_audio_lane,
-                        )
-                        scene.audio_tracks.append(placed_audio_track)
-                        logger.info("Take audio auto-placed on lane %d at frames %d-%d", new_audio_lane, timeline_start_frame, timeline_end_frame)
-                    except Exception as e:
-                        logger.warning("Take mode audio auto-placement failed for %s: %s", output_filename, e)
-                        if audio_asset is not None and audio_asset in project.assets:
-                            project.assets.remove(audio_asset)
-                        scene.audio_lane_count = audio_lane_count
-                        scene.audio_lane_configs[:] = audio_lane_configs
-                        scene.audio_tracks[:] = audio_tracks
-                        discard_audio_file(audio_abs_path)
-                        audio_alerts.append(f"Saved {output_filename}, but its timeline audio could not be placed")
-                if take_placement_linked and placed_audio_track is not None:
-                    scene.linked_item_groups.append({
-                        "group_id": uuid.uuid4().hex[:8],
-                        "items": [
-                            {"type": "clip", "id": clip.clip_id},
-                            {"type": "audio", "id": placed_audio_track.track_id},
-                        ],
-                    })
-                logger.info(
-                    "Take auto-placed on lane %d at frames %d-%d (mode=%s linked=%s muted=%s)",
-                    new_lane, timeline_start_frame, timeline_end_frame,
-                    take_placement_mode, take_placement_linked, take_placement_muted,
-                )
+                            placed_audio_track = AudioTrack(
+                                source_path=audio_rel_path,
+                                timeline_start_frame=timeline_start_frame,
+                                timeline_end_frame=timeline_end_frame,
+                                source_in_frame=source_in_frame,
+                                total_source_frames=clip_total_source_frames,
+                                source_origin_frame=source_origin_frame,
+                                muted=take_placement_muted,
+                                lane_index=new_audio_lane,
+                            )
+                            scene.audio_tracks.append(placed_audio_track)
+                            auto_placement_ids["audio"].add(placed_audio_track.track_id)
+                            logger.info("Take audio auto-placed on lane %d at frames %d-%d", new_audio_lane, timeline_start_frame, timeline_end_frame)
+                        except Exception as e:
+                            logger.warning("Take mode audio auto-placement failed for %s: %s", output_filename, e)
+                            if audio_asset is not None and audio_asset in project.assets:
+                                project.assets.remove(audio_asset)
+                            scene.audio_lane_count = audio_lane_count
+                            scene.audio_lane_configs[:] = audio_lane_configs
+                            scene.audio_tracks[:] = audio_tracks
+                            discard_audio_file(audio_abs_path)
+                            audio_alerts.append(f"Saved {output_filename}, but its timeline audio could not be placed")
+                    if take_placement_linked and placed_audio_track is not None:
+                        scene.linked_item_groups.append({
+                            "group_id": uuid.uuid4().hex[:8],
+                            "items": [
+                                {"type": "clip", "id": clip.clip_id},
+                                {"type": "audio", "id": placed_audio_track.track_id},
+                            ],
+                        })
+                    logger.info(
+                        "Take auto-placed on lane %d at frames %d-%d (mode=%s linked=%s muted=%s)",
+                        new_lane, timeline_start_frame, timeline_end_frame,
+                        take_placement_mode, take_placement_linked, take_placement_muted,
+                    )
             else:
                 logger.warning("Take mode: scene_id '%s' not found, skipping auto-placement", ctx.get("scene_id", ""))
 
@@ -2583,7 +2534,7 @@ class SonderSaveVideo:
             ctx = _copy_execution_context(project)
             _mark_queue_job_completed(project, str(ctx.get("queue_job_id") or ""), asset.asset_id)
 
-        committed_project = _save_generated_project(project, str(execution_context.get("base_modified_at") or ""), created_ids=created_ids_since(_pre_item_ids, project))
+        committed_project = _save_generated_project(project, str(execution_context.get("base_modified_at") or ""), created_ids=created_ids_since(_pre_item_ids, project), auto_placement_ids=auto_placement_ids)
         _note_saved_to_project(sdk_runs.trusted_key_for_prompt(prompt), committed_project)
         _build_take_proxy(committed_project if committed_project is not None else project, asset.asset_id)
 

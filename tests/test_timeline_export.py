@@ -890,12 +890,13 @@ def test_failed_timeline_audio_placement_rolls_back_audio_asset_and_lane(tmp_pat
     monkeypatch.setattr(timeline_export, '_transient_temp_dir', lambda: str(tmp_path))
     monkeypatch.setattr(timeline_export, 'iter_scene_frames', lambda *a, **k: iter(np.zeros((4,32,32,3),np.uint8)))
     monkeypatch.setattr(timeline_export, 'ensure_thumbnail', lambda *a, **k: True)
-    original = timeline_export.ensure_lane_index
+    original = timeline_export.allocate_take_lane
     def failed_lane(scene, family, *args):
-        original(scene, family, *args)
+        lane = original(scene, family, *args)
         if family == 'audio':
             raise RuntimeError('test failed audio placement after lane creation')
-    monkeypatch.setattr(timeline_export, 'ensure_lane_index', failed_lane)
+        return lane
+    monkeypatch.setattr(timeline_export, 'allocate_take_lane', failed_lane)
     manager = TimelineExportManager(max_workers=1, ttl_seconds=60)
     job = manager.start(project, {'scene_id':'scene','range':{'start':0,'end':4},
         'include_video':True,'include_audio':True,'place_as_take':True,'save_preset':'Compatible MP4'})

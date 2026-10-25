@@ -294,8 +294,8 @@ def test_generated_commit_skips_registry_only_future_lane_family(monkeypatch):
 
 def test_io_node_take_placement_uses_registry_padding_for_video_and_audio():
     source = (ROOT / "nodes" / "io_nodes.py").read_text(encoding="utf-8")
-    assert source.count("ensure_lane_index(scene,") == 2
-    assert 'ensure_lane_index(scene, "video", new_lane, LaneConfig)' in source
-    assert 'ensure_lane_index(scene, "audio", new_audio_lane, LaneConfig)' in source
+    assert source.count("allocate_take_lane(scene,") == 2
+    assert 'allocate_take_lane(scene, "video", LaneConfig)' in source
+    assert 'allocate_take_lane(scene, "audio", LaneConfig)' in source
     assert "while len(scene.video_lane_configs)" not in source
     assert "while len(scene.audio_lane_configs)" not in source

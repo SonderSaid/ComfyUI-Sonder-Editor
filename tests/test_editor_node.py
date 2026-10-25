@@ -3231,10 +3231,10 @@ def test_save_video_take_trimmed_with_mask_offsets(tmp_path, monkeypatch):
     assert clip.total_source_frames == 9
 
 
-def test_save_video_take_trimmed_honors_snapped_mask_frames(tmp_path, monkeypatch):
+def test_save_video_take_trimmed_ignores_automatic_mask_snap(tmp_path, monkeypatch):
     # Mirrors the LTX 8n+1 snap from test_execute_snaps_mask_pre_offset_below_ltx_boundary:
     # the renderer floors mask_start from 38 -> 33 to include the straddling latent, so the
-    # take must extend 5 frames earlier than the un-snapped mask_pre_offset would imply.
+    # visible take retains the authored extension without the automatic five frames.
     io_nodes = _import_io_nodes(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")
     timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
@@ -3273,12 +3273,11 @@ def test_save_video_take_trimmed_honors_snapped_mask_frames(tmp_path, monkeypatc
     node.save_video(project, torch.zeros(169, 2, 2, 3, dtype=torch.float32), filename_prefix="snap", fps=24.0, mode="Take")
     clip = scene.clips[-1]
 
-    # context_start_scene_frame = 482 - 48 = 434; mask_start_frame=33 -> timeline 434+33=467
-    # (un-snapped placement would have used sel_start - mask_pre_offset = 472).
-    assert clip.timeline_start_frame == 467
+    # Authored Mask Pre=10 extends selection start 482 to 472.
+    assert clip.timeline_start_frame == 472
     # mask_end_frame=169 minus padding=2 -> visible_source_end=167; timeline 434+167=601.
     assert clip.timeline_end_frame == 601
-    assert clip.source_in_frame == 33
+    assert clip.source_in_frame == 38
     assert clip.source_out_frame == 167
     assert clip.total_source_frames == 167
 

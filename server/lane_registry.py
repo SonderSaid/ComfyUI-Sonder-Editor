@@ -273,3 +273,30 @@ def hidden_lane_indexes(scene, lane_type: str) -> set[int]:
         for index, config in enumerate(getattr(scene, descriptor.configs_attr, []) or [])
         if getattr(config, "hidden", False)
     }
+
+
+def allocate_take_lane(scene, lane_type: str, factory: Callable[[], object]) -> int:
+    """Use the first usable empty tail lane, preserving interior holes/configs.
+
+    Append the assigned item before allocating again to reserve its lane.
+    """
+    if lane_type not in {"video", "audio"}:
+        raise ValueError(f"Unsupported take lane: {lane_type}")
+    descriptor = variable_descriptor(lane_type)
+    occupied = [int(getattr(item, descriptor.item_index_attr, 0) or 0)
+                for item in getattr(scene, descriptor.items_attr, [])
+                if item_matches_descriptor(item, descriptor)]
+    first = max(occupied, default=-1) + 1
+    count = int(getattr(scene, descriptor.count_attr, 0) or 0)
+    configs = getattr(scene, descriptor.configs_attr)
+    pad_config_list(configs, count, factory)
+    # Durable data can retain configs beyond count. Preserve those configs
+    # and their usability when extending the active lane family over them.
+    configured_extent = max(count, len(configs))
+    for index in range(first, configured_extent):
+        if not configs[index].locked and not configs[index].hidden:
+            ensure_lane_index(scene, lane_type, index, factory)
+            return index
+    index = max(first, configured_extent)
+    ensure_lane_index(scene, lane_type, index, factory)
+    return index

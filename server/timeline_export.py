@@ -58,7 +58,8 @@ from .timeline_state import (
     Asset, AudioTrack, ClipReference, LaneConfig, Scene, TimelineProject,
     effective_scene_fps,
 )
-from .lane_registry import ensure_lane_index, hidden_lane_indexes
+from .lane_registry import allocate_take_lane, hidden_lane_indexes
+from .take_placement import calculate_take_placement
 
 
 
@@ -409,18 +410,12 @@ def _place_video_take(
     from .project_storage import hydrate_asset
     hydrate_asset(asset)
     total_frames = max(1, int(asset.frame_count or (end - start) or 1))
-    existing_lanes = [int(getattr(clip, "track_index", 0) or 0) for clip in getattr(scene, "clips", [])]
-    new_lane = (max(existing_lanes) if existing_lanes else -1) + 1
-    ensure_lane_index(scene, "video", new_lane, LaneConfig)
+    new_lane = allocate_take_lane(scene, "video", LaneConfig)
 
+    geometry = calculate_take_placement({"selection_start": start, "selection_end": end}, total_frames)
     clip = ClipReference(
         source_path=asset.path,
-        source_in_frame=0,
-        source_out_frame=total_frames,
-        total_source_frames=total_frames,
-        source_origin_frame=0,
-        timeline_start_frame=start,
-        timeline_end_frame=end,
+        **geometry,
         track_index=new_lane,
         muted=bool(muted),
         fit_mode=_take_fit_mode(fit_mode),
@@ -484,6 +479,7 @@ def _place_embedded_audio_take(
         with mapped_float_wav(audio_abs_path) as (sample_rate, samples):
             if not len(samples):
                 raise ValueError("Prepared timeline audio is empty")
+            audio_duration_sec = len(samples) / sample_rate
     except (OSError, ValueError):
         try:
             if os.path.isfile(audio_abs_path):
@@ -494,8 +490,9 @@ def _place_embedded_audio_take(
             cleanup_paths.remove(audio_abs_path)
         return None
 
-    fps = effective_scene_fps(project, scene)
-    total_frames = max(1, end - start)
+    total_frames = max(1, int(video_asset.frame_count or (end - start) or 1))
+    geometry = calculate_take_placement({"selection_start": start, "selection_end": end}, total_frames)
+    geometry.pop("source_out_frame")  # Audio derives its source end from the common visible span.
     previous_assets = list(project.assets)
     previous_tracks = list(scene.audio_tracks)
     previous_configs = list(scene.audio_lane_configs)
@@ -507,28 +504,23 @@ def _place_embedded_audio_take(
             asset_type="audio",
             folder=folder,
             technical_metadata={
-                "duration_sec": total_frames / fps,
+                "duration_sec": audio_duration_sec,
                 "sample_rate": sample_rate,
             },
             generation_params={
                 **dict(generation_params),
                 "source_video_asset_id": video_asset.asset_id,
+                "encoded_frame_count": total_frames,
                 "extracted_for_take_audio": not bool(prepared_audio_path),
                 "prepared_float_sidecar": bool(prepared_audio_path),
             },
         )
 
-        existing_lanes = [int(getattr(track, "lane_index", 0) or 0) for track in getattr(scene, "audio_tracks", [])]
-        new_lane = (max(existing_lanes) if existing_lanes else -1) + 1
-        ensure_lane_index(scene, "audio", new_lane, LaneConfig)
+        new_lane = allocate_take_lane(scene, "audio", LaneConfig)
 
         track = AudioTrack(
             source_path=audio_asset.path,
-            timeline_start_frame=start,
-            timeline_end_frame=end,
-            source_in_frame=0,
-            total_source_frames=total_frames,
-            source_origin_frame=0,
+            **geometry,
             muted=bool(muted),
             lane_index=new_lane,
         )
@@ -868,6 +860,8 @@ class TimelineExportManager:
             job.alerts.extend(encode_metadata.get("alerts") or [])
             generation_params = dict(encode_metadata)
             generation_params["editor_export"] = editor_export
+            if place_as_take and include_video:
+                generation_params.update(take_placement_policy="authored_v1", take_keep_padding=False, placement_fps=fps)
 
             if include_video:
                 technical = _technical_video_metadata(final_output_path, {
@@ -897,6 +891,7 @@ class TimelineExportManager:
             )
             self._check_cancel(job)
 
+            auto_placement_ids = {"clips": set(), "audio": set()}
             placed_audio_cleanup_path = ""
             if place_as_take and include_video and current_scene:
                 self._set_phase(job, "placing_take", "Placing take...")
@@ -910,6 +905,7 @@ class TimelineExportManager:
                     fit_mode=take_fit_mode,
                     crop_position=take_crop_position,
                 )
+                auto_placement_ids["clips"].add(clip.clip_id)
                 job.placed_clip = clip.to_dict()
                 job.result_scene_id = current_scene.scene_id
                 placed_audio_track = None
@@ -930,6 +926,7 @@ class TimelineExportManager:
                         )
                         if audio_take:
                             placed_audio_track, placed_audio_cleanup_path = audio_take
+                            auto_placement_ids["audio"].add(placed_audio_track.track_id)
                             # Validation alone is too early: failed placement still owns cleanup.
                             cleanup_paths.remove(placed_audio_cleanup_path)
                             job.retained_paths.append(_rel_media_path(
@@ -957,8 +954,14 @@ class TimelineExportManager:
                 current_project,
                 base_modified_at,
                 created_ids=created_ids_since(_pre_item_ids, current_project),
+                auto_placement_ids=auto_placement_ids,
             )
             job.result_asset_id = _resolve_committed_asset_id(committed_project, asset.asset_id)
+            if job.placed_clip:
+                committed_scene = committed_project.get_scene(job.result_scene_id)
+                committed_clip = next((item for item in committed_scene.clips
+                                       if item.clip_id == job.placed_clip["clip_id"]), None) if committed_scene else None
+                job.placed_clip = committed_clip.to_dict() if committed_clip else None
             if asset_type == "video":
                 from . import proxy_media
 

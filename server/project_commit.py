@@ -1,7 +1,8 @@
 import logging
+from copy import deepcopy
 
 from .project_manager import ProjectVersionConflict, load_project, save_project
-from .lane_registry import VARIABLE_LANE_DESCRIPTORS
+from .lane_registry import VARIABLE_LANE_DESCRIPTORS, allocate_take_lane
 from .timeline_state import LaneConfig, TimelineProject
 from .project_storage import has_generation_provenance, hydrate_asset
 
@@ -155,7 +156,7 @@ def _append_generated_lanes(items, idx_attr, current_count, current_configs):
     return next_new
 
 
-def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject, created_ids=None, asset_id_remap=None) -> bool:
+def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject, created_ids=None, asset_id_remap=None, auto_placement_ids=None) -> bool:
     # When `created_ids` is provided ({"clips","assets","audio"} → id sets), ONLY
     # items created during this run are merged in. Generated items the user
     # deleted mid-generation are still present in `produced` (the start-of-run
@@ -170,6 +171,7 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
     if asset_id_remap is None:
         asset_id_remap = {}
 
+    auto_placement_ids = auto_placement_ids or {}
     changed = False
     current_assets_by_id = {asset.asset_id: asset for asset in current.assets}
     current_assets = set(current_assets_by_id)
@@ -209,6 +211,7 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
                 changed = _copy_generated_asset_registration(current_same_path, asset) or changed
                 touched_assets.append(current_same_path)
             continue
+        asset = deepcopy(asset)
         current.assets.append(asset)
         current_assets.add(asset.asset_id)
         current_assets_by_id[asset.asset_id] = asset
@@ -267,7 +270,7 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
                 continue
             current_clip_ids.add(clip.clip_id)
             role = getattr(clip, "role", "render") or "render"
-            (new_driver if role == "motion_driver" else new_render).append(clip)
+            (new_driver if role == "motion_driver" else new_render).append(deepcopy(clip))
 
         current_track_ids = {track.track_id for track in current_scene.audio_tracks}
         new_audio = []
@@ -280,7 +283,7 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
             elif not _audio_is_generated(track, generated_paths):
                 continue
             current_track_ids.add(track.track_id)
-            new_audio.append(track)
+            new_audio.append(deepcopy(track))
 
         # Reconcile onto the COMMITTED (current) lane space by appending new
         # lanes — never by copying produced's base configs by absolute position,
@@ -299,6 +302,9 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
             items = items_by_lane_type.get(descriptor.lane_type)
             if not items:
                 continue
+            auto_ids = auto_placement_ids.get({"video": "clips", "audio": "audio"}.get(descriptor.lane_type), set())
+            auto_items = [item for item in items if getattr(item, descriptor.item_id_attr) in auto_ids]
+            items = [item for item in items if getattr(item, descriptor.item_id_attr) not in auto_ids]
             current_count = int(getattr(current_scene, descriptor.count_attr, 0) or 0)
             current_configs = list(getattr(current_scene, descriptor.configs_attr, []) or [])
             new_count = _append_generated_lanes(
@@ -307,6 +313,12 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
             getattr(current_scene, descriptor.items_attr).extend(items)
             setattr(current_scene, descriptor.configs_attr, current_configs)
             setattr(current_scene, descriptor.count_attr, new_count)
+            # Generic and Driver reconciliation keeps its original semantics.
+            # Only producer-declared automatic additions get fresh tail lanes.
+            for item in auto_items:
+                lane = allocate_take_lane(current_scene, descriptor.lane_type, LaneConfig)
+                setattr(item, descriptor.item_index_attr, lane)
+                getattr(current_scene, descriptor.items_attr).append(item)
             changed = True
 
         current_link_ids = {
@@ -354,13 +366,17 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
 _GENERATED_SAVE_MERGE_RETRIES = 8
 
 
-def save_generated_project(project: TimelineProject, base_modified_at: str = "", created_ids=None) -> TimelineProject:
+def save_generated_project(project: TimelineProject, base_modified_at: str = "", created_ids=None, auto_placement_ids=None) -> TimelineProject:
     """Save generated outputs without overwriting unrelated live editor changes.
 
     `created_ids` (optional {"clips","assets","audio"} → id sets, from
     `created_ids_since`) restricts the conflict-path merge to items created during
     this run, so generated items the user deleted mid-generation are not
     resurrected. When omitted, legacy add-any-generated-item behavior applies.
+
+    `auto_placement_ids` identifies only automatic video/audio additions. Those
+    receive fresh family-local tail lanes on conflict; explicit placements and
+    Drivers keep their generic reconciliation. Retry works on copied additions.
 
     The returned project may carry transient `_asset_id_remap` data when a
     conflict merge reconciles a generated asset onto an existing same-path
@@ -385,7 +401,7 @@ def save_generated_project(project: TimelineProject, base_modified_at: str = "",
     for _attempt in range(_GENERATED_SAVE_MERGE_RETRIES):
         current = load_project(project.project_dir)
         asset_id_remap = {}
-        changed = _merge_generated_outputs(current, project, created_ids, asset_id_remap=asset_id_remap)
+        changed = _merge_generated_outputs(current, project, created_ids, asset_id_remap=asset_id_remap, auto_placement_ids=auto_placement_ids)
         if not changed and not asset_id_remap:
             raise last_exc
         if changed:

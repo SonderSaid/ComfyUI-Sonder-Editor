@@ -62,6 +62,7 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup counts a chip as attached to an item under MiniMax H3 when it cites one of the item's members, directly or through a Subject.
 
 ### Fixed
+- Take placement: Save Video and timeline exports reuse usable empty tail lanes without counting Drivers; concurrent lane edits stay preserved, and a take no longer lands on top of a clip added to its row during generation. Trimmed takes and linked audio follow the Selection plus authored Mask Pre/Post extensions, without extra frames from automatic model alignment.
 - **Queue selected output nodes** no longer takes a Render Queue job for a Save that doesn't run. With Queue Active on, running only a preview leaves the next job pending.
 - A ProRes or FFV1 clip no longer paints the viewport black, latches Compare's play button on Pause, or leaves Crop, Trim & Preview black: each shows its proxy, or a notice saying what the clip waits for.
 - Sonder App takes no longer fail with "This run's SDK session has ended" when ComfyUI runs with `--cache-none` or is short of memory, and in that case the Editor no longer renders twice in one run. Save Video no longer saves a second take, and Save Bridge no longer misses files its saver already wrote. When a Sonder App take is refused, the message now says why: the take already ran, it belongs to another project, or it expired.

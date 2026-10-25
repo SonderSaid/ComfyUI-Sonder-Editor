@@ -985,6 +985,8 @@ class SonderEditor:
             # `_snap_pixel_to_constraint` helper below fires on the mask boundary as a
             # last resort. In the common case the helper is a no-op since boundaries
             # are already on grid by construction.
+            requested_mask_pre_offset = mask_pre_offset
+            requested_mask_post_offset = mask_post_offset
             execution_window = resolve_execution_window(
                 scene_duration=scene.duration_frames,
                 selection_start=generation_start,
@@ -1381,6 +1383,9 @@ class SonderEditor:
                 "context_end": context_end,
                 "pre_context_frames": actual_pre,
                 "post_context_frames": actual_post,
+                "placement_fps": float(proj_fps),
+                "requested_mask_pre_offset": requested_mask_pre_offset,
+                "requested_mask_post_offset": requested_mask_post_offset,
                 "actual_pre_context_frames": actual_pre,
                 "actual_post_context_frames": actual_post,
                 "mask_pre_offset": mask_pre_offset,
