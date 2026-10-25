@@ -1518,7 +1518,7 @@ async def unsubscribe(project_id: str, ws: web.WebSocketResponse) -> None:
 
 # High-rate status events kept out of the ws_broadcast diagnostic ring, which
 # would otherwise be flooded by progress and lose the events it exists to trace.
-_UNRECORDED_BROADCAST_TYPES = frozenset({"generation_status", "proxy_status"})
+_UNRECORDED_BROADCAST_TYPES = frozenset({"generation_status", "proxy_status", "live_preview"})
 
 
 async def broadcast_project_event(project_id: str, event: dict[str, Any]) -> None:
@@ -1566,12 +1566,19 @@ def project_event_aliases(project: Any) -> list[str]:
     return [alias for alias in dict.fromkeys((canonical, folder)) if alias]
 
 
-def schedule_project_event(project_id: str, event: dict[str, Any]) -> None:
+def schedule_project_event(project_id: str, event: dict[str, Any], delay: float = 0.0) -> None:
+    """Broadcast from any thread, on the server's loop; ``delay`` seconds later if given."""
     if not project_id:
         return
     loop = _event_loop
     if loop and loop.is_running():
-        asyncio.run_coroutine_threadsafe(broadcast_project_event(project_id, event), loop)
+        asyncio.run_coroutine_threadsafe(_broadcast_after(project_id, event, delay) if delay > 0
+                                         else broadcast_project_event(project_id, event), loop)
+
+
+async def _broadcast_after(project_id: str, event: dict[str, Any], delay: float) -> None:
+    await asyncio.sleep(delay)
+    await broadcast_project_event(project_id, event)
 
 
 async def sweep_stale_sessions_once() -> int:

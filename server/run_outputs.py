@@ -22,12 +22,20 @@ replay of a node the run never selected, and is ignored.
 Graph walks (scope, a source's Editors) run outside this module's lock; the lock
 covers dict work only, because the event loop takes it too (``put``, register,
 holds). The observer side runs on ComfyUI's prompt-worker thread. Stdlib only.
+
+Live sampling previews (Phase 4) are observation data too: the newest preview
+per source of a run, by reference, attributed by ``sampling_previews``. A
+payload is dropped when a newer run of the same canvas host takes its source,
+or oldest first past a process-wide budget; its metadata stays, so a pane can
+say why nothing is shown.
 """
 
 from __future__ import annotations
 
+import collections
 import copy
 import hashlib
+import itertools
 import json
 import logging
 import threading
@@ -53,16 +61,51 @@ _DATA: dict[str, dict[str, Any]] = {}
 _HOLDS: dict[str, dict[str, Any]] = {}
 _LISTENERS: list[Callable[[dict[str, Any]], None]] = []
 
+# Live sampling previews.
+LIVE_BUDGET_BYTES = 64 * 1024 * 1024
+MAX_LIVE_SOURCES_PER_RUN = 16
+MAX_SEEN = 32
+_LIVE_N = itertools.count(1)
+_LIVE_BYTES = {"total": 0}
+# Payload-holding records, oldest first: the budget evicts from the front.
+_PAYLOADS: "collections.OrderedDict[tuple[str, str], int]" = collections.OrderedDict()
+# (canvas host owner, workflow, source) -> (seq, prompt_id) of the newest run that
+# published it: a newer run drops the older payload. Sonder App owners are one per
+# run, so ("sdk", workflow, source) only reorders the budget: an older run's payload,
+# which no read shows any more, is evicted first.
+_LIVE_LATEST: dict[tuple, tuple[int, str]] = {}
+_LIVE_LISTENERS: list[Callable[[dict[str, Any]], None]] = []
+
 
 def _new_data() -> dict[str, Any]:
     return {"executing": set(), "nodes": {}, "entry_count": 0, "truncated": 0,
-            "editor_context": {}, "source_editors": {}}
+            "editor_context": {}, "source_editors": {},
+            # Phase 4: newest preview per source, first-record source facts, each
+            # sampler's upstream Override nodes, the run's preview method, and the
+            # nodes that actually ran (kept past finish, for From cache).
+            "live": {}, "live_info": {}, "kj_chain": {}, "display_ids": {}, "preview_method": "", "ran": None}
 
 
 def _prune_locked(live: set[str]) -> None:
     """Drop what was observed for runs ``sdk_runs`` no longer keeps."""
     for prompt_id in [pid for pid in _DATA if pid not in live]:
+        for source, record in _DATA[prompt_id]["live"].items():
+            _drop_payload_locked(prompt_id, source, record)
         del _DATA[prompt_id]
+    for key, (_seq, prompt_id) in list(_LIVE_LATEST.items()):
+        if prompt_id not in _DATA:
+            del _LIVE_LATEST[key]
+
+
+def _drop_payload_locked(prompt_id: str, source: str, record: dict, state: str | None = None) -> None:
+    """The one place a payload leaves memory, so the budget counter stays exact."""
+    if record.get("payload") is not None:
+        _LIVE_BYTES["total"] -= int(record.get("size") or 0)
+        record["payload"] = None
+        record["size"] = 0
+    _PAYLOADS.pop((prompt_id, source), None)
+    if state is not None:
+        record["state"] = state
 
 
 # --- Observation (prompt-worker thread) -----------------------------------------
@@ -197,6 +240,10 @@ def finish(prompt_key: Any, prompt_id: Any, history_result: Any, outcome: str) -
             _record_output(prompt_id, node, display or node, output)
     graph_rev = graph_revision(sdk_runs.bound_prompt(prompt_id))
     record = sdk_runs.record_snapshot(prompt_key) or {}
+    with _LOCK:
+        # Before the run reads finished: a read in between must not take "nothing ran".
+        if prompt_id in _DATA:
+            _DATA[prompt_id]["ran"] = frozenset(_DATA[prompt_id]["executing"])
     hint = sdk_runs.finish_bound(prompt_id, outcome or OUTCOME_SUCCESS, graph_rev,
                                  bool(record.get("saved_to_project")), str(record.get("committed_modified_at") or ""))
     live = sdk_runs.bound_ids()
@@ -421,6 +468,261 @@ def _expire_holds_locked(now: float) -> None:
             del _HOLDS[hold_id]
 
 
+# --- Live sampling previews (Phase 4) ------------------------------------------------
+#
+# ``sampling_previews`` attributes each preview and calls in here from the
+# sending thread: dict work under the lock, nothing else.
+
+def _writable_locked(prompt_id: str) -> dict | None:
+    """The run's data to record into; never recreates data a prune already dropped."""
+    data = _DATA.get(prompt_id)
+    if data is None and sdk_runs.is_bound(prompt_id):
+        data = _DATA[prompt_id] = _new_data()
+    return data
+
+
+def live_display_id(prompt_id: str, node_id: str) -> str | None:
+    with _LOCK:
+        return (_DATA.get(prompt_id) or {}).get("display_ids", {}).get(node_id)
+
+
+def note_live_display_id(prompt_id: str, node_id: str, display: str) -> None:
+    with _LOCK:
+        data = _writable_locked(prompt_id)
+        if data is not None and len(data["display_ids"]) < 4096:
+            data["display_ids"].setdefault(node_id, display)
+
+
+def live_source_info(prompt_id: str, source: str) -> dict | None:
+    """First-record facts of a source: ``{class_type, title}``, ``{}`` for a source
+    that is no key of the prompt, None when not yet looked at."""
+    with _LOCK:
+        return (_DATA.get(prompt_id) or {}).get("live_info", {}).get(source)
+
+
+def note_live_source_info(prompt_id: str, source: str, info: dict) -> None:
+    with _LOCK:
+        data = _writable_locked(prompt_id)
+        if data is not None:
+            data["live_info"].setdefault(source, dict(info))
+
+
+def live_kj_chain(prompt_id: str, via: str) -> frozenset | None:
+    with _LOCK:
+        return (_DATA.get(prompt_id) or {}).get("kj_chain", {}).get(via)
+
+
+def note_live_kj_chain(prompt_id: str, via: str, chain: frozenset) -> None:
+    with _LOCK:
+        data = _writable_locked(prompt_id)
+        if data is not None:
+            data["kj_chain"].setdefault(via, frozenset(chain))
+
+
+def note_preview_method(prompt_id: str, method: str) -> None:
+    with _LOCK:
+        data = _writable_locked(prompt_id)
+        if data is not None:
+            data["preview_method"] = str(method or "")[:32]
+
+
+def record_live(bound: dict, source: str, record: dict, payload: tuple | None, size: int) -> None:
+    """Keep the newest preview of ``source`` for the bound run, then hint its owners."""
+    prompt_id = bound["prompt_id"]
+    with _LOCK:
+        data = _writable_locked(prompt_id)
+        if data is None:
+            return
+        live = data["live"]
+        if source not in live and len(live) >= MAX_LIVE_SOURCES_PER_RUN:
+            return
+        previous = live.get(source)
+        if previous is not None:
+            _drop_payload_locked(prompt_id, source, previous)
+        entry = dict(record)
+        entry.setdefault("state", "ok")
+        entry.update(n=next(_LIVE_N), at=time.time(), prompt_id=prompt_id,
+                     payload=payload, size=int(size) if payload is not None else 0)
+        live[source] = entry
+        if payload is not None:
+            _PAYLOADS[(prompt_id, source)] = entry["size"]
+            _LIVE_BYTES["total"] += entry["size"]
+        for owner in bound["owners"]:
+            if not (isinstance(owner, tuple) and owner):
+                continue
+            if owner[0] == "sdk":
+                _prefer_eviction_locked(("sdk", bound["workflow_id"], source), bound["seq"], prompt_id, source)
+                continue
+            if owner[0] != "host":
+                continue
+            key = (owner, bound["workflow_id"], source)
+            latest = _LIVE_LATEST.get(key)
+            if latest is not None and latest[1] != prompt_id:
+                if latest[0] > bound["seq"]:
+                    # A newer run already shows this source: a late payload is never shown.
+                    _drop_payload_locked(prompt_id, source, entry, "evicted")
+                    entry["superseded"] = True
+                    continue
+                older = (_DATA.get(latest[1]) or {}).get("live", {}).get(source)
+                if older is not None:
+                    _drop_payload_locked(latest[1], source, older, "evicted")
+                    older["superseded"] = True
+            _LIVE_LATEST[key] = (bound["seq"], prompt_id)
+        while _LIVE_BYTES["total"] > LIVE_BUDGET_BYTES and _PAYLOADS:
+            oldest = next(iter(_PAYLOADS))
+            if oldest == (prompt_id, source):
+                if len(_PAYLOADS) == 1:
+                    break
+                _PAYLOADS.move_to_end(oldest)
+                continue
+            evicted = (_DATA.get(oldest[0]) or {}).get("live", {}).get(oldest[1])
+            if evicted is None:
+                _PAYLOADS.pop(oldest, None)
+                continue
+            _drop_payload_locked(oldest[0], oldest[1], evicted, "evicted")
+        listeners = list(_LIVE_LISTENERS)
+    hint = _hint(bound)
+    if not hint or not hint["owners"]:
+        return
+    for listener in listeners:
+        try:
+            listener(dict(hint))
+        except Exception:
+            logger.exception("Live preview listener failed")
+
+
+def _prefer_eviction_locked(key: tuple, seq: int, prompt_id: str, source: str) -> None:
+    """Sonder App runs: put the payload no read shows any more at the front of the budget."""
+    latest = _LIVE_LATEST.get(key)
+    if latest is None or latest[1] == prompt_id:
+        _LIVE_LATEST[key] = (seq, prompt_id)
+        return
+    if latest[0] > seq:
+        stale = (prompt_id, source)
+    else:
+        stale = (latest[1], source)
+        _LIVE_LATEST[key] = (seq, prompt_id)
+    if stale in _PAYLOADS:
+        _PAYLOADS.move_to_end(stale, last=False)
+
+
+def _live_public(record: dict) -> dict:
+    public = {key: value for key, value in record.items() if key not in ("payload", "size")}
+    public["has_payload"] = record.get("payload") is not None
+    return public
+
+
+def read_live(owners: Iterable[tuple], workflow_id: str = "", sources: Iterable[str] = ()) -> dict[str, Any]:
+    """The preview a pane shows per source, the state it is in, and the sources
+    this owner's retained runs saw publish (for the picker)."""
+    wanted = [str(source) for source in sources if str(source)][:MAX_SOURCES_PER_READ]
+    runs = [_with_scope(bound) for bound in sdk_runs.visible_bound(owners, workflow_id)]
+    ran = [bound for bound in runs if bound["outcome"] != OUTCOME_REMOVED]
+    with _LOCK:
+        empty = _new_data()
+        answer = {}
+        for source in wanted:
+            relevant = [bound for bound in ran
+                        if source in (_DATA.get(bound["prompt_id"]) or empty)["live"]
+                        or _in_scope(bound, _DATA.get(bound["prompt_id"]) or empty, source)]
+            if not relevant:
+                answer[source] = {"state": "none", "live": None, "run": None,
+                                  "latest_run": _latest_public(ran[0], relevant) if ran else None}
+                continue
+            # A run still waiting in ComfyUI's queue does not make the one sampling
+            # now "previous": the newest run that started (or ended) decides.
+            started = [bound for bound in relevant if bound["state"] != sdk_runs.BOUND_QUEUED]
+            newest = started[0] if started else relevant[0]
+            newest_data = _DATA.get(newest["prompt_id"]) or empty
+            shown = next((bound for bound in relevant
+                          if source in (_DATA.get(bound["prompt_id"]) or empty)["live"]), None)
+            record = _DATA[shown["prompt_id"]]["live"][source] if shown is not None else None
+            has = record is not None and record.get("payload") is not None
+            if shown is newest:
+                if has:
+                    state = "last" if newest["finished"] else "live"
+                elif record["state"] in ("too_large", "unsupported"):
+                    state = record["state"]
+                elif record["state"] == "starting":
+                    state = "no_previews" if newest["finished"] else "waiting"
+                else:
+                    state = "evicted"
+            elif not newest["finished"]:
+                state = "previous" if has else "waiting"
+            elif (has and newest["outcome"] == OUTCOME_SUCCESS
+                  and record.get("via", source) not in (newest_data["ran"] or frozenset())):
+                state = "cached"  # the sampler came from ComfyUI's cache: its last preview stands
+            else:
+                state = "no_previews"
+            suppressed_by = next((other for other, item in newest_data["live"].items()
+                                  if other != source and item.get("publisher") == "kj"
+                                  and item.get("via") == source), None)
+            answer[source] = {
+                "state": state,
+                "live": _live_public(record) if record is not None else None,
+                "run": {"prompt_id": newest["prompt_id"], "seq": newest["seq"], "finished": newest["finished"],
+                        "outcome": newest["outcome"], "preview_method": newest_data["preview_method"],
+                        "suppressed_by": suppressed_by, "in_scope": True},
+                "latest_run": _latest_public(ran[0], relevant),
+            }
+        seen: dict[str, dict] = {}
+        for bound in ran:
+            for source, record in (_DATA.get(bound["prompt_id"]) or empty)["live"].items():
+                if source not in seen and len(seen) < MAX_SEEN:
+                    seen[source] = {"source": source, "class_type": record.get("class_type", ""),
+                                    "title": record.get("title", ""), "publisher": record.get("publisher", "")}
+        return {"sources": answer, "seen": list(seen.values())}
+
+
+def _latest_public(bound: dict, relevant: list[dict]) -> dict:
+    """The owner's newest run, and whether this source was in it (a newer run may have left it out)."""
+    return {"prompt_id": bound["prompt_id"], "seq": bound["seq"], "finished": bound["finished"],
+            "outcome": bound["outcome"], "in_scope": any(item is bound for item in relevant)}
+
+
+def live_payload(owners: Iterable[tuple], prompt_id: str, source: str) -> tuple[str, dict | None, tuple | None]:
+    """``(code, record, payload)`` for the newest preview of one run's source, for its owner."""
+    prompt_id, source = str(prompt_id or ""), str(source or "")
+    if not any(bound["prompt_id"] == prompt_id for bound in sdk_runs.visible_bound(owners)):
+        return "unknown_run", None, None
+    with _LOCK:
+        record = (_DATA.get(prompt_id) or {}).get("live", {}).get(source)
+        if record is None:
+            return "unknown_source", None, None
+        if record.get("payload") is None:
+            return ("superseded" if record.get("superseded") else "unavailable"), _live_public(record), None
+        return "ok", _live_public(record), record["payload"]
+
+
+def store_live_bytes(prompt_id: str, source: str, n: int, body: bytes) -> None:
+    """Keep the encoded bytes in place of the image or base64 they came from."""
+    with _LOCK:
+        record = (_DATA.get(prompt_id) or {}).get("live", {}).get(source)
+        if (record is None or record.get("n") != n or record.get("payload") is None
+                or record["payload"][0] == "bytes"):
+            return
+        _LIVE_BYTES["total"] += len(body) - int(record.get("size") or 0)
+        record["payload"], record["size"] = ("bytes", body), len(body)
+        _PAYLOADS[(prompt_id, source)] = len(body)
+
+
+def live_bytes_in_use() -> int:
+    with _LOCK:
+        return _LIVE_BYTES["total"]
+
+
+def add_live_listener(listener: Callable[[dict[str, Any]], None]) -> Callable[[], None]:
+    """``listener(hint)`` after a run records a live preview; runs on the sending thread."""
+    with _LOCK:
+        _LIVE_LISTENERS.append(listener)
+
+    def remove() -> None:
+        with _LOCK:
+            if listener in _LIVE_LISTENERS:
+                _LIVE_LISTENERS.remove(listener)
+    return remove
+
+
 # --- Change hints --------------------------------------------------------------------
 
 def _hint(bound: dict | None) -> dict | None:
@@ -464,3 +766,7 @@ def reset_for_tests() -> None:
         _DATA.clear()
         _HOLDS.clear()
         _LISTENERS.clear()
+        _LIVE_LISTENERS.clear()
+        _PAYLOADS.clear()
+        _LIVE_LATEST.clear()
+        _LIVE_BYTES["total"] = 0

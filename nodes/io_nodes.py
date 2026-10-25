@@ -1272,6 +1272,11 @@ def _run_control_observer(event, data) -> None:
 
 
 _RUN_OUTPUT_HINTS_INSTALLED = False
+# Live preview hints, per prompt: at most one per period, the last one trailing.
+LIVE_HINT_PERIOD_SEC = 0.25
+_LIVE_HINT_LOCK = threading.Lock()
+_LIVE_HINT_STATE: dict = {}
+_LIVE_HINT_MAX_PROMPTS = 256
 
 
 def _install_run_output_hints(run_outputs) -> None:
@@ -1285,9 +1290,16 @@ def _install_run_output_hints(run_outputs) -> None:
         return
     _RUN_OUTPUT_HINTS_INSTALLED = True
 
-    def announce(hint):
+    def owner_ids(hint):
         host_ids = [owner[2] for owner in hint["owners"] if owner and owner[0] == "host" and len(owner) > 2]
         run_ids = [owner[1] for owner in hint["owners"] if owner and owner[0] == "sdk" and len(owner) > 1]
+        return host_ids, run_ids
+
+    def announce(hint):
+        host_ids, run_ids = owner_ids(hint)
+        if hint["finished"]:
+            with _LIVE_HINT_LOCK:
+                _LIVE_HINT_STATE.pop(hint["prompt_id"], None)
         for alias in hint["project_ids"]:
             schedule_project_event(alias, {
                 "type": "outputs_changed",
@@ -1299,7 +1311,42 @@ def _install_run_output_hints(run_outputs) -> None:
                 "run_ids": run_ids,
             })
 
+    def announce_live(hint):
+        # No source ids: like outputs_changed, the hint only says "read again".
+        delay = _live_hint_delay(hint["prompt_id"], time.monotonic())
+        if delay is None:
+            return
+        host_ids, run_ids = owner_ids(hint)
+        for alias in hint["project_ids"]:
+            schedule_project_event(alias, {
+                "type": "live_preview",
+                "project_id": alias,
+                "prompt_id": hint["prompt_id"],
+                "seq": hint["seq"],
+                "host_ids": host_ids,
+                "run_ids": run_ids,
+            }, delay)
+
     run_outputs.add_listener(announce)
+    run_outputs.add_live_listener(announce_live)
+
+
+def _live_hint_delay(prompt_id: str, now: float) -> float | None:
+    """0 to send now, a delay for the trailing hint, or None when one is already due."""
+    with _LIVE_HINT_LOCK:
+        state = _LIVE_HINT_STATE.get(prompt_id)
+        if state is None:
+            if len(_LIVE_HINT_STATE) >= _LIVE_HINT_MAX_PROMPTS:
+                _LIVE_HINT_STATE.pop(next(iter(_LIVE_HINT_STATE)))
+            state = _LIVE_HINT_STATE[prompt_id] = {"next_at": 0.0, "trailing_at": 0.0}
+        if now >= state["next_at"]:
+            state["next_at"] = now + LIVE_HINT_PERIOD_SEC
+            return 0.0
+        if state["trailing_at"] > now:
+            return None
+        state["trailing_at"] = state["next_at"]
+        state["next_at"] += LIVE_HINT_PERIOD_SEC
+        return state["trailing_at"] - now
 
 
 def _install_bridge_prompt_queue_hooks() -> bool:
@@ -1413,6 +1460,17 @@ def _install_bridge_prompt_queue_hooks() -> bool:
             _install_run_output_hints(run_outputs)
         except Exception:
             logger.exception("Run output observation unavailable")
+
+        try:
+            # Live sampling previews (Output Views Phase 4). The KJ adapter is
+            # retried at server startup, once every custom node has loaded;
+            # never in ``get``, which must stay O(1).
+            from ..server import kj_preview_adapter, sampling_previews
+            sampling_previews.install()
+            kj_preview_adapter.install()
+            kj_preview_adapter.install_on_startup(prompt_server)
+        except Exception:
+            logger.exception("Sampling preview observation unavailable")
 
         _BRIDGE_HOOKED_PROMPT_QUEUE_ID = current_queue_id
         return (

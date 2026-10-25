@@ -28,6 +28,30 @@ _EVENTS = {"progress", "progress_state", "executing"}
 _OBSERVED_EVENTS = frozenset({"executing", "executed", "execution_start", "execution_success",
                               "execution_error", "execution_interrupted"})
 _OBSERVERS: list = []
+# Sampling previews (Output Views Phase 4) ride the same wrap: their observer
+# names the events it takes, ComfyUI's binary preview ints included, so this
+# module stays free of ComfyUI imports. Int events and tuple data never reach
+# the observers above.
+_PREVIEW_EVENTS: set = set()
+_PREVIEW_OBSERVERS: list = []
+_WRAPPED = {"installed": False}
+
+
+def is_installed() -> bool:
+    """Whether a ``send_sync`` wrap is in place (observers see nothing otherwise)."""
+    return _WRAPPED["installed"]
+
+
+def add_preview_observer(observer, events):
+    """``observer(event, data)`` for each message whose event is in ``events``. Idempotent.
+
+    Expiry: retire with the preview dispatch when ComfyUI offers in-process
+    preview subscribers that carry the prompt's identity.
+    """
+    with _LOCK:
+        _PREVIEW_EVENTS.update(events)
+        if observer not in _PREVIEW_OBSERVERS:
+            _PREVIEW_OBSERVERS.append(observer)
 
 
 def add_observer(observer):
@@ -156,6 +180,7 @@ def install(prompt_server):
         if not callable(original):
             return False
         if getattr(original, "_sonder_sdk_progress", False):
+            _WRAPPED["installed"] = True
             return True
         @functools.wraps(original)
         def send_sync(event, data, *args, **kwargs):
@@ -172,9 +197,18 @@ def install(prompt_server):
                         observer(event, data)
                     except Exception:
                         _warn_once("run observer")
+            elif event in _PREVIEW_EVENTS:
+                with _LOCK:
+                    observers = list(_PREVIEW_OBSERVERS)
+                for observer in observers:
+                    try:
+                        observer(event, data)
+                    except Exception:
+                        _warn_once("preview observer")
             return result
         send_sync._sonder_sdk_progress = True
         prompt_server.send_sync = send_sync
+        _WRAPPED["installed"] = True
         return True
     except Exception:
         _warn_once("installation")
@@ -185,5 +219,8 @@ def reset_for_tests():
     with _LOCK:
         _WATCHED.clear()
         _OBSERVERS.clear()
+        _PREVIEW_EVENTS.clear()
+        _PREVIEW_OBSERVERS.clear()
+        _WRAPPED["installed"] = False
         _LISTENERS.clear()
         _WARNED.clear()

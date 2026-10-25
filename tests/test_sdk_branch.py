@@ -386,3 +386,42 @@ def test_sdk_run_cancel_route_needs_the_session_secret_its_tab_and_its_own_run(w
     assert refused == (404, 409, 404, [])
     assert status == 200 and body == {"ok": True, "canceling": run["run_ids"]}
     assert cancelled == [run["prompt_id"]]
+
+
+def test_sdk_live_routes_need_the_session_secret_and_its_tab(world, monkeypatch):
+    """GET …/runs/live and …/runs/live/{prompt_id}/bytes (Phase 4): the SDK headers,
+    and only this session's runs' previews."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from server import run_outputs, sdk_routes
+
+    run_outputs.reset_for_tests()
+    monkeypatch.setattr(sdk_routes, "get_runner", lambda *a, **kw: world.runner)
+    routes = web.RouteTableDef()
+    sdk_routes.register_sdk_routes(routes, resolve_project=world.resolve, remember_event_loop=lambda: None, projects_dir=lambda: "")
+    app = web.Application()
+    app.add_routes(routes)
+
+    async def go():
+        session = await world.open()
+        run = await branch(world, session)
+        body = world.branch.bodies[-1]
+        bound = sdk_runs.bind_queued(body["prompt_id"], body["prompt"], body["partial_execution_targets"])
+        assert bound and bound["owners"] == [("sdk", run["run_ids"][0])]
+        run_outputs.record_live(bound, "2", {"publisher": "kj", "via": "2", "mime": "image/webp"},
+                                ("bytes", b"RIFFwebp"), 8)
+        mine = {sdk_routes.SECRET_HEADER: session.secret, sdk_routes.TAB_HEADER: "tab-1"}
+        base = f"/sonder-editor/sdk/session/{session.session_id}/runs/live"
+        async with TestClient(TestServer(app)) as http:
+            wrong = await http.get(base, params={"sources": "2"}, headers={**mine, sdk_routes.SECRET_HEADER: "wrong"})
+            other_tab = await http.get(base, params={"sources": "2"}, headers={**mine, sdk_routes.TAB_HEADER: "tab-2"})
+            read = await (await http.get(base, params={"sources": "2"}, headers=mine)).json()
+            raw = await http.get(f"{base}/{body['prompt_id']}/bytes", params={"source": "2"}, headers=mine)
+            foreign = await http.get(f"{base}/someone-elses-prompt/bytes", params={"source": "2"}, headers=mine)
+            return (wrong.status, other_tab.status, foreign.status), read, (raw.status, await raw.read())
+
+    refused, read, raw = asyncio.run(go())
+    assert refused == (404, 409, 404)
+    assert read["sources"]["2"]["state"] == "live" and read["seen"][0]["source"] == "2"
+    assert raw == (200, b"RIFFwebp")
+    run_outputs.reset_for_tests()

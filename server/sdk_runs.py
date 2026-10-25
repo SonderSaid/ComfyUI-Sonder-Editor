@@ -637,6 +637,7 @@ def _bound_public(bound: dict[str, Any]) -> dict[str, Any]:
         "scope_known": bound["scope"] is not _SCOPE_UNSET, "prompt_keys": bound["prompt_keys"],
         "graph_rev": bound["graph_rev"], "saved_to_project": bound["saved_to_project"],
         "committed_modified_at": bound["committed_modified_at"], "cancel_requested": bound["cancel_requested"],
+        "finished_at": bound["finished_at"],
     }
 
 
@@ -652,6 +653,12 @@ def is_observing(prompt_id: Any) -> bool:
     with _LOCK:
         bound = _BOUND.get(_key(prompt_id))
         return bound is not None and bound["state"] != BOUND_FINISHED
+
+
+def is_bound(prompt_id: Any) -> bool:
+    """O(1): whether ``sdk_runs`` still keeps a bound run for this prompt."""
+    with _LOCK:
+        return _key(prompt_id) in _BOUND
 
 
 def bound_ids() -> set[str]:

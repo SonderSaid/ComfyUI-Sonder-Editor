@@ -260,3 +260,23 @@ def test_a_hold_keeps_its_runs_editor_context_through_the_route(registry):
             assert hold["editor_context"] == {"ed": context}
             assert hold["fresh"] is True
     run(scenario())
+
+
+def test_live_reads_and_bytes_use_the_same_gate(registry):
+    async def scenario():
+        await setup_hosts()
+        async with client() as http:
+            refused = await http.get(f"/sonder-editor/project/{PID}/runs/live",
+                                     params={"host_id": HID, "session_id": "nobody", "sources": "out"})
+            assert refused.status in (403, 409)
+            ok = await http.get(f"/sonder-editor/project/{PID}/runs/live",
+                                params={"host_id": HID, "session_id": CANVAS, "sources": "out"})
+            body = await ok.json()
+            assert ok.status == 200 and body["sources"]["out"]["state"] == "none" and body["seen"] == []
+            assert "kj" in body["sampling"]
+            missing = await http.get(f"/sonder-editor/project/{PID}/runs/live/p1/bytes",
+                                     params={"host_id": HID, "session_id": TAB, "source": "out"})
+            assert missing.status == 404
+            capability = await (await http.get("/sonder-editor/runs/capability")).json()
+            assert "branch" in capability and capability["sampling"]["kj"]["state"]
+    run(scenario())

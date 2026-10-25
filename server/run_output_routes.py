@@ -4,7 +4,10 @@ Canvas and mounted hosts use the project routes here; the Sonder App uses the
 twins in ``sdk_routes`` (session secret), which share the response builders.
 Reads are driven by ``outputs_changed`` hints and host polling, never by project
 edits, so they sit outside the change-certificate contract. Media is never served
-here: entries name files ComfyUI's ``/view`` serves.
+here: entries name files ComfyUI's ``/view`` serves. The one exception is a live
+sampling preview (Phase 4), which exists only in memory: ``runs/live`` reads its
+state and ``runs/live/{prompt_id}/bytes`` serves the newest one, driven by
+``live_preview`` hints, the picker and a short poll, never by project edits.
 
 Every read checks a file's presence on a worker thread and reports a held file
 whose size or modification time changed as unavailable, never the new bytes.
@@ -19,7 +22,7 @@ from typing import Any, Iterable
 
 from aiohttp import web
 
-from . import run_control, run_outputs, sdk_runs, session_registry
+from . import run_control, run_outputs, sampling_previews, sdk_runs, session_registry
 
 logger = logging.getLogger("sonder_editor")
 
@@ -185,6 +188,42 @@ async def cancel_response(owners: list, prompt_id: str) -> web.Response:
     return web.json_response({"ok": True, "cancel": how})
 
 
+LIVE_MIMES = sampling_previews.SERVED_MIMES
+
+
+def _build_live(owners: list, workflow_id: str, sources: list[str]) -> dict:
+    _reap_removed_runs()
+    # ``sampling`` as in GET /runs/capability, so a host reads one shape.
+    return {"ok": True, **run_outputs.read_live(owners, workflow_id, sources),
+            "sampling": sampling_previews.capability()}
+
+
+async def live_response(owners: list, workflow_id: str, sources: str) -> web.Response:
+    """Live sampling preview state per source, plus the publishers this owner's runs saw."""
+    return web.json_response(await asyncio.to_thread(_build_live, owners, str(workflow_id or ""), _sources(sources)))
+
+
+async def live_bytes_response(owners: list, prompt_id: str, source: str) -> web.Response:
+    """The newest preview of one run's source; its ``n`` in ``X-Sonder-Live-N``.
+
+    409 only when a newer run of the same host took the source (read again);
+    404 when the run, source or payload is not there for this owner.
+    """
+    prompt_id, source = _clean_id(prompt_id), _clean_id(source)
+    code, record, payload = await asyncio.to_thread(run_outputs.live_payload, owners, prompt_id, source)
+    if code == "superseded":
+        return web.json_response({"ok": False, "code": code}, status=409)
+    if code != "ok" or record is None or payload is None or record.get("mime") not in LIVE_MIMES:
+        return web.json_response({"ok": False, "code": code if code != "ok" else "unsupported"}, status=404)
+    body = await asyncio.to_thread(sampling_previews.encode_payload, payload)
+    if not body:
+        return web.json_response({"ok": False, "code": "unavailable"}, status=404)
+    if payload[0] != "bytes":
+        await asyncio.to_thread(run_outputs.store_live_bytes, prompt_id, source, record["n"], body)
+    return web.Response(body=body, content_type=record["mime"],
+                        headers={"Cache-Control": "no-store", "X-Sonder-Live-N": str(record["n"])})
+
+
 def release_response(owners: list, body: dict) -> web.Response:
     """Release one hold, or the page's holds at once (``hold_ids``, on pagehide)."""
     if isinstance(body.get("hold_ids"), list):
@@ -236,6 +275,22 @@ def register_run_output_routes(routes) -> None:
             return refused(code)
         return await outputs_response([owner], query.get("workflow_id", ""), query.get("sources", ""), query.get("keep_holds"))
 
+    @routes.get("/sonder-editor/project/{project_id}/runs/live")
+    async def api_run_live(request: web.Request) -> web.Response:
+        query = request.rel_url.query
+        code, owner = await gate(request.match_info.get("project_id"), query.get("host_id"), query.get("session_id"))
+        if code:
+            return refused(code)
+        return await live_response([owner], query.get("workflow_id", ""), query.get("sources", ""))
+
+    @routes.get("/sonder-editor/project/{project_id}/runs/live/{prompt_id}/bytes")
+    async def api_run_live_bytes(request: web.Request) -> web.Response:
+        query = request.rel_url.query
+        code, owner = await gate(request.match_info.get("project_id"), query.get("host_id"), query.get("session_id"))
+        if code:
+            return refused(code)
+        return await live_bytes_response([owner], request.match_info.get("prompt_id", ""), query.get("source", ""))
+
     @routes.post("/sonder-editor/project/{project_id}/runs/hold")
     async def api_run_hold(request: web.Request) -> web.Response:
         body = await body_of(request)
@@ -254,8 +309,10 @@ def register_run_output_routes(routes) -> None:
 
     @routes.get("/sonder-editor/runs/capability")
     async def api_run_capability(_request: web.Request) -> web.Response:
-        """Whether this ComfyUI can run one output branch (``partial_execution_targets``)."""
-        return web.json_response({"ok": True, "branch": await asyncio.to_thread(run_control.branch_capability)})
+        """Whether this ComfyUI can run one output branch (``partial_execution_targets``),
+        and what its sampling previews can be matched to."""
+        return web.json_response({"ok": True, "branch": await asyncio.to_thread(run_control.branch_capability),
+                                  "sampling": sampling_previews.capability()})
 
     # Mounted run lane: the owner tab posts, its canvas host claims and reports.
     @routes.post("/sonder-editor/project/{project_id}/runs/requests")

@@ -460,6 +460,20 @@ def register_sdk_routes(
         return await run_output_routes.outputs_response(owners, query.get("workflow_id", ""), query.get("sources", ""),
                                                         query.get("keep_holds"))
 
+    @routes.get("/sonder-editor/sdk/session/{session_id}/runs/live")
+    @handle
+    async def api_sdk_run_live(request: web.Request) -> web.Response:
+        owners, _holder = await output_owners(request)
+        query = request.rel_url.query
+        return await run_output_routes.live_response(owners, query.get("workflow_id", ""), query.get("sources", ""))
+
+    @routes.get("/sonder-editor/sdk/session/{session_id}/runs/live/{prompt_id}/bytes")
+    @handle
+    async def api_sdk_run_live_bytes(request: web.Request) -> web.Response:
+        owners, _holder = await output_owners(request)
+        return await run_output_routes.live_bytes_response(owners, request.match_info.get("prompt_id", ""),
+                                                           request.rel_url.query.get("source", ""))
+
     @routes.post("/sonder-editor/sdk/session/{session_id}/runs/hold")
     @handle
     async def api_sdk_run_hold(request: web.Request) -> web.Response:
