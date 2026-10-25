@@ -276,7 +276,7 @@ if(SCENARIO==='markdown'){
         // Editor-section bindings sit in the Editor group after your settings; their drag handle shows only in Manage (#7).
         const adv=byTarget('binding:adv:value');assert.ok(editor.contains(adv));
         const editorRows=walk(editor.children[1]).filter(n=>n.dataset.controlsMirror||n.dataset.controlTarget).map(n=>n.dataset.controlsMirror||n.dataset.controlTarget);
-        assert.deepEqual(editorRows,['render.takePlacementMuted','render.linkedTakePlacement','batchRender.maxFramesPerChunk','binding:adv:value']);
+        assert.deepEqual(editorRows,['render.takePlacementMuted','render.linkedTakePlacement','render.keepTakePadding','batchRender.maxFramesPerChunk','binding:adv:value']);
         assert.equal(walk(adv).find(n=>n.dataset.panelDragHandle==='true').hidden,true);assert.equal(input('binding:adv:value').checked,false);
         input('binding:adv:value').checked=true;input('binding:adv:value').dispatch('change');await settle();
         assert.deepEqual(calls,[{'binding:adv:value':true}]);

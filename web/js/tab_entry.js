@@ -89,6 +89,7 @@ const DEFAULT_WIDGET_VALUES = {
     take_placement_muted: false,
     take_fit_mode: "pad_edge",
     take_crop_position: "center",
+    take_keep_padding: false,
 };
 
 function setStatus(message) {

@@ -152,9 +152,11 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
         take_placement_muted=True,
         take_fit_mode="cover",
         take_crop_position="top",
+        take_keep_padding=True,
     )
 
     assert result[6] == 14
+    assert project._execution_context["take_keep_padding"] is True
     assert result[11] == pytest.approx(1 / 24.0)
     assert result[12] == pytest.approx(11 / 24.0)
     assert project._execution_context["pre_context_frames"] == 3
@@ -166,7 +168,7 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
     assert project._execution_context["take_fit_mode"] == "cover"
     assert project._execution_context["take_crop_position"] == "top"
     optional_fields = list(editor_node.SonderEditor.INPUT_TYPES()["optional"])
-    assert optional_fields[-2:] == ["take_fit_mode", "take_crop_position"]
+    assert optional_fields[-3:] == ["take_fit_mode", "take_crop_position", "take_keep_padding"]
     assert "render_cache_max_bytes" in optional_fields
     assert "render_cache_enabled" not in optional_fields
 
@@ -1716,7 +1718,10 @@ def test_render_scene_frames_uses_take_source_in_without_repeating_seam_frame(tm
     assert values == [4, 5, 6, 7]
 
 
-def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monkeypatch):
+# A queued job freezes Keep padding: absent (jobs queued before it existed) means
+# off, whatever the live widget says; only a frozen true turns it on.
+@pytest.mark.parametrize("frozen_keep_padding", ["absent", False, True])
+def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monkeypatch, frozen_keep_padding):
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     torch = importlib.import_module("torch")
 
@@ -1751,6 +1756,8 @@ def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monke
         scene_height=0,
         scene_fps=0.0,
     )
+    if frozen_keep_padding != "absent":
+        queue_job.take_keep_padding = frozen_keep_padding
 
     class DummyProject:
         def __init__(self):
@@ -1801,6 +1808,7 @@ def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monke
         pre_context_frames=1,
         post_context_frames=2,
         take_placement_mode="untrimmed",
+        take_keep_padding=frozen_keep_padding is not True,
     )
 
     # render_queue_active defaults True and a job is pending; with no save node the
@@ -1818,6 +1826,7 @@ def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monke
     # Snapshot reference for read-only consumers (prompt relay bridge) IS set on peek
     assert project._execution_context["queue_job_ref_id"] == "job-1"
     assert project._execution_context["take_placement_mode"] == "untrimmed"
+    assert project._execution_context["take_keep_padding"] is (frozen_keep_padding is True)
 
 
 def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):

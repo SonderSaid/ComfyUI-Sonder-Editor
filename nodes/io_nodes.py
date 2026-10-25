@@ -2404,7 +2404,7 @@ class SonderSaveVideo:
                 take_generation_params = {
                     **_public_execution_context(ctx), **dict(asset_generation_params),
                     "take_placement_policy": "authored_v1",
-                    "take_keep_padding": False,
+                    "take_keep_padding": ctx.get("take_keep_padding") is True,
                     "placement_fps": ctx.get("placement_fps", effective_scene_fps(project, scene)),
                     "requested_mask_pre_offset": ctx.get("requested_mask_pre_offset", ctx.get("mask_pre_offset", 0)),
                     "requested_mask_post_offset": ctx.get("requested_mask_post_offset", ctx.get("mask_post_offset", 0)),
@@ -2453,6 +2453,12 @@ class SonderSaveVideo:
                     )
                     scene.clips.append(clip)
                     auto_placement_ids["clips"].add(clip.clip_id)
+                    past_end = timeline_end_frame - int(getattr(scene, "duration_frames", 0) or 0)
+                    if getattr(scene, "duration_frames", 0) and past_end > 0:
+                        audio_alerts.append(
+                            f"Placed {output_filename}; its last {past_end} frame{'s' if past_end != 1 else ''} "
+                            "run past the scene's end. Lengthen the scene to see and hear them."
+                        )
                     if timeline_end_frame > timeline_start_frame:
                         scene_map = {
                             "scene_id": scene.scene_id,

@@ -48,6 +48,7 @@ POST_V022_JOB_DEFAULTS = {
     "reference_input_snapshots": [],
     "minimax_h3_setup_snapshot": {},
     "dimension_constraint": None,
+    "take_keep_padding": False,
 }
 
 POST_V022_PARAM_FIELDS = {

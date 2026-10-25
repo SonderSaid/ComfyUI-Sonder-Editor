@@ -299,6 +299,7 @@ function syncSettingsPanelControls() {
     if (controls.takePlacementMode) controls.takePlacementMode.value = this._settings.render?.takePlacementMode ?? "trimmed";
     if (controls.linkedTakePlacement) controls.linkedTakePlacement.checked = this._settings.render?.linkedTakePlacement !== false;
     if (controls.takePlacementMuted) controls.takePlacementMuted.checked = !!this._settings.render?.takePlacementMuted;
+    if (controls.keepTakePadding) controls.keepTakePadding.checked = this._settings.render?.keepTakePadding === true;
     if (controls.defaultSavePreset) {
         controls.defaultSavePreset.value = this._settings.render?.defaultSavePreset ?? DEFAULT_SAVE_PRESET;
         controls.defaultSavePreset._sonderSyncTitle?.();
@@ -1510,6 +1511,14 @@ function showSettingsPanel() {
         () => !!this._settings.render?.takePlacementMuted,
         (checked) => updateCategory("render", "takePlacementMuted", checked)
     );
+    createCheckbox(
+        renderSection,
+        "keepTakePadding",
+        "Keep Take Padding",
+        "Some models render a few extra frames to meet their frame rule. When the render generated them, new takes keep them, running to the end of the file. Post-context left outside Mask Post means they weren't generated, so the take is trimmed as usual. Queued jobs keep the choice they were queued with.",
+        () => this._settings.render?.keepTakePadding === true,
+        (checked) => updateCategory("render", "keepTakePadding", checked)
+    );
     createSelect(
         renderSection,
         "defaultSavePreset",
@@ -1596,6 +1605,7 @@ function showSettingsPanel() {
                 takePlacementMode: DEFAULT_EDITOR_SETTINGS.render.takePlacementMode,
                 linkedTakePlacement: DEFAULT_EDITOR_SETTINGS.render.linkedTakePlacement,
                 takePlacementMuted: DEFAULT_EDITOR_SETTINGS.render.takePlacementMuted,
+                keepTakePadding: DEFAULT_EDITOR_SETTINGS.render.keepTakePadding,
                 defaultSavePreset: DEFAULT_EDITOR_SETTINGS.render.defaultSavePreset,
                 maxRenderCacheSizeBytes: DEFAULT_EDITOR_SETTINGS.render.maxRenderCacheSizeBytes,
             },

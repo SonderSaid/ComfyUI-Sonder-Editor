@@ -77,7 +77,7 @@ def _require_writable(template_id: str) -> None:
     if check_template_id(template_id) in starter_sources():
         raise TemplateError("Bundled workflows are read-only.", "starter_read_only", 409)
 
-# The 13 editor values a mounted host relays (``session_registry.WIDGET_FIELD_NAMES``),
+# The 14 editor values a mounted host relays (``session_registry.WIDGET_FIELD_NAMES``),
 # which are also what the SDK host stores. Kept as a literal list here so this module
 # does not import the registry; ``tests/test_sdk_templates.py`` pins the two equal.
 EDITOR_STATE_FIELDS = (
@@ -86,6 +86,7 @@ EDITOR_STATE_FIELDS = (
     "mask_pre_offset", "mask_post_offset",
     "take_placement_mode", "take_placement_linked", "take_placement_muted",
     "take_fit_mode", "take_crop_position", "render_queue_active",
+    "take_keep_padding",
 )
 
 

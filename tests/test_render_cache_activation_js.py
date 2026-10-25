@@ -123,7 +123,7 @@ def test_canvas_host_owns_cache_widget_lifecycle_without_relay():
     fields_match = re.search(r"EDITOR_WIDGET_FIELDS\s*=\s*\[(.*?)\]", controller, re.DOTALL)
     assert fields_match
     fields = re.findall(r'"([^"]+)"', fields_match.group(1))
-    assert len(fields) == 13
+    assert len(fields) == 14
     assert "render_cache_enabled" not in fields
     assert "render_cache_max_bytes" not in fields
 

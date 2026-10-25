@@ -1,6 +1,7 @@
 """Placement geometry, lane allocation and generated-commit ownership regressions."""
 from copy import deepcopy
 import importlib
+from pathlib import Path
 
 import pytest
 
@@ -271,3 +272,174 @@ def test_asset_remaps_are_independent_across_retries():
         project_commit._merge_generated_outputs(current,produced,{"assets":{"produced-video","produced-audio"}},asset_id_remap=remap)
         assert current.get_asset("produced-audio").generation_params["source_video_asset_id"]==placeholder
         assert produced.to_dict()==before
+
+
+# --- Phase 2: Keep padding ---------------------------------------------------
+
+# The Editor's mask reached the tensor's end, so post-context and pad were generated.
+PADDED = {"selection_start": 20, "selection_end": 33, "actual_pre_context_frames": 20,
+          "actual_post_context_frames": 8, "frame_count_padding": 3, "mask_end_frame": 44, "frame_count": 44}
+
+
+@pytest.mark.parametrize("mode,keep,padding,count,expected", [
+    # Off trims the padding; post-context stays out of a trimmed take.
+    ("trimmed", False, 3, 44, (20, 33, 20, 33, 41)),
+    # On keeps the chosen start and exposes the whole tail: post-context, then padding.
+    ("trimmed", True, 3, 44, (20, 44, 20, 44, 44)),
+    ("untrimmed", False, 3, 44, (0, 41, 0, 41, 41)),
+    ("untrimmed", True, 3, 44, (0, 44, 0, 44, 44)),
+    # Zero padding changes nothing.
+    ("trimmed", True, 0, 41, (20, 33, 20, 33, 41)),
+    ("untrimmed", True, 0, 41, (0, 41, 0, 41, 41)),
+])
+def test_keep_padding_geometry(mode, keep, padding, count, expected):
+    result = calculate_take_placement(dict(PADDED, take_placement_mode=mode, frame_count_padding=padding,
+                                           take_keep_padding=keep), count)
+    assert tuple(result[k] for k in ("timeline_start_frame", "timeline_end_frame", "source_in_frame",
+                                     "source_out_frame", "total_source_frames")) == expected
+    assert (result["timeline_end_frame"] - result["timeline_start_frame"]
+            == result["source_out_frame"] - result["source_in_frame"])
+
+
+def test_keep_padding_keeps_authored_start_and_needs_a_real_true():
+    with_pre = calculate_take_placement(dict(PADDED, requested_mask_pre_offset=3, take_keep_padding=True), 44)
+    assert (with_pre["timeline_start_frame"], with_pre["source_in_frame"], with_pre["source_out_frame"]) == (17, 17, 44)
+    for loose in ("true", 1, "on"):
+        assert calculate_take_placement(dict(PADDED, take_keep_padding=loose), 44)["source_out_frame"] == 33
+
+
+def test_keep_padding_skips_a_pad_the_mask_never_generated():
+    # Post-context outside the mask leaves the pad as the repeated last frame
+    # (sonder_editor_bugs.md, grid padding outside the mask): keeping it would
+    # place filler, so Keep padding behaves as off.
+    for ctx in (dict(PADDED, mask_end_frame=36), {k: v for k, v in PADDED.items() if k != "mask_end_frame"}):
+        result = calculate_take_placement(dict(ctx, take_keep_padding=True), 44)
+        assert (result["source_out_frame"], result["total_source_frames"]) == (33, 41)
+
+
+def test_save_video_alerts_when_kept_padding_runs_past_the_scene_end(tmp_path, monkeypatch):
+    from test_editor_node import TEST_PACKAGE, _import_io_nodes, _fake_encode_video_success
+    io = _import_io_nodes(tmp_path, monkeypatch)
+    state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    torch = importlib.import_module("torch")
+    (tmp_path / "media").mkdir()
+    scene = state.Scene(scene_id="s", duration_frames=33)
+    project = state.TimelineProject(project_dir=str(tmp_path), scenes=[scene], fps=24.0)
+    project._execution_context = dict(PADDED, scene_id="s", actual_post_context_frames=0,
+                                      frame_count_padding=4, mask_end_frame=37, frame_count=37,
+                                      take_keep_padding=True)
+    monkeypatch.setattr(io, "encode_video", _fake_encode_video_success(io))
+    monkeypatch.setattr(io, "save_project", lambda _: None)
+    monkeypatch.setattr(io, "_build_take_proxy", lambda *a: None)
+    thumbs = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+    monkeypatch.setattr(thumbs, "ensure_thumbnail", lambda *a, **k: None)
+    result = io.SonderSaveVideo().save_video(project, torch.zeros(37, 2, 2, 3), fps=24.0, mode="Take")
+    assert (scene.clips[-1].timeline_start_frame, scene.clips[-1].timeline_end_frame) == (20, 37)
+    assert any("last 4 frames run past the scene's end" in a for a in result["ui"]["sonder_video"][0]["alerts"])
+
+
+def test_job_freezes_keep_padding_and_old_jobs_mean_off():
+    from server.timeline_state import GenerationJob
+    assert GenerationJob.from_dict({}).take_keep_padding is False
+    assert GenerationJob.from_dict({"take_keep_padding": "true"}).take_keep_padding is False
+    job = GenerationJob.from_dict({"take_keep_padding": True})
+    assert job.take_keep_padding is True and job.to_dict()["take_keep_padding"] is True
+    assert GenerationJob.from_dict(job.to_dict()).take_keep_padding is True
+
+
+def test_marker_absent_jobs_refuse_keep_padding_and_keep_the_v022_allowlist():
+    from server import frozen_prompt
+    from server.timeline_state import GenerationJob
+    frozen_prompt.validate_marker_absent_v022(GenerationJob())  # old/default job stays valid
+    with pytest.raises(frozen_prompt.FrozenPromptEnvelopeError, match="take_keep_padding"):
+        frozen_prompt.validate_marker_absent_v022(GenerationJob(take_keep_padding=True))
+    assert "take_keep_padding" not in frozen_prompt.V022_QUEUE_BODY_FIELDS
+    with pytest.raises(frozen_prompt.FrozenPromptEnvelopeError, match="take_keep_padding"):
+        frozen_prompt.validate_marker_absent_queue_body({"scene_id": "s", "take_keep_padding": False}, {})
+
+
+@pytest.mark.parametrize("value,expected", [(True, True), (False, False), ("true", False), (1, False), (None, False)])
+def test_enqueue_body_freezes_only_a_real_true(value, expected):
+    from server import routes
+    body = {"scene_id": "s", "selection_start": 0, "selection_end": 8, "prompt_context_format": "prompt_context_v1"}
+    if value is not None:
+        body["take_keep_padding"] = value
+    assert routes._queue_job_from_body(body).take_keep_padding is expected
+
+
+def test_keep_padding_travels_with_every_host():
+    import re
+    from server import binding_policy, sdk_templates, session_registry
+    from server.editor_inputs import clean_editor_values, editor_optional_inputs
+    inputs = editor_optional_inputs()
+    assert list(inputs)[-1] == "take_keep_padding" and inputs["take_keep_padding"][1]["default"] is False
+    assert "take_keep_padding" in sdk_templates.EDITOR_STATE_FIELDS
+    assert "take_keep_padding" in session_registry.WIDGET_FIELD_NAMES
+    assert clean_editor_values({"take_keep_padding": True}, ["take_keep_padding"]) == {"take_keep_padding": True}
+    assert clean_editor_values({"take_keep_padding": "true"}, ["take_keep_padding"]) == {}
+    assert "take_keep_padding" in binding_policy._RUNNER_OWNED["SonderEditor"]
+    root = Path(__file__).resolve().parents[1] / "web" / "js"
+    for name, pattern in [("editor_node_controller.js", r"EDITOR_WIDGET_FIELDS\s*=\s*\[(.*?)\]"),
+                          ("tab_entry.js", r"DEFAULT_WIDGET_VALUES\s*=\s*\{(.*?)\}"),
+                          ("extension.js", r"hiddenWidgetNames\s*=\s*\[(.*?)\]"),
+                          ("control_bindings.js", r"SonderEditor:\s*\[(.*?)\]")]:
+        block = re.search(pattern, (root / name).read_text(encoding="utf-8"), re.DOTALL).group(1)
+        assert "take_keep_padding" in block, name
+    assert re.search(r"take_keep_padding:\s*false", (root / "tab_entry.js").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("keep", [False, True])
+def test_save_video_places_video_and_audio_through_the_padding(tmp_path, monkeypatch, keep):
+    from test_editor_node import TEST_PACKAGE, _import_io_nodes, _fake_encode_video_success
+    io = _import_io_nodes(tmp_path, monkeypatch)
+    state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    torch = importlib.import_module("torch")
+    (tmp_path / "media").mkdir()
+    scene = state.Scene(scene_id="s")
+    project = state.TimelineProject(project_dir=str(tmp_path), scenes=[scene], fps=24.0)
+    project._execution_context = dict(PADDED, scene_id="s", take_keep_padding=keep, placement_fps=24.0)
+    monkeypatch.setattr(io, "encode_video", _fake_encode_video_success(io))
+    monkeypatch.setattr(io, "save_project", lambda _: None)
+    monkeypatch.setattr(io, "_build_take_proxy", lambda *a: None)
+    thumbs = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+    monkeypatch.setattr(thumbs, "ensure_thumbnail", lambda *a, **k: None)
+    io.SonderSaveVideo().save_video(project, torch.zeros(44, 2, 2, 3), fps=24.0, mode="Take",
+                                    audio={"waveform": torch.zeros(1, 2, 88000), "sample_rate": 48000})
+    end, total = (44, 44) if keep else (33, 41)
+    for item in (scene.clips[-1], scene.audio_tracks[-1]):
+        assert (item.timeline_start_frame, item.timeline_end_frame,
+                item.source_in_frame, item.total_source_frames) == (20, end, 20, total)
+    assert scene.clips[-1].source_out_frame == end
+    video, audio = project.assets
+    assert video.generation_params["take_keep_padding"] is keep
+    assert audio.generation_params["take_keep_padding"] is keep
+
+
+def test_keep_padding_setting_normalizes_resets_and_is_a_controls_mirror(tmp_path):
+    import json
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node required")
+    root = Path(__file__).resolve().parents[1] / "web" / "js"
+    script = """
+import assert from 'node:assert/strict';
+globalThis.localStorage = { getItem() { return null; }, setItem() {} };
+const s = await import(SETTINGS_URL);
+assert.equal(s.DEFAULT_EDITOR_SETTINGS.render.keepTakePadding, false);
+assert.equal(s.normalizeEditorSettings().render.keepTakePadding, false);
+assert.equal(s.normalizeEditorSettings({ render: { keepTakePadding: 'yes' } }).render.keepTakePadding, false);
+assert.equal(s.normalizeEditorSettings({ render: { keepTakePadding: true } }).render.keepTakePadding, true);
+assert.deepEqual(s.controlsPanelSettingPatch('render.keepTakePadding', true), { render: { keepTakePadding: true } });
+assert.throws(() => s.controlsPanelSettingPatch('render.keepTakePadding', 'true'), /on or off/);
+console.log('ok');
+""".replace("SETTINGS_URL", json.dumps((root / "editor_settings.js").as_uri()))
+    path = tmp_path / "keep_padding_settings.mjs"
+    path.write_text(script, encoding="utf-8")
+    result = subprocess.run([node, str(path)], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    panel = (root / "editor_settings_panel.js").read_text(encoding="utf-8").replace("\r\n", "\n")
+    reset = panel[panel.index('"Reset Render Section"'):]
+    assert "keepTakePadding: DEFAULT_EDITOR_SETTINGS.render.keepTakePadding" in reset[:800]
+    assert 'createCheckbox(\n        renderSection,\n        "keepTakePadding"' in panel

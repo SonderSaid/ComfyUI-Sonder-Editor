@@ -10601,6 +10601,7 @@ export class EditorWidget {
         this._setWidgetValue("take_placement_muted", !!settings?.render?.takePlacementMuted);
         this._setWidgetValue("take_fit_mode", fitMode);
         this._setWidgetValue("take_crop_position", cropPosition);
+        this._setWidgetValue("take_keep_padding", settings?.render?.keepTakePadding === true);
     }
 
     _trackCollapseSceneKey(scene = this.activeScene) {
@@ -25409,6 +25410,7 @@ export class EditorWidget {
             frame_constraint: this._resolveFrameConstraintForTemplate(this._templateId),
             dimension_constraint: getDimensionConstraint(this._getActiveTemplate()),
             take_placement_mode: this._settings?.render?.takePlacementMode ?? "trimmed",
+            take_keep_padding: this._settings?.render?.keepTakePadding === true,
             // take_placement_linked / take_placement_muted intentionally NOT
             // snapshotted: they resolve from live settings/widgets at execution
             // (user decision 2026-06-11).

@@ -330,6 +330,7 @@ edits affect a queued job and which don't.
 | **Scene geometry** | width, height, FPS at queue time |
 | **Model template** | the selected template and its frame rule |
 | **Take placement mode** | trimmed/untrimmed, per job |
+| **Keep take padding** | on/off, per job |
 
 ### Still live at execution time
 

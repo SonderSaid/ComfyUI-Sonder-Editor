@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- **Keep take padding** (Settings ▸ Render, and the Controls tab's Editor group): place a new take with the extra frames a model renders to meet its frame rule, when the render generated them, from the take's start to the end of the file. A take whose kept frames run past the scene's end says so. Off by default; a queued job keeps the choice it was queued with.
 - Output Views can show a sampler's live preview: pick a sampler or KJNodes Model Preview Override from a pane's **Sampling previews** list and watch its newest preview, labelled with the step, while the workflow runs. Works in fullscreen, mounted tabs and the Sonder App.
 - Output Views can follow the timeline: a Save Video take, or an output with timing you set in Manage, plays and scrubs with the editor, says when the playhead is outside what it generated, catches up after a stall, marks when the scene changed in its range since it ran, and can take over the sound from the timeline.
 - Viewport panes: show up to four sources side by side (one pane, two or three columns, or 2×2): the composite, Guides, a Driver lane, or a named output View. Pick an output node from a pane to create its View; run that output alone, cancel it, hold a result to compare with the next, and rename, reorder or delete Views in Manage. Works in fullscreen, mounted tabs and the Sonder App.

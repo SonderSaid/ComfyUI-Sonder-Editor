@@ -6043,6 +6043,8 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
 
     raw_take_placement_mode = body.get("take_placement_mode", "trimmed")
     take_placement_mode = raw_take_placement_mode if raw_take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
+    # Keep padding freezes with the mode; only a real boolean true turns it on.
+    take_keep_padding = body.get("take_keep_padding") is True
     # take_placement_linked / take_placement_muted are deliberately NOT read from
     # the body: they are live editing preferences resolved from the editor widgets
     # at execution time, never frozen into the job (user decision 2026-06-11).
@@ -6088,6 +6090,7 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
         frame_constraint=frame_constraint,
         dimension_constraint=dimension_constraint,
         take_placement_mode=take_placement_mode,
+        take_keep_padding=take_keep_padding,
         params=params,
     )
 

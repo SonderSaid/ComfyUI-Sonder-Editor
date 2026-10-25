@@ -77,6 +77,10 @@ def editor_optional_inputs() -> dict[str, tuple[str, dict[str, Any]]]:
             "default": DEFAULT_CROP_POSITION,
             "tooltip": "Crop anchor stamped on newly placed takes (set by editor settings).",
         }),
+        "take_keep_padding": ("BOOLEAN", {
+            "default": False,
+            "tooltip": "Place a take with its generated model-frame padding instead of trimming it (set by editor settings).",
+        }),
     }
 
 

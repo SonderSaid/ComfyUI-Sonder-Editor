@@ -730,7 +730,8 @@ class SonderEditor:
                 prompt=None, unique_id=None, take_placement_mode="trimmed",
                 take_placement_linked=True, take_placement_muted=False,
                 render_cache_max_bytes=0, render_queue_active=True,
-                take_fit_mode=DEFAULT_FIT_MODE, take_crop_position=DEFAULT_CROP_POSITION):
+                take_fit_mode=DEFAULT_FIT_MODE, take_crop_position=DEFAULT_CROP_POSITION,
+                take_keep_padding=False):
         # A repeat within one prompt must not claim the run token or a queue job
         # again, or hand downstream nodes a second project object.
         return run_once_per_prompt(prompt, unique_id, "SonderEditor", lambda: self._execute_once(
@@ -742,6 +743,7 @@ class SonderEditor:
             take_placement_linked=take_placement_linked, take_placement_muted=take_placement_muted,
             render_cache_max_bytes=render_cache_max_bytes, render_queue_active=render_queue_active,
             take_fit_mode=take_fit_mode, take_crop_position=take_crop_position,
+            take_keep_padding=take_keep_padding,
         ))
 
     def _execute_once(self, project, project_name, fps, width, height,
@@ -751,7 +753,8 @@ class SonderEditor:
                       prompt=None, unique_id=None, take_placement_mode="trimmed",
                       take_placement_linked=True, take_placement_muted=False,
                       render_cache_max_bytes=0, render_queue_active=True,
-                      take_fit_mode=DEFAULT_FIT_MODE, take_crop_position=DEFAULT_CROP_POSITION):
+                      take_fit_mode=DEFAULT_FIT_MODE, take_crop_position=DEFAULT_CROP_POSITION,
+                      take_keep_padding=False):
         base_dir = _get_projects_base_dir()
         execute_started_at = time.perf_counter()
         render_cache_requested = render_cache_max_bytes
@@ -764,6 +767,7 @@ class SonderEditor:
         take_placement_mode = take_placement_mode if take_placement_mode in ("trimmed", "untrimmed") else "trimmed"
         take_placement_linked = self._coerce_bool(take_placement_linked, True)
         take_placement_muted = self._coerce_bool(take_placement_muted, False)
+        take_keep_padding = self._coerce_bool(take_keep_padding, False)
         take_fit_mode = str(take_fit_mode or DEFAULT_FIT_MODE).strip().lower()
         if take_fit_mode not in FIT_MODES:
             take_fit_mode = DEFAULT_FIT_MODE
@@ -1348,13 +1352,14 @@ class SonderEditor:
             else:
                 audio = self._minimal_audio_output()
 
-            # --- Queue snapshots freeze take placement MODE only; linked/muted are
-            # live editing preferences resolved from the hidden widgets at execution
-            # (user decision 2026-06-11 — never frozen per job). ---
+            # --- Queue snapshots freeze take placement MODE and Keep padding;
+            # linked/muted are live editing preferences resolved from the hidden
+            # widgets at execution (user decision 2026-06-11 — never frozen per job). ---
             if queue_job:
                 raw_mode = getattr(queue_job, "take_placement_mode", None)
                 if raw_mode in ("trimmed", "untrimmed"):
                     take_placement_mode = raw_mode
+                take_keep_padding = getattr(queue_job, "take_keep_padding", False) is True
 
             # Drift-correction reference: downsampled copies of the mask-protected
             # context frames, paired by index at save time (never persisted — the
@@ -1399,6 +1404,7 @@ class SonderEditor:
                 "frame_count": frame_count,
                 "frame_count_padding": frame_count_padding,
                 "take_placement_mode": take_placement_mode,
+                "take_keep_padding": take_keep_padding,
                 "take_placement_linked": take_placement_linked,
                 "take_placement_muted": take_placement_muted,
                 "take_fit_mode": take_fit_mode,

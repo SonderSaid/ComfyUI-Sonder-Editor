@@ -2575,6 +2575,7 @@ class GenerationJob:
     frame_constraint: dict | None = None
     dimension_constraint: dict | None = None
     take_placement_mode: str = "trimmed"
+    take_keep_padding: bool = False
     take_placement_linked: bool = True
     take_placement_muted: bool = False
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
@@ -2627,6 +2628,7 @@ class GenerationJob:
             "frame_constraint": self.frame_constraint,
             "dimension_constraint": self.dimension_constraint,
             "take_placement_mode": self.take_placement_mode,
+            "take_keep_padding": self.take_keep_padding,
             "take_placement_linked": self.take_placement_linked,
             "take_placement_muted": self.take_placement_muted,
             "created_at": self.created_at,
@@ -2688,6 +2690,7 @@ class GenerationJob:
             frame_constraint=data.get("frame_constraint"),
             dimension_constraint=data.get("dimension_constraint"),
             take_placement_mode=take_placement_mode,
+            take_keep_padding=data.get("take_keep_padding") is True,
             take_placement_linked=bool(data.get("take_placement_linked", data.get("take_linked", True))),
             take_placement_muted=bool(data.get("take_placement_muted", data.get("take_muted", False))),
             created_at=data.get("created_at", ""),

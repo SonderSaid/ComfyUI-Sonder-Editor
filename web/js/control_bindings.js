@@ -61,7 +61,8 @@ export const DENIED_INPUTS = {
     SonderDriverSelector: ["driver_selector_overrides_json"],
     SonderEditor: ["mask_post_offset", "mask_pre_offset", "post_context_frames", "pre_context_frames", "project",
         "render_cache_max_bytes", "render_queue_active", "scene_id", "selection_end", "selection_start",
-        "take_crop_position", "take_fit_mode", "take_placement_linked", "take_placement_mode", "take_placement_muted"],
+        "take_crop_position", "take_fit_mode", "take_keep_padding", "take_placement_linked", "take_placement_mode",
+        "take_placement_muted"],
     SonderGuidesBridgeStart: ["bridge_overrides_json", "iteration_index"],
 };
 // Mirrors server/binding_policy.py PICKERS: "class/input" -> the picker kind.

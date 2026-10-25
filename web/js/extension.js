@@ -1080,6 +1080,7 @@ app.registerExtension({
                     "render_queue_active",
                     "take_fit_mode",
                     "take_crop_position",
+                    "take_keep_padding",
                 ];
 
                 // Store original types

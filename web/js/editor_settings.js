@@ -396,6 +396,7 @@ export const DEFAULT_EDITOR_SETTINGS = {
         takePlacementMode: "trimmed",
         linkedTakePlacement: true,
         takePlacementMuted: false,
+        keepTakePadding: false,
         defaultSavePreset: DEFAULT_SAVE_PRESET,
         maxRenderCacheSizeBytes: 0,
         trashRetentionDays: 5,
@@ -1469,6 +1470,7 @@ export function normalizeEditorSettings(source = null) {
             takePlacementMuted: stored?.render?.takePlacementMuted == null
                 ? defaults.render.takePlacementMuted
                 : !!stored.render.takePlacementMuted,
+            keepTakePadding: stored?.render?.keepTakePadding === true,
             defaultSavePreset: VALID_SAVE_PRESETS.has(stored?.render?.defaultSavePreset)
                 ? stored.render.defaultSavePreset
                 : defaults.render.defaultSavePreset,
@@ -1663,6 +1665,7 @@ const readBool = value => {
 export const CONTROLS_PANEL_SETTINGS = Object.freeze({
     "render.takePlacementMuted": readBool,
     "render.linkedTakePlacement": readBool,
+    "render.keepTakePadding": readBool,
     "batchRender.maxFramesPerChunk": value => {
         const text = typeof value === "number" ? String(value) : String(value ?? "").trim();
         if (!/^\d+$/.test(text) || Number(text) > BATCH_FRAMES_MAX) {

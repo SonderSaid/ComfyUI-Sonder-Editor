@@ -138,6 +138,7 @@ const EDITOR_WIDGET_FIELDS = [
     "take_fit_mode",
     "take_crop_position",
     "render_queue_active",
+    "take_keep_padding",
 ];
 
 const PREVIEW_WIDGET_FIELDS = new Set([
@@ -1857,7 +1858,7 @@ export class EditorNodeController {
             const fallback = name === "scene_id" ? ""
                 : name === "take_placement_mode" ? "trimmed"
                 : name === "take_placement_linked" ? true
-                    : name === "take_placement_muted" ? false
+                    : name === "take_placement_muted" || name === "take_keep_padding" ? false
                         : name === "take_fit_mode" ? "pad_edge"
                             : name === "take_crop_position" ? "center"
                                 : name === "render_queue_active" ? true

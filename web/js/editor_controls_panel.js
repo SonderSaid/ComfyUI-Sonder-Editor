@@ -45,6 +45,8 @@ const LONG_VALUE = 18; // a choice longer than this gets a wide card
 const MIRRORS = [
     { key: "render.takePlacementMuted", label: "Takes start muted", kind: "BOOLEAN" },
     { key: "render.linkedTakePlacement", label: "Link take video + audio", kind: "BOOLEAN" },
+    { key: "render.keepTakePadding", label: "Keep take padding", kind: "BOOLEAN",
+        title: "Place new takes with the extra frames a model renders to meet its frame rule, when the render generated them. Queued jobs keep the choice they were queued with." },
     { key: "batchRender.maxFramesPerChunk", label: "Max frames per batch", kind: "INT",
         title: "Total frames per + Batch job, context included; 0 uses the built-in size. Snaps up to the model's frame rule." },
 ];

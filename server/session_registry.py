@@ -44,6 +44,7 @@ WIDGET_FIELD_NAMES = {
     "take_fit_mode",
     "take_crop_position",
     "render_queue_active",
+    "take_keep_padding",
 }
 
 HostKey = tuple[str, str]

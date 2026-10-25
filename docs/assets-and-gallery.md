@@ -90,17 +90,27 @@ unlocked and visible; otherwise they add a row.
 ![A generated take placed on its own linked video and audio lanes](images/take-placed.webp)
 
 How takes land is set in **Settings** (the **⚙** at the right end of the
-toolbar) **▸ Render**. **Takes start muted** and **Link take video + audio**
-also appear in the **Editor** group of the [Controls](controls.md) tab:
+toolbar) **▸ Render**. **Takes start muted**, **Link take video + audio** and
+**Keep take padding** also appear in the **Editor** group of the
+[Controls](controls.md) tab:
 
 - **Take Placement Mode:** **Trimmed** places the Selection plus any context
   you deliberately include with **Mask Pre/Post**. Automatic model alignment
   does not extend that placement. **Untrimmed** also places the context frames,
-  for checking seams. Both modes leave model-frame padding out of the timeline;
-  the saved file still contains the complete output.
+  for checking seams. Both modes leave model-frame padding out of the timeline
+  unless **Keep Take Padding** is on; the saved file always contains the
+  complete output.
 - **Link Take Video + Audio:** picture and sound move and mute together.
 - **New Takes Start Muted:** a new take doesn't change what plays until you
   unmute it.
+- **Keep Take Padding:** off by default. Some models need a set number of
+  frames, so they render a few extra at the end. Tick it to place those frames
+  too: the take still starts where it would, but runs to the end of the file.
+  The extra frames are generated only when no post-context sits outside
+  **Mask Post**; otherwise the take is trimmed as usual. At the end of a scene
+  the kept frames land past its end, and the take says so: lengthen the scene
+  to see and hear them. A take that is queued keeps the choice it was queued
+  with.
 
 ### Which takes should start muted
 

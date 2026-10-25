@@ -14,7 +14,13 @@ def calculate_take_placement(context: dict, encoded_frame_count: int) -> dict:
 
     count = max(0, int(encoded_frame_count))
     padding = max(0, integer("frame_count_padding"))
-    available = max(0, count - padding)
+    # Keep padding exposes the whole encoded tail, but only when the Editor's mask
+    # reached the end of the tensor: otherwise the pad was never generated (the
+    # repeated last frame sits after post-context, outside the mask). With zero
+    # padding it changes nothing.
+    keep_padding = (context.get("take_keep_padding") is True and padding > 0
+                    and integer("mask_end_frame", -1) >= integer("frame_count", count))
+    available = count if keep_padding else max(0, count - padding)
     start = integer("selection_start")
     end = integer("selection_end", start + count)
     pre = max(0, integer("actual_pre_context_frames",
@@ -30,7 +36,8 @@ def calculate_take_placement(context: dict, encoded_frame_count: int) -> dict:
         timeline_start = start - pre
     else:
         source_in = min(available, pre - before)
-        source_out = max(source_in, min(available, pre + max(0, end - start) + after))
+        source_out = available if keep_padding else max(
+            source_in, min(available, pre + max(0, end - start) + after))
         timeline_start = start - before
     return {
         "source_in_frame": source_in,
