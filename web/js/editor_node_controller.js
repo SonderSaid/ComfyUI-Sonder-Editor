@@ -39,6 +39,7 @@ import { createCanvasControlsRelay } from "./controls_canvas_relay.js";
 import { createRunOutputsClient } from "./run_outputs_client.js";
 import { BRANCH_WAIT_MS, runBranch } from "./run_registration.js";
 import { createCanvasViewsHost } from "./views_hosts.js";
+import { viewPathState } from "./control_bindings.js";
 import { EditorWidget, buildProjectAssetViewURL, importFileIntoProject, replaceAssetInProject, importFailureMessage } from "./editor_widget.js";
 import { loadMediaAsBlob, mountSharedAssetGallery } from "./shared_asset_gallery.js";
 import { deriveCurrentSceneAssetIds } from "./current_scene_assets.js";
@@ -818,7 +819,9 @@ class FullscreenEditorSession {
         const editor = new EditorWidget(this.controller.node, {
             controlsHost: this.controller.getControlsHost(),
             // Output Views: this page's runs and branch runs (fullscreen has none of its own).
-            viewsHost: createCanvasViewsHost({ controller: this.controller, apiURL: path => api.apiURL(path) }),
+            viewsHost: createCanvasViewsHost({ controller: this.controller, apiURL: path => api.apiURL(path),
+                // The pane picker greys out a "seen" sampling node that is off or gone.
+                nodeState: path => viewPathState(this.controller.node?.graph?.rootGraph || this.controller.node?.graph, path) }),
             onFullscreenExit: () => this._handleEditorClosed(),
             onMountInTab: () => this.controller.mountFullscreenInTab(),
             onWidgetValueChange: (name, value) => this.controller.onEditorWidgetValueChange(name, value),

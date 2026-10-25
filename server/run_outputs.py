@@ -551,14 +551,14 @@ def record_live(bound: dict, source: str, record: dict, payload: tuple | None, s
             if not (isinstance(owner, tuple) and owner):
                 continue
             if owner[0] == "sdk":
-                _prefer_eviction_locked(("sdk", bound["workflow_id"], source), bound["seq"], prompt_id, source)
+                _prefer_eviction_locked(("sdk", bound["workflow_id"], source), _live_order(bound), prompt_id, source)
                 continue
             if owner[0] != "host":
                 continue
             key = (owner, bound["workflow_id"], source)
             latest = _LIVE_LATEST.get(key)
             if latest is not None and latest[1] != prompt_id:
-                if latest[0] > bound["seq"]:
+                if latest[0] > _live_order(bound):
                     # A newer run already shows this source: a late payload is never shown.
                     _drop_payload_locked(prompt_id, source, entry, "evicted")
                     entry["superseded"] = True
@@ -567,7 +567,7 @@ def record_live(bound: dict, source: str, record: dict, payload: tuple | None, s
                 if older is not None:
                     _drop_payload_locked(latest[1], source, older, "evicted")
                     older["superseded"] = True
-            _LIVE_LATEST[key] = (bound["seq"], prompt_id)
+            _LIVE_LATEST[key] = (_live_order(bound), prompt_id)
         while _LIVE_BYTES["total"] > LIVE_BUDGET_BYTES and _PAYLOADS:
             oldest = next(iter(_PAYLOADS))
             if oldest == (prompt_id, source):
@@ -591,17 +591,27 @@ def record_live(bound: dict, source: str, record: dict, payload: tuple | None, s
             logger.exception("Live preview listener failed")
 
 
-def _prefer_eviction_locked(key: tuple, seq: int, prompt_id: str, source: str) -> None:
+def _live_order(bound: dict) -> tuple:
+    """Which of two runs' previews is newer: the one that started later.
+
+    ComfyUI runs one prompt at a time but not in registration order (Queue
+    Front), so start order decides; registration ``seq`` breaks ties and orders
+    runs that have not started.
+    """
+    return (int(bound.get("started_seq") or 0), int(bound.get("seq") or 0))
+
+
+def _prefer_eviction_locked(key: tuple, order: tuple, prompt_id: str, source: str) -> None:
     """Sonder App runs: put the payload no read shows any more at the front of the budget."""
     latest = _LIVE_LATEST.get(key)
     if latest is None or latest[1] == prompt_id:
-        _LIVE_LATEST[key] = (seq, prompt_id)
+        _LIVE_LATEST[key] = (order, prompt_id)
         return
-    if latest[0] > seq:
+    if latest[0] > order:
         stale = (prompt_id, source)
     else:
         stale = (latest[1], source)
-        _LIVE_LATEST[key] = (seq, prompt_id)
+        _LIVE_LATEST[key] = (order, prompt_id)
     if stale in _PAYLOADS:
         _PAYLOADS.move_to_end(stale, last=False)
 
@@ -618,11 +628,14 @@ def read_live(owners: Iterable[tuple], workflow_id: str = "", sources: Iterable[
     wanted = [str(source) for source in sources if str(source)][:MAX_SOURCES_PER_READ]
     runs = [_with_scope(bound) for bound in sdk_runs.visible_bound(owners, workflow_id)]
     ran = [bound for bound in runs if bound["outcome"] != OUTCOME_REMOVED]
+    # Newest first by the order runs started in (Queue Front reorders them);
+    # `latest_run` stays the owner's newest registration.
+    live_order = sorted(ran, key=_live_order, reverse=True)
     with _LOCK:
         empty = _new_data()
         answer = {}
         for source in wanted:
-            relevant = [bound for bound in ran
+            relevant = [bound for bound in live_order
                         if source in (_DATA.get(bound["prompt_id"]) or empty)["live"]
                         or _in_scope(bound, _DATA.get(bound["prompt_id"]) or empty, source)]
             if not relevant:
@@ -657,12 +670,16 @@ def read_live(owners: Iterable[tuple], workflow_id: str = "", sources: Iterable[
             suppressed_by = next((other for other, item in newest_data["live"].items()
                                   if other != source and item.get("publisher") == "kj"
                                   and item.get("via") == source), None)
+            ran_set = newest_data["ran"]
             answer[source] = {
                 "state": state,
                 "live": _live_public(record) if record is not None else None,
                 "run": {"prompt_id": newest["prompt_id"], "seq": newest["seq"], "finished": newest["finished"],
                         "outcome": newest["outcome"], "preview_method": newest_data["preview_method"],
-                        "suppressed_by": suppressed_by, "in_scope": True},
+                        "suppressed_by": suppressed_by, "in_scope": True,
+                        # Whether the node itself executed (null until the run says): a
+                        # node served from ComfyUI's cache sends no previews.
+                        "source_ran": (source in ran_set) if ran_set is not None else None},
                 "latest_run": _latest_public(ran[0], relevant),
             }
         seen: dict[str, dict] = {}

@@ -8,7 +8,7 @@
 // server/control_manifest.py and server/control_descriptors.py are the authority.
 import { getGraphLink, getGraphNode } from "./project_source_resolver.js";
 import { findControlWidget, seedModeWidget } from "./control_widgets.js";
-import { cleanGroup, DESCRIPTION_MAX, VIEW_FEED_OUTPUT, VIEW_FEED_SAMPLING, viewFeed } from "./control_targets.js";
+import { cleanGroup, DESCRIPTION_MAX, KJ_PREVIEW_CLASS, VIEW_FEED_OUTPUT, VIEW_FEED_SAMPLING, viewFeed } from "./control_targets.js";
 import { pluralName, rowFieldGroup, rowGroupOf, rowGroups, rowsLinked, rowWidgetsReady } from "./control_rows.js";
 
 export { DESCRIPTION_MAX, VIEW_FEED_OUTPUT, VIEW_FEED_SAMPLING, cleanGroup, groupNameError, isStructuralTarget, parseTarget, viewFeed } from "./control_targets.js";
@@ -342,7 +342,7 @@ export function readExecution(raw) {
 
 // Always offered as sampling-preview sources; mirrors control_views.SAMPLING_CLASSES.
 export const SAMPLING_CLASSES = new Set(["KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced",
-    "ModelPreviewOverrideKJ"]);
+    KJ_PREVIEW_CLASS]);
 
 // The saved Views, tolerant like control_manifest.read_views (parity-tested).
 export const isOurViewsSection = raw => isPlainObject(raw) && (!Object.hasOwn(raw, "v") || raw.v === VIEWS_VERSION);
@@ -1181,6 +1181,17 @@ export function isOutputNodeOf(node) {
 function pathOffReason(node, hosts) {
     for (const host of hosts) if (isOff(host)) return { mode: modeName(host), by: "parent", label: String(host.title || nodeType(host)) };
     return offReason(node, null);
+}
+
+// Whether a node path can take a new View on the live graph, for the pane
+// picker's "seen" rows: {missing: true} | {inactive: reason} | null (it can).
+// The canvas sends bodies only for some switched-off nodes, so the server
+// refuses any other one that is off.
+export function viewPathState(root, path) {
+    const resolved = root ? resolveExecPath(root, path) : null;
+    if (!resolved) return { missing: true };
+    const reason = pathOffReason(resolved.node, resolved.hosts);
+    return reason ? { inactive: reason } : null;
 }
 
 // Every View of a manifest on the live graph: {status, path, class_type,

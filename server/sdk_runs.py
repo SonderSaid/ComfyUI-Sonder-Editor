@@ -56,6 +56,7 @@ _RELEASES: dict[str, dict[str, Any]] = {}
 _KEY_BY_PROMPT_OBJECT: dict[int, str] = {}
 _TOKENS: dict[str, dict[str, Any]] = {}
 _SEQ = itertools.count(1)
+_STARTED_SEQ = itertools.count(1)
 # receipt -> registration. Unbound ones expire; bound ones are kept a while so a
 # re-queued prompt carrying the same receipt is recognised and not observed twice.
 _RECEIPTS: dict[str, dict[str, Any]] = {}
@@ -637,7 +638,7 @@ def _bound_public(bound: dict[str, Any]) -> dict[str, Any]:
         "scope_known": bound["scope"] is not _SCOPE_UNSET, "prompt_keys": bound["prompt_keys"],
         "graph_rev": bound["graph_rev"], "saved_to_project": bound["saved_to_project"],
         "committed_modified_at": bound["committed_modified_at"], "cancel_requested": bound["cancel_requested"],
-        "finished_at": bound["finished_at"],
+        "finished_at": bound["finished_at"], "started_seq": bound.get("started_seq", 0),
     }
 
 
@@ -733,6 +734,15 @@ def mark_bound_started(prompt_id: Any) -> None:
         bound = _BOUND.get(_key(prompt_id))
         if bound is not None and bound["state"] == BOUND_QUEUED:
             bound["state"] = BOUND_STARTED
+            # ComfyUI runs one prompt at a time, but not in registration order
+            # (Queue Front): live previews follow the order runs started in.
+            bound["started_seq"] = next(_STARTED_SEQ)
+
+
+def any_bound_started() -> bool:
+    """Whether a bound run is executing now."""
+    with _LOCK:
+        return any(bound["state"] == BOUND_STARTED for bound in _BOUND.values())
 
 
 def _end_bound_locked(bound: dict[str, Any], outcome: str) -> None:

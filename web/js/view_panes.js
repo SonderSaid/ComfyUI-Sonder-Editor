@@ -2,12 +2,15 @@
 // Guides, a Driver lane or an output View. Owns the grid, the layout control
 // (1 / 2 / 3 / 2×2) in the viewport header and each pane's chrome: its source
 // button and picker, status chip, Hold/Release, Run/Cancel, item picker, fit
-// and sound, and for a video or audio output its Link to the editor clock. The
-// coordinator (views_coordinator.js) owns state; the widget owns the Composite
-// canvas and is told where it goes (`placeComposite`).
+// and sound, and for a video or audio output its Link to the editor clock. A
+// sampling-preview View (Phase 4) shows its node's newest preview with its
+// step, and offers only Fit and zoom/pan. The coordinator (views_coordinator.js)
+// owns state; the widget owns the Composite canvas and is told where it goes
+// (`placeComposite`).
 import { LAYOUTS, LAYOUT_LABELS, LAYOUT_ORDER, LAYOUT_TITLES, entryPlayer, pickerSections } from "./views_model.js";
 import { openPanePicker } from "./view_pane_picker.js";
 import { mountOutputMedia, messageEl } from "./output_pane_media.js";
+import { mountSamplingMedia } from "./sampling_pane_media.js";
 import { mountDriverPainter, mountGuidesPainter } from "./editor_source_followers.js";
 import { fileKey } from "./output_media_cache.js";
 import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, THEME, TYPE, segmentCss, setButtonDisabled, setButtonVariant } from "./editor_theme.js";
@@ -50,6 +53,8 @@ export function sourceLabel(model, { driverLabel = index => `Driver ${index + 1}
 function contentKey(model) {
     const source = model.source;
     if (source.kind !== "view") return `${source.kind}:${source.index ?? ""}`;
+    // A sampling pane mounts once and swaps its previews in place.
+    if (model.sampling) return `view:${source.viewId}:sampling`;
     return `view:${source.viewId}:${model.entry ? fileKey(model.entry) : ""}`;
 }
 
@@ -127,7 +132,17 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         const onStatus = text => { entry.painterStatus = text; showMessage(entry, text); };
         if (source.kind === "guides") entry.content = mountGuidesPainter({ canvas: paneCanvas(), cell: entry.body, host: sourceHost, onStatus });
         else if (source.kind === "driver") entry.content = mountDriverPainter({ canvas: paneCanvas(), cell: entry.body, host: sourceHost, index: source.index, onStatus });
-        else if (source.kind === "view" && model.entry) {
+        else if (source.kind === "view" && model.sampling) {
+            entry.content = mountSamplingMedia({
+                container: entry.body, fit: model.pane.fit, zoom: model.pane.zoom,
+                onZoom: zoom => {
+                    clearTimeout(zoomTimers.get(index));
+                    zoomTimers.set(index, setTimeout(() => coordinator.setPaneOption(index, { zoom }), ZOOM_SAVE_MS));
+                },
+                onCondition: condition => coordinator.setMediaCondition(index, condition),
+            });
+            entry.content.show(model.frame);
+        } else if (source.kind === "view" && model.entry) {
             entry.content = mountOutputMedia({
                 container: entry.body, entry: model.entry, cache, paneId: coordinator.paneId(index), audio,
                 fit: model.pane.fit, zoom: model.pane.zoom, takeSaved: !!model.result?.run?.saved_to_project,
@@ -153,6 +168,10 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
     function actionsFor(index, model) {
         const out = [];
         if (model.source.kind !== "view") return out;
+        if (model.sampling) {
+            if (model.frame) out.push(fitButton(index, model));
+            return out;
+        }
         const entries = model.entries || [];
         if (entries.length > 1 && !model.held) {
             const prev = button("◀", "Previous item");
@@ -165,16 +184,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
             out.push(prev, count, next);
         }
         const player = model.entry ? entryPlayer(model.entry) : null;
-        if (player && player !== "audio" && player !== "unsupported") {
-            const fit = button(model.pane.fit === "cover" ? "Fill" : "Fit", model.pane.fit === "cover"
-                ? "The output fills the pane. Show all of it" : "The whole output shows. Fill the pane");
-            fit.addEventListener("click", () => {
-                const value = model.pane.fit === "cover" ? "contain" : "cover";
-                coordinator.setPaneOption(index, { fit: value });
-                cells[index]?.content?.setFit?.(value);
-            });
-            out.push(fit);
-        }
+        if (player && player !== "audio" && player !== "unsupported") out.push(fitButton(index, model));
         // A video or audio output follows the editor clock while linked.
         if (model.linkable) {
             const on = !!model.pane.link;
@@ -223,10 +233,22 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         return out;
     }
 
+    function fitButton(index, model) {
+        const fit = button(model.pane.fit === "cover" ? "Fill" : "Fit", model.pane.fit === "cover"
+            ? "The output fills the pane. Show all of it" : "The whole output shows. Fill the pane");
+        fit.addEventListener("click", () => {
+            const value = model.pane.fit === "cover" ? "contain" : "cover";
+            coordinator.setPaneOption(index, { fit: value });
+            cells[index]?.content?.setFit?.(value);
+        });
+        return fit;
+    }
+
     function actionSignature(model) {
         return JSON.stringify([model.entries?.length || 0, model.itemIndex, model.pane.fit, model.audible, model.held, model.holdPending,
             model.unavailable, model.canHold, model.cancellable, model.runnable,
-            model.entry ? entryPlayer(model.entry) : null, !!model.linkable, !!model.pane.link, !!model.linked]);
+            model.entry ? entryPlayer(model.entry) : null, !!model.linkable, !!model.pane.link, !!model.linked,
+            !!model.sampling, !!model.frame]);
     }
 
     function renderPane(index, single) {
@@ -237,6 +259,9 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
             destroyContent(entry);
             entry.key = key;
             mountContent(index, entry, model);
+        } else if (model.sampling) {
+            // A newer preview (or none to show): swapped in place.
+            entry.content?.show?.(model.frame);
         } else if (model.source.kind === "view") {
             // A new run's timing, a Link toggle, a length check: no remount.
             entry.content?.setLink?.(model.linked ? model.link : null);
@@ -248,7 +273,8 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         entry.sourceButton.textContent = `${sourceLabel(model, { driverLabel: sourceHost.driverLabel })} ▾`;
         entry.sourceButton.setAttribute("aria-expanded", String(picker?.index === index));
         entry.chip.textContent = model.chip || "";
-        entry.chip.title = model.chip || "";
+        // "Matched through the model chain" for a reattributed KJ preview.
+        entry.chip.title = [model.chip, model.chipTitle].filter(Boolean).join(" · ");
         const signature = actionSignature(model);
         if (entry.actionSignature !== signature) {
             entry.actionSignature = signature;
@@ -317,7 +343,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
             anchor, sections, current: coordinator.layout().panes[index]?.source,
             onPick: value => {
                 if (value.source) coordinator.assign(index, value.source);
-                else if (value.candidate) void coordinator.createView(index, value.candidate);
+                else if (value.candidate) void coordinator.createView(index, value.candidate, value.feed ? { feed: value.feed } : undefined);
             },
             onClose: () => {
                 if (picker?.handle === handle) picker = null;
@@ -332,6 +358,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         const view = coordinator.controlsView() || {};
         return pickerSections({
             views: view.views || [], candidates: view.view_candidates || [], drivers: sourceHost.driverLanes(),
+            samplingCandidates: view.view_sampling_candidates || [], seen: coordinator.liveSeen(), nodeState: coordinator.nodeState,
             // A Relay error (two Relays, a muted one) leaves no Views and no candidates: say why.
             viewsError: view.views_error || view.error || null, viewsReady: view.state === "ready",
         });

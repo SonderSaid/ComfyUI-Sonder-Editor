@@ -47,6 +47,9 @@ SERVED_MIMES = KJ_MIMES | frozenset(NATIVE_MIMES.values())
 # The inputs a model chain runs through: a sampler's model (or guider) and, upstream,
 # each patch node's model. A latent or image link is another chain (a second pass).
 MODEL_TYPES = frozenset({"MODEL", "GUIDER"})
+# A passthrough reached through a model link carries the model on: a switch's
+# "*" inputs, a V3 MatchType or an input that takes several types including MODEL.
+GENERIC_TYPES = frozenset({"*", "COMFY_MATCHTYPE_V3"})
 MAX_INPUT_TYPE_CLASSES = 2048
 # Base64 characters kept per payload; a larger one records ``too_large`` only.
 MAX_PAYLOAD_CHARS = 16 * 1024 * 1024
@@ -182,6 +185,15 @@ def _source_info(prompt_id: str, source: str) -> dict | None:
     return info
 
 
+def _only_override(prompt_id: str) -> str | None:
+    """The prompt's one ``ModelPreviewOverrideKJ`` key, or None (none, several, or no prompt)."""
+    prompt = sdk_runs.bound_prompt(prompt_id)
+    if not isinstance(prompt, dict):
+        return None
+    keys = [key for key, node in prompt.items() if isinstance(node, dict) and node.get("class_type") == KJ_CLASS]
+    return keys[0] if len(keys) == 1 else None
+
+
 def _kj_chain(prompt_id: str, via: str) -> frozenset | None:
     """The Override nodes upstream of a sampler, one walk per (prompt, sampler)."""
     known = run_outputs.live_kj_chain(prompt_id, via)
@@ -222,6 +234,15 @@ def _input_types(class_type: Any) -> dict | None:
     return types
 
 
+def _carries_model(declared: Any) -> bool:
+    """Whether a linked input of this declared type can be the model chain."""
+    if declared is None:
+        return True  # not a plain type name: unknown, followed
+    if declared in MODEL_TYPES or declared in GENERIC_TYPES:
+        return True
+    return any(part.strip() in MODEL_TYPES for part in declared.split(","))
+
+
 def _model_upstream(prompt: dict, via: str) -> set[str]:
     """Prompt keys on the sampler's model chain: only MODEL/GUIDER links are followed.
 
@@ -247,7 +268,7 @@ def _model_upstream(prompt: dict, via: str) -> set[str]:
             continue
         types = _input_types(node.get("class_type"))
         for name, upstream in links:
-            if types is not None and types.get(str(name)) not in MODEL_TYPES:
+            if types is not None and not _carries_model(types.get(str(name))):
                 continue
             if upstream not in seen:
                 stack.append(upstream)
@@ -335,8 +356,12 @@ def _observe_kj(data: Any) -> None:
     context = _context()
     if context is None:
         _bump("unattributed_kj")
-        kj_preview_adapter.note_unattributed()
+        # Only while a run Sonder observes executes: a stray event from another
+        # thread or an unbound client says nothing about the runs panes show.
+        if sdk_runs.any_bound_started():
+            kj_preview_adapter.note_unattributed()
         return
+    kj_preview_adapter.note_attributed()
     prompt_id = str(context.prompt_id or "")
     named = data.get("prompt_id")
     if isinstance(named, str) and named and named != prompt_id:
@@ -358,6 +383,10 @@ def _observe_kj(data: Any) -> None:
         source, reattributed = next(iter(chain)), True
     elif chain is None and run_outputs.live_source_info(prompt_id, raw):
         source = raw  # finished run in its grace: the verdict was taken on its first record
+    elif chain is not None and not chain and _only_override(prompt_id) == raw:
+        # The walk found none (a passthrough it can't read), but the prompt holds
+        # exactly one Override node: no other node's wrapper can be reused.
+        source = raw
     else:
         _bump("kj_ambiguous")
         return

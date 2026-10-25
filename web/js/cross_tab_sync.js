@@ -63,6 +63,9 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
                 publishRunEvent(projectId, event);
                 handlers.onOutputsChanged?.(event);
             }
+            // A run recorded a live sampling preview (at most every 250 ms per
+            // run): ids only; sampling panes read runs/live again.
+            else if (event.type === "live_preview") publishRunEvent(projectId, event);
             // Mounted run lane (session_registry): the canvas claims, the tab
             // rereads its request's outcome.
             else if (event.type === "run_requests_pending") handlers.onRunRequestsPending?.(event);

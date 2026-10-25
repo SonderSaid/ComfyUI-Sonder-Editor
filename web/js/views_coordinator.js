@@ -20,9 +20,19 @@
 // Editor's executed window) follows the editor clock; `paneModel` resolves the
 // link (view_timing.js) and whether the scene changed in its range since
 // ("Previous context", compared against the run's recorded digest).
+//
+// Live sampling previews (Phase 4): a sampling View's pane reads runs/live
+// instead, one read for every visible sampling pane, latest-wins, on a pane
+// change, an own live_preview hint or a finish hint (each coalesced per
+// animation frame), the page becoming visible, and the picker opening (a
+// seen-only read, for its Sampling previews group). A 2 s poll runs only while
+// a pane is waiting, live or showing a previous run. Each pane fetches the
+// newest preview's bytes when the read names a newer one than it has, one
+// fetch at a time; a 409 (a newer run took the node) reads once more, and a
+// refused preview is never asked for twice.
 import {
     MAX_PANES, assignSource, cancelAvailability, isDefaultLayout, mediaStatus, normalizeLayout, paneCount, refusalText,
-    runAvailability, sameSource, viewPaneStatus,
+    runAvailability, sameSource, samplingMediaStatus, samplingPaneStatus, viewPaneStatus,
 } from "./views_model.js";
 import { TIMELINE } from "./audio_ownership.js";
 import { mintId } from "./controls_manage.js";
@@ -36,6 +46,11 @@ export const KEEPALIVE_MS = 10 * 60 * 1000;
 export const UNCONFIRMED_MS = 60000;
 // While the editor plays, Previous context is checked at most this often.
 export const PREVIOUS_CONTEXT_PLAYING_MS = 500;
+// A sampling pane re-reads this often while a run may still send previews,
+// in case a hint was missed.
+export const LIVE_POLL_MS = 2000;
+const LIVE_POLLED = new Set(["waiting", "live", "previous"]);
+const VIEW_UNUSABLE = ["missing", "duplicate", "kind", "unsupported"];
 const HOLD_LIMIT_REASON = "Up to 8 results can be held at once, shared with this workflow's other editor tab. Release one first.";
 
 // `scene` is the editor's own scene for linking: {projectId(), sceneId(), fps(),
@@ -48,7 +63,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
     let key = "";
     let layout = normalizeLayout(null);
     const panes = Array.from({ length: MAX_PANES }, () => ({ held: null, outcome: null, condition: null, followerState: null, previous: null, released: false, creating: false,
-        duration: null }));
+        duration: null, frame: null, fetch: null, refused: null, retry: null, creatingFeed: null }));
     let answer = null; // the latest readOutputs answer
     let readToken = 0;
     let reading = null;
@@ -61,7 +76,15 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
     let sessionLost = false;
     let capability = null;
     let unsubscribeHint = null;
+    let unsubscribeLiveHint = null;
     let hintClient = null;
+    let live = null; // the latest runs/live answer {sources, seen, sampling}
+    let liveReading = null;
+    let liveAgain = false;
+    let livePollTimer = null;
+    let liveHintFrame = null;
+    let liveSignature = "";
+    let liveToken = 0; // bumped when the project or host changes: older answers are dropped
     const cleanups = [];
     const changed = () => { if (!destroyed) onChange(); };
 
@@ -72,6 +95,8 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
     const visibleCount = () => paneCount(layout.layout);
     const viewPanes = () => layout.panes.slice(0, visibleCount())
         .map((pane, index) => ({ pane, index })).filter(({ pane }) => pane.source.kind === "view");
+    const isSampling = view => viewFeed(view) === VIEW_FEED_SAMPLING;
+    const samplingPanes = () => viewPanes().filter(({ pane }) => isSampling(viewFor(pane.source.viewId)));
 
     // ── Layout ───────────────────────────────────────────────────────────────
 
@@ -87,7 +112,12 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         key = next;
         layout = normalizeLayout(key ? layoutStore.read(key) : null);
         answer = null;
-        for (const pane of panes) Object.assign(pane, { held: null, outcome: null, condition: null, followerState: null, previous: null, released: false, creating: false });
+        live = null;
+        liveToken++;
+        for (const [index, pane] of panes.entries()) {
+            resetLive(index);
+            Object.assign(pane, { held: null, outcome: null, condition: null, followerState: null, previous: null, released: false, creating: false });
+        }
         return true;
     }
 
@@ -105,9 +135,9 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         // already here, and a file still shown keeps playing (no remount).
         for (const { pane } of viewPanes()) {
             const view = viewFor(pane.source.viewId);
-            // A sampling View has no file results: it reads runs/live instead (Phase 4C).
-            if (viewFeed(view) === VIEW_FEED_SAMPLING) continue;
-            if (view?.path && !["missing", "duplicate", "kind", "unsupported"].includes(view.status)) paths.add(view.path);
+            // A sampling View has no file results: it reads runs/live instead.
+            if (isSampling(view)) continue;
+            if (view?.path && !VIEW_UNUSABLE.includes(view.status)) paths.add(view.path);
         }
         return [...paths].sort();
     }
@@ -199,12 +229,131 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         const reader = client();
         if (reader === hintClient) return;
         unsubscribeHint?.();
+        unsubscribeLiveHint?.();
         hintClient = reader;
         unsubscribeHint = reader?.onOutputsChanged?.(() => {
+            // A finish hint also settles a sampling pane (Last preview, From cache).
+            liveHint();
             if (hintFrame !== null) return;
             hintFrame = true; // set first: a frame callback may run at once
             raf(() => { hintFrame = null; scheduleRead(); });
         }) || null;
+        unsubscribeLiveHint = reader?.onLivePreview?.(liveHint) || null;
+    }
+    function liveHint() {
+        if (liveHintFrame !== null) return;
+        liveHintFrame = true;
+        raf(() => { liveHintFrame = null; scheduleLive(); });
+    }
+
+    // ── Live sampling previews ───────────────────────────────────────────────
+
+    function liveSources() {
+        const paths = new Set();
+        for (const { pane } of samplingPanes()) {
+            const view = viewFor(pane.source.viewId);
+            if (view?.path && !VIEW_UNUSABLE.includes(view.status)) paths.add(view.path);
+        }
+        return [...paths].sort();
+    }
+    // A pane let go of its node (another source, closed, another workflow):
+    // its fetch stops and its preview goes.
+    function resetLive(index) {
+        const state = panes[index];
+        state.fetch?.controller.abort();
+        state.fetch = null;
+        state.frame = null;
+        state.refused = null;
+        state.retry = null;
+    }
+    function scheduleLive() {
+        // The picker reads too, with no sampling pane: its seen group.
+        if (!canRead() || (!samplingPanes().length && !pickerOpen)) { scheduleLivePoll(); return; }
+        if (liveReading) { liveAgain = true; return; }
+        liveReading = readLive().finally(() => {
+            liveReading = null;
+            if (liveAgain && !destroyed) { liveAgain = false; scheduleLive(); }
+        });
+    }
+    async function readLive() {
+        const reader = client();
+        if (!reader?.readLive) return;
+        const wanted = liveSources();
+        const forKey = key;
+        const token = liveToken;
+        liveSignature = wanted.join(",");
+        let result;
+        try {
+            result = await reader.readLive(wanted);
+        } catch (_error) {
+            result = null;
+        }
+        if (destroyed || forKey !== key || token !== liveToken) return;
+        if (result?.ok) {
+            live = result;
+            // A fetch that could not reach the server is tried again once per read.
+            for (const pane of panes) pane.retry = null;
+            fetchFrames();
+        }
+        scheduleLivePoll();
+        changed();
+    }
+    function scheduleLivePoll() {
+        clearTimer(livePollTimer);
+        livePollTimer = null;
+        const active = canRead() && samplingPanes().some(({ pane }) => LIVE_POLLED.has(liveRead(viewFor(pane.source.viewId))?.state));
+        if (active) livePollTimer = setTimer(() => { livePollTimer = null; scheduleLive(); }, LIVE_POLL_MS);
+    }
+    const liveRead = view => (view?.path ? live?.sources?.[view.path] || null : null);
+    function liveStatus(view) {
+        return samplingPaneStatus({ view, read: liveRead(view), sampling: live?.sampling || null, sessionLost,
+            viewsError: controls.getView()?.views_error || controls.getView()?.error || null });
+    }
+    // Each pane that should show a newer preview than it has fetches it.
+    function fetchFrames() {
+        for (const { pane, index } of samplingPanes()) {
+            const view = viewFor(pane.source.viewId);
+            const record = liveRead(view)?.live;
+            const state = panes[index];
+            if (state.fetch || !record?.has_payload || !liveStatus(view).show) continue;
+            if (state.frame?.source === view.path && state.frame.promptId === record.prompt_id && state.frame.n >= record.n) continue;
+            const asked = `${record.prompt_id}#${record.n}`;
+            if (state.refused === asked || state.retry === asked) continue;
+            void fetchFrame(index, view.path, record);
+        }
+    }
+    async function fetchFrame(index, source, record) {
+        const reader = client();
+        const state = panes[index];
+        if (!reader?.fetchLiveBytes) return;
+        const fetch = { controller: new AbortController(), token: liveToken };
+        state.fetch = fetch;
+        const asked = `${record.prompt_id}#${record.n}`;
+        let result;
+        try {
+            result = await reader.fetchLiveBytes(record.prompt_id, source, { signal: fetch.controller.signal });
+        } catch (_error) {
+            result = { ok: false, code: "unreachable" };
+        }
+        if (destroyed || state.fetch !== fetch || fetch.token !== liveToken) return; // aborted: the pane moved on
+        state.fetch = null;
+        if (result?.ok) {
+            const n = Number.isFinite(result.n) ? result.n : record.n;
+            state.frame = { key: `${record.prompt_id}#${n}`, promptId: record.prompt_id, source, n, mime: result.mime || record.mime, blob: result.blob };
+            if (state.condition === "too_large") state.condition = null;
+        } else if (result?.status === 409) {
+            // A newer run took the node: read once more, then wait for a hint or the poll.
+            state.refused = asked;
+            scheduleLive();
+        } else if (result?.code === "unreachable") {
+            // ComfyUI restarting, the network down: the next hint, poll or read tries again.
+            state.retry = asked;
+        } else {
+            state.refused = asked;
+            if (result?.code === "too_large") state.condition = "too_large";
+        }
+        changed();
+        fetchFrames(); // a newer preview may have been named meanwhile
     }
 
     // ── Runs ─────────────────────────────────────────────────────────────────
@@ -326,11 +475,11 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
             outcome: state.outcome, released: state.released };
         if (pane.source.kind !== "view") return model;
         const view = viewFor(pane.source.viewId);
-        if (!view && state.creating) return { ...model, view: null, message: "Adding this output…", chip: null, entries: [], entry: null,
+        if (!view && state.creating) return { ...model, view: null, entries: [], entry: null, chip: null,
+            message: state.creatingFeed === VIEW_FEED_SAMPLING ? "Adding this sampling preview…" : "Adding this output…",
             runnable: { show: false }, cancellable: { show: false }, canHold: false };
-        // A sampling View has no file results: never another read's files (Phase 4C reads runs/live).
-        const sampling = viewFeed(view) === VIEW_FEED_SAMPLING;
-        const item = view?.path && !sampling ? answer?.sources?.[view.path] || null : null;
+        if (isSampling(view)) return samplingModel(index, model, view);
+        const item = view?.path ? answer?.sources?.[view.path] || null : null;
         const status = viewPaneStatus({ view, read: item, run: state.outcome, hold: heldRecord(index), held: !!state.held && !state.held.pending,
             // A Relay error leaves no Views: the pane says why, not "no longer in the workflow".
             sessionLost, viewsError: controls.getView()?.views_error || controls.getView()?.error || null });
@@ -358,17 +507,36 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         }
         return {
             ...model, view, read: item, status, entries, itemIndex, entry, chip,
-            linkable: !sampling && !!entry && isLinkable(entry), link, linked, outside,
+            linkable: !!entry && isLinkable(entry), link, linked, outside,
             message: media?.message || status.message || (outside ? "Outside generated range" : linked && link.pending ? "Linking…" : null),
             unavailable: !!status.unavailable,
             result: status.result, runnable: runAvailability({ view, capability, outcome: state.outcome, busy, sessionLost }),
             cancellable: cancelAvailability(state.outcome && !state.outcome.canceling ? state.outcome : null),
-            canHold: !sampling && !state.held && !!entry && !!status.result?.prompt_id && !sessionLost,
+            canHold: !state.held && !!entry && !!status.result?.prompt_id && !sessionLost,
             audible: audio?.owner() === paneId(index),
         };
     }
 
     const paneId = index => `pane:${index}`;
+
+    // A sampling preview pane: the newest fetched preview of the run the read
+    // names, its step, and why nothing shows. Inspection only: no Run, Hold,
+    // Link or sound.
+    function samplingModel(index, model, view) {
+        const state = panes[index];
+        const read = liveRead(view);
+        const status = liveStatus(view);
+        const frame = status.show && state.frame && read?.live && state.frame.source === view.path
+            && state.frame.promptId === read.live.prompt_id ? state.frame : null;
+        const media = status.show ? samplingMediaStatus(state.condition) : null;
+        return {
+            ...model, view, sampling: true, read, status, frame, entries: [], itemIndex: 0, entry: null,
+            chip: media?.chip || status.chip, chipTitle: media ? "" : status.chipTitle,
+            message: media?.message || status.message || null,
+            linkable: false, link: null, linked: false, outside: false, unavailable: false, result: null,
+            runnable: runAvailability({ view, capability, sessionLost }), cancellable: { show: false }, canHold: false, audible: false,
+        };
+    }
 
     // The pane's link: {linked: true, map, audioMap, Fm, sig, previous, ...}
     // | {linked: false, reason, text} | null (not linkable, or no editor scene).
@@ -437,6 +605,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         for (let i = visibleCount(); i < Math.max(before, MAX_PANES); i++) {
             if (panes[i].held) releasePane(i, { quiet: true });
             audio?.release(paneId(i));
+            resetLive(i);
             panes[i].condition = null;
             panes[i].followerState = null;
         }
@@ -444,6 +613,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         syncDemand();
         changed();
         scheduleRead();
+        scheduleLive();
     }
 
     function assign(index, source) {
@@ -453,12 +623,14 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
             if (sameSource(pane.source, before[i])) return;
             if (panes[i].held) releasePane(i, { quiet: true });
             audio?.release(paneId(i));
+            resetLive(i);
             Object.assign(panes[i], { outcome: null, condition: null, followerState: null, previous: null, released: false });
         });
         persist();
         syncDemand();
         changed();
         scheduleRead();
+        scheduleLive();
     }
 
     function setPaneOption(index, patch) {
@@ -486,13 +658,15 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         const previous = layout.panes[index]?.source || null;
         assign(index, { kind: "view", viewId: id });
         panes[index].creating = true;
+        panes[index].creatingFeed = feed;
         changed();
         let result;
         try { result = await write; } catch (error) { result = { ok: false, rejected: [{ reason: error?.message }] }; }
         if (destroyed) return false;
         panes[index].creating = false;
         if (!result?.ok) {
-            notify(result?.rejected?.[0]?.reason || "The output could not be added as a View.");
+            notify(result?.rejected?.[0]?.reason || (feed === VIEW_FEED_SAMPLING
+                ? "The sampling preview could not be added as a View." : "The output could not be added as a View."));
             if (layout.panes[index]?.source.viewId === id) assign(index, previous || { kind: "guides" });
             return false;
         }
@@ -542,16 +716,22 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         setPickerOpen(open) {
             pickerOpen = !!open;
             syncDemand();
+            // Its Sampling previews group lists the nodes recent runs saw.
+            if (pickerOpen) scheduleLive();
         },
+        // Nodes that sent previews in this owner's recent runs (the picker's seen rows).
+        liveSeen: () => live?.seen || [],
+        // Whether a node can take a new View, where the page can tell (the canvas).
+        nodeState: path => current()?.nodeState?.(path) || null,
         // Fullscreen opened or closed (the panes mount only while it shows).
         setVisible(next) {
             visible = !!next;
             if (!visible) {
                 releaseAll();
-                for (let i = 0; i < MAX_PANES; i++) audio?.release(paneId(i));
+                for (let i = 0; i < MAX_PANES; i++) { audio?.release(paneId(i)); resetLive(i); }
             }
             syncDemand();
-            if (visible) { watchHints(); scheduleRead(); } else schedulePolls();
+            if (visible) { watchHints(); scheduleRead(); scheduleLive(); } else { schedulePolls(); scheduleLivePoll(); }
             changed();
         },
         // The host changed under the panes (a project switch, a Sonder App workflow switch).
@@ -562,6 +742,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
             syncDemand();
             changed();
             scheduleRead();
+            scheduleLive();
         },
         // The other editor tab on this workflow saved a newer layout (browser
         // storage sync): the last write wins, as for other layout settings.
@@ -577,33 +758,45 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
                 if (sameSource(pane.source, before[i]) && i < visibleCount()) return;
                 if (panes[i].held) releasePane(i, { quiet: true });
                 audio?.release(paneId(i));
+                resetLive(i);
                 Object.assign(panes[i], { outcome: null, condition: null, followerState: null, previous: null, released: false, creating: false });
             });
             if (count !== visibleCount() || layout.panes.some((pane, i) => !sameSource(pane.source, before[i]))) {
                 syncDemand();
                 changed();
                 scheduleRead();
+                scheduleLive();
             } else changed();
         },
         // Another project: its holds end and its results go; the layout stays.
         projectChanged() {
             releaseAll();
             answer = null;
+            live = null;
+            liveToken++;
             for (const pane of panes) Object.assign(pane, { outcome: null, condition: null, followerState: null, previous: null, released: false, creating: false });
-            for (let i = 0; i < MAX_PANES; i++) audio?.release(paneId(i));
+            for (let i = 0; i < MAX_PANES; i++) { audio?.release(paneId(i)); resetLive(i); }
             watchHints();
             changed();
             scheduleRead();
+            scheduleLive();
         },
-        refresh: scheduleRead,
+        refresh() { scheduleRead(); scheduleLive(); },
         start() {
             adoptKey();
             const adapter = current();
             askCapability();
-            cleanups.push(adapter?.onSessionLost?.(() => { sessionLost = true; syncDemand(); schedulePolls(); changed(); }) || (() => {}));
-            cleanups.push(adapter?.onSessionRestored?.(() => { sessionLost = false; askCapability(); syncDemand(); scheduleRead(); changed(); }) || (() => {}));
-            cleanups.push(controls.subscribe?.(() => { syncDemand(); changed(); scheduleRead(); }) || (() => {}));
-            const onVisibility = () => { if (!documentRef.hidden) { askCapability(); scheduleRead(); } };
+            cleanups.push(adapter?.onSessionLost?.(() => { sessionLost = true; syncDemand(); schedulePolls(); scheduleLivePoll(); changed(); }) || (() => {}));
+            cleanups.push(adapter?.onSessionRestored?.(() => { sessionLost = false; askCapability(); syncDemand(); scheduleRead(); scheduleLive(); changed(); }) || (() => {}));
+            cleanups.push(controls.subscribe?.(() => {
+                syncDemand();
+                changed();
+                scheduleRead();
+                // A describe that resolves a sampling pane's node: read it. One
+                // that changes nothing a read names (most of them) reads nothing.
+                if (liveSources().join(",") !== liveSignature) scheduleLive();
+            }) || (() => {}));
+            const onVisibility = () => { if (!documentRef.hidden) { askCapability(); scheduleRead(); scheduleLive(); } };
             documentRef?.addEventListener?.("visibilitychange", onVisibility);
             cleanups.push(() => documentRef?.removeEventListener?.("visibilitychange", onVisibility));
             const onPageHide = () => releaseAll({ keepalive: true });
@@ -615,11 +808,14 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         destroy() {
             if (destroyed) return;
             releaseAll();
+            for (let i = 0; i < MAX_PANES; i++) resetLive(i);
             destroyed = true;
             for (const fn of cleanups.splice(0)) { try { fn(); } catch (_error) { /* torn down */ } }
             unsubscribeHint?.();
+            unsubscribeLiveHint?.();
             clearTimer(pollTimer);
             clearTimer(keepaliveTimer);
+            clearTimer(livePollTimer);
             current()?.setViewsDemand?.(false);
         },
     };

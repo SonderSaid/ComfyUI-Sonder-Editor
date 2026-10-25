@@ -46,6 +46,9 @@ export function parseTarget(target) {
 export const VIEW_FEED_OUTPUT = "output";
 export const VIEW_FEED_SAMPLING = "sampling";
 export const viewFeed = entry => (entry?.feed === VIEW_FEED_SAMPLING ? VIEW_FEED_SAMPLING : VIEW_FEED_OUTPUT);
+// KJNodes Model Preview Override, the one third-party sampling-preview
+// publisher (server/kj_preview_adapter.KJ_CLASS).
+export const KJ_PREVIEW_CLASS = "ModelPreviewOverrideKJ";
 
 export const STRUCTURAL_OPS = {
     binding: BINDING_STRUCTURAL_OPS, note: new Set(["create", "remove", "hide", "unhide"]),

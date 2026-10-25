@@ -10,10 +10,14 @@ const SDK_SECRET_HEADER = "X-Sonder-SDK-Session";
 const SDK_TAB_HEADER = "X-Sonder-Tab-Session";
 const DIAG_HINTS = 32;
 
-// Every page that syncs a project feeds its `outputs_changed` and
-// `run_request_changed` events here (cross_tab_sync.js), whichever mode it is;
-// clients pick their own.
-const RUN_EVENTS = new Set(["outputs_changed", "run_request_changed"]);
+// Every page that syncs a project feeds its `outputs_changed`,
+// `run_request_changed` and `live_preview` events here (cross_tab_sync.js),
+// whichever mode it is; clients pick their own.
+const RUN_EVENTS = new Set(["outputs_changed", "run_request_changed", "live_preview"]);
+// Hints that name the runs they concern (host ids, Sonder App run ids).
+const OWNED_HINTS = new Set(["outputs_changed", "live_preview"]);
+// A live sampling preview larger than this is refused on the client too.
+export const LIVE_BYTES_MAX = 16 * 1024 * 1024;
 const hintListeners = new Set();
 const diag = { clients: new Map(), hints: [] };
 
@@ -67,11 +71,11 @@ export function createRunOutputsClient({ mode, identity, apiURL, fetchImpl = glo
         ...(keepalive ? { keepalive: true } : {}),
     }).then(json);
 
-    // Whether an `outputs_changed` event concerns this host. The Sonder App
+    // Whether an `outputs_changed` or `live_preview` event concerns this host. The Sonder App
     // matches the run ids it knows; with none known yet, any hint counts and
     // the authorized read decides.
     const isOwnHint = (event) => {
-        if (event?.type !== "outputs_changed") return false;
+        if (!OWNED_HINTS.has(event?.type)) return false;
         const id = identity() || {};
         if (sdk) {
             const runIds = typeof id.runIds === "function" ? id.runIds() : id.runIds;
@@ -79,6 +83,16 @@ export function createRunOutputsClient({ mode, identity, apiURL, fetchImpl = glo
             return Array.isArray(event.run_ids) && event.run_ids.some(runId => runIds.includes(runId));
         }
         return Array.isArray(event.host_ids) && event.host_ids.includes(id.hostId || "");
+    };
+
+    const subscribe = (type, listener) => {
+        if (typeof listener !== "function") return () => {};
+        const relay = (projectId, event) => {
+            if (projectId !== String((identity() || {}).projectId || "")) return;
+            if (event?.type === type && isOwnHint(event)) listener(event);
+        };
+        hintListeners.add(relay);
+        return () => hintListeners.delete(relay);
     };
 
     const client = {
@@ -112,17 +126,35 @@ export function createRunOutputsClient({ mode, identity, apiURL, fetchImpl = glo
                 ? post(`/${encodeURIComponent(runId)}/cancel`, {})
                 : post(`/${encodeURIComponent(promptId)}/cancel`, {});
         },
-        isOwnHint,
-        // `listener(event)` for each hint about this host's runs. Returns cleanup.
-        onOutputsChanged(listener) {
-            if (typeof listener !== "function") return () => {};
-            const relay = (projectId, event) => {
-                if (projectId !== String((identity() || {}).projectId || "")) return;
-                if (isOwnHint(event)) listener(event);
-            };
-            hintListeners.add(relay);
-            return () => hintListeners.delete(relay);
+        // Live sampling previews (Phase 4): each source's state, the shown
+        // record and the publishers this owner's runs saw. `sources` may be
+        // empty: a seen-only read, for the pane picker.
+        readLive(sources, { workflowId = (identity() || {}).workflowId || "" } = {}) {
+            return get("/live", { sources: [...sources].join(","), workflow_id: workflowId });
         },
+        // The newest preview of one run's source, as a blob: {ok, status, code?,
+        // n (X-Sonder-Live-N), mime, blob}. `too_large` past LIVE_BYTES_MAX.
+        async fetchLiveBytes(promptId, source, { signal } = {}) {
+            const query = new URLSearchParams({ ...hostFields(), source });
+            const resp = await fetchImpl(apiURL(`${base()}/live/${encodeURIComponent(promptId)}/bytes?${query}`),
+                { headers: headers(), cache: "no-store", ...(signal ? { signal } : {}) });
+            if (!resp.ok) {
+                const answer = await json(resp);
+                return { ok: false, status: resp.status, code: String(answer.code || "") };
+            }
+            const declared = Number(resp.headers?.get?.("Content-Length"));
+            if (Number.isFinite(declared) && declared > LIVE_BYTES_MAX) return { ok: false, status: resp.status, code: "too_large" };
+            const blob = await resp.blob();
+            if (blob.size > LIVE_BYTES_MAX) return { ok: false, status: resp.status, code: "too_large" };
+            const n = Number(resp.headers?.get?.("X-Sonder-Live-N"));
+            return { ok: true, status: resp.status, n: Number.isFinite(n) ? n : null,
+                mime: String(resp.headers?.get?.("Content-Type") || blob.type || "").split(";")[0].trim(), blob };
+        },
+        isOwnHint,
+        // `listener(event)` for each `outputs_changed` hint about this host's runs. Returns cleanup.
+        onOutputsChanged: listener => subscribe("outputs_changed", listener),
+        // `listener(event)` for each `live_preview` hint about this host's runs. Returns cleanup.
+        onLivePreview: listener => subscribe("live_preview", listener),
         dispose() {
             diag.clients.delete(client);
         },

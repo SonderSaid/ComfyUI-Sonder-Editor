@@ -397,3 +397,19 @@ out.refused = [r.ok, r.rejected?.[0]?.reason, preview.properties.sonderViews ?? 
 """)
     assert out["refused"][0] is False and "moved" in out["refused"][1]
     assert out["refused"][2] == {"": "old"}
+
+
+def test_view_path_state_says_off_or_gone_for_the_pane_pickers_seen_rows():
+    out = run("""
+const custom = add(inner, 'MySampler', 21);
+out.ok = B.viewPathState(root, '12:21');
+out.gone = [B.viewPathState(root, '12:99'), B.viewPathState(root, '77'), B.viewPathState(null, '6')];
+custom.mode = 4;
+out.self = B.viewPathState(root, '12:21');
+custom.mode = 0; host.mode = 2;
+out.parent = B.viewPathState(root, '12:21');
+""")
+    assert out["ok"] is None
+    assert out["gone"] == [{"missing": True}] * 3
+    assert out["self"] == {"inactive": {"mode": "bypassed", "by": "self", "label": "MySampler"}}
+    assert out["parent"] == {"inactive": {"mode": "muted", "by": "parent", "label": "Pass two"}}

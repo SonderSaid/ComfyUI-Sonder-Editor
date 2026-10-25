@@ -6,7 +6,7 @@
 // or a named output View (the Relay's `views` section). Sources and layout
 // are inspection only; nothing here reaches a prompt or the project.
 
-import { VIEW_FEED_SAMPLING, viewFeed } from "./control_targets.js";
+import { KJ_PREVIEW_CLASS, VIEW_FEED_SAMPLING, viewFeed } from "./control_targets.js";
 
 export const LAYOUTS = Object.freeze({ "1": 1, "2c": 2, "3c": 3, "2x2": 4 });
 export const LAYOUT_ORDER = Object.freeze(["1", "2c", "3c", "2x2"]);
@@ -113,9 +113,14 @@ export const compositePane = record => visiblePanes(record).findIndex(pane => pa
 
 // ── Picker ───────────────────────────────────────────────────────────────────
 
-// The pane picker's sections. `views` and `candidates` come from the Controls
-// view (the server's one list of eligible outputs); `drivers` from the scene.
-export function pickerSections({ views = [], candidates = [], drivers = [], viewsError = null, viewsReady = true } = {}) {
+// The pane picker's sections. `views`, `candidates` and `samplingCandidates`
+// come from the Controls view (the server's lists of eligible outputs and core
+// samplers); `seen` from a runs/live read (nodes that sent previews in a recent
+// run); `drivers` from the scene. `nodeState(path)` says, where the page can
+// tell (the canvas), that a seen node is switched off or gone: {inactive} |
+// {missing} | null.
+export function pickerSections({ views = [], candidates = [], samplingCandidates = [], seen = [], drivers = [], viewsError = null,
+    viewsReady = true, nodeState = () => null } = {}) {
     const editor = [
         { kind: "composite", label: "Composite", source: { kind: "composite" } },
         { kind: "guides", label: "Guides", source: { kind: "guides" } },
@@ -126,12 +131,28 @@ export function pickerSections({ views = [], candidates = [], drivers = [], view
         status: view.status, detail: view.status !== "ok" ? "Unavailable" : view.participation === "inactive" ? "Switched off" : "",
         reason: view.reason || "",
     }));
+    // One View per node, whatever it shows: a path any View has is taken.
     const taken = new Set(views.map(view => view.path).filter(Boolean));
+    const where = candidate => (candidate.inactive ? inactiveText(candidate.inactive) : candidate.path.includes(":") ? "Inside a subgraph" : "");
     const add = candidates.filter(candidate => !taken.has(candidate.path)).map(candidate => ({
-        kind: "candidate", label: candidate.title || candidate.class_type, candidate,
-        detail: candidate.inactive ? inactiveText(candidate.inactive) : candidate.path.includes(":") ? "Inside a subgraph" : "",
+        kind: "candidate", label: candidate.title || candidate.class_type, candidate, detail: where(candidate),
     }));
-    return { editor, views: viewItems, add, viewsError, viewsReady };
+    const sampling = samplingCandidates.filter(candidate => !taken.has(candidate.path)).map(candidate => ({
+        kind: "sampling", label: candidate.title || candidate.class_type, candidate, detail: where(candidate),
+    }));
+    const listed = new Set([...taken, ...sampling.map(item => item.candidate.path)]);
+    for (const entry of seen) {
+        const path = typeof entry?.source === "string" ? entry.source : "";
+        if (!path || listed.has(path)) continue;
+        listed.add(path);
+        const candidate = { path, class_type: String(entry.class_type || ""), title: String(entry.title || "") };
+        const state = nodeState(path);
+        const off = state?.missing ? "This node is no longer in the workflow"
+            : state?.inactive ? `${inactiveText(state.inactive)}. Switch it on to add it` : "";
+        sampling.push({ kind: "sampling", label: candidate.title || candidate.class_type || path, candidate, seen: true,
+            detail: off || "Sent previews in a recent run", disabled: !!off });
+    }
+    return { editor, views: viewItems, add, sampling, viewsError, viewsReady };
 }
 
 export function inactiveText(reason) {
@@ -243,6 +264,69 @@ export function viewPaneStatus({ view = null, read = null, run = null, hold = nu
         default:
             return { message: "No result yet", chip: null, result: null };
     }
+}
+
+// The pane for a sampling-preview View (Phase 4). `read` is the runs/live
+// answer for its node ({state, live, run, latest_run}); `sampling` the
+// server's capability ({native, kj: {state}}), from the same read. Returns
+// {message, chip, chipTitle, show (show the newest fetched preview)}.
+export const KJ_UNMATCHED = "Model Preview Override previews can't be matched to a run with this KJNodes version";
+export function samplingPaneStatus({ view = null, read = null, sampling = null, sessionLost = false, viewsError = null } = {}) {
+    const nothing = (message, chip) => ({ message, chip, show: false, chipTitle: "" });
+    if (sessionLost) return nothing("Disconnected", null);
+    if (viewsError) return nothing(viewsError, "Unavailable");
+    if (!view) return nothing("This View is no longer in the workflow. Pick another source.", "Unavailable");
+    if (VIEW_PROBLEMS.has(view.status)) return nothing(`${view.reason || "This View can't be shown."} Fix in Manage Controls.`, "Unavailable");
+    // Without the KJ adapter its step previews carry no run: none can be shown truthfully.
+    if (view.class_type === KJ_PREVIEW_CLASS && ["unsupported", "degraded"].includes(sampling?.kj?.state)) return nothing(KJ_UNMATCHED, "Unavailable");
+    const live = read?.live || null;
+    const steps = Number.isFinite(live?.step) ? (Number.isFinite(live?.total) && live.total > 0 ? ` · step ${live.step}/${live.total}` : ` · step ${live.step}`) : "";
+    const chipTitle = live?.reattributed ? "Matched through the model chain" : "";
+    // The owner's newest run left this node out (another output ran on its own).
+    const leftOut = read?.latest_run && read.latest_run.in_scope === false;
+    const outNote = leftOut ? " · Not in the newest run" : "";
+    let status;
+    switch (read?.state || "none") {
+        case "live": status = { message: null, chip: `Sampling${steps}`, show: true }; break;
+        case "last": status = { message: null, chip: `Last preview${steps}${outNote}`, show: true }; break;
+        case "cached": status = { message: null, chip: `From cache${outNote}`, show: true }; break;
+        case "previous": status = { message: null, chip: "Previous run · Running", show: true }; break;
+        // A Model Preview Override on the sampler's model takes its previews while it runs too.
+        case "waiting": status = { message: read.run?.suppressed_by ? "This sampler's previews go to Model Preview Override"
+            : "Waiting for previews", chip: "Running", show: false }; break;
+        case "no_previews": {
+            // A run that was canceled or failed may have ended before the node ran.
+            if (read.run?.outcome && read.run.outcome !== "success") {
+                const word = outcomeWord(read.run);
+                status = { message: word, chip: word, show: false };
+                break;
+            }
+            const native = live?.publisher !== "kj" && view.class_type !== KJ_PREVIEW_CLASS;
+            // A node ComfyUI served from its cache did not run, so it sent nothing. (An
+            // Override node can be cached while its sampler runs: not said for KJ.)
+            const message = read.run?.suppressed_by ? "This sampler's previews went to Model Preview Override"
+                : native && read.run?.source_ran === false ? "This node came from ComfyUI's cache in the last run, so it sent no previews"
+                : native && read.run?.preview_method === "none"
+                    ? "Previews were off for this run (ComfyUI's Live preview method setting, or --preview-method)"
+                    : "No previews arrived from this node in the last run";
+            status = { message, chip: "No previews", show: false };
+            break;
+        }
+        case "evicted": status = { message: "This preview is no longer kept", chip: "Unavailable", show: false }; break;
+        case "too_large": status = { message: "Too large to show here", chip: "Unavailable", show: false }; break;
+        case "unsupported": status = { message: "This preview type can't be shown here", chip: "Unsupported", show: false }; break;
+        default: status = { message: leftOut ? "The newest run didn't include this node" : "No result yet", chip: null, show: false };
+    }
+    // A switched-off sampler keeps showing its last preview.
+    if (view.participation === "inactive") status = { ...status, chip: "Switched off", message: status.show ? null : status.message };
+    return { ...status, chipTitle };
+}
+
+// A client-side condition of a shown preview overrides the read.
+export function samplingMediaStatus(condition) {
+    if (condition === "too_large") return { message: "Too large to show here", chip: "Unavailable" };
+    if (condition === "decode" || condition === "unsupported") return { message: "This preview type can't be shown here", chip: "Unsupported" };
+    return null;
 }
 
 // A media-level condition overrides the read: the file was gone, too large, or

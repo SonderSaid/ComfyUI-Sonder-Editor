@@ -1,9 +1,12 @@
 // The pane picker: a toggled menu under a pane's source button. Sections:
-// Editor (Composite, Guides, each Driver lane), Views (with their status) and
-// Add output… (output nodes without a View; muted ones say why). It closes
+// Editor (Composite, Guides, each Driver lane), Views (with their status), Add
+// output… (output nodes without a View; muted ones say why) and Sampling
+// previews (core samplers and nodes that sent previews in a recent run; one the
+// page knows is off or gone is greyed out with why). It closes
 // from its trigger, on an outside pointer and on Escape (keyboard ownership,
 // OVERLAY). Owns its DOM and listeners; returns close().
 import { register, PRIORITY } from "./keyboard_ownership.js";
+import { VIEW_FEED_SAMPLING } from "./control_targets.js";
 import { EDITOR_COLORS as COLORS, FONT, SPACE, TYPE, chromeMenuCss } from "./editor_theme.js";
 
 let serial = 0;
@@ -20,25 +23,26 @@ function heading(text) {
         + "text-transform:uppercase;letter-spacing:0.06em;");
 }
 
-function row(label, detail, { selected = false, onPick, title = "" } = {}) {
+function row(label, detail, { selected = false, onPick, title = "", disabled = false } = {}) {
     const button = make("button", undefined, `display:flex;flex-direction:column;align-items:flex-start;gap:1px;width:100%;box-sizing:border-box;`
-        + `padding:${SPACE.s1 + 1}px ${SPACE.s3}px;border:0;background:${selected ? COLORS.accentSoft : "transparent"};cursor:pointer;`
-        + `color:${COLORS.text};font:${TYPE.t11}px ${FONT.sans};text-align:left;`);
+        + `padding:${SPACE.s1 + 1}px ${SPACE.s3}px;border:0;background:${selected ? COLORS.accentSoft : "transparent"};`
+        + `cursor:${disabled ? "not-allowed" : "pointer"};color:${disabled ? COLORS.textDim : COLORS.text};font:${TYPE.t11}px ${FONT.sans};text-align:left;`);
     button.type = "button";
     if (title) button.title = title;
     button.setAttribute("role", "menuitem");
     if (selected) button.setAttribute("aria-current", "true");
+    if (disabled) button.setAttribute("aria-disabled", "true");
     const name = make("span", label, "overflow-wrap:anywhere;");
     button.append(name);
     if (detail) button.append(make("span", detail, `color:${COLORS.textDim};font-size:${TYPE.t10}px;overflow-wrap:anywhere;`));
-    button.addEventListener("mouseenter", () => { if (!selected) button.style.background = COLORS.panelRaisedHover; });
+    button.addEventListener("mouseenter", () => { if (!selected && !disabled) button.style.background = COLORS.panelRaisedHover; });
     button.addEventListener("mouseleave", () => { if (!selected) button.style.background = "transparent"; });
-    button.addEventListener("click", event => { event.stopPropagation(); onPick(); });
+    button.addEventListener("click", event => { event.stopPropagation(); if (!disabled) onPick(); });
     return button;
 }
 
 // `sections` comes from views_model.pickerSections; `current` is the pane's
-// source. onPick({source}) or onPick({candidate}).
+// source. onPick({source}), onPick({candidate}) or onPick({candidate, feed: VIEW_FEED_SAMPLING}).
 export function openPanePicker({ anchor, sections, current, onPick, onClose = () => {} }) {
     const menu = make("div", undefined, chromeMenuCss(220) + "max-height:min(70vh,520px);overflow:auto;");
     menu.setAttribute("role", "menu");
@@ -72,6 +76,19 @@ export function openPanePicker({ anchor, sections, current, onPick, onClose = ()
         else if (!next.viewsReady) menu.append(make("div", "Reading the workflow's outputs…", `padding:2px ${SPACE.s3}px ${SPACE.s1}px;color:${COLORS.textDim};font-size:${TYPE.t11}px;`));
         else if (!next.add.length) menu.append(make("div", "Every output node already has a View.", `padding:2px ${SPACE.s3}px ${SPACE.s1}px;color:${COLORS.textDim};font-size:${TYPE.t11}px;`));
         if (!next.viewsError) for (const item of next.add) menu.append(row(item.label, item.detail, { title: "Show this output's results here, as a View", onPick: () => pick({ candidate: item.candidate }) }));
+        // A node's live sampling preview, as a View (the server checks the node on create).
+        menu.append(heading("Sampling previews"));
+        const note = text => menu.append(make("div", text, `padding:2px ${SPACE.s3}px ${SPACE.s1}px;color:${COLORS.textDim};font-size:${TYPE.t11}px;`));
+        if (next.viewsError) note("Sampling previews can be added once the problem above is fixed.");
+        else if (!next.viewsReady) note("Reading the workflow's samplers…");
+        else if (!next.sampling.length) note("No sampler without a View. Nodes that send previews in a run are listed here after it.");
+        if (!next.viewsError) for (const item of next.sampling) {
+            menu.append(row(item.label, item.detail, {
+                disabled: !!item.disabled,
+                title: item.disabled ? item.detail : "Show this node's newest sampling preview here while the workflow runs, as a View",
+                onPick: () => pick({ candidate: item.candidate, feed: VIEW_FEED_SAMPLING }),
+            }));
+        }
     };
     fill(sections);
     document.body.append(menu);

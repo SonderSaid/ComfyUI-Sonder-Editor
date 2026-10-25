@@ -292,6 +292,8 @@ Click it and choose:
   (**Preview Image**, **Sonder Preview Video**, **Sonder Save Video** and
   the like, including ones inside a subgraph). Click one to add it as a View
   and show it in this pane. On the canvas, adding a View is one Undo step.
+- **Sampling previews**: samplers whose live preview you can watch. See
+  [Watching a sampler's preview](#watching-a-samplers-preview).
 
 The panes and their sources are remembered for each workflow in this
 browser. Fullscreen and **Mount in Tab** share them; each workflow in the
@@ -362,6 +364,58 @@ What the pane shows while linked:
   no Timing (**No timing for this output. Set it in Manage ▸ Views**).
 
 A linked pane sounds only while the editor plays inside its range.
+
+#### Watching a sampler's preview
+
+A pane can show the preview a sampler draws while it runs, the same picture
+ComfyUI shows on the sampler node, with the step it is on.
+
+1. Make sure ComfyUI draws previews. Open ComfyUI's **Settings** (the gear
+   icon), search for `preview`, and set **Live preview method** to **auto**,
+   **latent2rgb** or **taesd**. **default** uses the option ComfyUI was
+   started with, which draws no previews unless ComfyUI was started with
+   `--preview-method`. The [Sonder App](sonder-app.md) always uses that start
+   option, so for it start ComfyUI with `--preview-method auto`.
+2. In the editor, click a pane's source button and look under **Sampling
+   previews**. It lists the workflow's **KSampler**, **KSampler (Advanced)**,
+   **SamplerCustom**, **SamplerCustomAdvanced** and KJNodes **Model Preview
+   Override** nodes, and any other node that sent previews in a recent run
+   (marked **Sent previews in a recent run**). In fullscreen, a greyed-out
+   row says why it can't be added, for example **This node is no longer in
+   the workflow**; in a mounted tab or the Sonder App, a message says so
+   when you click it.
+3. Click the sampler. It becomes a View, and the pane shows it from now on.
+4. Run the workflow as usual (**Queue** on the canvas, or **Generate** or
+   another pane's **Run** in the Sonder App). A sampling View has no **Run**
+   of its own.
+
+The pane shows the newest preview only. Its bar has **Fit** / **Fill**, and
+the mouse wheel and dragging zoom and pan. The text beside the source button
+says:
+
+- **Sampling · step 12/30** while the sampler runs, and **Last preview ·
+  step 30/30** after it finishes.
+- **Running** and **Waiting for previews** before the first preview arrives.
+- **Previous run · Running**: a new run has started, and the picture is still
+  the last run's.
+- **From cache**: ComfyUI reused the sampler's earlier result, so the picture
+  is from the run that made it.
+- **No previews**, with the reason: previews were off for the run (see step
+  1), the node came from ComfyUI's cache, or a **Model Preview Override** on
+  the sampler's model took them (add a View on the Override node instead).
+  **Last run was canceled** or **Last run failed** when the run ended before
+  the node sent one.
+- **Not in the newest run** (added to the text): your last run didn't include
+  this node, so the picture is from an earlier one.
+- **Switched off**: the node is muted or bypassed; the last picture stays.
+- **Unavailable**: the preview is no longer kept, or is too large to show
+  here; for a **Model Preview Override** View, this KJNodes version can't
+  tell which run a preview belongs to.
+- **Unsupported**: the browser can't show this preview's format.
+
+Through **Model Preview Override**, a preview can be a short looping clip. A
+sampler inside a subgraph works the same way. Previews are not kept: after a
+ComfyUI restart the pane reads **No result yet** until the next run.
 
 ## Safety & recovery
 

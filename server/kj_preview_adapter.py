@@ -68,6 +68,14 @@ def note_unattributed() -> None:
                            "its previews can't be matched to a run")
 
 
+def note_attributed() -> None:
+    """A KJ event arrived inside its sampler's context: a degradation was a stray event."""
+    with _LOCK:
+        if _STATUS.get("state") == STATE_DEGRADED and _STATUS.get("reason") == "event_without_context":
+            _STATUS["state"] = STATE_OK
+            _STATUS.pop("reason", None)
+
+
 def _kj_version(module: Any) -> str:
     try:
         root = Path(inspect.getfile(module)).resolve().parents[1]

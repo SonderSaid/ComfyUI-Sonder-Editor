@@ -826,3 +826,377 @@ c.destroy();
     # The sampling View's node is no output: runs/outputs never asks for it (4C reads runs/live).
     assert out["sources"] == ["9"]
     assert out["created"] == {"candidate": {"path": "31"}, "feed": "sampling"}
+
+
+# ── Live sampling previews (Phase 4C) ───────────────────────────────────────
+
+LIVE_CLIENT = r"""
+    async readLive(sources) { liveReads.push([...sources]); return JSON.parse(JSON.stringify(liveAnswer)); },
+    fetchLiveBytes(pid, source, opts) {
+        byteCalls.push([pid, source]);
+        if (bytesImpl) return bytesImpl(pid, source, opts.signal);
+        return Promise.resolve({ ok: true, status: 200, n: liveAnswer.sources[source]?.live?.n, mime: 'image/jpeg', blob: { size: 3, pid } });
+    },
+    onLivePreview(fn) { client.liveHint = fn; return () => { client.liveHint = null; }; },
+    onOutputsChanged(fn) { client.hint = fn; return () => { client.hint = null; }; },
+"""
+
+SAMPLING_VIEWS = r"""
+controlsView = { state: 'ready', views: [
+    { view_id: 'a', status: 'ok', participation: 'active', path: '9', label: 'Preview' },
+    { view_id: 's', feed: 'sampling', status: 'ok', participation: 'active', path: '6', label: 'Pass 1', class_type: 'KSampler' }],
+    view_candidates: [], view_sampling_candidates: [] };
+for (const fn of controlsListeners) fn(controlsView);
+const rec = (n, extra = {}) => ({ prompt_id: 'p1', n, step: n, total: 6, mime: 'image/jpeg', publisher: 'native', has_payload: true, ...extra });
+const liveTimers = () => timers.map((t, i) => [t, i + 1]).filter(([t, id]) => t[0] === LIVE_POLL_MS && !cleared.has(id));
+"""
+
+
+def run_live_coordinator(body: str):
+    script = (COORDINATOR.replace("COORD_URL", url("views_coordinator.js")).replace("AUDIO_URL", url("audio_ownership.js"))
+              .replace("    onOutputsChanged(fn) { client.hint = fn; return () => { client.hint = null; }; },\n", LIVE_CLIENT)
+              .replace("clearTimer: () => {}", "clearTimer: id => { if (id) cleared.add(id); }")
+              .replace("const { createViewsCoordinator, KEEPALIVE_MS, POLL_MS }", "const { createViewsCoordinator, KEEPALIVE_MS, POLL_MS, LIVE_POLL_MS }"))
+    prefix = ("const cleared = new Set(); const liveReads = [], byteCalls = []; let bytesImpl = null;\n"
+              "let liveAnswer = { ok: true, sources: {}, seen: [], sampling: { native: true, kj: { state: 'ok' } } };\n")
+    script = script.replace("const rafQueue = [];", prefix + "const rafQueue = [];", 1)
+    return node_run(script + SAMPLING_VIEWS + body + "\nconsole.log('RESULT=' + JSON.stringify(out));")
+
+
+def test_coordinator_live_reads_fetch_the_newest_bytes_and_poll_only_while_active():
+    out = run_live_coordinator("""
+c.setVisible(true); await settle();
+out.noPane = liveReads.length;  // no sampling pane, no picker: nothing to read
+c.setLayout('2c'); c.assign(0, {kind: 'view', viewId: 'a'}); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
+out.outputSources = reads.at(-1)[0];
+out.liveSources = liveReads.at(-1);
+liveAnswer.sources = { '6': { state: 'live', live: rec(4), run: { prompt_id: 'p1', finished: false }, latest_run: { prompt_id: 'p1', in_scope: true } } };
+client.liveHint(); await settle();
+let m = c.paneModel(1);
+out.first = [byteCalls.length, m.frame?.n, m.chip, m.runnable.show, m.canHold, m.linkable, m.message];
+out.polling = liveTimers().length;
+// The server serves its newest payload: the header's n is what shows.
+liveAnswer.sources['6'].live = rec(7);
+bytesImpl = async () => ({ ok: true, status: 200, n: 8, mime: 'image/jpeg', blob: {} });
+client.liveHint(); await settle();
+out.newest = [byteCalls.length, c.paneModel(1).frame.n, c.paneModel(1).frame.key];
+// A read naming what the pane already has fetches nothing.
+liveAnswer.sources['6'].live = rec(8);
+client.liveHint(); await settle();
+out.same = byteCalls.length;
+// The run finishes (a finish hint): Last preview, the poll stops.
+liveAnswer.sources['6'] = { state: 'last', live: rec(8), run: { prompt_id: 'p1', finished: true, outcome: 'success' } };
+const before = liveReads.length;
+client.hint(); await settle();
+out.finish = [liveReads.length - before, c.paneModel(1).chip, liveTimers().length];
+// A hidden page reads nothing; visible again, it reads.
+document.hidden = true;
+const hiddenReads = liveReads.length;
+client.liveHint(); await settle();
+out.hidden = liveReads.length === hiddenReads;
+document.hidden = false;
+for (const fn of docListeners.visibilitychange || []) fn();
+await settle();
+out.visible = liveReads.length > hiddenReads;
+c.destroy();
+""")
+    assert out["noPane"] == 0
+    # The sampling View's node never reaches runs/outputs; runs/live reads only it.
+    assert out["outputSources"] == ["9"] and out["liveSources"] == ["6"]
+    assert out["first"] == [1, 4, "Sampling · step 4/6", False, False, False, None]
+    assert out["polling"] >= 1
+    assert out["newest"] == [2, 8, "p1#8"]
+    assert out["same"] == 2
+    assert out["finish"][0] >= 1 and out["finish"][1] == "Last preview · step 8/6" and out["finish"][2] == 0
+    assert out["hidden"] and out["visible"]
+
+
+def test_coordinator_live_conflict_rereads_once_refused_never_twice_abort_and_picker_seen_read():
+    out = run_live_coordinator("""
+c.setVisible(true); await settle();
+// The picker opens with no sampling pane: a seen-only read for its group.
+liveAnswer.seen = [{ source: '31', class_type: 'MySampler', title: 'Custom', publisher: 'native' }];
+c.setPickerOpen(true); await settle();
+out.seenRead = [liveReads.at(-1), c.liveSeen().map(s => s.source)];
+c.setPickerOpen(false);
+c.setLayout('2c'); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
+// 409: a newer run took the node. One more read, then no retry loop.
+liveAnswer.sources = { '6': { state: 'live', live: rec(3), run: { prompt_id: 'p1', finished: false } } };
+bytesImpl = async () => ({ ok: false, status: 409, code: 'superseded' });
+const readsBefore = liveReads.length;
+client.liveHint(); await settle();
+out.conflict = [byteCalls.length, liveReads.length - readsBefore, c.paneModel(1).frame];
+client.liveHint(); await settle();
+out.noLoop = byteCalls.length;
+// Too large on the client: Unavailable, and never asked again.
+liveAnswer.sources['6'].live = rec(5);
+bytesImpl = async () => ({ ok: false, status: 200, code: 'too_large' });
+client.liveHint(); await settle(); client.liveHint(); await settle();
+out.tooLarge = [byteCalls.length, c.paneModel(1).chip, c.paneModel(1).message];
+// A fetch in flight is aborted when the pane shows something else.
+liveAnswer.sources['6'].live = rec(6);
+let signal = null;
+bytesImpl = (pid, source, s) => { signal = s; return new Promise(() => {}); };
+client.liveHint(); await settle();
+c.assign(1, {kind: 'guides'}); await settle();
+out.aborted = [!!signal?.aborted, byteCalls.length];
+// Back on the View: it fetches again; teardown aborts that one too.
+const first = signal;
+c.assign(1, {kind: 'view', viewId: 's'}); await settle();
+const second = signal;
+c.destroy();
+out.destroyAborted = [!!second && second !== first, !!second?.aborted];
+""")
+    assert out["seenRead"] == [[], ["31"]]
+    assert out["conflict"] == [1, 2, None]  # the hint's read, then one re-read
+    assert out["noLoop"] == 1
+    assert out["tooLarge"] == [2, "Unavailable", "Too large to show here"]
+    assert out["aborted"] == [True, 3]
+    assert out["destroyAborted"] == [True, True]
+
+
+def test_sampling_media_swaps_on_load_revokes_and_tears_down():
+    out = node_run(FAKE_DOM + f"""
+const {{ mountSamplingMedia }} = await import({url("sampling_pane_media.js")});
+const created = [], revoked = [], conditions = [];
+let serial = 0;
+const container = document.createElement('div');
+const media = mountSamplingMedia({{ container, onCondition: c => conditions.push(c),
+    createObjectURL: blob => {{ const u = `blob:${{++serial}}`; created.push(u); return u; }}, revokeObjectURL: u => revoked.push(u) }});
+const layer = container.children[0].children[0];
+const out = {{}};
+const frame = (n, mime = 'image/jpeg') => ({{ key: `p1#${{n}}`, mime, blob: {{ n }} }});
+media.show(frame(1));
+out.incoming = [layer.children.length, layer.children[0].tagName, layer.children[0].style.cssText.includes('visibility:hidden')];
+layer.children[0].dispatch('load');
+out.shown = [layer.children.length, layer.children[0].style.visibility, conditions.at(-1)];
+media.show(frame(1));  // the same preview: nothing new
+media.show(frame(2));
+media.show(frame(3));  // replaces 2 while it loads: at most one incoming
+out.loading = [layer.children.length, revoked.slice()];
+layer.children[1].dispatch('load');
+out.swapped = [layer.children.length, revoked.slice(), layer.children[0].src];
+media.show(frame(4, 'video/mp4'));
+const video = layer.children[1];
+out.video = [video.tagName, video.muted, video.loop, video.autoplay, video.playsInline];
+video.dispatch('error');
+out.decode = [conditions.at(-1), layer.children.length, revoked.includes(video.src)];
+media.show(frame(5, 'image/gif'));
+out.unsupported = conditions.at(-1);
+media.show(frame(6));
+media.destroy();
+out.destroyed = [container.children.length, created.every(u => revoked.includes(u))];
+console.log('RESULT=' + JSON.stringify(out));
+""")
+    assert out["incoming"] == [1, "IMG", True]
+    assert out["shown"] == [1, "", None]
+    assert out["loading"] == [2, ["blob:2"]]
+    assert out["swapped"] == [1, ["blob:2", "blob:1"], "blob:3"]
+    assert out["video"] == ["VIDEO", True, True, True, True]
+    assert out["decode"] == ["decode", 1, True]
+    assert out["unsupported"] == "unsupported"
+    assert out["destroyed"] == [0, True]
+
+
+def test_sampling_pane_dom_picker_group_create_and_fit_only():
+    script = (COORDINATOR.replace("COORD_URL", url("views_coordinator.js")).replace("AUDIO_URL", url("audio_ownership.js"))
+              .replace("    onOutputsChanged(fn) { client.hint = fn; return () => { client.hint = null; }; },\n", LIVE_CLIENT))
+    prefix = ("const liveReads = [], byteCalls = []; let bytesImpl = null;\n"
+              "let liveAnswer = { ok: true, sources: {}, seen: [{ source: '31', class_type: 'MySampler', title: 'Custom', publisher: 'native' }], "
+              "sampling: { native: true, kj: { state: 'ok' } } };\n")
+    script = script.replace("const rafQueue = [];", prefix + "const rafQueue = [];", 1)
+    script += f"""
+globalThis.URL.createObjectURL = () => 'blob:x'; globalThis.URL.revokeObjectURL = () => {{}};
+controlsView = {{ state: 'ready', views: [{{ view_id: 's', feed: 'sampling', status: 'ok', participation: 'active', path: '6', label: 'Pass 1', class_type: 'KSampler',
+    run_reason: 'Shows previews while another output runs' }}],
+    view_candidates: [], view_sampling_candidates: [{{ path: '7', class_type: 'KSamplerAdvanced', title: 'Refiner' }}] }};
+const {{ mountViewPanes }} = await import({url("view_panes.js")});
+const root = document.createElement('div'); const header = document.createElement('div');
+document.body.append(root, header);
+const sourceHost = {{ driverLanes: () => [], driverLabel: i => `Driver ${{i + 1}}`, getScene: () => ({{ guide_frames: [] }}), sceneAspect: () => 16 / 9,
+    frame: () => 0, totalFrames: () => 48, isGuideTrackHidden: () => false, clock: {{ subscribe: () => () => {{}} }} }};
+c.setVisible(true);
+const panes = mountViewPanes({{ root, header, coordinator: c, audio, sourceHost, cache: {{}}, placeComposite: () => {{}} }});
+globalThis.onCoordinatorChange = () => panes.update();
+flushRaf();
+c.setLayout('2c'); c.assign(1, {{ kind: 'view', viewId: 's' }}); await settle(); flushRaf();
+const cell = () => root.find(el => el.dataset?.sonderPane === '1');
+const buttons = () => cell().all(el => el.tagName === 'BUTTON').map(el => el.textContent);
+out.waiting = [buttons(), cell().textContent.includes('No result yet')];
+liveAnswer.sources = {{ '6': {{ state: 'live', live: {{ prompt_id: 'p1', n: 2, step: 2, total: 6, mime: 'image/jpeg', has_payload: true, reattributed: true }},
+    run: {{ prompt_id: 'p1', finished: false }} }} }};
+client.liveHint(); await settle(); flushRaf();
+const chip = cell().find(el => el.dataset?.sonderPaneChip === '1');
+out.live = [buttons(), chip.textContent, chip.title, cell().all(el => el.tagName === 'IMG').length];
+// The picker: Sampling previews lists the core sampler and the seen node, not the one already shown.
+root.find(el => el.dataset?.sonderPaneSource === '0').click(); flushRaf(); await settle(); flushRaf();
+const menu = () => document.body.find(el => el.dataset?.sonderPanePicker === 'true');
+const labels = menu().all(el => el.tagName === 'BUTTON').map(el => el.children[0]?.textContent);
+out.picker = [menu().textContent.includes('Sampling previews'), labels.includes('Refiner'), labels.includes('Custom'), labels.includes('KSampler')];
+menu().all(el => el.tagName === 'BUTTON').find(el => el.children[0]?.textContent === 'Custom').click(); await settle();
+const target = Object.keys(applied.at(-1))[0];
+out.created = applied.at(-1)[target];
+panes.destroy();
+"""
+    out = node_run(script + "\nconsole.log('RESULT=' + JSON.stringify(out));")
+    # Before any preview: the message, and no Run, Hold, Link, Fit or sound.
+    assert out["waiting"][1] is True
+    assert [b for b in out["waiting"][0] if not b.endswith("▾")] == []
+    assert [b for b in out["live"][0] if not b.endswith("▾")] == ["Fit"]
+    assert out["live"][1:] == ["Sampling · step 2/6", "Sampling · step 2/6 · Matched through the model chain", 1]
+    assert out["picker"] == [True, True, True, False]
+    assert out["created"] == {"candidate": {"path": "31"}, "feed": "sampling"}
+
+
+def test_run_outputs_client_live_reads_bytes_and_hints_in_every_host():
+    out = node_run(f"""
+const C = await import({url("run_outputs_client.js")});
+const calls = [];
+let body = {{ size: 4 }}, headers = {{ 'X-Sonder-Live-N': '12', 'Content-Type': 'image/webp' }}, status = 200;
+const fetchImpl = async (u, init = {{}}) => (calls.push([u, init.headers, init.cache]),
+    {{ ok: status === 200, status, headers: {{ get: k => headers[k] ?? null }}, blob: async () => body, json: async () => ({{ ok: false, code: 'superseded' }}) }});
+const sdk = C.createRunOutputsClient({{ mode: 'sdk', apiURL: p => p, fetchImpl,
+    identity: () => ({{ projectId: 'P', sessionId: 's1', secret: 'k', tabSessionId: 'tab-1', runIds: () => ['run-1'], workflowId: 't2' }}) }});
+const canvas = C.createRunOutputsClient({{ mode: 'canvas', apiURL: p => p, fetchImpl,
+    identity: () => ({{ projectId: 'P', hostId: 'h1', sessionId: 'e1', workflowId: 'wf' }}) }});
+const out = {{}};
+await canvas.readLive(['6', '12:5']);
+await sdk.readLive([]);
+out.canvasBytes = await canvas.fetchLiveBytes('p1', '12:5');
+out.sdkBytes = await sdk.fetchLiveBytes('p1', '6');
+status = 409;
+out.conflict = await canvas.fetchLiveBytes('p1', '6');
+status = 200; headers = {{ 'Content-Length': String(17 * 1024 * 1024) }};
+out.declared = (await canvas.fetchLiveBytes('p1', '6')).code;
+headers = {{}}; body = {{ size: 17 * 1024 * 1024 }};
+out.measured = (await canvas.fetchLiveBytes('p1', '6')).code;
+out.calls = calls.map(([u, h, cache]) => [u, h?.['X-Sonder-SDK-Session'] || null, cache]);
+// Hints: live_preview reaches onLivePreview only; outputs_changed reaches onOutputsChanged only.
+const heard = [];
+canvas.onLivePreview(e => heard.push(['canvas-live', e.type]));
+canvas.onOutputsChanged(e => heard.push(['canvas-out', e.type]));
+sdk.onLivePreview(e => heard.push(['sdk-live', e.type]));
+C.publishRunEvent('P', {{ type: 'live_preview', host_ids: ['h1'], run_ids: [] }});
+C.publishRunEvent('P', {{ type: 'live_preview', host_ids: ['other'], run_ids: ['run-1'] }});
+C.publishRunEvent('P', {{ type: 'outputs_changed', host_ids: ['h1'], run_ids: [] }});
+C.publishRunEvent('Q', {{ type: 'live_preview', host_ids: ['h1'], run_ids: ['run-1'] }});
+out.heard = heard;
+out.own = [canvas.isOwnHint({{ type: 'live_preview', host_ids: ['h1'] }}), canvas.isOwnHint({{ type: 'run_request_changed', host_ids: ['h1'] }})];
+delete out.canvasBytes.blob; delete out.sdkBytes.blob;
+console.log('RESULT=' + JSON.stringify(out));
+""")
+    assert out["calls"][0] == ["/sonder-editor/project/P/runs/live?host_id=h1&session_id=e1&sources=6%2C12%3A5&workflow_id=wf", None, None]
+    assert out["calls"][1] == ["/sonder-editor/sdk/session/s1/runs/live?sources=&workflow_id=t2", "k", None]
+    assert out["calls"][2] == ["/sonder-editor/project/P/runs/live/p1/bytes?host_id=h1&session_id=e1&source=12%3A5", None, "no-store"]
+    assert out["calls"][3] == ["/sonder-editor/sdk/session/s1/runs/live/p1/bytes?source=6", "k", "no-store"]
+    assert out["canvasBytes"] == {"ok": True, "status": 200, "n": 12, "mime": "image/webp"}
+    assert out["sdkBytes"]["n"] == 12
+    assert out["conflict"] == {"ok": False, "status": 409, "code": "superseded"}
+    assert out["declared"] == out["measured"] == "too_large"
+    assert out["heard"] == [["canvas-live", "live_preview"], ["sdk-live", "live_preview"], ["canvas-out", "outputs_changed"]]
+    assert out["own"] == [True, False]
+
+
+def test_cross_tab_sync_routes_live_preview_to_the_hint_bus():
+    out = node_run(f"""
+const sockets = [];
+globalThis.window = {{ location: {{ href: "http://x/" }}, comfyAPI: {{ api: {{ api: {{ apiURL: p => `http://x${{p}}` }} }} }} }};
+globalThis.fetch = async () => ({{ ok: true, json: async () => ({{ items: {{}} }}) }});
+globalThis.WebSocket = class {{ constructor(url) {{ this.url = url; this.readyState = 1; sockets.push(this); }}
+    send() {{}} close() {{}} static get OPEN() {{ return 1; }} }};
+const {{ connectProjectSync }} = await import({url("cross_tab_sync.js")});
+const {{ createRunOutputsClient }} = await import({url("run_outputs_client.js")});
+const client = createRunOutputsClient({{ mode: 'canvas', apiURL: p => p, fetchImpl: async () => ({{}}),
+    identity: () => ({{ projectId: 'P', hostId: 'h1', sessionId: 'e1' }}) }});
+const heard = [];
+client.onLivePreview(e => heard.push(['live', e.prompt_id]));
+client.onOutputsChanged(e => heard.push(['out', e.prompt_id]));
+const sync = connectProjectSync('P', {{}}, {{ clientId: 'c' }});
+sockets[0].onopen();
+const send = event => sockets[0].onmessage({{ data: JSON.stringify(event) }});
+send({{ type: 'live_preview', project_id: 'P', prompt_id: 'p1', seq: 1, host_ids: ['h1'], run_ids: [] }});
+send({{ type: 'live_preview', project_id: 'P', prompt_id: 'p2', seq: 2, host_ids: ['other'], run_ids: [] }});
+send({{ type: 'outputs_changed', project_id: 'P', prompt_id: 'p1', seq: 1, finished: true, host_ids: ['h1'], run_ids: [] }});
+sync.close();
+console.log('RESULT=' + JSON.stringify(heard));
+""")
+    assert out == [["live", "p1"], ["out", "p1"]]
+
+
+def test_coordinator_an_unreachable_server_is_retried_once_per_read_not_in_a_loop():
+    out = run_live_coordinator("""
+c.setVisible(true); c.setLayout('2c'); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
+liveAnswer.sources = { '6': { state: 'live', live: rec(4), run: { prompt_id: 'p1', finished: false } } };
+bytesImpl = async () => { throw new TypeError('Failed to fetch'); };
+client.liveHint(); await settle(); await settle();
+out.afterFirst = byteCalls.length;
+client.liveHint(); await settle(); await settle();
+out.afterSecond = byteCalls.length;
+bytesImpl = null;  // the server is back
+client.liveHint(); await settle();
+out.recovered = [byteCalls.length, c.paneModel(1).frame?.n];
+""")
+    assert out["afterFirst"] == 1 and out["afterSecond"] == 2
+    assert out["recovered"] == [3, 4]
+
+
+def test_coordinator_drops_a_live_answer_from_before_a_project_switch():
+    out = run_live_coordinator("""
+c.setVisible(true); c.setLayout('2c'); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
+let release;
+const realRead = client.readLive;
+client.readLive = sources => new Promise(r => { release = () => r({ ok: true, sources: { '6': { state: 'live', live: rec(9),
+    run: { prompt_id: 'old', finished: false } } }, seen: [], sampling: {} }); });
+client.liveHint(); await settle();
+c.projectChanged();
+client.readLive = realRead;
+release(); await settle(); await settle();
+out.after = [c.paneModel(1).read?.live?.n ?? null, byteCalls.length];
+""")
+    assert out["after"] == [None, 0]
+
+
+def test_sampling_pane_wording_while_adding_and_when_refused():
+    out = run_live_coordinator("""
+c.setVisible(true); c.setLayout('2c');
+let resolve;
+controls.applyChanges = () => new Promise(r => { resolve = r; });
+const creating = c.createView(1, { path: '31' }, { feed: 'sampling' });
+out.adding = c.paneModel(1).message;
+resolve({ ok: false, rejected: [{}] }); await creating; await settle();
+out.refused = notes.at(-1);
+""")
+    assert out["adding"] == "Adding this sampling preview…"
+    assert out["refused"] == "The sampling preview could not be added as a View."
+
+
+def test_sampling_media_never_rebuilds_a_preview_that_failed_to_decode():
+    out = node_run(FAKE_DOM + f"""
+const {{ mountSamplingMedia }} = await import({url("sampling_pane_media.js")});
+let created = 0;
+const container = document.createElement('div');
+const media = mountSamplingMedia({{ container, createObjectURL: () => `blob:${{++created}}`, revokeObjectURL: () => {{}} }});
+const layer = container.children[0].children[0];
+const frame = {{ key: 'p1#3', mime: 'image/jpeg', blob: {{}} }};
+media.show(frame);
+layer.children[0].dispatch('error');
+media.show(frame); media.show(frame);
+const before = created;
+media.show({{ key: 'p1#4', mime: 'image/jpeg', blob: {{}} }});
+console.log('RESULT=' + JSON.stringify([before, created, layer.children.length]));
+""")
+    assert out == [1, 2, 1]
+
+
+def test_views_hosts_node_state_canvas_reads_the_graph_others_cannot_tell():
+    out = node_run(FAKE_DOM + f"""
+const H = await import({url("views_hosts.js")});
+const states = [];
+const canvas = H.createCanvasViewsHost({{ controller: {{ node: {{ graph: {{ rootGraph: {{ id: 'wf' }} }} }} }}, apiURL: p => p,
+    nodeState: path => (states.push(path), path === '32' ? {{ inactive: {{ mode: 'muted', by: 'self' }} }} : null) }});
+const mounted = H.createMountedViewsHost({{ workflowId: 'wf', runOutputs: () => null, runRequests: () => null, controlsHost: () => null, apiURL: p => p }});
+const sdk = H.createSdkViewsHost({{ host: {{ templateId: 't' }}, runOutputs: () => null, apiURL: p => p }});
+const out = {{ canvas: [canvas.nodeState('32'), canvas.nodeState('6')], mounted: mounted.nodeState('32'), sdk: sdk.nodeState('32'), states }};
+console.log('RESULT=' + JSON.stringify(out));
+""")
+    assert out == {"canvas": [{"inactive": {"mode": "muted", "by": "self"}}, None], "mounted": None, "sdk": None, "states": ["32", "6"]}

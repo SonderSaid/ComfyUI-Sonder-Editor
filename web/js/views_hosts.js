@@ -2,7 +2,7 @@
 //
 //   {mode, workflowKey(), capability(), runOutputs(), runBranch(path) -> Outcome,
 //    cancel(Outcome) -> {ok, code}, resolve(Outcome) -> Outcome, setViewsDemand(bool),
-//    onSessionLost(cb), onSessionRestored(cb), sessionLost(), editorKey()}
+//    onSessionLost(cb), onSessionRestored(cb), sessionLost(), editorKey(), nodeState(path)}
 //   Outcome = {state: "queued", promptId?, runId?} | {state: "refused"|"unsupported", code}
 //           | {state: "unconfirmed"|"busy"|"pending"}
 //
@@ -17,6 +17,13 @@
 // pickContext): the canvas node's id when it is a root node (an Editor inside
 // a subgraph has a path key the page does not derive; "" then), the Sonder
 // App's sole Editor.
+//
+// `nodeState(path)` says whether a node can take a new View where the page
+// can tell: the canvas reads its live graph ({missing} | {inactive: reason} |
+// null); the mounted tab and the Sonder App hold no graph (null), and the
+// server's refusal says why. Live sampling previews (Phase 4) need no method
+// of their own: `runOutputs()` reads and fetches them, and each runs/live read
+// carries the server's `sampling` capability, fresh after every finish hint.
 import { normalizeOutcome } from "./views_model.js";
 
 const CAPABILITY_PATH = "/sonder-editor/runs/capability";
@@ -68,7 +75,7 @@ const cancelBy = async (client, body) => {
 
 // Fullscreen on the canvas page: the controller's client, branch runs and
 // Controls host. The workflow is the canvas graph's (`rootGraph.id`).
-export function createCanvasViewsHost({ controller, apiURL, fetchImpl, controlsHost = () => controller.getControlsHost?.() }) {
+export function createCanvasViewsHost({ controller, apiURL, fetchImpl, controlsHost = () => controller.getControlsHost?.(), nodeState = () => null }) {
     const events = sessionEvents();
     const graphId = () => String(controller.node?.graph?.rootGraph?.id || controller.node?.graph?.id || "");
     return {
@@ -89,6 +96,7 @@ export function createCanvasViewsHost({ controller, apiURL, fetchImpl, controlsH
             : Promise.resolve({ ok: false, code: "no_prompt" })),
         resolve: outcome => outcome,
         setViewsDemand: on => controlsHost()?.setViewsDemand?.(!!on),
+        nodeState: path => nodeState(path),
         ...events,
     };
 }
@@ -112,6 +120,7 @@ export function createMountedViewsHost({ workflowId = "", editorKey = "", runOut
             : Promise.resolve({ ok: false, code: "no_prompt" })),
         resolve: outcome => outcome,
         setViewsDemand: on => controlsHost()?.setViewsDemand?.(!!on),
+        nodeState: () => null,
         ...events,
     };
 }
@@ -144,6 +153,7 @@ export function createSdkViewsHost({ host, runOutputs, apiURL, fetchImpl, contro
                 ...(final ? { finalState: run.state } : {}) };
         },
         setViewsDemand: on => controlsHost()?.setViewsDemand?.(!!on),
+        nodeState: () => null,
         ...events,
     };
 }

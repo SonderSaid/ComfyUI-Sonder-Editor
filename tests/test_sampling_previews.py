@@ -615,3 +615,90 @@ def test_announce_live_sends_ids_only_on_the_registry_loop_and_throttles(tmp_pat
                         "host_ids": ["host-1"], "run_ids": ["run-1"]}
     captured["all"]({**hint, "finished": True})
     assert "p1" not in io_nodes._LIVE_HINT_STATE
+
+
+# --- Phase 4C -------------------------------------------------------------------------
+
+def test_the_run_says_whether_the_node_itself_ran(_clean):
+    # A sampler served from ComfyUI's cache in this owner's first run has no
+    # preview to show: the pane says it came from the cache, not "no previews arrived".
+    queue("p1", graph())
+    assert live("s")["sources"]["s"]["run"]["source_ran"] is None  # unknown until the run ends
+    run_outputs.observe("executing", {"prompt_id": "p1", "node": None})  # ComfyUI's end-of-run signal
+    finish("p1")
+    answer = live("s")["sources"]["s"]
+    assert answer["state"] == "no_previews" and answer["run"]["source_ran"] is False
+    queue("p2", graph(receipt=R2), receipt=R2, key="2")
+    run_outputs.observe("executing", {"prompt_id": "p2", "node": "s"})
+    finish("p2", key="2")
+    answer = live("s")["sources"]["s"]
+    assert answer["state"] == "no_previews" and answer["run"]["source_ran"] is True
+
+
+# --- Phase 4 audit fixes (2026-10-25) ----------------------------------------------------
+
+def test_a_switch_on_the_model_chain_is_followed(_clean, monkeypatch):
+    # rgthree's Any Switch ("*") and Sonder's lazy switches (V3 MatchType) pass
+    # the model on: the Override node behind them is still on the sampler's chain.
+    classes = dict(CLASSES, AnySwitch=_node_class(any_01="*"), Lazy=_node_class(on_true="COMFY_MATCHTYPE_V3"),
+                   Multi=_node_class(value="MODEL,CLIP"))
+    monkeypatch.setattr(sp, "_class_lookup", lambda name: classes.get(name))
+    for switch, name in (("AnySwitch", "any_01"), ("Lazy", "on_true"), ("Multi", "value")):
+        for module in (sdk_runs, run_outputs, sp):
+            module.reset_for_tests()
+        # Two Override nodes, so only the walk (not the lone-Override rule) can attribute.
+        prompt = graph(kj=("kj", "kj2"))
+        prompt["sw"] = {"class_type": switch, "inputs": {name: ["kj2", 0]}}
+        prompt["s"]["inputs"] = {"model": ["sw", 0]}
+        queue("p1", prompt)
+        kj(_clean, "p1", "s", "kj2", image=WEBP, mime="image/webp")
+        assert live("kj2")["sources"]["kj2"]["state"] == "live", switch
+
+
+def test_an_unreadable_passthrough_still_attributes_the_prompts_only_override(_clean, monkeypatch):
+    classes = dict(CLASSES, Opaque=_node_class(thing="SOMETHING_ELSE"))
+    monkeypatch.setattr(sp, "_class_lookup", lambda name: classes.get(name))
+    prompt = graph()
+    prompt["op"] = {"class_type": "Opaque", "inputs": {"thing": ["kj", 0]}}
+    prompt["s"]["inputs"] = {"model": ["op", 0]}
+    queue("p1", prompt)
+    kj(_clean, "p1", "s", "kj", image=WEBP, mime="image/webp")
+    assert live("kj")["sources"]["kj"]["state"] == "live"
+    # Two Override nodes: a cached wrapper could name either, so nothing is guessed.
+    for module in (sdk_runs, run_outputs, sp):
+        module.reset_for_tests()
+    prompt = graph(kj=("kj", "kj2"))
+    prompt["op"] = {"class_type": "Opaque", "inputs": {"thing": ["kj2", 0]}}
+    prompt["s"]["inputs"] = {"model": ["op", 0]}
+    queue("p1", prompt)
+    kj(_clean, "p1", "s", "kj2", image=WEBP, mime="image/webp")
+    assert sp.COUNTERS["kj_ambiguous"] == 1 and live("kj2")["sources"]["kj2"]["live"] is None
+
+
+def test_previews_follow_start_order_when_a_later_prompt_runs_first(_clean):
+    # Queue Front: p2 is registered after p1 but runs first.
+    for prompt_id, receipt, key in (("p1", R1, "1"), ("p2", R2, "2")):
+        sdk_runs.register_receipt(receipt, OWNER, ["ed"])
+        sdk_runs.bind_queued(prompt_id, graph(receipt=receipt), ["out"], workflow_id="wf")
+        sdk_runs.open_release(key, prompt_id, graph(receipt=receipt), ["out"])
+    run_outputs.observe("execution_start", {"prompt_id": "p2"})
+    native4("p2", "s")
+    finish("p2", key="2")
+    run_outputs.observe("execution_start", {"prompt_id": "p1"})
+    native4("p1", "s")
+    answer = live("s")["sources"]["s"]
+    assert answer["state"] == "live" and answer["live"]["prompt_id"] == "p1" and answer["run"]["prompt_id"] == "p1"
+    assert run_outputs.live_payload([OWNER], "p1", "s")[0] == "ok"
+    assert run_outputs.live_payload([OWNER], "p2", "s")[0] == "superseded"
+
+
+def test_kj_degrades_only_while_an_observed_run_executes_and_heals(_clean):
+    kj_preview_adapter._set(kj_preview_adapter.STATE_OK)
+    _clean.context = None
+    sp.observe_preview("kj_preview_override", {"node_id": "kj", "step": 1, "total": 4})
+    assert kj_preview_adapter.status()["state"] == "ok"  # nothing Sonder observes is running
+    queue("p1", graph())
+    sp.observe_preview("kj_preview_override", {"node_id": "kj", "step": 1, "total": 4})
+    assert kj_preview_adapter.status()["state"] == "degraded"
+    kj(_clean, "p1", "s", "kj", image=WEBP, mime="image/webp")  # attributed: the stray one was not the adapter
+    assert kj_preview_adapter.status() == {"state": "ok"}
