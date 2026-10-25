@@ -28,6 +28,7 @@ import { TIMELINE } from "./audio_ownership.js";
 import { mintId } from "./controls_manage.js";
 import { contentStatus, isLinkable, resolveLink } from "./view_timing.js";
 import { fileKey } from "./output_media_cache.js";
+import { VIEW_FEED_SAMPLING, viewFeed } from "./control_targets.js";
 
 export const POLL_MS = 5000;
 export const KEEPALIVE_MS = 10 * 60 * 1000;
@@ -104,6 +105,8 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         // already here, and a file still shown keeps playing (no remount).
         for (const { pane } of viewPanes()) {
             const view = viewFor(pane.source.viewId);
+            // A sampling View has no file results: it reads runs/live instead (Phase 4C).
+            if (viewFeed(view) === VIEW_FEED_SAMPLING) continue;
             if (view?.path && !["missing", "duplicate", "kind", "unsupported"].includes(view.status)) paths.add(view.path);
         }
         return [...paths].sort();
@@ -325,7 +328,9 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         const view = viewFor(pane.source.viewId);
         if (!view && state.creating) return { ...model, view: null, message: "Adding this output…", chip: null, entries: [], entry: null,
             runnable: { show: false }, cancellable: { show: false }, canHold: false };
-        const item = view?.path ? answer?.sources?.[view.path] || null : null;
+        // A sampling View has no file results: never another read's files (Phase 4C reads runs/live).
+        const sampling = viewFeed(view) === VIEW_FEED_SAMPLING;
+        const item = view?.path && !sampling ? answer?.sources?.[view.path] || null : null;
         const status = viewPaneStatus({ view, read: item, run: state.outcome, hold: heldRecord(index), held: !!state.held && !state.held.pending,
             // A Relay error leaves no Views: the pane says why, not "no longer in the workflow".
             sessionLost, viewsError: controls.getView()?.views_error || controls.getView()?.error || null });
@@ -353,12 +358,12 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         }
         return {
             ...model, view, read: item, status, entries, itemIndex, entry, chip,
-            linkable: !!entry && isLinkable(entry), link, linked, outside,
+            linkable: !sampling && !!entry && isLinkable(entry), link, linked, outside,
             message: media?.message || status.message || (outside ? "Outside generated range" : linked && link.pending ? "Linking…" : null),
             unavailable: !!status.unavailable,
             result: status.result, runnable: runAvailability({ view, capability, outcome: state.outcome, busy, sessionLost }),
             cancellable: cancelAvailability(state.outcome && !state.outcome.canceling ? state.outcome : null),
-            canHold: !state.held && !!entry && !!status.result?.prompt_id && !sessionLost,
+            canHold: !sampling && !state.held && !!entry && !!status.result?.prompt_id && !sessionLost,
             audible: audio?.owner() === paneId(index),
         };
     }
@@ -469,11 +474,13 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         changed();
     }
 
-    // Pick an output node as a new View in pane `index`: one Controls write
-    // (one native Undo step on the canvas), then the pane shows it.
-    async function createView(index, candidate) {
+    // Pick an output node (or, `feed: "sampling"`, a node's live sampling previews)
+    // as a new View in pane `index`: one Controls write (one native Undo step on
+    // the canvas), then the pane shows it.
+    async function createView(index, candidate, { feed = "output" } = {}) {
         const id = mintId();
-        const write = controls.applyChanges?.({ [`view:${id}:create`]: { candidate: { path: candidate.path } } });
+        const value = { candidate: { path: candidate.path }, ...(feed === VIEW_FEED_SAMPLING ? { feed } : {}) };
+        const write = controls.applyChanges?.({ [`view:${id}:create`]: value });
         if (!write) return false;
         // A refused write puts back what the pane showed (the Composite, say).
         const previous = layout.panes[index]?.source || null;

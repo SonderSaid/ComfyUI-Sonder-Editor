@@ -216,11 +216,11 @@ def test_create_remove_label_order_and_refusals():
     assert ok == {"view:a:label": "Look", "view:a:order": 2}
     # The mounted pre-check checks shape only; the canvas writer revalidates.
     shape, rejected = cd.validate_binding_changes(view, {"view:n9:create": {"candidate": {"path": "77"}}}, structural="relay")
-    assert not rejected and shape["view:n9:create"] == {"candidate": {"path": "77"}, "label": ""}
+    assert not rejected and shape["view:n9:create"] == {"candidate": {"path": "77"}, "label": "", "feed": "output"}
     # Views never change what a run submits: the JS changesRun test covers the save gate
     # (test_control_views_js.py), and a View write plan names no widget or binding.
     plan, _ = cd.validate_binding_changes(view, {"view:n9:create": {"candidate": {"path": "12:7"}}}, structural="canvas")
-    assert set(plan["view:n9:create"]) == {"candidate", "label", "order"}
+    assert set(plan["view:n9:create"]) == {"candidate", "label", "order", "feed"}
     assert set(plan["view:n9:create"]["candidate"]) == {"path", "class_type", "host", "rel"}
 
 
@@ -385,3 +385,185 @@ def test_sdk_renaming_a_view_off_at_export_keeps_it_inactive_and_exported(app):
     assert rows["m"]["reason"] == cv.OFF_AT_EXPORT_REASON and not rows["m"]["runnable"]
     exported = cm.find_relay(json.loads(st.export_curated(identity)))["manifest"]["views"]
     assert exported["m"]["participation"] == "inactive" and exported["m"]["path"] == "40" and exported["m"]["label"] == "Muted pass"
+
+
+# ── Phase 4: sampling-preview Views (feed) ───────────────────────────────────
+
+def test_feed_reads_as_sampling_or_absent_and_anything_else_skips_the_entry():
+    items, error = cm.read_views({"v": 1, "items": {"s": {"feed": "sampling"}, "o": {"feed": "output"}, "d": {},
+                                                     "bad": {"feed": "video"}, "num": {"feed": 1}}})
+    assert error is None and set(items) == {"s", "o", "d"}
+    assert items["s"]["feed"] == "sampling" and "feed" not in items["o"] and "feed" not in items["d"]
+
+
+def test_sampling_candidates_inventory_and_one_view_per_node():
+    prompt = prompt_with({"a": view_entry("9")}, **{"30": node("KSamplerAdvanced", title="Pass 2"),
+                                                    "31": node("CustomSampler"), "32": node("ModelPreviewOverrideKJ")})
+    authoring = {"40": {"class_type": "SamplerCustom", "inputs": {}, "_meta": {}, "mode": "muted", "by": "self", "label": "Off"}}
+    view = describe(prompt, authoring=authoring)
+    offered = {c["path"]: c for c in view["view_sampling_candidates"]}
+    # The core classes only; a custom sampler is offered once a run saw it publish (the pane picker).
+    assert set(offered) == {"6", "30", "32", "40"}
+    assert offered["30"]["title"] == "Pass 2" and offered["40"]["inactive"]["mode"] == "muted"
+    index = view["_view_sampling_index"]
+    # Any node but an output node, the Editor or the Relay; uncapped, a path and a class only.
+    assert {"6", "30", "31", "32", "40"} <= set(index) and index["31"] == "CustomSampler"
+    assert not {"1", "90", "9", "12:7"} & set(index)
+    assert "_view_sampling_index" not in cd.json_safe(view)
+    # A node that has a View (any feed) is offered in neither list.
+    prompt = prompt_with({"a": view_entry("9"), "s": view_entry("6", "KSampler", feed="sampling")})
+    view = describe(prompt)
+    assert "6" not in {c["path"] for c in view["view_sampling_candidates"]}
+    assert "9" not in {c["path"] for c in view["view_candidates"]}
+
+
+def test_describe_sampling_views_never_run_and_need_no_output_node():
+    views = {"s": view_entry("6", "KSampler", feed="sampling"), "k": view_entry("6", "KSampler"),
+             "e": view_entry("1", "SonderEditor", feed="sampling"),
+             "m": view_entry("40", "SamplerCustom", feed="sampling")}
+    prompt = prompt_with(views)
+    authoring = {"40": {"class_type": "SamplerCustom", "inputs": {}, "_meta": {}, "mode": "bypassed", "by": "self", "label": ""}}
+    rows = {d["view_id"]: d for d in describe(prompt, authoring=authoring)["views"]}
+    assert rows["s"]["status"] == "ok" and rows["s"]["feed"] == "sampling" and rows["s"]["participation"] == "active"
+    assert rows["s"]["runnable"] is False and "while another output runs" in rows["s"]["run_reason"]
+    assert rows["k"]["status"] == "kind" and rows["k"]["feed"] == "output"  # an output View still needs an output
+    assert rows["e"]["status"] == "unsupported"
+    assert rows["m"]["participation"] == "inactive" and rows["m"]["reason"] == "Its node is bypassed."
+
+
+def test_create_a_sampling_view_and_its_refusals():
+    prompt = prompt_with({"a": view_entry("9")}, **{"31": node("CustomSampler")})
+    view = describe(prompt, authoring={})
+    cleaned, rejected = cd.validate_binding_changes(
+        view, {"view:n1:create": {"candidate": {"path": "31"}, "feed": "sampling"}}, structural="canvas")
+    assert not rejected and cleaned["view:n1:create"]["feed"] == "sampling"
+    assert cleaned["view:n1:create"]["candidate"] == {"path": "31", "class_type": "CustomSampler", "host": "31", "rel": ""}
+    for changes, reason in [
+        ({"view:n2:create": {"candidate": {"path": "9"}, "feed": "sampling"}}, "output node"),
+        ({"view:n2:create": {"candidate": {"path": "12:15:3"}, "feed": "sampling"}}, "output node"),
+        ({"view:n2:create": {"candidate": {"path": "77"}, "feed": "sampling"}}, "switched off or no longer"),
+        ({"view:n2:create": {"candidate": {"path": "31"}, "feed": "video"}}, "sampling preview"),
+        ({"view:n2:create": {"candidate": {"path": "1"}, "feed": "sampling"}}, "switched off or no longer"),
+        ({"view:n2:create": {"candidate": {"path": "../x"}, "feed": "sampling"}}, "Choose a node"),
+        ({"view:n2:create": {"candidate": {"path": "31"}}}, "no longer in the workflow"),  # not an output node
+    ]:
+        _, rejected = cd.validate_binding_changes(view, changes, structural="canvas")
+        assert rejected and reason in rejected[0]["reason"], (changes, rejected)
+    shape, rejected = cd.validate_binding_changes(
+        view, {"view:n9:create": {"candidate": {"path": "77"}, "feed": "sampling"}}, structural="relay")
+    assert not rejected and shape["view:n9:create"]["feed"] == "sampling"
+
+
+def test_a_sampling_view_has_no_timing():
+    prompt = prompt_with({"s": view_entry("6", "KSampler", feed="sampling")})
+    view = describe(prompt)
+    _, rejected = cd.validate_binding_changes(
+        view, {"view:s:timing": {"anchor": "render_start", "source_offset": 0, "fps": "editor"}}, structural="canvas")
+    assert rejected and "own rate" in rejected[0]["reason"]
+    cleaned, rejected = cd.validate_binding_changes(view, {"view:s:timing": None}, structural="canvas")
+    assert not rejected and cleaned == {"view:s:timing": None}
+
+
+def test_sdk_sampling_views_store_copy_export_and_switch_off():
+    prompt = prompt_with({"s": view_entry("6", "KSampler", feed="sampling")}, **{"31": node("CustomSampler")})
+    view = describe(copy.deepcopy(prompt))
+    view["_node_modes"] = {"6": "muted"}
+    stored = {"views": {"n": {"label": "", "order": 1, "source": {"path": "31", "class_type": "CustomSampler"},
+                              "feed": "sampling"},
+                        "odd": {"label": "", "order": 2, "source": {"path": "31", "class_type": "CustomSampler"},
+                                "feed": "film"}}}
+    cv.apply_sdk_views(view, prompt, stored, class_lookup=CLASSES.get)
+    rows = {d["view_id"]: d for d in view["views"]}
+    assert set(rows) == {"s", "n"}
+    assert rows["n"]["feed"] == "sampling" and rows["n"]["status"] == "ok" and rows["n"]["origin"] == "app"
+    assert rows["s"]["participation"] == "inactive"  # its sampler is switched off in the app
+    assert {c["path"]: c.get("inactive", {}).get("mode") for c in view["view_sampling_candidates"]} == {}
+    assert set(view["_view_sampling_index"]) >= {"31", "6"}
+    # Renaming the workflow's own sampling View copies it whole: it stays a sampling View.
+    data = {"views": {}}
+    cv.store_sdk_change(data, view, "s", "label", "Pass 1 live")
+    assert data["views"]["s"]["feed"] == "sampling" and data["views"]["s"]["label"] == "Pass 1 live"
+    cv.store_sdk_change(data, view, "m", "create",
+                        {"candidate": {"path": "31", "class_type": "CustomSampler"}, "label": "", "order": 3, "feed": "sampling"})
+    assert data["views"]["m"]["feed"] == "sampling"
+    assert cv.stored_views(data)["m"]["feed"] == "sampling"
+    # Export as API keeps it a sampling View.
+    section = cv.curated_views(view)
+    assert section["items"]["n"]["feed"] == "sampling" and section["items"]["s"]["feed"] == "sampling"
+    assert cm.read_views(section)[0]["n"]["feed"] == "sampling"
+
+
+def test_the_mounted_publication_checks_feed_and_the_sampling_list():
+    from server import session_registry as sr
+    base = {"bindings": [], "notes": [], "views": [{"view_id": "s", "status": "ok", "feed": "sampling"}],
+            "view_sampling_candidates": [{"path": "6"}]}
+
+    def publish(view):
+        return sr._prepare_control_publication({"view_seq": 1, "prompt_hash": "h", "view": view})
+
+    assert publish(copy.deepcopy(base))["view"]["views"][0]["feed"] == "sampling"
+    with pytest.raises(ValueError):
+        publish({**copy.deepcopy(base), "views": [{"view_id": "s", "status": "ok", "feed": "film"}]})
+    with pytest.raises(ValueError):
+        publish({**copy.deepcopy(base), "view_sampling_candidates": [{"path": str(i)} for i in range(cv.MAX_CANDIDATES + 1)]})
+
+
+def test_sdk_sampling_view_create_rename_export_and_reimport(app):
+    st, identity, prompt, validation, snapshot, write = app
+    assert {c["path"] for c in snapshot()[2]["view_sampling_candidates"]} == {"6"}
+    data = write({"view:s1:create": {"candidate": {"path": "6"}, "feed": "sampling"}})
+    assert data["views"]["s1"]["feed"] == "sampling"
+    write({"view:s1:label": "Pass 1 live"})
+    row = snapshot()[2]["views"][0]
+    assert (row["feed"], row["label"], row["status"], row["runnable"]) == ("sampling", "Pass 1 live", "ok", False)
+    assert snapshot()[2]["view_sampling_candidates"] == []
+    # Export materializes a Relay carrying the feed; the import reads it back as a sampling View.
+    exported = json.loads(st.export_curated(identity))
+    assert cm.find_relay(exported)["manifest"]["views"]["s1"]["feed"] == "sampling"
+    back = {d["view_id"]: d for d in describe(exported)["views"]}
+    assert back["s1"]["feed"] == "sampling" and back["s1"]["status"] == "ok"
+
+
+def test_a_sampling_view_on_an_output_node_or_a_subgraph_says_why():
+    views = {"o": view_entry("9", "PreviewImage", feed="sampling"),
+             "g": view_entry("44", "SamplerCustom", status="kind", feed="sampling"),
+             "gone": view_entry("77", "SamplerCustom", status="missing", feed="sampling"),
+             "t": view_entry("6", "KSampler", feed="sampling",
+                             timing={"mode": "editor_window", "anchor": "render_start", "source_offset": 0, "fps": "editor"})}
+    rows = {d["view_id"]: d for d in describe(prompt_with(views))["views"]}
+    assert rows["o"]["status"] == "kind" and "give it an output View" in rows["o"]["reason"]
+    assert rows["g"]["status"] == "kind" and "can't show sampling previews" in rows["g"]["reason"]
+    assert rows["gone"]["status"] == "missing" and "add the node again" in rows["gone"]["reason"]
+    # A stored timing on a sampling View is ignored: it plays at its own rate.
+    assert rows["t"]["status"] == "ok" and rows["t"]["timing"] is None
+
+
+def test_one_view_per_node_holds_across_feeds_in_imports_and_the_sonder_app():
+    # A hand-made export with two Views on one node: the later one reads duplicate.
+    views = {"a": view_entry("6", "KSampler", feed="sampling", order=1), "b": view_entry("6", "KSampler", feed="sampling", order=2)}
+    rows = {d["view_id"]: d for d in describe(prompt_with(views))["views"]}
+    assert rows["a"]["status"] == "ok" and rows["b"]["status"] == "duplicate" and not rows["b"]["runnable"]
+    # The Sonder App: an app-only View on a node the replaced workflow now gives its own View.
+    prompt = prompt_with({"w": view_entry("6", "KSampler", feed="sampling", order=5)})
+    view = describe(copy.deepcopy(prompt))
+    stored = {"views": {"app1": {"label": "", "order": 0, "source": {"path": "6", "class_type": "KSampler"}, "feed": "sampling"}}}
+    cv.apply_sdk_views(view, prompt, stored, class_lookup=CLASSES.get)
+    rows = {d["view_id"]: d for d in view["views"]}
+    assert rows["w"]["status"] == "ok" and rows["app1"]["status"] == "duplicate"
+
+
+def test_the_sampling_index_is_uncapped():
+    many = {str(1000 + i): node("Foo") for i in range(2100)}
+    prompt = prompt_with(**many, **{"5000": node("KSampler")})
+    view = describe(prompt)
+    assert "5000" in {c["path"] for c in view["view_sampling_candidates"]} and "5000" in view["_view_sampling_index"]
+    cleaned, rejected = cd.validate_binding_changes(
+        view, {"view:n1:create": {"candidate": {"path": "5000"}, "feed": "sampling"}}, structural="canvas")
+    assert not rejected
+
+
+def test_the_publication_refuses_a_malformed_sampling_list():
+    from server import session_registry as sr
+    with pytest.raises(ValueError):
+        sr._prepare_control_publication({"view_seq": 1, "prompt_hash": "h",
+                                         "view": {"bindings": [], "notes": [], "view_sampling_candidates": "6"}})

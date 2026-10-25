@@ -40,6 +40,13 @@ export function parseTarget(target) {
     return match[1] ? { source: match[1], id: match[2], field: match[5] } : { source: "group", id: match[4], field: match[5] };
 }
 
+// What a View shows (Output Views Phase 4): an output's results (no `feed`, the
+// default, never written) or a node's live sampling previews (`feed: "sampling"`).
+// One View per node either way. Mirrors control_views.feed_of.
+export const VIEW_FEED_OUTPUT = "output";
+export const VIEW_FEED_SAMPLING = "sampling";
+export const viewFeed = entry => (entry?.feed === VIEW_FEED_SAMPLING ? VIEW_FEED_SAMPLING : VIEW_FEED_OUTPUT);
+
 export const STRUCTURAL_OPS = {
     binding: BINDING_STRUCTURAL_OPS, note: new Set(["create", "remove", "hide", "unhide"]),
     group: GROUP_OPS, preset: new Set(["create", "capture", "apply"]), workflow: new Set(["cleanup", "restore"]),

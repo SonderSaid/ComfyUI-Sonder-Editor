@@ -8,10 +8,10 @@
 // server/control_manifest.py and server/control_descriptors.py are the authority.
 import { getGraphLink, getGraphNode } from "./project_source_resolver.js";
 import { findControlWidget, seedModeWidget } from "./control_widgets.js";
-import { cleanGroup, DESCRIPTION_MAX } from "./control_targets.js";
+import { cleanGroup, DESCRIPTION_MAX, VIEW_FEED_OUTPUT, VIEW_FEED_SAMPLING, viewFeed } from "./control_targets.js";
 import { pluralName, rowFieldGroup, rowGroupOf, rowGroups, rowsLinked, rowWidgetsReady } from "./control_rows.js";
 
-export { DESCRIPTION_MAX, cleanGroup, groupNameError, isStructuralTarget, parseTarget } from "./control_targets.js";
+export { DESCRIPTION_MAX, VIEW_FEED_OUTPUT, VIEW_FEED_SAMPLING, cleanGroup, groupNameError, isStructuralTarget, parseTarget, viewFeed } from "./control_targets.js";
 
 export const RELAY_CLASS = "SonderControlRelay";
 export const ANCHOR_PROPERTY = "sonderBindings";
@@ -340,6 +340,10 @@ export function readExecution(raw) {
     return {controls: result, error: null};
 }
 
+// Always offered as sampling-preview sources; mirrors control_views.SAMPLING_CLASSES.
+export const SAMPLING_CLASSES = new Set(["KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced",
+    "ModelPreviewOverrideKJ"]);
+
 // The saved Views, tolerant like control_manifest.read_views (parity-tested).
 export const isOurViewsSection = raw => isPlainObject(raw) && (!Object.hasOwn(raw, "v") || raw.v === VIEWS_VERSION);
 export function readViews(raw) {
@@ -351,7 +355,8 @@ export function readViews(raw) {
         if (Object.keys(result).length >= MAX_VIEWS) break;
         if (!ID_RE.test(id) || FORBIDDEN_KEYS.has(id) || !isPlainObject(entry)
             || !(entry.label == null || (typeof entry.label === "string" && [...entry.label].length <= LABEL_MAX))
-            || !validOrder(entry.order ?? undefined)) continue;
+            || !validOrder(entry.order ?? undefined)
+            || !(entry.feed == null || entry.feed === VIEW_FEED_OUTPUT || entry.feed === VIEW_FEED_SAMPLING)) continue;
         result[id] = {...entry, label: String(entry.label ?? "").trim(), order: entry.order ?? 0};
     }
     return {items: result, error: null};
@@ -1203,7 +1208,11 @@ export function resolveViews(root, manifest, { isOutputNode = isOutputNodeOf } =
         const { node, hosts } = live;
         const base = { path, class_type: nodeType(node), title: String(node.title || nodeType(node)), node, host, rel };
         if (INFRASTRUCTURE_CLASSES.has(nodeType(node)) || (!isHost(node) && node.isVirtualNode)) { views[id] = { ...base, status: "unsupported" }; continue; }
-        if (isHost(node) || !isOutputNode(node)) { views[id] = { ...base, status: "kind" }; continue; }
+        // A sampling View may name any node but an output node, which keeps its
+        // output View (a sampler, Model Preview Override, a node a recent run saw
+        // publish previews); an output View needs an output node.
+        const sampling = viewFeed(items[id]) === VIEW_FEED_SAMPLING;
+        if (isHost(node) || (sampling ? isOutputNode(node) : !isOutputNode(node))) { views[id] = { ...base, status: "kind" }; continue; }
         const inactive = pathOffReason(node, hosts);
         views[id] = { ...base, status: "ok", participation: inactive ? "inactive" : "active", ...(inactive ? { inactiveReason: inactive } : {}) };
     }
@@ -1235,8 +1244,9 @@ function exportViews(saved, root, manifest) {
     return out;
 }
 
-// Muted and bypassed output nodes, root and inside instances, with their
-// path and reason: the server lists them as View candidates that are off.
+// Muted and bypassed output nodes and core sampling-preview sources
+// (`SAMPLING_CLASSES`), root and inside instances, with their path and reason:
+// the server lists them as View candidates that are off.
 export function inactiveOutputs(root, { isOutputNode = isOutputNodeOf, limit = MAX_INACTIVE_BODIES } = {}) {
     const found = [];
     const walk = (graph, prefix, parent, depth) => {
@@ -1248,7 +1258,8 @@ export function inactiveOutputs(root, { isOutputNode = isOutputNodeOf, limit = M
             const own = isOff(node) ? { mode: modeName(node), by: "self", label: String(node.title || nodeType(node)) } : null;
             if (isHost(node)) { walk(node.subgraph, path, parent || (own ? { ...own, by: "parent" } : null), depth + 1); continue; }
             const reason = parent || own;
-            if (reason && !node.isVirtualNode && isOutputNode(node) && !INFRASTRUCTURE_CLASSES.has(nodeType(node))) found.push({ node, path, inactive: reason });
+            if (reason && !node.isVirtualNode && (isOutputNode(node) || SAMPLING_CLASSES.has(nodeType(node)))
+                && !INFRASTRUCTURE_CLASSES.has(nodeType(node))) found.push({ node, path, inactive: reason });
         }
     };
     walk(root, "", null, 0);

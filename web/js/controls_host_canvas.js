@@ -5,7 +5,7 @@ import {
     executionCandidatesFor, inactiveBodies, isStructuralTarget, listCandidates, listExecutionCandidates, nodesOf, parseManifest, parseTarget, readAnchors,
     readExecution, readExecutionAnchor, relayCensus, resolveBindings, resolveCandidate, resolveExecution, resolveExecutionCandidate,
     planRestore, restoreAnchors, restoreDynamicPrompts, restoreExecutionAnchor, setAnchor, setExecutionAnchor,
-    VIEWS_VERSION, dropViewAnchors, inactiveOutputs, isOutputNodeOf, nodeType, readViewAnchors, readViews, resolveExecPath, resolveViews,
+    INFRASTRUCTURE_CLASSES, VIEWS_VERSION, VIEW_FEED_SAMPLING, dropViewAnchors, inactiveOutputs, isOutputNodeOf, nodeType, readViewAnchors, readViews, resolveExecPath, resolveViews,
     restoreViewAnchors, setViewAnchor, viewAnchorSnapshot,
 } from "./control_bindings.js";
 import { syncRelayRows } from "./control_relay_rows.js";
@@ -465,15 +465,25 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         if (field === "create") {
             if (views.items[id]) throw new Error("This View id is already in use.");
             const {path, class_type: classType, host, rel = ""} = value.candidate || {};
+            // A sampling View names any node; an output View an output node.
+            const sampling = value.feed === VIEW_FEED_SAMPLING;
             const hostNode = nodesOf(root).find(n => String(n?.id) === String(host));
             const live = resolveExecPath(root, path);
             const anchoredOn = live ? (rel ? live.hosts[0] : live.node) : null;
-            if (!hostNode || !live || anchoredOn !== hostNode || nodeType(live.node) !== classType || !isOutputNodeOf(live.node)) {
-                throw new Error("This output moved. Refresh the Controls panel.");
+            // A sampling View never names an output node (it keeps its output View),
+            // a subgraph instance, a virtual node, the Editor or the Relay.
+            const samplingRefused = sampling && (isOutputNodeOf(live?.node) || !!live?.node?.subgraph
+                || !!live?.node?.isVirtualNode || INFRASTRUCTURE_CLASSES.has(nodeType(live?.node)));
+            if (!hostNode || !live || anchoredOn !== hostNode || nodeType(live.node) !== classType
+                || (!sampling && !isOutputNodeOf(live.node)) || samplingRefused) {
+                throw new Error(sampling ? "This node moved. Refresh the Controls panel." : "This output moved. Refresh the Controls panel.");
             }
             const owner = readViewAnchors(hostNode)[rel];
-            if (owner && owner !== id && views.items[owner]) throw new Error("This output already has a View.");
-            manifestOps.push(m => { table(m)[id] = {label: value.label || "", order: value.order ?? 0}; });
+            if (owner && owner !== id && views.items[owner]) {
+                throw new Error(sampling ? "This node already has a View." : "This output already has a View.");
+            }
+            manifestOps.push(m => { table(m)[id] = {label: value.label || "", order: value.order ?? 0,
+                ...(sampling ? {feed: VIEW_FEED_SAMPLING} : {})}; });
             anchors.push(() => { setViewAnchor(hostNode, rel, id); return [hostNode]; });
             return;
         }

@@ -806,3 +806,23 @@ w._setPlayhead(3, "duration-clamp");  // clamped down: a jump
 console.log('RESULT=' + JSON.stringify(heard));
 """)
     assert out == [[5, "scene-switch", True], [3, "duration-clamp", True]]
+
+
+def test_coordinator_creates_sampling_views_and_never_reads_them_as_outputs():
+    out = run_coordinator("""
+controlsView = { state: 'ready', views: [
+    { view_id: 'a', status: 'ok', participation: 'active', path: '9', label: 'Preview' },
+    { view_id: 's', feed: 'sampling', status: 'ok', participation: 'active', path: '6', label: 'Pass 1' }],
+    view_candidates: [], view_sampling_candidates: [{ path: '6', class_type: 'KSampler' }] };
+for (const fn of controlsListeners) fn(controlsView);
+c.setVisible(true); c.setLayout('2c'); c.assign(0, {kind: 'view', viewId: 'a'}); c.assign(1, {kind: 'view', viewId: 's'});
+await settle();
+out.sources = reads.at(-1)?.[0];
+await c.createView(0, { path: '31' }, { feed: 'sampling' });
+const target = Object.keys(applied.at(-1))[0];
+out.created = applied.at(-1)[target];
+c.destroy();
+""")
+    # The sampling View's node is no output: runs/outputs never asks for it (4C reads runs/live).
+    assert out["sources"] == ["9"]
+    assert out["created"] == {"candidate": {"path": "31"}, "feed": "sampling"}

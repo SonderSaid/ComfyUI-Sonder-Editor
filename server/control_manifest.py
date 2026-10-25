@@ -9,7 +9,7 @@ Saved in a workflow it holds presentation only, keyed by ``binding_id``:
      "groups": {"<name>": {"order"}},
      "execution": {"v": 1, "controls": {"<id>": {"label", "group", "order", "advanced", "note",
                                                 "target": {"kind": "node"|"instance"|"group", "group_id"?}}}},
-     "views": {"v": 1, "items": {"<id>": {"label", "order", "timing"?}}}}
+     "views": {"v": 1, "items": {"<id>": {"label", "order", "timing"?, "feed"?: "sampling"}}}}
 
 A node or instance target is located by ``node.properties.sonderExecution`` on a
 root node (as a binding is by its anchor); a group by its root ``group.id``.
@@ -91,6 +91,8 @@ _ROOT_PATH_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 VIEWS_VERSION = 1
 MAX_VIEWS = 32
 VIEW_STATUSES = frozenset({"ok", "missing", "duplicate", "kind", "unsupported"})
+# A View shows an output's results (the default, never written) or a node's live sampling previews.
+VIEW_FEED_OUTPUT, VIEW_FEED_SAMPLING = "output", "sampling"
 # An execution path: 1-8 ``:``-joined node ids (MAX_NESTING), the grammar
 # ComfyUI gives an expanded subgraph node.
 MAX_PATH_SEGMENTS = 8
@@ -339,6 +341,13 @@ def _view_entry(raw: Any) -> dict:
     if isinstance(order, float) and order.is_integer():
         order = int(order)
     entry = {"label": _text(raw.get("label"), LABEL_MAX, "label").strip(), "order": _order(order)}
+    # What the View shows (Phase 4): an output's results (absent, the default) or a
+    # node's live sampling previews. Anything else skips the entry, which stays saved.
+    feed = raw.get("feed")
+    if feed not in (None, VIEW_FEED_OUTPUT, VIEW_FEED_SAMPLING):
+        raise ManifestError("A View's feed must be output or sampling.")
+    if feed == VIEW_FEED_SAMPLING:
+        entry["feed"] = VIEW_FEED_SAMPLING
     # Authored timing (Phase 3B): invalid reads as none (unlinked); the entry stays.
     timing = view_timing.clean_timing(raw.get("timing"))
     if timing is not None:

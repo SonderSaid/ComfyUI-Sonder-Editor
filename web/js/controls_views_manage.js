@@ -8,6 +8,7 @@
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { EDITOR_COLORS as COLORS, SPACE, TYPE, chromeInputCss, chromeSelectCss, setButtonDisabled, setButtonVariant } from "./editor_theme.js";
 import { normalizeTiming } from "./view_timing.js";
+import { VIEW_FEED_SAMPLING, viewFeed } from "./control_targets.js";
 
 let serial = 0;
 const make = (tag, text) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; return el; };
@@ -170,7 +171,7 @@ export function mountViewsManage(host, { track = work => work, notify = () => {}
     // on every focus change, and a rebuild between a press and its click loses it.
     const listKey = value => JSON.stringify([value.views_error || null, (value.views || []).map(d =>
         [d.view_id, d.label, d.default_label, d.order, d.origin, d.status, d.reason, d.participation, d.title, d.class_type,
-            timingKey(d.timing)])]);
+            timingKey(d.timing), d.feed || "output"])]);
 
     function render(next = host.getView()) {
         view = next || {};
@@ -213,7 +214,7 @@ export function mountViewsManage(host, { track = work => work, notify = () => {}
             setButtonDisabled(down, index === views.length - 1);
             up.addEventListener("click", () => move(descriptor.view_id, -1));
             down.addEventListener("click", () => move(descriptor.view_id, 1));
-            const remove = button("Delete", "Delete this View; its output node stays in the workflow");
+            const remove = button("Delete", "Delete this View; its node stays in the workflow");
             remove.addEventListener("click", () => {
                 if (host.capabilities?.hide && !globalThis.confirm(`Delete View “${descriptor.label || descriptor.default_label}”?`)) return;
                 void write(() => ({ [`view:${descriptor.view_id}:remove`]: true }));
@@ -224,11 +225,14 @@ export function mountViewsManage(host, { track = work => work, notify = () => {}
                 reset.addEventListener("click", () => void write(() => ({ [`view:${descriptor.view_id}:reset`]: true })));
                 top.append(reset);
             }
-            const detail = make("div", [descriptor.title || descriptor.class_type, ORIGINS[descriptor.origin] || "",
+            const sampling = viewFeed(descriptor) === VIEW_FEED_SAMPLING;
+            const detail = make("div", [descriptor.title || descriptor.class_type, sampling ? "Sampling preview" : "",
+                ORIGINS[descriptor.origin] || "",
                 descriptor.status !== "ok" ? descriptor.reason : descriptor.participation === "inactive" ? "Switched off" : ""]
                 .filter(Boolean).join(" · "));
             detail.style.cssText = `font-size:${TYPE.t11}px;color:${COLORS.textDim};overflow-wrap:anywhere;`;
-            row.append(top, detail, timingRow(descriptor));
+            // A sampling preview plays at its own rate: it has no Timing to set.
+            row.append(top, detail, ...(sampling ? [] : [timingRow(descriptor)]));
             return row;
         }));
         const kept = draft && inputs.get(draft.id);

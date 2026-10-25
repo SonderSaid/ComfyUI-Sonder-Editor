@@ -844,7 +844,7 @@ def _prepare_control_publication(body: Any) -> dict:
                         control_descriptors.coerce_control_value(numeric_kind, descriptor[bound])
                 if kind == control_rows.ROWS_KIND:
                     control_rows.check_publication(descriptor)
-    for name in ("suggestions", "candidates", "views", "view_candidates"):
+    for name in ("suggestions", "candidates", "views", "view_candidates", "view_sampling_candidates"):
         if name in view and (not isinstance(view[name], list) or not all(isinstance(d, dict) for d in view[name])):
             raise ValueError(f"{name} must be a list.")
     for descriptor in view.get("views") or []:
@@ -856,6 +856,11 @@ def _prepare_control_publication(body: Any) -> dict:
         raise ValueError("Too many Views.")
     if len(view.get("view_candidates") or []) > control_views.MAX_CANDIDATES:
         raise ValueError("Too many View candidates.")
+    if len(view.get("view_sampling_candidates") or []) > control_views.MAX_CANDIDATES:
+        raise ValueError("Too many sampling preview candidates.")
+    for descriptor in view.get("views") or []:
+        if descriptor.get("feed") not in (None, control_views.FEED_OUTPUT, control_views.FEED_SAMPLING):
+            raise ValueError("A View's feed must be output or sampling.")
     if view.get("views_error") is not None and not isinstance(view["views_error"], str):
         raise ValueError("The Views error must be text.")
     if len(view.get("candidates") or []) > control_descriptors.MAX_CANDIDATES:

@@ -6,6 +6,8 @@
 // or a named output View (the Relay's `views` section). Sources and layout
 // are inspection only; nothing here reaches a prompt or the project.
 
+import { VIEW_FEED_SAMPLING, viewFeed } from "./control_targets.js";
+
 export const LAYOUTS = Object.freeze({ "1": 1, "2c": 2, "3c": 3, "2x2": 4 });
 export const LAYOUT_ORDER = Object.freeze(["1", "2c", "3c", "2x2"]);
 export const LAYOUT_LABELS = Object.freeze({ "1": "1", "2c": "2", "3c": "3", "2x2": "2×2" });
@@ -259,6 +261,8 @@ export function mediaStatus(condition, { takeSaved = false } = {}) {
 
 // Whether the pane's Run button shows, and whether it is enabled (with why not).
 export function runAvailability({ view = null, capability = null, outcome = null, busy = false, sessionLost = false } = {}) {
+    // A sampling preview never runs on its own (inspection only).
+    if (viewFeed(view) === VIEW_FEED_SAMPLING) return { show: false, reason: view.run_reason || "A sampling preview shows while another output runs" };
     if (!capability?.ok) return { show: false, reason: "This ComfyUI can't run one output on its own" };
     if (!view || view.status !== "ok") return { show: true, enabled: false, reason: "This View is unavailable" };
     if (view.participation === "inactive") return { show: true, enabled: false, reason: view.reason || "Its node is switched off" };

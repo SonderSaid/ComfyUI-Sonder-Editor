@@ -274,3 +274,126 @@ console.log('RESULT=' + JSON.stringify({{
     assert result.returncode == 0, result.stderr
     out = json.loads(next(line for line in result.stdout.splitlines() if line.startswith("RESULT="))[7:])
     assert out == {"run": [False] * 6, "structural": [True, True, False, False, False, False], "binding": True}
+
+
+# ── Phase 4: sampling-preview Views (feed) ───────────────────────────────────
+
+def test_read_views_feed_parity_with_python():
+    cases = [{"items": {"s": {"feed": "sampling"}, "o": {"feed": "output"}, "n": {"feed": None}, "d": {},
+                        "bad": {"feed": "video"}, "num": {"feed": 2}}}]
+    out = run(f"""
+const cases = {json.dumps(cases)};
+out.js = cases.map(c => {{ const r = B.readViews(c);
+    return Object.fromEntries(Object.entries(r.items).map(([k,v]) => [k, B.viewFeed(v)])); }});
+out.classes = [...B.SAMPLING_CLASSES].sort();
+""")
+    from server import control_views as cv
+    for case, js in zip(cases, out["js"]):
+        items, _error = cm.read_views(case)
+        assert js == {k: cv.feed_of(v) for k, v in items.items()}, case
+    assert out["classes"] == sorted(cv.SAMPLING_CLASSES)
+
+
+def test_resolve_views_lets_a_sampling_view_name_any_node():
+    out = run("""
+sampler.properties.sonderViews = {'':'s'};
+host.properties.sonderViews = {'':'h'};
+const m = manifest({s:{feed:'sampling'}, h:{feed:'sampling'}});
+let r = B.resolveViews(root, m).views;
+out.ok = [r.s.status, r.s.participation, r.s.class_type];
+out.host = r.h.status;  // a subgraph instance has no previews of its own
+// As an output View the same node is not an output.
+out.output = B.resolveViews(root, manifest({s:{}, h:{}})).views.s.status;
+sampler.mode = 2;
+r = B.resolveViews(root, m).views;
+out.muted = [r.s.status, r.s.participation, r.s.inactiveReason.mode];
+// A muted core sampler is a candidate that is off; a muted unknown node is not.
+const other = add(root, 'CustomSampler', 33); other.mode = 2;
+out.inactive = B.inactiveOutputs(root).map(v => v.path);
+// The export keeps the feed and adds the facts.
+const exported = JSON.parse(B.exportManifest(JSON.stringify(m), root)).views.items;
+out.exported = [exported.s.feed, exported.s.status, exported.s.class_type];
+""")
+    assert out["ok"] == ["ok", "active", "KSampler"]
+    assert out["host"] == "kind" and out["output"] == "kind"
+    assert out["muted"] == ["ok", "inactive", "muted"]
+    assert "6" in out["inactive"] and "33" not in out["inactive"]
+    assert out["exported"] == ["sampling", "ok", "KSampler"]
+
+
+def test_writer_creates_a_sampling_view_on_a_non_output_node():
+    out = run_writer("""
+plan = changes => Object.fromEntries(Object.entries(changes).map(([t,v]) =>
+    [t, {candidate:{path:'6',class_type:'KSampler',host:'6',rel:''},label:'',order:2,feed:v.feed}]));
+let r = await writer.applyChanges({'view:s1:create':{candidate:{path:'6'},feed:'sampling'}});
+out.created = [r.ok, saved().views.items.s1, sampler.properties.sonderViews];
+// Without the sampling feed the same node can't be an output View.
+r = await writer.applyChanges({'view:s2:create':{candidate:{path:'6'}}});
+out.output = [r.ok, r.rejected?.[0]?.reason];
+// The node has a View now: a second one (any feed) is refused.
+r = await writer.applyChanges({'view:s3:create':{candidate:{path:'6'},feed:'sampling'}});
+out.taken = [r.ok, r.rejected?.[0]?.reason];
+// Renaming keeps the feed.
+plan = changes => changes;
+r = await writer.applyChanges({'view:s1:label':'Pass 1 live'});
+out.renamed = saved().views.items.s1;
+""")
+    assert out["created"] == [True, {"label": "", "order": 2, "feed": "sampling"}, {"": "s1"}]
+    assert out["output"][0] is False and "moved" in out["output"][1]
+    assert out["taken"] == [False, "This node already has a View."]
+    assert out["renamed"] == {"label": "Pass 1 live", "order": 2, "feed": "sampling"}
+
+
+def test_the_mounted_publication_shrinks_sampling_candidates_first_and_keeps_the_feed():
+    relay = (ROOT / "web" / "js" / "controls_canvas_relay.js").as_uri()
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for browser module tests")
+    script = f"""
+const R = await import({json.dumps(relay)});
+const big = 'x'.repeat(4000);
+const row = i => ({{path: String(i), class_type: 'KSampler', title: big, host: String(i), rel: ''}});
+const view = {{bindings: [], notes: [], views: [{{view_id: 's', feed: 'sampling', status: 'ok', label: 'L', runnable: false,
+    run_reason: 'r', path: '6'}}],
+    view_sampling_candidates: Array.from({{length: 120}}, (_, i) => row(i)),
+    view_candidates: Array.from({{length: 20}}, (_, i) => row(500 + i))}};
+const fitted = R.fitPublicationView(view, {{}});
+const minimal = R.fitPublicationView({{...view, views: view.views.map(v => ({{...v, bulk: big.repeat(400)}}))}}, {{}});
+console.log('RESULT=' + JSON.stringify({{
+    sampling: fitted.view_sampling_candidates?.length ?? null, samplingCut: !!fitted.view_sampling_candidates_truncated,
+    outputs: fitted.view_candidates?.length ?? null,
+    minimal: minimal.views?.[0] ? [minimal.views[0].feed, minimal.views[0].run_reason, 'bulk' in minimal.views[0]] : null,
+}}));
+"""
+    result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert result.returncode == 0, result.stderr
+    out = json.loads(next(line for line in result.stdout.splitlines() if line.startswith("RESULT="))[7:])
+    # Sampling-preview sources shrink before the output candidates do.
+    assert out["samplingCut"] and out["sampling"] < 120 and out["outputs"] == 20
+    assert out["minimal"] == ["sampling", "r", False]
+
+
+def test_a_sampling_view_never_names_an_output_node_and_a_muted_seen_node_sends_its_body():
+    out = run("""
+preview.properties.sonderViews = {'':'o'};
+const custom = add(root, 'CustomSampler', 33); custom.properties.sonderViews = {'':'c'}; custom.mode = 2;
+const m = manifest({o:{feed:'sampling'}, c:{feed:'sampling'}});
+const r = B.resolveViews(root, m).views;
+out.statuses = [r.o.status, r.c.status, r.c.participation];
+// The canvas sends a body for a sampling View's own muted source, whatever its class.
+const sources = Object.values(r).filter(v => v.inactiveReason && v.node).map(v => ({node: v.node, path: v.path, inactive: v.inactiveReason}));
+out.bodies = Object.keys(B.inactiveBodies({}, {first: sources, last: B.inactiveOutputs(root)}));
+""")
+    assert out["statuses"] == ["kind", "ok", "inactive"]
+    assert "33" in out["bodies"]
+
+
+def test_the_writer_refuses_a_sampling_view_on_an_output_node():
+    out = run_writer("""
+plan = changes => Object.fromEntries(Object.entries(changes).map(([t,v]) =>
+    [t, {candidate:{path:'9',class_type:'PreviewImage',host:'9',rel:''},label:'',order:2,feed:'sampling'}]));
+const r = await writer.applyChanges({'view:s9:create':{candidate:{path:'9'},feed:'sampling'}});
+out.refused = [r.ok, r.rejected?.[0]?.reason, preview.properties.sonderViews ?? null];
+""")
+    assert out["refused"][0] is False and "moved" in out["refused"][1]
+    assert out["refused"][2] == {"": "old"}

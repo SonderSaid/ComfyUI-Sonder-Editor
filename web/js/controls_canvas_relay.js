@@ -19,8 +19,8 @@ const INVALID_VIEW = unavailableView(
 
 const publicationBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
 // What a pane needs of each View, kept even when the Controls cannot fit.
-const VIEW_KEYS = ["view_id", "origin", "label", "default_label", "order", "path", "class_type", "title", "status",
-    "participation", "inactive_reason", "reason", "runnable", "timing"];
+const VIEW_KEYS = ["view_id", "origin", "feed", "label", "default_label", "order", "path", "class_type", "title", "status",
+    "participation", "inactive_reason", "reason", "runnable", "run_reason", "timing"];
 const minimalViews = views => (views || []).map(d => Object.fromEntries(VIEW_KEYS.filter(key => key in d).map(key => [key, d[key]])));
 const shorten = (descriptor, field, limit) =>
     typeof descriptor[field] === "string" && descriptor[field].length > limit
@@ -39,7 +39,12 @@ export function fitPublicationView(view, envelope) {
     }
     const fits = candidate => publicationBytes({ ...envelope, view: candidate }) <= MAX_PUBLICATION_BYTES;
     if (fits(view)) return view;
-    // Outputs that could become a View are for the pane picker only; they go first.
+    // Nodes that could become a View are for the pane picker only; they go first,
+    // sampling-preview sources before outputs.
+    while (view.view_sampling_candidates?.length && !fits(view)) {
+        view = { ...view, view_sampling_candidates: view.view_sampling_candidates.slice(0, Math.floor(view.view_sampling_candidates.length / 2)),
+            view_sampling_candidates_truncated: true };
+    }
     while (view.view_candidates?.length && !fits(view)) {
         view = { ...view, view_candidates: view.view_candidates.slice(0, Math.floor(view.view_candidates.length / 2)),
             view_candidates_truncated: true };

@@ -182,3 +182,12 @@ console.log('RESULT=' + JSON.stringify(out));
     assert result.returncode == 0, result.stderr
     out = json.loads(next(l for l in result.stdout.splitlines() if l.startswith("RESULT="))[7:])
     assert out == {"both": ["c:a", "c:b"], "after": ["c:b"], "stored": "2c"}
+
+
+def test_a_sampling_view_never_offers_run():
+    out = run("""
+out.run = M.runAvailability({view: {status: 'ok', participation: 'active', feed: 'sampling', run_reason: 'Not alone.'},
+    capability: {ok: true}});
+out.output = M.runAvailability({view: {status: 'ok', participation: 'active'}, capability: {ok: true}}).show;
+""")
+    assert out["run"] == {"show": False, "reason": "Not alone."} and out["output"] is True
