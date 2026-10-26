@@ -91,13 +91,20 @@ class _FrameCapture:
         self.frame = int(value)
         return True
 
+    def grab(self):
+        self.frame += 1
+        return True
+
     def read(self):
-        if self.cancel_frame is not None and self.frame == self.cancel_frame[0]:
+        # Like a real decoder, a read returns the frame at the position and advances.
+        frame = self.frame
+        self.frame += 1
+        if self.cancel_frame is not None and frame == self.cancel_frame[0]:
             self.cancel_frame[1].set()
-        if self.fail_frame is not None and self.frame == self.fail_frame:
+        if self.fail_frame is not None and frame == self.fail_frame:
             return False, None
         base = 100 if os.path.basename(self.path).startswith("take") else 0
-        value = (base + self.frame) % 256
+        value = (base + frame) % 256
         return True, np.array([[[value, value, value]]], dtype=np.uint8)
 
     def release(self):
@@ -479,6 +486,7 @@ def test_source_revision_change_during_render_retries_once_and_publishes_retry(t
 
     class RevisingCapture(_FrameCapture):
         def read(self):
+            # Before the base read advances the position.
             if self.frame == 3 and not changed["done"]:
                 source_path.write_bytes(b"replacement-during-render")
                 changed["done"] = True

@@ -53,7 +53,92 @@ class TimelineRenderCancelled(RuntimeError):
 
 def _check_cancel(cancel_event) -> None:
     if cancel_event is not None and cancel_event.is_set():
-        raise TimelineRenderCancelled("timeline export cancelled")
+        raise TimelineRenderCancelled("timeline render cancelled")
+
+
+# A reader up to this many frames behind its target decodes forward instead of
+# seeking. OpenCV's FFmpeg seek steps back from the target and decodes forward
+# to it, so even an all-intra FFV1 seek decodes several frames: Phase 0 measured
+# 5 ms (640px H.264) to 1.4 s (2560x1536 FFV1) per seek, against at most 2.2 ms
+# per grab, so 16 grabs cost less than one seek on every measured codec.
+SEQUENTIAL_GRAB_LIMIT = 16
+# A reader no clip has used for more than this many canvas frames is released,
+# so a long export does not keep one decoder per source it ever touched.
+READER_IDLE_RELEASE_FRAMES = 48
+# Decoders of one source open at once. Layers beyond this share a reader and seek.
+MAX_READERS_PER_SOURCE = 4
+
+
+def _release_capture(cap) -> None:
+    # A failing release must not replace the exception a render is unwinding with.
+    try:
+        cap.release()
+    except Exception:
+        logger.warning("Releasing a video capture failed", exc_info=True)
+
+
+class _SourceReader:
+    """One open capture and where its decoder stands.
+
+    ``next_pos`` is the frame the next ``read()`` returns, or None when unknown
+    (fresh capture, failed seek, grab or read), which forces a seek. The last
+    decoded frame is kept so a repeated index (rate up-conversion, the end clamp,
+    two layers on one frame) costs no decode.
+    """
+
+    __slots__ = ("cap", "next_pos", "last_index", "last_bgr", "last_used")
+
+    def __init__(self, cap, frame_index):
+        self.cap = cap
+        self.next_pos = None
+        self.last_index = None
+        self.last_bgr = None
+        self.last_used = frame_index
+
+    def holds(self, target: int) -> bool:
+        return self.last_index == target and self.last_bgr is not None
+
+    def can_reach(self, target: int) -> bool:
+        return self.next_pos is not None and self.next_pos <= target <= self.next_pos + SEQUENTIAL_GRAB_LIMIT
+
+    def _lose_position(self) -> None:
+        self.next_pos = None
+        self.last_index = None
+        self.last_bgr = None
+
+    def _keep(self, target: int, frame_bgr: np.ndarray) -> np.ndarray:
+        self.next_pos = target + 1
+        self.last_index = target
+        self.last_bgr = frame_bgr
+        return frame_bgr
+
+    def read(self, target: int, mark) -> np.ndarray | None:
+        """The BGR frame at decode index ``target``, or None after marking why."""
+        if self.holds(target):
+            return self.last_bgr
+        if self.can_reach(target):
+            grabbed = all(self.cap.grab() for _ in range(target - self.next_pos))
+            ok, frame_bgr = self.cap.read() if grabbed else (False, None)
+            if ok:
+                return self._keep(target, frame_bgr)
+            # The block stays out of the cache, but the frame gets the seek the
+            # old seek-every-frame path would have made.
+            self._lose_position()
+            mark("read_failed")
+        seek_failed = self.cap.set(cv2.CAP_PROP_POS_FRAMES, target) is False
+        if seek_failed:
+            mark("seek_failed")
+        ok, frame_bgr = self.cap.read()
+        if not ok:
+            self._lose_position()
+            mark("read_failed")
+            return None
+        if seek_failed:
+            # The frame is used as before, but nothing is known about where the
+            # decoder stands, so the next request seeks again.
+            self._lose_position()
+            return frame_bgr
+        return self._keep(target, frame_bgr)
 
 
 def _resolve_project_media_path(project: TimelineProject, source_path: str) -> str:
@@ -277,8 +362,12 @@ def iter_scene_frames(
     visible_clips = _visible_render_clips(scene)
     scene_fps = effective_scene_fps(project, scene)
     prepared_sources = prepared_sources or _prepare_sources(project, scene, visible_clips)
-    captures = {}
+    # Readers per capture key. Several readers of one source exist only while
+    # clips of that source are composited at different positions at once.
+    readers: dict[tuple, list[_SourceReader]] = {}
     failed_captures = set()
+    # Keys whose extra reader failed to open: their layers share existing readers.
+    reader_limited = set()
 
     if render_status is not None:
         render_status.setdefault("failed_blocks", set())
@@ -292,13 +381,13 @@ def iter_scene_frames(
         if len(render_status["failures"]) < 64:
             render_status["failures"].append((block_index, source_path, reason))
 
-    def get_cap(source_path: str, frame_index: int):
+    def capture_key_for(source_path: str, frame_index: int):
         source = prepared_sources.get(source_path)
         abs_path = source.abs_path if source else ""
         if not abs_path:
             logger.info("Skipping render clip %s: file not found or quarantined", source_path)
             mark_failure(frame_index, source_path, "missing_or_quarantined")
-            return None
+            return None, None
         capture_key = (
             abs_path,
             source.source_fps if source else 0.0,
@@ -307,30 +396,105 @@ def iter_scene_frames(
         )
         if capture_key in failed_captures:
             mark_failure(frame_index, source_path, "open_failed")
-            return None
-        if capture_key not in captures:
-            cap = video_capture_factory(abs_path)
-            if cap.isOpened():
-                captures[capture_key] = (
-                    cap,
-                    source.color_affine if source else None,
-                    source.rate_ratio if source else 1.0,
-                    source.native_frame_count if source else 0,
-                )
+            return None, None
+        return capture_key, source
+
+    def open_reader(capture_key, source, source_path: str, frame_index: int):
+        pool = readers.setdefault(capture_key, [])
+        cap = video_capture_factory(source.abs_path)
+        if cap.isOpened():
+            reader = _SourceReader(cap, frame_index)
+            pool.append(reader)
+            return reader
+        logger.warning("Cannot open video: %s", source.abs_path)
+        _release_capture(cap)
+        if pool:
+            # A reader of this source already works: share it rather than drop
+            # the layer, and stop opening more for this render.
+            reader_limited.add(capture_key)
+            return pool[0]
+        failed_captures.add(capture_key)
+        mark_failure(frame_index, source_path, "open_failed")
+        return None
+
+    def assign_readers(requests: list, frame_index: int) -> None:
+        """Give each clip request the reader that reaches its frame most cheaply.
+
+        Cached frames and in-reach readers are handed out before any reader is
+        taken to seek, so a cut on one layer never steals the reader another
+        layer of the same source is continuing on.
+        """
+        taken = set()
+        # (key, target) -> the reader that will hold that frame this canvas frame,
+        # so a second layer on the same source frame shares one decode.
+        serving = {}
+
+        def give(request, reader):
+            request["reader"] = reader
+            taken.add(reader)
+            serving[(request["key"], request["target"])] = reader
+
+        for request in requests:
+            if request["key"] is None:
+                continue
+            for reader in readers.get(request["key"], ()):
+                if reader.holds(request["target"]):
+                    give(request, reader)
+                    break
+        for request in requests:
+            if request["key"] is None or request["reader"] is not None:
+                continue
+            shared = serving.get((request["key"], request["target"]))
+            if shared is not None:
+                request["reader"] = shared
+                continue
+            reachable = [reader for reader in readers.get(request["key"], ())
+                         if reader not in taken and reader.can_reach(request["target"])]
+            if reachable:
+                give(request, min(reachable, key=lambda reader: request["target"] - reader.next_pos))
+        for request in requests:
+            if request["key"] is None or request["reader"] is not None:
+                continue
+            shared = serving.get((request["key"], request["target"]))
+            if shared is not None:
+                request["reader"] = shared
+                continue
+            pool = readers.get(request["key"], [])
+            free = [reader for reader in pool if reader not in taken]
+            if free:
+                request["reader"] = free[0]
+            elif pool and (len(pool) >= MAX_READERS_PER_SOURCE or request["key"] in reader_limited):
+                # Reading happens in track order, so a shared reader serves the
+                # earlier layer before it moves for this one.
+                request["reader"] = pool[0]
             else:
-                logger.warning("Cannot open video: %s", abs_path)
-                try:
-                    cap.release()
-                except Exception:
-                    pass
-                failed_captures.add(capture_key)
-                mark_failure(frame_index, source_path, "open_failed")
-                return None
-        return captures[capture_key]
+                request["reader"] = open_reader(request["key"], request["source"], request["clip"].source_path,
+                                                frame_index)
+            if request["reader"] is not None:
+                give(request, request["reader"])
+
+    def retire_idle_readers(frame_index: int) -> None:
+        for capture_key, pool in list(readers.items()):
+            kept = []
+            for reader in pool:
+                idle = frame_index - reader.last_used
+                if idle > READER_IDLE_RELEASE_FRAMES:
+                    _release_capture(reader.cap)
+                    continue
+                if idle > 1:
+                    # Only a frame used on the previous canvas frame can repeat.
+                    reader.last_bgr = None
+                    reader.last_index = None
+                kept.append(reader)
+            if kept:
+                readers[capture_key] = kept
+            else:
+                readers.pop(capture_key, None)
 
     try:
         for frame_index in range(render_start, render_end):
             _check_cancel(cancel_event)
+            retire_idle_readers(frame_index)
             canvas = np.zeros((proj_h, proj_w, 3), dtype=np.uint8)
             active = [
                 clip
@@ -339,26 +503,33 @@ def iter_scene_frames(
             ]
             active.sort(key=lambda clip: clip.track_index)
 
+            requests = []
             for clip in active:
-                _check_cancel(cancel_event)
-                capture_entry = get_cap(clip.source_path, frame_index)
-                if capture_entry is None:
-                    continue
-                cap, color_affine, rate_ratio, native_frame_count = capture_entry
-                source_units = clip.source_in_frame + (frame_index - clip.timeline_start_frame)
-                source_frame = int(math.floor((source_units + 0.5) * rate_ratio))
-                if native_frame_count > 0:
-                    source_frame = min(native_frame_count - 1, max(0, source_frame))
-                seek_result = cap.set(cv2.CAP_PROP_POS_FRAMES, source_frame)
-                if seek_result is False:
-                    mark_failure(frame_index, clip.source_path, "seek_failed")
-                ok, frame_bgr = cap.read()
-                if not ok:
-                    mark_failure(frame_index, clip.source_path, "read_failed")
-                    continue
+                capture_key, source = capture_key_for(clip.source_path, frame_index)
+                target = None
+                if capture_key is not None:
+                    source_units = clip.source_in_frame + (frame_index - clip.timeline_start_frame)
+                    target = int(math.floor((source_units + 0.5) * source.rate_ratio))
+                    if source.native_frame_count > 0:
+                        target = min(source.native_frame_count - 1, max(0, target))
+                requests.append({"clip": clip, "key": capture_key, "source": source, "target": target,
+                                 "reader": None})
+            assign_readers(requests, frame_index)
 
+            for request in requests:
+                _check_cancel(cancel_event)
+                clip, reader = request["clip"], request["reader"]
+                if reader is None:
+                    continue
+                reader.last_used = frame_index
+                frame_bgr = reader.read(
+                    request["target"],
+                    lambda reason, clip=clip: mark_failure(frame_index, clip.source_path, reason),
+                )
+                if frame_bgr is None:
+                    continue
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                frame_rgb = apply_rgb_color_correction(frame_rgb, color_affine)
+                frame_rgb = apply_rgb_color_correction(frame_rgb, request["source"].color_affine)
                 placed, (dx, dy, dw, dh) = fit_frame_to_canvas(
                     frame_rgb, proj_w, proj_h,
                     mode=getattr(clip, "fit_mode", "pad_edge"),
@@ -379,8 +550,9 @@ def iter_scene_frames(
                     )
             yield np.ascontiguousarray(canvas)
     finally:
-        for cap, _affine, _rate_ratio, _native_frame_count in captures.values():
-            cap.release()
+        for pool in readers.values():
+            for reader in pool:
+                _release_capture(reader.cap)
 
 
 def render_scene_frames(
@@ -393,8 +565,18 @@ def render_scene_frames(
     video_capture_factory=None,
     use_cache: bool = True,
     cache_max_bytes: int | None = None,
+    progress=None,
 ) -> torch.Tensor:
-    """Composite visible render clips into an RGB float tensor for [start_frame, end_frame)."""
+    """Composite visible render clips into an RGB float tensor for [start_frame, end_frame).
+
+    ``progress(done, total)``, when given, starts at ``(0, total)`` and counts
+    requested frames as they are composited, copied from the cache or found
+    empty; ``total`` is the requested frame count. Frames a cache block composes
+    outside the request are not counted, so ``done`` never passes ``total``. A
+    retried attempt starts again at 0. An exception raised by the callback
+    (an interrupt) propagates after captures are released and staged blocks
+    discarded.
+    """
     _check_cancel(cancel_event)
     video_capture_factory = video_capture_factory or _default_video_capture
     proj_w, proj_h = _scene_resolution(project, scene)
@@ -421,14 +603,25 @@ def render_scene_frames(
             render_end,
             0,
         )
-        frames = list(iter_scene_frames(
+        frame_iter = iter_scene_frames(
             project,
             scene,
             render_start,
             render_end,
             cancel_event=cancel_event,
             video_capture_factory=video_capture_factory,
-        ))
+        )
+        frames = []
+        if progress is not None:
+            progress(0, num_frames)
+        try:
+            for frame in frame_iter:
+                frames.append(frame)
+                if progress is not None:
+                    progress(len(frames), num_frames)
+        finally:
+            # Release the captures now, not when an exception's traceback is freed.
+            frame_iter.close()
         arr = np.stack(frames, axis=0).astype(np.float32) / 255.0
         return torch.from_numpy(arr)
 
@@ -455,6 +648,7 @@ def render_scene_frames(
             cancel_event=cancel_event,
             video_capture_factory=video_capture_factory,
             use_cache=False,
+            progress=progress,
         )
 
     store_activity = active_cache_store(store)
@@ -483,6 +677,7 @@ def render_scene_frames(
             cancel_event=cancel_event,
             video_capture_factory=video_capture_factory,
             use_cache=False,
+            progress=progress,
         )
 
     block_frames = store.block_frames
@@ -512,6 +707,17 @@ def render_scene_frames(
 
     def render_attempt(staged):
         _check_cancel(cancel_event)
+        done = 0
+
+        def count_requested(first: int, end: int) -> None:
+            nonlocal done
+            added = max(0, min(end, render_end) - max(first, render_start))
+            if added and progress is not None:
+                done += added
+                progress(done, num_frames)
+
+        if progress is not None:
+            progress(0, num_frames)
         output = torch.zeros(num_frames, proj_h, proj_w, 3, dtype=torch.float32)
         prepared = _prepare_sources(project, scene, coverage_clips)
         block_info = {}
@@ -522,6 +728,8 @@ def render_scene_frames(
         staging_failed = False
 
         for block_index in requested_block_indices:
+            # A cache hit is a large disk read; a cancel must not wait for all of them.
+            _check_cancel(cancel_event)
             block_start = block_index * block_frames
             block_end = min(scene_duration, block_start + block_frames)
             contributors = _block_contributors(visible_clips, block_start, block_end, prepared)
@@ -537,6 +745,7 @@ def render_scene_frames(
             block_info[block_index] = (block_start, block_end, contributors, fingerprint)
             if not contributors:
                 delete_indices.add(block_index)
+                count_requested(block_start, block_end)
                 continue
             sources_available = all(
                 prepared.get(str(getattr(clip, "source_path", "") or "")) is not None
@@ -567,6 +776,7 @@ def render_scene_frames(
                 request_start=render_start,
                 request_end=render_end,
             )
+            count_requested(block_start, block_end)
             hit_count += 1
             hit_indices.append(block_index)
 
@@ -595,6 +805,7 @@ def render_scene_frames(
                             block_array[offset] = next(frame_iter)
                         except StopIteration as exc:
                             raise RuntimeError("Timeline renderer ended before the cache block was complete") from exc
+                        count_requested(block_start + offset, block_start + offset + 1)
                     block_tensor = torch.from_numpy(block_array)
                     _copy_uint8_slice_to_output(
                         output,

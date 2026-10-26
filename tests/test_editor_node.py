@@ -1704,9 +1704,14 @@ def test_render_scene_frames_uses_take_source_in_without_repeating_seam_frame(tm
             if prop == editor_node.cv2.CAP_PROP_POS_FRAMES:
                 self.pos = int(value)
 
+        def grab(self):
+            self.pos += 1
+            return True
+
         def read(self):
             base = 4 if self.path.endswith("chunk2.mp4") else 0
             value = base + self.pos
+            self.pos += 1
             return True, np.full((1, 1, 3), value, dtype=np.uint8)
 
         def release(self):

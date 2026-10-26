@@ -348,9 +348,9 @@ def test_renderer_maps_scene_units_to_native_frames_and_ratio_one_is_identical(t
     project = TimelineProject(project_dir=str(project_dir), fps=24.0, resolution=(2, 2), assets=[asset])
     scene = Scene(scene_id="scene", fps=24.0, duration_frames=4)
     scene.clips = [ClipReference(source_path=asset.path, timeline_start_frame=0, timeline_end_frame=4)]
-    positions = []
 
     class Capture:
+        # Models a decoder: a read returns the frame at the position and advances.
         def __init__(self, _path):
             self.position = 0
 
@@ -359,18 +359,23 @@ def test_renderer_maps_scene_units_to_native_frames_and_ratio_one_is_identical(t
 
         def set(self, _prop, value):
             self.position = int(value)
-            positions.append(self.position)
+
+        def grab(self):
+            self.position += 1
+            return True
 
         def read(self):
-            return True, np.full((2, 2, 3), self.position, dtype=np.uint8)
+            frame = self.position
+            self.position += 1
+            return True, np.full((2, 2, 3), frame, dtype=np.uint8)
 
         def release(self):
             pass
 
-    list(iter_scene_frames(project, scene, 0, 4, video_capture_factory=Capture))
-    assert positions == [0, 1, 3, 4]
+    frames = list(iter_scene_frames(project, scene, 0, 4, video_capture_factory=Capture))
+    decoded = [int(frame[0, 0, 0]) for frame in frames]
+    assert decoded == [0, 1, 3, 4]
 
-    positions.clear()
     project.assets = []  # unregistered-media compatibility fallback is ratio 1.0
-    list(iter_scene_frames(project, scene, 0, 4, video_capture_factory=Capture))
-    assert positions == [0, 1, 2, 3]
+    frames = list(iter_scene_frames(project, scene, 0, 4, video_capture_factory=Capture))
+    assert [int(frame[0, 0, 0]) for frame in frames] == [0, 1, 2, 3]
