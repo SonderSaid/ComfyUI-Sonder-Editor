@@ -373,6 +373,8 @@ def test_streamed_same_path_replace_retries_conflict_and_preserves_metadata(tmp_
     assert replaced.favorite is True
     assert committed.get_asset("asset-1").media_probe_signature == routes._media_probe_signature(str(source))
     assert not list(staging_dir.glob("*.rollback.*"))
+    # Take restoration reads this: provenance survives a replacement, eligibility does not.
+    assert committed.get_asset("asset-1").media_replaced_at
 
 
 def test_frontend_import_and_replace_post_directly_to_sonder():

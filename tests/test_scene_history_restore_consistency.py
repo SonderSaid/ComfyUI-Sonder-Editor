@@ -24,7 +24,7 @@ def test_mutation_produced_geometry_is_restorable(tmp_path, monkeypatch):
         elif case == "guide_overhang":
             module._apply_create_guide(scene, {"frame_index": 12})
         else:
-            clip, _, _ = module._apply_create_clip(project, scene, {"asset_id": "video", "timeline_start_frame": 0})
+            clip, *_ = module._apply_create_clip(project, scene, {"asset_id": "video", "timeline_start_frame": 0})
             if case == "negative":
                 module._apply_update_clip(project, scene, clip.clip_id, {"timeline_start_frame": -3})
             elif case == "stranded_lane":
@@ -34,7 +34,7 @@ def test_mutation_produced_geometry_is_restorable(tmp_path, monkeypatch):
                 module._apply_update_clip(project, scene, clip.clip_id, {"track_index": 1})
                 module._set_scene_lane_count(scene, "video", 1)
             elif case == "overlap":
-                second, _, _ = module._apply_create_clip(project, scene, {"asset_id": "video", "timeline_start_frame": 30})
+                second, *_ = module._apply_create_clip(project, scene, {"asset_id": "video", "timeline_start_frame": 30})
                 module._apply_update_clip(project, scene, second.clip_id, {"timeline_start_frame": 2, "timeline_end_frame": 6})
         raw = scene.to_dict()
         corpus.append(raw)

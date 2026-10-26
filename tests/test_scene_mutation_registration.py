@@ -2171,6 +2171,20 @@ _PROMPT_KEYS = frozenset({"prompt_id", "start_frame", "end_frame", "prompt",
 _CLIP_KEYS = frozenset({"clip_id", "timeline_start_frame", "track_index", "role"})
 _AUDIO_KEYS = frozenset({"track_id", "timeline_start_frame", "lane_index"})
 
+
+def _routes_string_tuple(name: str) -> frozenset:
+    """A module-level tuple of strings in routes.py, read rather than re-listed."""
+    for node in ast.parse(ROUTES.read_text(encoding="utf-8")).body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name) and node.targets[0].id == name):
+            return frozenset(element.value for element in node.value.elts)
+    raise AssertionError(f"routes.py no longer defines {name}")
+
+
+# A restoring create (`restore_take: true`) compares the take's identity and the
+# geometry the browser painted. Optional: an ordinary drop sends no `expected`.
+_TAKE_RESTORATION_KEYS = _routes_string_tuple("TAKE_RESTORATION_EXPECTED_KEYS")
+
 GUARD_CONTRACTS = {
     # -- validates a closed key set -------------------------------------------
     "update_scene_fields": (_FIXED, frozenset({
@@ -2237,6 +2251,16 @@ GUARD_CONTRACTS = {
     "swap_prompt_sections": (_FIXED, _PROMPT_KEYS,
         "`_apply_swap_prompt_sections` calls `_validate_prompt_identity` twice, "
         "under `expected_a` and `expected_b` rather than `expected`."),
+    "create_clip": (_FIXED, _TAKE_RESTORATION_KEYS,
+        "Only a restoring create reads it. `_apply_create_clip` calls "
+        "`_validate_take_restoration_identity` before anything hydrates, then "
+        "`_validate_take_restoration_geometry` against what "
+        "`_resolve_take_restoration` recomputed from the asset's record. An "
+        "ordinary drop sends no `expected` and is additive as before."),
+    "create_audio_track": (_FIXED, _TAKE_RESTORATION_KEYS,
+        "As create_clip: `_apply_create_audio_track` validates a restoring "
+        "create through `_validate_take_restoration_identity` and "
+        "`_validate_take_restoration_geometry`."),
     "create_reference_item": (_FIXED, frozenset({"next_start_frame"}),
         "The dispatch branch calls `_validate_reference_creation_identity`, which "
         "recomputes `_next_reference_start_after` and compares it with what the "
@@ -2332,7 +2356,7 @@ GUARD_CONTRACTS = {
         "the items loop reads one."),
 }
 
-# The 23 that read no `expected` on any path. Held as data rather than as
+# The 21 that read no `expected` on any path. Held as data rather than as
 # "everything else" so `test_the_guard_contracts_still_match_the_code` can fail
 # in BOTH directions -- an operation that gains validation, and one that loses it.
 #
@@ -2344,8 +2368,6 @@ GUARD_CONTRACTS.update({op: (_NOTHING, frozenset(), evidence) for op, evidence i
     "consolidate_items": "`_consolidate_media_items` reads target_lane and "
                          "item_ids, range-checks the lane and refuses an id it "
                          "cannot resolve; it reads no expected.",
-    "create_audio_track": "`_apply_create_audio_track` reads fields only.",
-    "create_clip": "`_apply_create_clip` reads fields only.",
     "create_prompt_section": "`_apply_create_prompt_section` reads fields only. "
                              "`_require_no_prompt_overlap` is a range check "
                              "against the other sections, not a claim about a "

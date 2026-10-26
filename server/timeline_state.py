@@ -926,6 +926,10 @@ class Asset:
     favorite: bool = False                  # user-pinned in the asset gallery
     trashed_at: str = ""                    # ISO timestamp when moved to trash
     trash_previous_folder: str = ""         # folder before trashing, used for restore
+    # ISO timestamp of the last media replacement. Provenance deliberately survives
+    # a replacement, so this is what tells take restoration the file it describes
+    # is gone. Replacements made before this field existed are not detectable.
+    media_replaced_at: str = ""
 
     def __getattribute__(self, name):
         if name == "generation_params" and object.__getattribute__(self, "__dict__").get("_generation_unhydrated", False):
@@ -979,6 +983,7 @@ class Asset:
             "favorite": bool(self.favorite),
             "trashed_at": self.trashed_at,
             "trash_previous_folder": self.trash_previous_folder,
+            "media_replaced_at": self.media_replaced_at,
         }
 
     @classmethod
@@ -1011,6 +1016,7 @@ class Asset:
             favorite=bool(data.get("favorite", False)),
             trashed_at=data.get("trashed_at", ""),
             trash_previous_folder=data.get("trash_previous_folder", ""),
+            media_replaced_at=data.get("media_replaced_at", ""),
         )
 
 

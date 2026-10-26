@@ -137,6 +137,7 @@ from .timeline_state import (
     effective_scene_fps, media_timeline_frames, normalize_reference_tags,
     normalize_staged_members, retime_scene_geometry,
 )
+from .take_placement import restore_take_geometry, take_restoration_source
 from .lane_registry import (
     LANE_DESCRIPTORS,
     VARIABLE_LANE_DESCRIPTORS,
@@ -5263,6 +5264,223 @@ def _apply_swap_prompt_sections(scene: Scene, op: dict) -> tuple:
     return section_a, section_b
 
 
+# Take restoration: a create that asks to put a take back where it was placed.
+# The browser resolves first and sends the identity and geometry it painted; the
+# server recomputes both from the asset's own record and refuses on any
+# difference rather than placing something the author did not see.
+_TAKE_RESTORATION_REASONS = {
+    "legacy": "This take was saved before Sonder recorded take placement",
+    "unsupported_policy": "This take's placement was recorded by a newer Sonder",
+    "missing_fps": "This take's placement frame rate is missing",
+    "incomplete": "This take's placement record is incomplete",
+    "not_take": "This asset is not a take",
+    "empty": "This take has no frames in its placed range",
+    "collapsed": "This take's range has no frames left at this scene's frame rate",
+    "before_scene_start": "This take would start before the scene",
+    "replaced": "This asset's media was replaced after the take was saved",
+    "missing": "This asset's media file is missing",
+    "trashed": "This asset is in the trash",
+    "audio_short": "This audio is shorter than the take's placed range",
+}
+# The identity and geometry a restoring create must carry in `expected`. A
+# change to any of them between the browser's read and this commit refuses.
+TAKE_RESTORATION_EXPECTED_KEYS = (
+    "asset_id", "provenance_revision", "path", "media_probe_signature",
+    "frame_count", "duration_sec", "media_replaced_at", "scene_fps",
+    "source_in_frame", "source_out_frame", "total_source_frames", "timeline_end_frame",
+)
+
+
+def _take_restoration_unavailable(reason: str):
+    message = _TAKE_RESTORATION_REASONS.get(reason, "This take cannot be restored")
+    _mutation_error(f"{message}. Drop it again to place it at the cursor.",
+                    409, "take_restoration_unavailable", {"reason": reason})
+
+
+def _validate_take_restoration_identity(project: TimelineProject, scene: Scene,
+                                        asset: Asset, expected) -> None:
+    """Compare the identity the browser resolved against, before any hydration."""
+    if not isinstance(expected, dict):
+        _mutation_error("A restoring create requires expected", 400, "missing_expected")
+    missing = [key for key in TAKE_RESTORATION_EXPECTED_KEYS if key not in expected]
+    if missing:
+        _mutation_error(f"Restoring create is missing expected {', '.join(missing)}",
+                        400, "missing_expected")
+    actual = {
+        "asset_id": asset.asset_id,
+        "provenance_revision": _asset_summary_and_revision(asset)[1],
+        "path": asset.path,
+        "media_probe_signature": asset.media_probe_signature,
+        "media_replaced_at": asset.media_replaced_at,
+    }
+    numeric = {
+        "frame_count": getattr(asset, "frame_count", 0),
+        "duration_sec": getattr(asset, "duration_sec", 0.0),
+        "scene_fps": effective_scene_fps(project, scene),
+    }
+    stale = [key for key, value in actual.items() if str(expected.get(key) or "") != str(value or "")]
+    for key, value in numeric.items():
+        try:
+            if float(expected.get(key)) != float(value or 0):
+                stale.append(key)
+        except (TypeError, ValueError, OverflowError):
+            stale.append(key)
+    if stale:
+        _mutation_error("The take or scene changed since it was dropped; the timeline was refreshed.",
+                        409, "take_restoration_stale", {"fields": stale})
+
+
+def _resolve_take_restoration(project: TimelineProject, scene: Scene, asset: Asset,
+                              cursor_frame: int) -> tuple[dict, dict]:
+    """``(source, geometry)`` for a take restored into ``scene``, or refuse."""
+    if _asset_is_trashed(asset):
+        _take_restoration_unavailable("trashed")
+    if asset.media_replaced_at:
+        _take_restoration_unavailable("replaced")
+    if _asset_missing(project, asset):
+        _take_restoration_unavailable("missing")
+    source = take_restoration_source(asset.generation_params, asset.asset_type)
+    if source["status"] != "supported":
+        _take_restoration_unavailable(source.get("reason") or source["status"])
+    encoded = (_valid_source_frame_count(asset) if asset.asset_type == "video"
+               else source["encoded_frame_count"])
+    if encoded <= 0:
+        _take_restoration_unavailable("incomplete")
+    fps = effective_scene_fps(project, scene)
+    geometry = restore_take_geometry(
+        source, encoded, same_scene=source["scene_id"] == scene.scene_id,
+        destination_fps=fps, cursor_frame=cursor_frame)
+    if "reason" in geometry:
+        _take_restoration_unavailable(geometry["reason"])
+    if asset.asset_type == "audio" and not _take_audio_covers(asset, geometry, fps):
+        _take_restoration_unavailable("audio_short")
+    return source, geometry
+
+
+def _validate_take_restoration_geometry(expected: dict, fields: dict, geometry: dict) -> None:
+    stale = [key for key in ("source_in_frame", "source_out_frame", "total_source_frames",
+                             "timeline_end_frame")
+             if _mutation_int(expected.get(key), key) != geometry[key]]
+    if _mutation_int(fields.get("timeline_start_frame", 0), "timeline_start_frame") != geometry["timeline_start_frame"]:
+        stale.append("timeline_start_frame")
+    if stale:
+        _mutation_error("The take or scene changed since it was dropped; the timeline was refreshed.",
+                        409, "take_restoration_stale", {"fields": stale})
+
+
+def _take_audio_covers(audio: Asset, geometry: dict, fps: float) -> bool:
+    """Whether audio reaches the restored source end, within one frame of rounding."""
+    return media_timeline_frames(audio, fps) >= geometry["source_out_frame"] - 1
+
+
+def _original_take_audio(project: TimelineProject, video: Asset, source: dict,
+                         geometry: dict, fps: float) -> Asset | None:
+    """The take's own prepared audio, verified through ``source_video_asset_id``.
+
+    Candidates are narrowed without hydration, and only the record decides; a
+    name or a shared selection never does. The names the producers give a take's
+    audio come first -- Save Video's ``{video stem}_audio.wav``, export's
+    ``{asset_id}_audio.wav`` -- then other audio of the same inline scene and
+    selection, newest first, since retaking one selection is the usual workflow.
+    Unusable candidates are dropped before the cap, so old takes cannot fill it.
+    """
+    inline = video.inline_generation_params
+    key = _asset_storage_key(project, video, purpose="take audio lookup")
+    stem = os.path.splitext(os.path.basename(str(video.path or "").replace("\\", "/")))[0]
+    names = {name for name in (f"{stem}_audio.wav" if stem else "", f"{key}_audio.wav" if key else "") if name}
+
+    def usable(candidate):
+        return (candidate.asset_type == "audio" and not _asset_is_trashed(candidate)
+                and not candidate.media_replaced_at)
+
+    def same_selection(candidate):
+        params = candidate.inline_generation_params
+        return bool(inline.get("scene_id") and inline.get("selection_start") is not None
+                    and params.get("scene_id") == inline["scene_id"]
+                    and params.get("selection_start") == inline["selection_start"])
+
+    newest_first = [candidate for candidate in reversed(project.assets) if usable(candidate)]
+    named = [candidate for candidate in newest_first
+             if os.path.basename(str(candidate.path or "").replace("\\", "/")) in names]
+    # By identity: dataclass equality would compare (and so hydrate) every candidate.
+    named_ids = {id(candidate) for candidate in named}
+    candidates = named + [candidate for candidate in newest_first
+                          if id(candidate) not in named_ids and same_selection(candidate)]
+    for candidate in candidates[:16]:
+        if _asset_missing(project, candidate):
+            continue
+        params = candidate.generation_params
+        if params.get("source_video_asset_id") != video.asset_id:
+            continue
+        audio_source = take_restoration_source(params, "audio")
+        if (audio_source["status"] != "supported"
+                or audio_source["scene_id"] != source["scene_id"]
+                or audio_source["encoded_frame_count"] != _valid_source_frame_count(video)
+                or not _take_audio_covers(candidate, geometry, fps)):
+            continue
+        return candidate
+    return None
+
+
+def _restored_take_audio(project: TimelineProject, video: Asset, source: dict,
+                         geometry: dict, fps: float) -> tuple[Asset | None, str]:
+    """``(audio asset, "original" | "extracted")``, or ``(None, "failed")``."""
+    original = _original_take_audio(project, video, source, geometry, fps)
+    if original is not None:
+        return original, "original"
+    if video.asset_type == "video" and video.has_audio:
+        known = {candidate.asset_id for candidate in project.assets}
+        try:
+            derived = _prepare_video_audio_asset(project, video, bind_identity=True)
+        except Exception as exc:
+            logger.warning("Take audio extraction failed for %s: %s", video.asset_id, exc)
+            derived = None
+        if derived is not None and media_timeline_frames(derived, fps) > geometry["source_in_frame"]:
+            return derived, "extracted"
+        if derived is not None and derived.asset_id not in known:
+            # Extracted but unusable here: leave neither an asset nor a file behind.
+            project.assets = [candidate for candidate in project.assets if candidate is not derived]
+            derived_path = _asset_abspath(project, derived)
+            try:
+                if derived_path and os.path.isfile(derived_path):
+                    os.remove(derived_path)
+            except OSError:
+                logger.warning("Could not remove unused take audio %s", derived_path)
+    return None, "failed"
+
+
+def _restored_audio_track(audio: Asset, geometry: dict, lane_index: int) -> AudioTrack:
+    return AudioTrack(
+        source_path=audio.path,
+        timeline_start_frame=geometry["timeline_start_frame"],
+        timeline_end_frame=geometry["timeline_end_frame"],
+        source_in_frame=geometry["source_in_frame"],
+        total_source_frames=geometry["total_source_frames"],
+        source_origin_frame=0,
+        lane_index=lane_index,
+    )
+
+
+def _remove_batch_created_audio_lane(scene: Scene, lane_index: int, batch_start: dict | None) -> bool:
+    """Drop the audio lane this batch added for audio that never landed.
+
+    Only that exact lane: the last one, empty, at or past the count the batch
+    started from. Configs at and past it return to their batch-start state.
+    """
+    if not batch_start:
+        return False
+    start_count = int(batch_start.get("audio_lane_count", 0) or 0)
+    count = _scene_lane_count(scene, "audio")
+    if (lane_index != count - 1 or lane_index < start_count or count <= 1
+            or registry_lane_items(scene, "audio", lane_index)):
+        return False
+    scene.audio_lane_count = lane_index
+    configs = scene.audio_lane_configs
+    del configs[lane_index:]
+    configs.extend(copy.deepcopy(batch_start.get("audio_lane_configs", [])[lane_index:]))
+    return True
+
+
 def _clip_dual_drop_uses_media_io(asset: Asset, role: str, fields: dict) -> bool:
     """Return whether a valid clip create can attempt embedded-audio extraction."""
     return (
@@ -5274,8 +5492,9 @@ def _clip_dual_drop_uses_media_io(asset: Asset, role: str, fields: dict) -> bool
 
 
 def _apply_create_clip(
-        project: TimelineProject, scene: Scene, fields: dict,
-) -> tuple[ClipReference, AudioTrack | None, Asset | None]:
+        project: TimelineProject, scene: Scene, fields: dict, expected=None,
+        batch_start: dict | None = None,
+) -> tuple[ClipReference, AudioTrack | None, Asset | None, dict | None]:
     if not isinstance(fields, dict):
         _mutation_error("create_clip requires fields", 400)
 
@@ -5290,7 +5509,15 @@ def _apply_create_clip(
     if role == "motion_driver" and asset.asset_type != "video":
         _mutation_error("Driver clips require video assets", 400, "invalid_clip_role")
 
-    start_frame = int(fields.get("timeline_start_frame", 0))
+    start_frame = _mutation_int(fields.get("timeline_start_frame", 0), "timeline_start_frame")
+    if fields.get("restore_take") is True:
+        if role != "render" or asset.asset_type != "video":
+            _mutation_error("Only a video take on a video lane can be restored", 400,
+                            "invalid_take_restoration")
+        _validate_take_restoration_identity(project, scene, asset, expected)
+        restoration = _resolve_take_restoration(project, scene, asset, start_frame)
+        _validate_take_restoration_geometry(expected, fields, restoration[1])
+        return _apply_restored_clip(project, scene, asset, fields, restoration, batch_start)
     native_frame_count = _valid_source_frame_count(asset)
     frame_count = media_timeline_frames(asset, effective_scene_fps(project, scene))
     if (asset.asset_type == "video" and native_frame_count <= 0
@@ -5375,12 +5602,88 @@ def _apply_create_clip(
         except Exception as exc:
             logger.warning("Dual drop audio extraction failed: %s", exc)
 
-    return clip, audio_track, audio_asset
+    return clip, audio_track, audio_asset, None
+
+
+def _apply_restored_clip(project: TimelineProject, scene: Scene, asset: Asset, fields: dict,
+                         restoration: tuple[dict, dict], batch_start: dict | None,
+                         ) -> tuple[ClipReference, AudioTrack | None, Asset | None, dict]:
+    """Place a video take at its restored geometry, with its audio when dual.
+
+    Audio prefers the take's own verified audio, else this video's embedded audio
+    under the same trim. When neither lands the video still does, with a warning
+    in the response, and an audio lane this batch added for it is removed again.
+    """
+    source, geometry = restoration
+    track_index = _mutation_int(fields.get("track_index", 0), "track_index")
+    audio_lane_idx = _mutation_int(fields.get("audio_lane_index", 0), "audio_lane_index")
+    if track_index < 0 or track_index >= _scene_lane_count(scene, "video"):
+        _mutation_error("Video lane index is out of range", 404, "item_not_found")
+    # The request decides whether audio is attempted: the take's own audio needs
+    # no embedded stream, and a batch that added a lane for audio must remove it
+    # when none lands. Only extraction depends on `has_audio`.
+    dual_drop = bool(fields.get("dual_drop"))
+    if dual_drop and (audio_lane_idx < 0 or audio_lane_idx >= _scene_lane_count(scene, "audio")):
+        _mutation_error("Audio lane index is out of range", 404, "item_not_found")
+    fit_mode = str(fields.get("fit_mode", DEFAULT_FIT_MODE) or DEFAULT_FIT_MODE).strip().lower()
+    if fit_mode not in FIT_MODES:
+        _mutation_error(f"Invalid fit_mode: {fit_mode}", 400, "invalid_fit_mode")
+    crop_position = str(fields.get("crop_position", DEFAULT_CROP_POSITION)
+                        or DEFAULT_CROP_POSITION).strip().lower()
+    if crop_position not in CROP_POSITIONS:
+        _mutation_error(f"Invalid crop_position: {crop_position}", 400, "invalid_crop_position")
+    _require_lane_unlocked(scene, "video", track_index)
+    if dual_drop:
+        _require_lane_unlocked(scene, "audio", audio_lane_idx)
+
+    start, end = geometry["timeline_start_frame"], geometry["timeline_end_frame"]
+    clip = ClipReference(
+        source_path=asset.path,
+        timeline_start_frame=start,
+        timeline_end_frame=end,
+        source_in_frame=geometry["source_in_frame"],
+        source_out_frame=geometry["source_out_frame"],
+        total_source_frames=geometry["total_source_frames"],
+        source_origin_frame=0,
+        track_index=track_index,
+        role="render",
+        muted=bool(fields.get("muted", False)),
+        fit_mode=fit_mode,
+        crop_position=crop_position,
+    )
+    # Checked before any media work: an occupied range refuses the whole create.
+    targets = [(clip, start, end, "video", track_index)]
+    if dual_drop:
+        targets.append((_restored_audio_track(asset, geometry, audio_lane_idx),
+                        start, end, "audio", audio_lane_idx))
+    _require_media_target_bounds_fit(scene, targets)
+    scene.clips.append(clip)
+
+    audio_track = None
+    audio_asset = None
+    info = {"same_scene": source["scene_id"] == scene.scene_id, "audio_source": "none",
+            "warnings": []}
+    if dual_drop:
+        audio_asset, info["audio_source"] = _restored_take_audio(
+            project, asset, source, geometry, effective_scene_fps(project, scene))
+        if audio_asset is not None:
+            audio_track = _restored_audio_track(audio_asset, geometry, audio_lane_idx)
+            scene.audio_tracks.append(audio_track)
+            if fields.get("linked") is not False and fields.get("link_video_audio", True):
+                _add_link_group(scene, [
+                    {"type": "clip", "id": clip.clip_id},
+                    {"type": "audio", "id": audio_track.track_id},
+                ])
+        else:
+            info["warnings"].append("Placed the take's video, but its audio could not be restored.")
+            info["removed_audio_lane"] = _remove_batch_created_audio_lane(
+                scene, audio_lane_idx, batch_start)
+    return clip, audio_track, audio_asset, info
 
 
 def _apply_create_audio_track(
-        project: TimelineProject, scene: Scene, fields: dict,
-) -> tuple[AudioTrack, Asset | None]:
+        project: TimelineProject, scene: Scene, fields: dict, expected=None,
+) -> tuple[AudioTrack, Asset | None, dict | None]:
     if not isinstance(fields, dict):
         _mutation_error("create_audio_track requires fields", 400)
 
@@ -5389,10 +5692,34 @@ def _apply_create_audio_track(
     if not asset:
         _mutation_error(f"Asset not found: {asset_id}", 404, "asset_not_found")
 
-    lane_index = int(fields.get("lane_index", 0))
+    lane_index = _mutation_int(fields.get("lane_index", 0), "lane_index")
     if lane_index < 0 or lane_index >= _scene_lane_count(scene, "audio"):
         _mutation_error("Audio lane index is out of range", 404, "item_not_found")
     _require_lane_unlocked(scene, "audio", lane_index)
+
+    if fields.get("restore_take") is True:
+        if asset.asset_type not in {"video", "audio"}:
+            _mutation_error("Only a take can be restored", 400, "invalid_take_restoration")
+        start_frame = _mutation_int(fields.get("timeline_start_frame", 0), "timeline_start_frame")
+        _validate_take_restoration_identity(project, scene, asset, expected)
+        source, geometry = _resolve_take_restoration(project, scene, asset, start_frame)
+        _validate_take_restoration_geometry(expected, fields, geometry)
+        probe = _restored_audio_track(asset, geometry, lane_index)
+        _require_media_target_bounds_fit(scene, [(probe, geometry["timeline_start_frame"],
+                                                  geometry["timeline_end_frame"], "audio", lane_index)])
+        if asset.asset_type == "audio":
+            audio, audio_source = asset, "original"
+        else:
+            audio, audio_source = _restored_take_audio(
+                project, asset, source, geometry, effective_scene_fps(project, scene))
+            if audio is None:
+                _mutation_error("This take has no audio that can be restored", 409,
+                                "take_audio_unavailable", {"reason": "no_audio"})
+        track = _restored_audio_track(audio, geometry, lane_index)
+        scene.audio_tracks.append(track)
+        info = {"same_scene": source["scene_id"] == scene.scene_id,
+                "audio_source": audio_source, "warnings": []}
+        return track, (audio if audio is not asset else None), info
 
     derived_audio_asset = None
     if asset.asset_type == "video":
@@ -5422,7 +5749,7 @@ def _apply_create_audio_track(
         lane_index=lane_index,
     )
     scene.audio_tracks.append(track)
-    return track, derived_audio_asset
+    return track, derived_audio_asset, None
 
 
 def _media_io_operation_count(project: TimelineProject, operations: list) -> int:
@@ -5445,7 +5772,8 @@ def _media_io_operation_count(project: TimelineProject, operations: list) -> int
     return count
 
 
-def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: dict) -> dict:
+def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: dict, *,
+                                    batch_start: dict | None = None) -> dict:
     """Apply one scene operation; this branch owns validation and mutation.
 
     Scene Mutation Authoring: review operation, gesture and Scene-field duties
@@ -5542,24 +5870,30 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
     if op_type == "consolidate_items":
         return _consolidate_media_items(scene, op)
     if op_type == "create_clip":
-        clip, audio_track, audio_asset = _apply_create_clip(
-            project, scene, op.get("fields", {}))
-        return {
+        clip, audio_track, audio_asset, restoration = _apply_create_clip(
+            project, scene, op.get("fields", {}), op.get("expected"), batch_start)
+        result = {
             "type": op_type,
             "clip_id": clip.clip_id,
             "clip": clip.to_dict(),
             "audio_track": audio_track.to_dict() if audio_track else None,
             "audio_asset": audio_asset.to_dict() if audio_asset else None,
         }
+        if restoration is not None:
+            result["take_restoration"] = restoration
+        return result
     if op_type == "create_audio_track":
-        track, audio_asset = _apply_create_audio_track(
-            project, scene, op.get("fields", {}))
-        return {
+        track, audio_asset, restoration = _apply_create_audio_track(
+            project, scene, op.get("fields", {}), op.get("expected"))
+        result = {
             "type": op_type,
             "track_id": track.track_id,
             "audio_track": track.to_dict(),
             "audio_asset": audio_asset.to_dict() if audio_asset else None,
         }
+        if restoration is not None:
+            result["take_restoration"] = restoration
+        return result
     if op_type == "create_link_group":
         # The raw value, NOT `str(...)`: coercing here would defeat the type
         # check `_client_link_group_id` makes, which is the whole point of it.
@@ -5948,8 +6282,12 @@ def _apply_scene_mutation_batch(project: TimelineProject, scene_id: str,
     scene_before = (scene.to_dict()
                     if _batch_changes_only_the_scene(operations) else None)
 
+    # What the batch started from, so a create can undo exactly the lane an
+    # earlier operation of this same batch added for it.
+    batch_start = {"audio_lane_count": scene.audio_lane_count,
+                   "audio_lane_configs": copy.deepcopy(list(scene.audio_lane_configs))}
     results = [
-        _apply_scene_mutation_operation(project, scene, operation)
+        _apply_scene_mutation_operation(project, scene, operation, batch_start=batch_start)
         for operation in operations
     ]
     _validate_single_driver_per_lane(scene)
@@ -8276,6 +8614,23 @@ def _extract_frame_source(project: TimelineProject, body: dict) -> tuple[str, st
     return getattr(asset, "path", "") or "", abs_path
 
 
+def _asset_summary_and_revision(asset: Asset, params: dict | None = None) -> tuple[dict, str]:
+    """The asset's ``generation_summary`` and ``provenance_revision``, as listed.
+
+    ``params`` defaults to the backing value, so it never hydrates. With a stored
+    descriptor the revision names the descriptor, not the params, and the two
+    spellings agree.
+    """
+    from .project_storage import generation_summary, INLINE_GENERATION_PARAM_KEYS, provenance_revision
+    if params is None:
+        params = asset.generation_params_for_storage
+    summary = {**{key: value for key, value in params.items() if key in INLINE_GENERATION_PARAM_KEYS}, **(
+        dict(getattr(asset, "_generation_summary", {}))
+        if getattr(asset, "_generation_unhydrated", False) else generation_summary(params))}
+    descriptor = getattr(asset, "_generation_descriptor", None)
+    return summary, provenance_revision(params, summary, descriptor)
+
+
 def _asset_payload(
     project: TimelineProject,
     asset: Asset,
@@ -8285,9 +8640,7 @@ def _asset_payload(
     thumbnail_snapshot: dict[str, dict] | None = None,
     proxy_states: dict[str, dict] | None = None,
 ) -> dict:
-    from .project_storage import (
-        generation_summary, has_generation_provenance, INLINE_GENERATION_PARAM_KEYS, provenance_revision,
-    )
+    from .project_storage import has_generation_provenance
     payload = asset.to_dict(include_provenance=not lean)
     # Lets the gallery skip a detail request for an asset with nothing to show. Reads the
     # descriptor and backing value only, so a lean list still never hydrates.
@@ -8295,11 +8648,7 @@ def _asset_payload(
     params = payload.pop("generation_params", {})
     if not lean:
         payload["generation_params"] = params
-    payload["generation_summary"] = {**{key: value for key, value in params.items() if key in INLINE_GENERATION_PARAM_KEYS}, **(
-        dict(getattr(asset, "_generation_summary", {}))
-        if getattr(asset, "_generation_unhydrated", False) else generation_summary(params))}
-    descriptor = getattr(asset, "_generation_descriptor", None)
-    payload["provenance_revision"] = provenance_revision(params, payload["generation_summary"], descriptor)
+    payload["generation_summary"], payload["provenance_revision"] = _asset_summary_and_revision(asset, params)
     source_path = _asset_abspath(project, asset)
     source_rel = _normalize_project_relpath(getattr(asset, "path", "") or "")
     cache_key = _asset_cache_key(project, asset)
@@ -8620,7 +8969,20 @@ def _extract_audio_from_video(video_path: str, output_path: str) -> bool:
     return False
 
 
-def _prepare_video_audio_asset(project: TimelineProject, asset: Asset) -> Asset | None:
+def _extraction_identity(video: Asset) -> dict:
+    """The video media a bound sidecar is extracted from, named into its path.
+
+    Stable fields only: Save Video registers a take before its probe signature
+    is known, and sync fills that in later. A replacement, or a sync that sees a
+    different frame count, marks the video replaced and so ends restoration.
+    """
+    return {"asset_id": video.asset_id, "path": str(video.path or "").replace("\\", "/"),
+            "frame_count": int(getattr(video, "frame_count", 0) or 0),
+            "duration_sec": float(getattr(video, "duration_sec", 0.0) or 0.0)}
+
+
+def _prepare_video_audio_asset(project: TimelineProject, asset: Asset, *,
+                               bind_identity: bool = False) -> Asset | None:
     """Extract a video asset's embedded audio into a derived audio asset.
 
     Shared by dual-drop clip creation and audio-only video drops. Reuses the
@@ -8635,24 +8997,34 @@ def _prepare_video_audio_asset(project: TimelineProject, asset: Asset) -> Asset 
     the one place project threads carry ffmpeg work, and `durable_rules` bounds it to
     one media-I/O create per batch — which is what keeps the pool's sizing reasoning
     about lock contention rather than encode time.
+
+    ``bind_identity`` (take restoration) never reads the shared path: whatever
+    sits there -- a sidecar from before a replacement, or an export take's own
+    audio -- says nothing provable about this media. It uses a path named for
+    the media identity instead, which only a bound extraction writes, so a file
+    there was extracted from exactly this media.
     """
     video_path = _asset_abspath(project, asset)
     asset_key = _asset_storage_key(project, asset, purpose="derived audio asset id")
     if not asset_key:
         return None
-    audio_filename = f"{asset_key}_audio.wav"
-    audio_rel_path = os.path.join("media", audio_filename)
-    audio_abs_path = resolve_project_path(project, audio_rel_path, purpose="derived audio path")
+    def sidecar(filename):
+        rel_path = os.path.join("media", filename)
+        abs_path = resolve_project_path(project, rel_path, purpose="derived audio path")
+        rel_norm = _normalize_project_relpath(rel_path)
+        existing = next((a for a in project.assets
+                         if _normalize_project_relpath(getattr(a, "path", "") or "") == rel_norm), None)
+        return rel_path, abs_path, existing
+
+    if bind_identity:
+        digest = hashlib.sha256(json.dumps(_extraction_identity(asset), sort_keys=True)
+                                .encode("utf-8")).hexdigest()[:8]
+        filename = f"{asset_key}_audio_{digest}.wav"
+    else:
+        filename = f"{asset_key}_audio.wav"
+    audio_rel_path, audio_abs_path, existing_audio_asset = sidecar(filename)
     if not audio_abs_path:
         return None
-    audio_rel_norm = _normalize_project_relpath(audio_rel_path)
-    existing_audio_asset = next(
-        (
-            a for a in project.assets
-            if _normalize_project_relpath(getattr(a, "path", "") or "") == audio_rel_norm
-        ),
-        None,
-    )
 
     extracted = True
     if not os.path.isfile(audio_abs_path):
@@ -8851,6 +9223,13 @@ def _sync_media_folder(
         except MediaProbeError as exc:
             logger.warning("Video metadata repair failed for %s: %s", asset.name, exc)
             continue
+        # Media changed on disk outside Sonder. A different length is evidence the
+        # file is no longer what its provenance describes, so take restoration
+        # must stop; one frame of probe disagreement is not.
+        if (signature_changed and metadata_valid
+                and abs(int(metadata["frame_count"] or 0) - int(current_metadata["frame_count"] or 0)) > 1):
+            asset.media_replaced_at = datetime.now().isoformat()
+            changed = True
         for field in ("width", "height", "frame_count", "fps", "duration_sec", "sample_rate", "has_audio"):
             if getattr(asset, field, None) != metadata[field]:
                 setattr(asset, field, metadata[field])
@@ -10840,6 +11219,7 @@ def _streamed_replace_commit(
                 _update_asset_references_for_path(current, old_rel_path, next_rel_path)
                 asset.path = next_rel_path
             _apply_uploaded_metadata(asset, metadata, replacement_type, artifact_kind, next_abs_path)
+            asset.media_replaced_at = datetime.now().isoformat()
             old_basename = os.path.basename(old_rel_path or "")
             if not asset.name or asset.name == old_basename:
                 asset.name = os.path.basename(asset.path)
@@ -11117,6 +11497,7 @@ def _replace_project_asset(project: TimelineProject, asset: Asset, source_path: 
     asset.has_audio_checked = asset.asset_type == "video" and _metadata_checked_for_asset(asset.asset_type, metadata)
     asset.duration_checked = asset.asset_type == "audio" and _metadata_checked_for_asset(asset.asset_type, metadata)
     asset.media_probe_signature = _media_probe_signature(next_abs_path)
+    asset.media_replaced_at = datetime.now().isoformat()
     if asset.asset_type == "video":
         apply_color_metadata(asset, metadata)
     else:
