@@ -9,7 +9,14 @@ Saved in a workflow it holds presentation only, keyed by ``binding_id``:
      "groups": {"<name>": {"order"}},
      "execution": {"v": 1, "controls": {"<id>": {"label", "group", "order", "advanced", "note",
                                                 "target": {"kind": "node"|"instance"|"group", "group_id"?}}}},
-     "views": {"v": 1, "items": {"<id>": {"label", "order", "timing"?, "feed"?: "sampling"}}}}
+     "views": {"v": 1, "items": {"<id>": {"label", "order", "timing"?, "feed"?: "sampling"}}},
+     "description": "<workflow description>",
+     "presets": {"<id>": {"name", "description", "order", "members": {"<binding_id>": {"value", "seed_mode"?}},
+                          "execution"?: {"<switch id>": {"mode", "node"} | {"modes"}}}},
+     "preset_categories": {"<id>": {"name", "description", "order", "choices": ["<preset id>", ...]}}}
+
+A preset is one choice; a category groups exclusive choices (Controls Modes)
+and owns their membership and order (``control_preset_categories``).
 
 A node or instance target is located by ``node.properties.sonderExecution`` on a
 root node (as a binding is by its anchor); a group by its root ``group.id``.
@@ -47,6 +54,9 @@ MAX_TARGETS = 64
 MAX_GROUPS = 256
 MAX_PRESETS = 32
 MAX_PRESET_TARGETS = 64
+# Controls Modes: categories of exclusive choices (presets).
+MAX_PRESET_CATEGORIES = 16
+CATEGORY_DESCRIPTION_MAX = 300
 # Nesting levels, counting the top object as 1. A preset holding a row list
 # needs 8 (manifest > presets > preset > members > member > rows > row >
 # value), with no spare; the export needs 5. control_bindings.js mirrors it.
@@ -145,7 +155,29 @@ def clean_group(value: Any) -> str:
 
 def empty_manifest() -> dict:
     return {"v": MANIFEST_VERSION, "bindings": {}, "notes": {}, "groups": {}, "suggestions": [], "description": "", "presets": {},
-            "execution": {}, "execution_error": None, "execution_routing": None, "views": {}, "views_error": None}
+            "preset_categories": {}, "execution": {}, "execution_error": None, "execution_routing": None, "views": {},
+            "views_error": None}
+
+
+# Python's str.strip() and JavaScript's trim() strip different characters
+# (\x1c-\x1f and \x85 only in Python, U+FEFF only in JavaScript), so a name is
+# blank by one rule in both: nothing left after both sets are stripped.
+# web/js/control_bindings.js ``blankName`` mirrors it.
+_BLANK_EXTRA = "﻿\x1c\x1d\x1e\x1f\x85"
+
+
+def blank_name(text: str) -> bool:
+    """Whether a preset or category name has nothing in it but whitespace."""
+    return all(ch.isspace() or ch in _BLANK_EXTRA for ch in text)
+
+
+def _whole(value: Any) -> Any:
+    """A whole float as its integer, as ``JSON.parse`` gives JavaScript (5.0 is 5)."""
+    return int(value) if isinstance(value, float) and value.is_integer() else value
+
+
+def _valid_order(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and abs(value) <= ORDER_LIMIT
 
 
 def _check_shape(value: Any, depth: int = 1) -> None:
@@ -451,19 +483,21 @@ def read_presets(raw: Any, *, limit: int | None = MAX_PRESETS) -> dict:
     """Tolerant, non-mutating projection. Hygiene is checked by the manifest.
 
     Invalid members are ignored individually; an empty/over-cap preset is
-    ignored. Only valid entries count toward the preset cap.
+    ignored. Only valid entries count toward the preset cap, in JavaScript's
+    key order, so readPresets keeps the same 32.
     """
     result = {}
     if not isinstance(raw, dict):
         return result
-    for identity, entry in raw.items():
+    for identity in _js_key_order(raw):
+        entry = raw[identity]
         if (not isinstance(identity, str) or not ID_RE.fullmatch(identity)
                 or identity in FORBIDDEN_KEYS or not isinstance(entry, dict)):
             continue
-        name, description, order = entry.get("name"), entry.get("description", ""), entry.get("order", 0)
-        if (not isinstance(name, str) or not name.strip() or len(name) > LABEL_MAX
+        name, description, order = entry.get("name"), entry.get("description", ""), _whole(entry.get("order", 0))
+        if (not isinstance(name, str) or blank_name(name) or len(name) > LABEL_MAX
                 or not isinstance(description, str) or len(description) > DESCRIPTION_MAX
-                or isinstance(order, bool) or not isinstance(order, int) or abs(order) > ORDER_LIMIT):
+                or not _valid_order(order)):
             continue
         members = {}
         for bid, member in (entry.get("members", {}).items() if isinstance(entry.get("members"), dict) else []):
@@ -496,6 +530,37 @@ def read_presets(raw: Any, *, limit: int | None = MAX_PRESETS) -> dict:
             break
         result[identity] = {"name": name, "description": description, "order": order, "members": members,
                             **({"execution": execution} if execution else {})}
+    return result
+
+
+def read_preset_categories(raw: Any) -> dict:
+    """Tolerant, non-mutating projection of ``preset_categories``.
+
+    An unreadable category is skipped (and kept in the saved text). A choice
+    that is not a valid id is dropped on its own; duplicates stay, so Manage
+    can name them. Whether a choice names a preset is decided where presets
+    are known (``control_preset_categories.category_rows``). At most
+    ``MAX_PRESET_CATEGORIES`` valid entries, in JavaScript's key order.
+    web/js/control_bindings.js ``readPresetCategories`` mirrors it.
+    """
+    result: dict = {}
+    if not isinstance(raw, dict):
+        return result
+    for identity in _js_key_order(raw):
+        entry = raw[identity]
+        if (not isinstance(identity, str) or not ID_RE.fullmatch(identity)
+                or identity in FORBIDDEN_KEYS or not isinstance(entry, dict)):
+            continue
+        name, description, order = entry.get("name"), entry.get("description", ""), _whole(entry.get("order", 0))
+        choices = entry.get("choices", [])
+        if (not isinstance(name, str) or blank_name(name) or len(name) > LABEL_MAX
+                or not isinstance(description, str) or len(description) > CATEGORY_DESCRIPTION_MAX
+                or not _valid_order(order) or not isinstance(choices, list) or len(choices) > MAX_PRESETS):
+            continue
+        if len(result) >= MAX_PRESET_CATEGORIES:
+            break
+        result[identity] = {"name": name, "description": description, "order": order,
+                            "choices": [c for c in choices if isinstance(c, str) and ID_RE.fullmatch(c) and c not in FORBIDDEN_KEYS]}
     return result
 
 
@@ -534,6 +599,7 @@ def parse_manifest(text: Any) -> dict:
 
     manifest = empty_manifest()
     manifest["presets"] = read_presets(raw.get("presets"))
+    manifest["preset_categories"] = read_preset_categories(raw.get("preset_categories"))
     manifest["execution"], manifest["execution_error"] = read_execution(raw.get("execution"))
     manifest["views"], manifest["views_error"] = read_views(raw.get("views"))
     # The export-only routing capsule (control_routing reads it), only beside a

@@ -424,6 +424,54 @@ if(SCENARIO==='preset'||SCENARIO==='preset-rollback'||SCENARIO==='preset-no-rela
         assert.equal(result.ok,true);assert.deepEqual(manifest().presets,{});assert.equal(captures,8);
     }
 }
+if(SCENARIO.startsWith('category')) {
+    // The server's canonical values: a created choice and its category, as validated.
+    const entry=name=>({name,description:'',order:0,members:{steps:{value:'20'}}});
+    globalThis.canon=changes=>Object.fromEntries(Object.entries(changes).map(([t,v])=>
+        [t, t.startsWith('preset:')&&t.endsWith(':create')?entry(v.name)
+            :t.endsWith(':create')?{name:v.name,description:'',choices:v.choices||[],order:0}:v]));
+    if(SCENARIO==='category-no-relay'){
+        root._nodes.splice(root._nodes.indexOf(relay),1);
+        raw={...raw,relay:{status:'none',key:null,error:null},bindings:[],notes:[]};
+        globalThis.LiteGraph={createNode(){throw Error('a category must never create a Relay');}};
+        const result=await host.applyChanges({'preset_category:task:create':{name:'Task'}});
+        assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/exactly one active Sonder Control Relay/);
+    } else if(SCENARIO==='category-rollback') {
+        relay.widgets[0].callback=()=>{throw Error('manifest failed');};
+        const result=await host.applyChanges({'preset:a:create':{name:'A',members:['steps']},'preset_category:task:create':{name:'Task',choices:['a']}});
+        assert.equal(result.ok,false);assert.equal(relay.widgets[0].value,manifestText());
+    } else if(SCENARIO==='category-refused') {
+        for(const changes of [{'preset_category:task:value':1},{'preset_category:__proto__:name':'x'},{'preset_category:ghost:name':'x'},
+                              {'preset_category:task:reset':true}]){
+            const result=await host.applyChanges(changes);
+            assert.equal(result.ok,false,JSON.stringify(changes));assert.equal(relay.widgets[0].value,manifestText());
+        }
+        assert.equal(Object.getPrototypeOf(manifest()),Object.prototype);
+    } else {
+        // A choice and the category listing it: one manifest write, one history step.
+        let result=await host.applyChanges({'preset:a:create':{name:'A',members:['steps']},'preset:b:create':{name:'B',members:['steps']},
+            'preset_category:task:create':{name:'Task',choices:['a','b']}});
+        assert.equal(result.ok,true,JSON.stringify(result));assert.equal(captures,2);
+        assert.deepEqual(manifest().preset_categories,{task:{name:'Task',description:'',choices:['a','b'],order:0}});
+        assert.deepEqual(manifest().future,{keep:true});
+        result=await host.applyChanges({'preset_category:look:create':{name:'Look'},'preset_category:task:name':'Job'});
+        assert.equal(result.ok,true,JSON.stringify(result));assert.equal(manifest().preset_categories.task.name,'Job');
+        // Moving a choice is two lists in one request; the presets are untouched.
+        const presets=JSON.stringify(manifest().presets);
+        result=await host.applyChanges({'preset_category:look:choices':['b'],'preset_category:task:choices':['a']});
+        assert.equal(result.ok,true);assert.deepEqual(manifest().preset_categories.look.choices,['b']);
+        assert.deepEqual(manifest().preset_categories.task.choices,['a']);assert.equal(JSON.stringify(manifest().presets),presets);
+        result=await host.applyChanges({'preset_category:look:move':{before:'task'}});
+        assert.equal(result.ok,true);assert.ok(manifest().preset_categories.look.order<manifest().preset_categories.task.order);
+        // Removing a choice drops it from its category in the same edit.
+        result=await host.applyChanges({'preset:b:remove':true});
+        assert.equal(result.ok,true);assert.deepEqual(manifest().preset_categories.look.choices,[]);
+        // Removing a category leaves its choices.
+        result=await host.applyChanges({'preset_category:task:remove':true});
+        assert.equal(result.ok,true);assert.ok(!('task' in manifest().preset_categories));assert.ok(manifest().presets.a);
+        assert.equal(captures,12);
+    }
+}
 
 if(SCENARIO.startsWith('restore')) {
     sampler.properties.sonderBindings = {};
@@ -461,7 +509,8 @@ SCENARIOS = ['restore', 'restore-rollback', 'restore-stale', 'restore-rebind', '
              'linked-or-gone', 'manifest-cap', 'hidden-hash', 'relay-error-view', 'refusal', 'stale-write', 'stale-view',
              'destroy', 'rollback', 'serial', 'history-failure', 'precision-refusal', 'hide-during-write',
              'event-during-write', 'group-batch-order', 'groups', 'groups-stale', 'groups-reparse', 'group-new-relay',
-             'preset', 'preset-rollback', 'preset-no-relay', 'dynamic-prompt']
+             'preset', 'preset-rollback', 'preset-no-relay', 'dynamic-prompt',
+             'category', 'category-rollback', 'category-no-relay', 'category-refused']
 
 
 @pytest.mark.parametrize('scenario', SCENARIOS)

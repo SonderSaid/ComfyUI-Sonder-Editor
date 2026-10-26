@@ -298,6 +298,14 @@ if(SCENARIO==='relay-fit'){
     assert.deepEqual(budgeted.bindings,grouped.bindings);
     assert.ok(new TextEncoder().encode(JSON.stringify({...ack,view:budgeted})).length<512*1024);
     assert.ok(budgeted.notes.every(n=>n.note_truncated));
+    // Category warnings are for Manage: they go before Manage's candidates, the rows stay.
+    const warning={code:'overlap',message:'m'.repeat(2000),pairs:[['a','b']],count:1};
+    const modes={bindings:[{binding_id:'a',status:'ok',kind:'INT',value:'1'}],notes:[],
+        preset_categories:Array.from({length:16},(_,i)=>({id:'c'+i,name:'C',description:'',order:i,choices:['a','b'],warnings:Array(10).fill(warning)})),
+        candidates:Array.from({length:300},(_,i)=>({path:String(i),input:'w'.repeat(1200),targets:[],label:'x'}))};
+    const shrunk=fitPublicationView(modes,envelope);
+    assert.ok(shrunk.preset_categories.every(c=>c.warnings.length===0&&c.choices.length===2));
+    assert.equal(shrunk.candidates.length,300);assert.ok(!shrunk.candidates_truncated);
 }
 if(SCENARIO==='canvas-http'||SCENARIO==='relay-error-recovery'||SCENARIO==='canvas-revoked'){
     const editor={id:1,type:'SonderEditor'},ctl={id:2,type:'KSampler',widgets:[{name:'steps',value:'20'}]};

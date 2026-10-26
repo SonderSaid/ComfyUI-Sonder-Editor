@@ -309,8 +309,10 @@ def coerce_panel_layout(field: str, raw: Any):
 # One grammar for every change target, parsed in one place (the JS mirror is
 # control_bindings.js ``parseTarget``): ``binding:<id>:<field>``,
 # ``note:<id>:<field>``, ``group:<name>:<op>`` (a name holds no ``:``) and the
-# two-part ``workflow:description``.
-_TARGET_RE = re.compile(r"^(?:(binding|note|preset|execution|view):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$")
+# two-part ``workflow:description``. ``preset_category`` (Controls Modes) is
+# presentation only: none of its fields is structural or changes a run.
+_TARGET_RE = re.compile(r"^(?:(binding|note|preset|preset_category|execution|view):([A-Za-z0-9_-]{1,64})"
+                        r"|(group):([^:]+)):([a-z_]+)$")
 # Manage's structural targets: the validator returns an internal write plan,
 # and the mounted relay forwards the original intent for the canvas to recheck.
 BINDING_STRUCTURAL_OPS = frozenset({"expose", "remove", "rebind", "hide", "unhide", "create"})
@@ -320,6 +322,8 @@ STRUCTURAL_OPS = {"binding": BINDING_STRUCTURAL_OPS, "note": frozenset({"create"
                   "execution": frozenset({"expose", "remove", "rebind", "hide", "unhide"}),
                   # An Output View: label and order are presentation.
                   "view": frozenset({"create", "remove"})}
+# The sources validate_preset_changes owns.
+PRESET_SOURCES = ("preset", "preset_category")
 
 
 def parse_target(target: Any) -> tuple[str, str, str] | None:
@@ -968,6 +972,7 @@ def describe_bindings(
         if picker is not None:
             descriptor["picker"] = picker
     view["_presets"] = manifest["presets"]
+    view["_preset_categories"] = manifest["preset_categories"]
     view["description"] = manifest["description"]
     view["groups"] = manifest["groups"]
     view["bindings"].sort(key=lambda d: (d["order"], d["label"].lower(), d["binding_id"]))
@@ -1311,8 +1316,9 @@ def validate_binding_changes(view: dict, changes: Any, *, prompt: dict | None = 
             return {"workflow:cleanup": validate(view, changes["workflow:cleanup"], mode=structural)}, []
         except ControlValueError as exc:
             return {}, [{"target": "workflow:cleanup", "reason": str(exc)}]
-    # Presets dispatch by source before fields shared with bindings/notes.
-    preset_targets = [target for target in changes if (parse_target(target) or (None,))[0] == "preset"]
+    # Presets and their categories dispatch by source before fields shared
+    # with bindings/notes; one validator sees both, in request order.
+    preset_targets = [target for target in changes if (parse_target(target) or (None,))[0] in PRESET_SOURCES]
     if preset_targets:
         from .control_presets import validate_preset_changes
         return validate_preset_changes(view, changes, prompt=prompt, structural=structural, inventory=inventory,
@@ -1834,3 +1840,8 @@ def next_seed_value(
 def preset_states(view, presets, **kwargs):
     from .control_presets import preset_states as project
     return project(view, presets, **kwargs)
+
+
+def preset_projection(view, presets, categories, **kwargs):
+    from .control_presets import preset_projection as project
+    return project(view, presets, categories, **kwargs)

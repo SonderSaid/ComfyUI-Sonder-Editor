@@ -53,6 +53,9 @@ export function fitPublicationView(view, envelope) {
     // Preset previews are display-only and shrink before candidate inventories.
     if (!fits(view) && view.presets?.length) view = { ...view, presets: view.presets.map(p => ({...p,
         members: p.members.map(m => ({...m, preview: ""}))})) };
+    // Category warnings are for Manage; the Modes table needs only the rows.
+    if (!fits(view) && view.preset_categories?.length) view = { ...view,
+        preset_categories: view.preset_categories.map(c => ({...c, warnings: []})) };
     // A switch's member titles only name its nodes; the canvas writer checks
     // member paths against its own fresh describe, never this publication.
     if (!fits(view) && view.execution?.length) view = { ...view, execution: view.execution.map(d => ({...d,

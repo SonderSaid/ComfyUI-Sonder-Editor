@@ -301,7 +301,8 @@ def _describe_controls_body(raw: bytes) -> dict:
         view.update(execution_candidates=switches, execution_candidates_truncated=switches_truncated)
     if authoring is not None:
         view["export_readiness"] = control_execution.export_readiness(view)
-    view["presets"] = control_descriptors.preset_states(view, view.get("_presets", {}), prompt=readable)
+    view["presets"], view["preset_categories"] = control_descriptors.preset_projection(
+        view, view.get("_presets", {}), view.get("_preset_categories", {}), prompt=readable)
     # Validation uses the full view, before json_safe caps display-only previews.
     if "changes" in body:
         cleaned, rejected = control_descriptors.validate_binding_changes(

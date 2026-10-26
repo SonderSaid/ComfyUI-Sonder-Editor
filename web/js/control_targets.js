@@ -27,8 +27,10 @@ export function groupNameError(name) {
 export const cleanGroup = value => (typeof value === "string" && !groupNameError(value) ? value.trim() : "");
 
 // `binding:<id>:<field>`, `note:<id>:<field>`, `execution:<id>:<field>`,
-// `view:<id>:<field>`, `group:<name>:<op>` and `workflow:description`.
-const TARGET_RE = /^(?:(binding|note|preset|execution|view):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$/;
+// `view:<id>:<field>`, `preset:<id>:<field>`, `preset_category:<id>:<field>`,
+// `group:<name>:<op>` and `workflow:description`. A preset category (Controls
+// Modes) is presentation only: none of its fields is structural or changes a run.
+const TARGET_RE = /^(?:(binding|note|preset|preset_category|execution|view):([A-Za-z0-9_-]{1,64})|(group):([^:]+)):([a-z_]+)$/;
 export const BINDING_STRUCTURAL_OPS = new Set(["expose", "remove", "rebind", "hide", "unhide", "create"]);
 export const GROUP_OPS = new Set(["create", "rename", "ungroup", "move"]);
 

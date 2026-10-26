@@ -176,6 +176,81 @@ def test_python_js_read_parity_and_source_table(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def category(name, choices, order=0, description=""):
+    return {"name": name, "description": description, "order": order, "choices": choices}
+
+
+def test_category_reader_edits_and_grammar_mirror_the_frontend(tmp_path):
+    from server import control_preset_categories as pc
+    root = Path(__file__).resolve().parents[1]
+    raw = {"ok": category("Task", ["a", "bad id", 3, "a", "__proto__"]), "noname": {"choices": []},
+           "long": category("x", [], description="d" * 301), "toomany": category("x", [f"p{i}" for i in range(33)]),
+           "badorder": category("x", [], order=True), "notlist": {"name": "x", "choices": "a"}, "bad id": category("x", []),
+           "whole": category("Whole", [], order=5.0), "unicode": category("😀" * 120, [], description="é" * 300),
+           **{f"blank{i}": category(text, []) for i, text in enumerate(["﻿", "\x1c", "\x1f", "\x85", " ", " 　 "])},
+           **{f"c{i}": category(f"C{i}", ["a"], i) for i in range(14)}, "7": category("Seven", []), "10": category("Ten", [])}
+    presets = {"5": definition(), "p": definition(name="﻿P"), "q": definition(name="\x85"), "r": definition(order=2.0)}
+    # One edit sequence through both writers.
+    steps = [("x", "create", {"name": "X", "description": "", "choices": ["a"], "order": 3}), ("y", "create", category("Y", [], 4)),
+             ("y", "move", {"before": "w"}), ("x", "choices", ["a", "b"]), ("w", "name", "Renamed"), ("x", "move", {"before": None}),
+             ("y", "description", "Text"), ("w", "remove", True)]
+    start = {"w": category("W", ["a", "b"], 1), "v": category("V", ["b"], 1)}
+    expected = copy.deepcopy(start)
+    for cid, field, value in steps:
+        pc.edit_categories(expected, cid, field, value)
+    dropped = copy.deepcopy(expected)
+    pc.drop_choice(dropped, "a")
+    targets = {f: (cd.is_structural(f"preset_category:c:{f}"), cd.parse_target(f"preset_category:c:{f}")) for f in sorted(pc.FIELDS)}
+    script = f'''import assert from 'node:assert/strict';
+    const b = await import({json.dumps((root / 'web/js/control_bindings.js').as_uri())});
+    const t = await import({json.dumps((root / 'web/js/control_targets.js').as_uri())});
+    assert.deepEqual(b.readPresetCategories({json.dumps(raw)}), {json.dumps(cm.read_preset_categories(raw))});
+    assert.deepEqual(b.readPresets({json.dumps(presets)}), {json.dumps(cm.read_presets(presets))});
+    for (const text of {json.dumps(["﻿", "\x1c", "\x1f", "\x85", " ", " ", "﻿A", "A"])})
+        assert.equal(b.blankName(text), !/A/.test(text), JSON.stringify(text));
+    for (const [field, [structural, parsed]] of Object.entries({json.dumps(targets)})) {{
+        const target = `preset_category:c:${{field}}`;
+        assert.equal(t.isStructuralTarget(target), structural); assert.equal(t.changesRun(target), false);
+        assert.deepEqual(t.parseTarget(target), {{source: parsed[0], id: parsed[1], field: parsed[2]}});
+    }}
+    const m = {{preset_categories: {json.dumps(start)}, keep: 1}};
+    for (const [cid, field, value] of {json.dumps(steps)}) b.applyCategoryEdit(m, cid, field, value);
+    assert.deepEqual(m.preset_categories, {json.dumps(expected)}); assert.equal(m.keep, 1);
+    b.dropChoiceFromCategories(m, 'a');
+    assert.deepEqual(m.preset_categories, {json.dumps(dropped)});
+    const odd = {{preset_categories: 3}}; b.dropChoiceFromCategories(odd, 'a'); assert.equal(odd.preset_categories, 3);
+    for (const [cid, field, value] of [['__proto__','create',{{name:'X',choices:[]}}], ['ghost','name','X'], ['x','reset',true],
+                                       ['x','move',{{before:'toString'}}], ['x','name','﻿'], ['x','value',1]])
+        assert.throws(() => b.applyCategoryEdit(m, cid, field, value), `${{cid}} ${{field}}`);
+    assert.equal(Object.getPrototypeOf(m.preset_categories), Object.prototype);
+    const full = {{preset_categories: Object.fromEntries(Array.from({{length: 16}}, (_, i) => [`c${{i}}`, {{name: 'C', order: i, choices: []}}]))}};
+    for (const id of ['extra', '7'])  // an index-like id sorts first: the cap is counted before it lands
+        assert.throws(() => b.applyCategoryEdit(full, id, 'create', {{name: 'X', description: '', choices: [], order: 17}}), id);
+    assert.equal(Object.keys(b.readPresetCategories(full.preset_categories)).length, 16);
+    // Builtin names never reach a prototype.
+    for (const field of ['description', 'choices', 'move', 'name'])
+        assert.throws(() => b.applyCategoryEdit(full, 'toString', field, field === 'move' ? {{before: null}} : field === 'choices' ? [] : 'x'), field);
+    assert.equal(Object.prototype.toString.description, undefined); assert.equal(Object.prototype.toString.choices, undefined);
+    // An unreadable entry under an id is replaced by an explicit create, as on the server.
+    const damaged = {{preset_categories: {{x: {{name: ''}}}}}};
+    b.applyCategoryEdit(damaged, 'x', 'create', {{name: 'X', description: '', choices: [], order: 0}});
+    assert.equal(damaged.preset_categories.x.name, 'X');
+    const odd2 = {{preset_categories: 'saved'}}; b.applyCategoryEdit(odd2, 'x', 'remove', true); assert.equal(odd2.preset_categories, 'saved');
+    // JavaScript's key order caps presets at the same 32 as Python's reader.
+    const many = {json.dumps({**{f"p{i}": definition(name=f"P{i}") for i in range(31)}, "5": definition(), "9": definition()})};
+    assert.deepEqual(Object.keys(b.readPresets(many)), {json.dumps(list(cm.read_presets({**{f"p{i}": definition(name=f"P{i}") for i in range(31)}, "5": definition(), "9": definition()})))});
+    const withPresets = {{presets: {{a: {json.dumps(definition())}}}, preset_categories: {{w: {{name: 'W', order: 0, choices: ['a']}}}}}};
+    b.applyPresetEdit(withPresets, 'a', 'remove', true); assert.deepEqual(withPresets.preset_categories.w.choices, []);
+    const cleaned = {{bindings: {{}}, presets: {{a: {json.dumps(definition())}}}, preset_categories: {{w: {{name: 'W', order: 0, choices: ['a']}}}}}};
+    b.applyCleanupPlan(cleaned, {{preset_members: [{{preset_id: 'a', binding_id: 'steps'}}]}});
+    assert.ok(!cleaned.presets.a); assert.deepEqual(cleaned.preset_categories.w.choices, []);
+    '''
+    path = tmp_path / 'categories.mjs'
+    path.write_text(script, encoding='utf-8')
+    result = subprocess.run(['node', str(path)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.fixture
 def app_template(tmp_path, monkeypatch):
     import sys
@@ -273,3 +348,94 @@ def test_app_preset_caps_fail_before_persistence(app_template):
     st.update_control_values(identity, lambda data: data["presets"].update(extra=definition()))
     with pytest.raises(st.TemplateError, match="32 presets"):
         st.export_curated(identity)
+
+
+# ── Categories (Controls Modes) in the Sonder App ─────────────────────────────
+
+def category_rows(snapshot):
+    return {row["id"]: row for row in snapshot()[2]["preset_categories"]}
+
+
+def test_app_categories_copy_on_write_reset_tombstone_and_replace(app_template):
+    st, identity, prompt, manifest, validation, snapshot, write = app_template
+    manifest["presets"]["q"] = definition({"steps": {"value": "30"}}, name="Other", order=1)
+    manifest["preset_categories"] = {"task": {"name": "Task", "order": 0, "choices": ["p", "q"]}}
+    prompt["9"]["inputs"]["manifest"] = json.dumps(manifest)
+    st.replace_template(identity, json.dumps(prompt).encode(), validate=validation)
+    assert category_rows(snapshot)["task"]["origin"] == "workflow"
+    data = write({"preset_category:task:name": "Job"})
+    assert data["preset_categories"]["task"]["name"] == "Job" and data["presets"] == {}
+    assert category_rows(snapshot)["task"]["origin"] == "app_copy"
+    manifest["preset_categories"]["task"]["description"] = "New workflow text"
+    prompt["9"]["inputs"]["manifest"] = json.dumps(manifest)
+    assert st.replace_template(identity, json.dumps(prompt).encode(), validate=validation)["categories_kept"] == 1
+    assert category_rows(snapshot)["task"]["name"] == "Job"
+    write({"preset_category:task:reset": True})
+    assert category_rows(snapshot)["task"]["description"] == "New workflow text"
+    write({"preset_category:task:remove": True})
+    assert "task" not in category_rows(snapshot)
+    assert snapshot()[1]["preset_categories"]["task"] == {"removed": True}
+
+
+def test_app_choice_move_rewrites_only_categories_and_removed_choices_stay_authored(app_template):
+    st, identity, prompt, manifest, validation, snapshot, write = app_template
+    manifest["presets"]["q"] = definition({"steps": {"value": "30"}}, name="Other", order=1)
+    manifest["preset_categories"] = {"task": {"name": "Task", "order": 0, "choices": ["p", "q"]},
+                                     "look": {"name": "Look", "order": 1, "choices": []}}
+    prompt["9"]["inputs"]["manifest"] = json.dumps(manifest)
+    st.replace_template(identity, json.dumps(prompt).encode(), validate=validation)
+    data = write({"preset_category:task:choices": ["p"], "preset_category:look:choices": ["q"]})
+    assert data["presets"] == {} and set(data["preset_categories"]) == {"task", "look"}
+    write({"preset_category:task:reset": True, "preset_category:look:reset": True})
+    # Removing a choice in the app leaves its category the workflow's.
+    data = write({"preset:q:remove": True})
+    assert data["preset_categories"] == {}
+    task = category_rows(snapshot)["task"]
+    assert task["origin"] == "workflow" and task["choices"] == ["p"] and not any(w["code"] == "missing" for w in task["warnings"])
+    write({"preset:q:reset": True})
+    assert category_rows(snapshot)["task"]["choices"] == ["p", "q"]
+    exported = cm.find_relay(json.loads(st.export_curated(identity)))["manifest"]
+    assert exported["preset_categories"]["task"]["choices"] == ["p", "q"]
+    write({"preset:q:remove": True})
+    exported = cm.find_relay(json.loads(st.export_curated(identity)))["manifest"]
+    assert exported["preset_categories"]["task"]["choices"] == ["p"]
+    # A new list can't name a choice the app removed; the copy keeps it for Reset.
+    write({"preset:r:create": {"name": "Third", "members": ["steps"]}})
+    data = write({"preset_category:task:choices": ["r", "p"]})
+    assert data["preset_categories"]["task"]["choices"] == ["r", "p", "q"]
+    assert category_rows(snapshot)["task"]["choices"] == ["r", "p"]
+    write({"preset:q:reset": True})
+    assert category_rows(snapshot)["task"]["choices"] == ["r", "p", "q"]
+
+
+def test_app_category_caps_curation_and_unknown_fields(app_template):
+    st, identity, prompt, manifest, validation, snapshot, write = app_template
+    assert not st._has_curation({"preset_categories": {}})
+    assert st._has_curation({"preset_categories": {"c": {"removed": True}}})
+    for i in range(16):
+        write({f"preset_category:c{i}:create": {"name": f"C{i}", "choices": ["p"] if i == 0 else []}})
+    current, stored, projected = snapshot()
+    assert len(projected["preset_categories"]) == 16
+    _, refused = cd.validate_binding_changes(projected, {"preset_category:x:create": {"name": "X"}}, structural="sdk")
+    assert refused and "16" in refused[0]["reason"]
+    with pytest.raises(st.TemplateError, match="unavailable"):
+        st.store_binding_changes(identity, {"preset_category:c0:value": 1}, projected, current)
+    # Externally over-cap storage refuses export, never truncates.
+    st.update_control_values(identity, lambda data: data["preset_categories"].update(
+        extra={"name": "Extra", "order": 99, "choices": []}))
+    with pytest.raises(st.TemplateError, match="16 categories"):
+        st.export_curated(identity)
+
+
+def test_app_export_creates_a_relay_for_categories_alone(tmp_path, monkeypatch):
+    import sys
+    import types
+    from server import sdk_templates as st
+    monkeypatch.setitem(sys.modules, "folder_paths", types.SimpleNamespace(get_user_directory=lambda: str(tmp_path)))
+    prompt = {"3": {"class_type": "Sampler", "inputs": {"steps": 20}}}
+    validation = lambda p: {"ok": True, "warnings": [], "errors": [], "description": ""}
+    identity = st.import_template(json.dumps(prompt).encode(), validate=validation)["template_id"]
+    st.update_control_values(identity, lambda data: data["preset_categories"].update(
+        only={"name": "Only", "order": 0, "choices": []}))
+    exported = cm.find_relay(json.loads(st.export_curated(identity)))
+    assert exported["status"] == "ok" and exported["manifest"]["preset_categories"]["only"]["name"] == "Only"

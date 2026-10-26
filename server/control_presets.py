@@ -119,11 +119,95 @@ def _preview(value, descriptor):
     return ("true" if value is True else "false" if value is False else "null" if value is None else str(value))[:200]
 
 
-def preset_states(view, presets, *, origins=None, prompt=None):
-    """One pure match authority, called after each host's effective projection."""
+# A value the batch did not validate: its condition can never hold.
+_UNSET = object()
+
+
+def match_condition(descriptor, member, value):
+    """What a setting member requires to match on this host: its coerced
+    ``value``, plus ``seed_mode`` for a captured seed mode. A fixed seed needs
+    both; an advancing seed needs its mode only (its number moves every run);
+    a stored mode is ignored where the host binding has no mode widget. The
+    one rule ``preset_states`` matches by and the category warnings compare."""
+    mode = member.get("seed_mode") if descriptor.get("seed_mode") is not None else None
+    condition = {}
+    if mode is not None:
+        condition["seed_mode"] = mode
+    if mode in (None, "fixed"):
+        condition["value"] = value
+    return condition
+
+
+def condition_holds(descriptor, condition):
+    if "seed_mode" in condition and condition["seed_mode"] != descriptor.get("seed_mode"):
+        return False
+    if "value" in condition:
+        if condition["value"] is _UNSET:
+            return False
+        try:
+            return cd.coerce_binding_value(descriptor, descriptor.get("value")) == condition["value"]
+        except cd.ControlValueError:
+            return False
+    return True
+
+
+def _stored_value(descriptor, raw):
+    """A member's value for comparison when its preset did not validate as a
+    batch: coerced like the batch would be, else its stored form (a decimal
+    string of an INT/SEED as the number)."""
+    if descriptor.get("status") == "ok":
+        try:
+            return cd.coerce_binding_value(descriptor, raw)
+        except (cd.ControlValueError, TypeError, ValueError, OverflowError):
+            pass
+    if isinstance(raw, str) and descriptor.get("kind") in (None, "INT", "SEED"):
+        try:
+            return cd.coerce_control_value("INT", raw)
+        except (cd.ControlValueError, TypeError, ValueError, OverflowError):
+            pass
+    return raw
+
+
+def _conditions(view, preset, cleaned):
+    """``{control key: condition}`` for one preset: ``("binding", id)`` per
+    setting and ``("node", path)`` per node its switches set. Values a batch
+    validated are the ones matching uses."""
+    bindings = {d["binding_id"]: d for d in view.get("bindings", [])}
+    result = {}
+    for bid, member in preset["members"].items():
+        descriptor = bindings.get(bid, {})
+        key = f"binding:{bid}:value"
+        value = cleaned[key] if key in cleaned else _stored_value(descriptor, member["value"])
+        if descriptor.get("status") == "ok":
+            condition = match_condition(descriptor, member, value)
+        else:
+            # No host binding to read: the member's own capture decides.
+            condition = {"value": value, **({"seed_mode": member["seed_mode"]} if "seed_mode" in member else {})}
+            if member.get("seed_mode") not in (None, "fixed"):
+                condition.pop("value")
+        result[("binding", bid)] = condition
+    for path, mode in (cm.execution_effects(preset.get("execution") or {}) or {}).items():
+        result[("node", path)] = {"mode": mode}
+    return result
+
+
+def _control_labels(view):
+    labels = {("binding", bid): label for bid, label in _labels(view).items()}
+    for descriptor in view.get("execution", []) or []:
+        for member in descriptor.get("members") or []:
+            labels.setdefault(("node", member.get("path")), descriptor.get("label") or descriptor.get("execution_id"))
+    return labels
+
+
+def preset_projection(view, presets, categories=None, *, origins=None, category_origins=None, prompt=None, dropped=()):
+    """The one pure match authority, called after each host's effective
+    projection: ``(preset rows, category rows)``. Category warnings are
+    computed only when the workflow has categories."""
+    from . import control_preset_categories
+
     bindings = {d["binding_id"]: d for d in view.get("bindings", [])}
     switches = _switches(view)
-    rows = []
+    rows, conditions = [], {}
     for identity, preset in sorted(presets.items(), key=lambda item: item[1]["order"]):
         changes, unavailable = _expand(view, preset)
         cleaned, rejected = (cd.validate_binding_changes(view, changes, prompt=prompt, expanded=True)
@@ -138,28 +222,30 @@ def preset_states(view, presets, *, origins=None, prompt=None):
                             # Two row lists can share a summary; Manage's hint needs the real comparison.
                             **({"differs": control_rows.canonical(member["value"]) != control_rows.canonical(descriptor.get("value"))}
                                if descriptor.get("kind") == control_rows.ROWS_KIND else {})})
-            if state != "match":
-                continue
-            mode = member.get("seed_mode") if descriptor.get("seed_mode") is not None else None
-            if mode is not None and mode != descriptor.get("seed_mode"):
+            if state == "match" and not condition_holds(
+                    descriptor, match_condition(descriptor, member, cleaned.get(f"binding:{bid}:value", _UNSET))):
                 state = "differs"
-            elif mode in (None, "fixed"):
-                try:
-                    if cd.coerce_binding_value(descriptor, descriptor.get("value")) != cleaned[f"binding:{bid}:value"]:
-                        state = "differs"
-                except (cd.ControlValueError, KeyError):
-                    state = "differs"
         execution = []
         for eid, member in (preset.get("execution") or {}).items():
             status = "unavailable" if eid in unavailable else "ok"
             execution.append({"execution_id": eid, "preview": _mode_preview(member), "status": status})
             if state == "match" and not _execution_matches(switches.get(eid, {}), member):
                 state = "differs"
+        if categories:
+            conditions[identity] = _conditions(view, preset, cleaned)
         rows.append({"id": identity, "name": preset["name"], "description": preset["description"],
                      "order": preset["order"], "origin": (origins or {}).get(identity, "workflow"),
                      "state": state, "members": members, "execution": execution, "unavailable": unavailable,
                      "reason": _reason(view, unavailable, preset) if unavailable else _refused_reason(view, rejected) if rejected else ""})
-    return rows
+    category_rows = (control_preset_categories.category_rows(categories, presets, conditions, labels=_control_labels(view),
+                                                            origins=category_origins, dropped=set(dropped))
+                     if categories else [])
+    return rows, category_rows
+
+
+def preset_states(view, presets, *, origins=None, prompt=None):
+    """The preset rows alone (``preset_projection`` without categories)."""
+    return preset_projection(view, presets, origins=origins, prompt=prompt)[0]
 
 
 def _capture_execution(view, identities, previous=None):
@@ -233,16 +319,31 @@ def _entry(base, members, switched):
 def validate_preset_changes(view, changes, *, prompt=None, structural=None, inventory=None, execution_inventory=None):
     """Return canonical preset edits or an ordinary atomic value/mode batch.
 
-    Mounted structural intents are shape-checked only and forwarded raw. The
-    private definitions never travel in its bounded publication view.
+    Category targets (``preset_category:<id>:<field>``) validate here too, in
+    request order against the same ephemeral definitions, so one request can
+    create a choice and list it. Mounted structural intents are shape-checked
+    only and forwarded raw. The private definitions never travel in its
+    bounded publication view.
     """
+    from . import control_preset_categories as pc
+
     definitions = copy.deepcopy(view.get("_presets", {}))
-    ordinary = {target: raw for target, raw in changes.items() if (cd.parse_target(target) or (None,))[0] != "preset"}
+    categories = copy.deepcopy(view.get("_preset_categories", {}))
+    start = copy.deepcopy(categories)
+    sources = {target: (cd.parse_target(target) or (None,))[0] for target in changes}
+    ordinary = {target: raw for target, raw in changes.items() if sources[target] not in cd.PRESET_SOURCES}
     cleaned, rejected = cd.validate_binding_changes(view, ordinary, prompt=prompt, structural=structural, inventory=inventory,
                                                     execution_inventory=execution_inventory) if ordinary else ({}, [])
     for target, raw in changes.items():
         parsed = cd.parse_target(target)
-        if not parsed or parsed[0] != "preset":
+        if not parsed or parsed[0] not in cd.PRESET_SOURCES:
+            continue
+        if parsed[0] == "preset_category":
+            # A mixed batch with ``preset:<id>:apply`` is refused by the apply target.
+            try:
+                cleaned[target] = _category_change(view, categories, definitions, parsed[1], parsed[2], raw, structural)
+            except (cd.ControlValueError, TypeError, ValueError) as exc:
+                rejected.append({"target": target, "reason": str(exc)})
             continue
         _, identity, field = parsed
         try:
@@ -269,7 +370,7 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                 raw = raw.strip()  # stored trimmed; names saved earlier are not rewritten
             if field in ("name", "description"):
                 limit = cm.LABEL_MAX if field == "name" else cm.DESCRIPTION_MAX
-                if not isinstance(raw, str) or len(raw) > limit or (field == "name" and not raw.strip()):
+                if not isinstance(raw, str) or len(raw) > limit or (field == "name" and cm.blank_name(raw)):
                     raise cd.ControlValueError(f"A preset {field} must be text of 1–{limit} characters." if field == "name" else f"A preset description may hold at most {limit} characters.")
             if field not in {"create", "capture", "apply", "name", "description", "move", "remove", "reset"}:
                 raise cd.ControlValueError("This preset target is unavailable.")
@@ -312,6 +413,9 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                 cleaned[target] = entry
             elif field in ("name", "description"):
                 definitions[identity][field] = raw
+                # Every writer stores what this accepts; refuse what its reader would drop.
+                if identity not in cm.read_presets({identity: definitions[identity]}):
+                    raise cd.ControlValueError("A preset needs a name of 1–120 characters and a description of at most 1000 characters.")
                 cleaned[target] = raw
             elif field == "move":
                 before = raw.get("before")
@@ -321,9 +425,87 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
             else:
                 cleaned[target] = True
                 definitions.pop(identity, None)
+                if field == "remove":
+                    # A deleted choice leaves its categories in the same edit.
+                    pc.drop_choice(categories, identity)
         except (cd.ControlValueError, TypeError, ValueError) as exc:
             rejected.append({"target": target, "reason": str(exc)})
+    if not rejected and structural != "relay" and "preset_category" in sources.values():
+        # Only a duplicate this batch makes is refused: one already there (a
+        # Replace, a reset, a hand edit) is resolved by the first category and
+        # warned in Manage, and never blocks an unrelated edit.
+        before = pc.claims(start)
+        for choice, cids in pc.introduced_duplicates(start, categories).items():
+            names = " and ".join(f"“{categories[cid]['name']}”" for cid in pc.ordered({c: categories[c] for c in cids}))
+            label = definitions.get(choice, {}).get("name", choice)
+            reason = f"“{label}” would be in two categories, {names}. Take it out of one."
+            # Each target that put it into a category it was not in before.
+            added = cids - before.get(choice, set())
+            for target in changes:
+                parsed = cd.parse_target(target)
+                if sources[target] == "preset_category" and parsed[1] in added and parsed[2] in ("create", "choices"):
+                    rejected.append({"target": target, "reason": reason})
     return ({} if rejected else cleaned), rejected
+
+
+def _category_change(view, categories, definitions, identity, field, raw, structural):
+    """One ``preset_category:<id>:<field>`` target, applied to this batch's
+    ephemeral ``categories``; the canonical value its writers store."""
+    from . import control_preset_categories as pc
+
+    if identity in cm.FORBIDDEN_KEYS or structural not in ("canvas", "sdk", "relay") or field not in pc.FIELDS:
+        raise cd.ControlValueError("This category target is unavailable.")
+    if view.get("error") or (view.get("relay") or {}).get("status") == "error":
+        raise cd.ControlValueError("The Sonder Control Relay cannot be read.")
+    if field == "create":
+        if not isinstance(raw, dict) or set(raw) - {"name", "description", "choices"}:
+            raise cd.ControlValueError("Name the new category.")
+        name, description, choices = raw.get("name"), raw.get("description", ""), raw.get("choices", [])
+    else:
+        name = raw if field == "name" else None
+        description = raw if field == "description" else ""
+        choices = raw if field == "choices" else []
+    if field in ("create", "name"):
+        if not isinstance(name, str) or cm.blank_name(name) or len(name.strip()) > cm.LABEL_MAX:
+            raise cd.ControlValueError(f"A category name must be text of 1–{cm.LABEL_MAX} characters.")
+        name = name.strip()
+    if not isinstance(description, str) or len(description) > cm.CATEGORY_DESCRIPTION_MAX:
+        raise cd.ControlValueError(f"A category description may hold at most {cm.CATEGORY_DESCRIPTION_MAX} characters.")
+    if (not isinstance(choices, list) or len(choices) > cm.MAX_PRESETS
+            or any(not isinstance(c, str) or not cm.ID_RE.fullmatch(c) or c in cm.FORBIDDEN_KEYS for c in choices)
+            or len(set(choices)) != len(choices)):
+        raise cd.ControlValueError(f"Choose at most {cm.MAX_PRESETS} different choices.")
+    if field == "move" and (not isinstance(raw, dict) or set(raw) != {"before"}
+                            or (raw["before"] is not None and not isinstance(raw["before"], str))):
+        raise cd.ControlValueError("Choose a category to move before.")
+    if field in ("remove", "reset") and raw is not True:
+        raise cd.ControlValueError(f"Send true to {field} a category.")
+    if field == "reset" and structural != "sdk":
+        raise cd.ControlValueError("Reset to the workflow's version is available in the Sonder App.")
+    value = ({"name": name, "description": description, "choices": list(choices)} if field == "create"
+             else name if field == "name" else copy.deepcopy(raw))
+    if structural == "relay":
+        # The mounted pre-check: shape only; the canvas writer revalidates.
+        return value
+    existing = categories.get(identity)
+    if field == "create":
+        if existing:
+            raise cd.ControlValueError("This category id is already in use.")
+        if len(categories) >= cm.MAX_PRESET_CATEGORIES:
+            raise cd.ControlValueError(f"At most {cm.MAX_PRESET_CATEGORIES} categories fit in one workflow.")
+        value["order"] = min(cm.ORDER_LIMIT, max((c["order"] for c in categories.values()), default=-1) + 1)
+    elif field not in ("remove", "reset") and not existing:
+        raise cd.ControlValueError("This category no longer exists. Open Manage.")
+    if field in ("create", "choices"):
+        unknown = [c for c in choices if c not in definitions]
+        if unknown:
+            raise cd.ControlValueError("A choice in this list no longer exists. Refresh Controls.")
+    if field == "move" and (raw["before"] == identity or (raw["before"] is not None and raw["before"] not in categories)):
+        raise cd.ControlValueError("Choose another category to move before.")
+    pc.edit_categories(categories, identity, field, value)
+    if field not in ("remove", "reset") and identity not in cm.read_preset_categories({identity: categories[identity]}):
+        raise cd.ControlValueError("This category would be unreadable. Check its name and description.")
+    return value
 
 
 def edit_definitions(definitions, identity, field, value):

@@ -1,7 +1,7 @@
 // Canvas graph authority for the shared Controls panel. No app/DOM at import.
 import {
     EXECUTION_VERSION, MAX_MANIFEST_BYTES, NATIVE_MODES, RELAY_CLASS, anchorSnapshot, applyCleanupPlan, definitionAnchorIds, dropAllAnchors,
-    dropExecutionAnchors, executionAnchorSnapshot, graphsOf, applyGroupPlan, applyPresetEdit, dropAnchors, editManifest, exportManifest,
+    dropExecutionAnchors, executionAnchorSnapshot, graphsOf, applyCategoryEdit, applyGroupPlan, applyPresetEdit, dropAnchors, editManifest, exportManifest,
     executionCandidatesFor, inactiveBodies, isStructuralTarget, listCandidates, listExecutionCandidates, nodesOf, parseManifest, parseTarget, readAnchors,
     readExecution, readExecutionAnchor, relayCensus, resolveBindings, resolveCandidate, resolveExecution, resolveExecutionCandidate,
     planRestore, restoreAnchors, restoreDynamicPrompts, restoreExecutionAnchor, setAnchor, setExecutionAnchor,
@@ -263,10 +263,17 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         };
         for (const [target, value] of Object.entries(changes)) {
             const parsed = parseTarget(target);
-            if (!parsed || (parsed.source !== "preset" && !FIELDS.has(parsed.field))) throw new Error("This target is unavailable.");
+            // Presets and their categories own their fields (`name`, `choices`,
+            // `move` mean something else there): routed before FIELDS.
+            if (!parsed || (!["preset", "preset_category"].includes(parsed.source) && !FIELDS.has(parsed.field)))
+                throw new Error("This target is unavailable.");
             const { source, id, field } = parsed;
             if (source === "preset") {
                 manifestOps.push(m => applyPresetEdit(m, id, field, value));
+                continue;
+            }
+            if (source === "preset_category") {
+                manifestOps.push(m => applyCategoryEdit(m, id, field, value));
                 continue;
             }
             if (source === "execution") {

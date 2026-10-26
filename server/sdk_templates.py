@@ -56,6 +56,7 @@ _starter_validation_cache = {}
 
 
 from . import control_presets
+from . import control_preset_categories
 
 
 def starter_sources() -> dict[str, str]:
@@ -431,7 +432,7 @@ _summary_cache: dict[str, tuple] = {}
 def _has_curation(stored: dict) -> bool:
     # Notes and layout count too: the summary carries groups and Advanced.
     return any(stored.get(name) for name in ("bindings", "local", "local_notes", "hidden", "labels",
-                                             "notes", "layout", "presets", "node_modes")) or "description" in stored
+                                             "notes", "layout", "presets", "preset_categories", "node_modes")) or "description" in stored
 
 
 def _overlay_summary(meta: dict) -> None:
@@ -518,11 +519,17 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
         })
         meta.setdefault("name", _name_from_source(source_name))
         data = read_control_values(template_id)
-        old_presets = control_manifest_of(parse_template_bytes(_read_bytes(json_path)))['presets']
-        new_presets = control_manifest_of(prompt)['presets']
+        old_manifest = control_manifest_of(parse_template_bytes(_read_bytes(json_path)))
+        new_manifest = control_manifest_of(prompt)
+        old_presets, new_presets = old_manifest['presets'], new_manifest['presets']
         presets_kept = sum(1 for identity, entry in data.get("presets", {}).items()
                            if isinstance(entry, dict) and identity in new_presets
                            and old_presets.get(identity) != new_presets[identity])
+        # App copies (not hidden ones) that now shadow a changed workflow category.
+        old_categories, new_categories = old_manifest['preset_categories'], new_manifest['preset_categories']
+        categories_kept = sum(1 for identity, entry in data.get("preset_categories", {}).items()
+                              if isinstance(entry, dict) and not entry.get("removed") and identity in new_categories
+                              and old_categories.get(identity) != new_categories[identity])
         description_reset = "description" in data
         data.pop("description", None)
         notes_reset = len(data["notes"])
@@ -567,7 +574,8 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
         except Exception:
             logger.warning("Could not check app-only Controls of workflow %s", template_id, exc_info=True)
     return {**_public_meta(template_id, meta), "notes_reset": notes_reset, "layout_reset": layout_reset,
-            "local_missing": local_missing, "local_shadowed": local_shadowed, "description_reset": description_reset, "presets_kept": presets_kept}
+            "local_missing": local_missing, "local_shadowed": local_shadowed, "description_reset": description_reset, "presets_kept": presets_kept,
+            "categories_kept": categories_kept}
 
 
 def export_curated(template_id: str) -> bytes:
@@ -592,6 +600,9 @@ def export_curated(template_id: str) -> bytes:
             raise TemplateError(" ".join(generate_refusals(view)), "invalid_controls")
         if len(view.get("_presets", {})) > cm.MAX_PRESETS:
             raise TemplateError("At most 32 presets fit in one workflow. Remove an app preset before exporting.", "invalid_controls")
+        if len(view.get("_preset_categories", {})) > cm.MAX_PRESET_CATEGORIES:
+            raise TemplateError(f"At most {cm.MAX_PRESET_CATEGORIES} categories fit in one workflow. Delete one before exporting.",
+                                "invalid_controls")
         manifest = _curated_manifest(prompt, relay, stored, view)
         try:
             text = json.dumps(manifest, ensure_ascii=False)
@@ -599,7 +610,7 @@ def export_curated(template_id: str) -> bytes:
         except (cm.ManifestError, UnicodeError) as exc:
             raise TemplateError(str(exc), "invalid_controls") from None
         if (relay["key"] or manifest["bindings"] or manifest["notes"] or manifest["groups"] or manifest["description"]
-                or manifest["presets"] or (manifest.get("views") or {}).get("items")):
+                or manifest["presets"] or manifest.get("preset_categories") or (manifest.get("views") or {}).get("items")):
             key = relay["key"]
             if key is None:
                 roots = [int(k) for k in prompt if k.isascii() and k.isdecimal()]
@@ -665,6 +676,13 @@ def _curated_manifest(prompt, relay, stored, view):
         manifest["notes"][identity] = entry
     _curated_execution(manifest, saved, stored, view)
     _curated_views(manifest, saved, view)
+    # The categories the app shows, after any preset the export leaves out
+    # (a hidden switch's) is gone, so no exported category lists a ghost.
+    exported = manifest.get("presets") or {}
+    if view.get("_preset_categories") or "preset_categories" in saved:
+        manifest["preset_categories"] = {
+            cid: {**copy.deepcopy(entry), "choices": [pid for pid in entry["choices"] if pid in exported]}
+            for cid, entry in (view.get("_preset_categories") or {}).items()}
     for key in ("status", "suggestions", "error"):
         manifest.pop(key, None)
     return manifest
@@ -801,7 +819,8 @@ def _write_bytes_atomic(path: str, data: bytes) -> None:
 def _normalized_controls(data: dict, presentation_hash: str) -> dict:
     data = dict(data)
     data["version"] = CONTROLS_VERSION
-    for name in ("bindings", "labels", "notes", "layout", "local", "local_notes", "hidden", "presets", "node_modes", "views"):
+    for name in ("bindings", "labels", "notes", "layout", "local", "local_notes", "hidden", "presets", "preset_categories",
+                 "node_modes", "views"):
         if not isinstance(data.get(name), dict):
             data[name] = {}
     if data.get("presentation_hash") != presentation_hash:
@@ -988,8 +1007,16 @@ def apply_stored_values(prompt: dict, described: dict, stored: dict, *, describe
         view["groups"] = _overlay_groups(view.get("groups"), layouts)
         view["group_order"] = cd.group_order(view)  # the overlays may regroup
     effective, origins = control_presets.effective_presets(control_manifest_of(prompt).get("presets"), stored.get("presets"))
+    categories, category_origins = control_preset_categories.effective_categories(
+        control_manifest_of(prompt).get("preset_categories"), stored.get("preset_categories"))
     view["_presets"] = effective
-    view["presets"] = cd.preset_states(view, effective, origins=origins, prompt=prompt)
+    view["_preset_categories"] = categories
+    # A choice the app removed itself leaves its categories silently: the
+    # category stays the workflow's, and Reset brings the choice back.
+    removed = {pid for pid, entry in (stored.get("presets") or {}).items()
+               if isinstance(entry, dict) and entry.get("removed") is True}
+    view["presets"], view["preset_categories"] = cd.preset_projection(
+        view, effective, categories, origins=origins, category_origins=category_origins, prompt=prompt, dropped=removed)
     from .control_cleanup import inventory
     view["cleanup"] = inventory(view, stored=stored)
     return view
@@ -1080,6 +1107,35 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                         if key == identity or definition != before.get(key):
                             data["presets"][key] = definition
                 continue
+            if source == "preset_category":
+                # Copy-on-write like presets. Moving a choice rewrites only the
+                # categories involved, never the choice.
+                authored = control_manifest_of(prompt).get("preset_categories", {})
+                if field not in control_preset_categories.FIELDS:
+                    raise TemplateError("This category change is unavailable.", "invalid_controls")
+                if field == "reset":
+                    data["preset_categories"].pop(identity, None)
+                elif field == "remove":
+                    if identity in authored:
+                        data["preset_categories"][identity] = {"removed": True}
+                    else:
+                        data["preset_categories"].pop(identity, None)
+                else:
+                    effective, _ = control_preset_categories.effective_categories(authored, data["preset_categories"])
+                    before = copy.deepcopy(effective)
+                    if field == "choices" and identity in before:
+                        # Choices the app removed itself are not in the view, so a
+                        # new list cannot name them; keep them so Reset of the
+                        # choice still brings it back here.
+                        removed = {pid for pid, entry in data["presets"].items()
+                                   if isinstance(entry, dict) and entry.get("removed") is True}
+                        kept = [pid for pid in before[identity]["choices"] if pid in removed and pid not in value]
+                        value = (list(value) + kept)[:control_descriptors.control_manifest.MAX_PRESETS]
+                    control_preset_categories.edit_categories(effective, identity, field, value)
+                    for key, definition in effective.items():
+                        if key == identity or definition != before.get(key):
+                            data["preset_categories"][key] = definition
+                continue
             if source == "view":
                 # Inspection only: the sidecar's own copy-on-write map.
                 control_views.store_sdk_change(data, current, identity, field, value)
@@ -1166,7 +1222,8 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                     entry["sig"] = signatures.get(identity)
                 else:
                     entry[field] = value
-        if any((control_descriptors.parse_target(target) or (None,))[0] in ("preset", "view") for target in changes):
+        if any((control_descriptors.parse_target(target) or (None,))[0] in ("preset", "preset_category", "view")
+               for target in changes):
             _check_manifest_projection(prompt, data)
     return update_control_values(template_id, mutate)
 
@@ -1176,10 +1233,15 @@ def _check_manifest_projection(prompt, data, describe=None):
     stay within the manifest's caps, so Export never starts failing."""
     cm = control_descriptors.control_manifest
     effective, _ = control_presets.effective_presets(control_manifest_of(prompt).get("presets"), data.get("presets"))
-    if not effective and not control_manifest_of(prompt).get("views") and not control_views.stored_views(data):
+    categories, _ = control_preset_categories.effective_categories(control_manifest_of(prompt).get("preset_categories"),
+                                                                   data.get("preset_categories"))
+    if (not effective and not categories and not control_manifest_of(prompt).get("views")
+            and not control_views.stored_views(data)):
         return
     if len(effective) > cm.MAX_PRESETS:
         raise TemplateError("At most 32 presets fit in one workflow. Remove an app preset before replacing this workflow.", "invalid_controls")
+    if len(categories) > cm.MAX_PRESET_CATEGORIES:
+        raise TemplateError(f"At most {cm.MAX_PRESET_CATEGORIES} categories fit in one workflow. Delete one first.", "invalid_controls")
     projected_prompt = copy.deepcopy(prompt or {})
     projected_view = apply_stored_values(projected_prompt, describe_stored(projected_prompt, data, describe), data)
     # The Views the export would carry: the workflow's not removed here, and the app's own.

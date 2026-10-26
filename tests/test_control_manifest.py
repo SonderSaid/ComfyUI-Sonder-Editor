@@ -208,7 +208,8 @@ def test_manifest_caps_mirror_the_frontend():
     def constant(name):
         return re.search(rf"export const {name} = ([^;]+);", source).group(1)
     assert eval(constant("MAX_MANIFEST_BYTES")) == cm.MAX_MANIFEST_BYTES
-    for name in ("MAX_BINDINGS", "MAX_NOTES", "MAX_SUGGESTIONS", "MAX_TARGETS", "MAX_DEPTH", "MAX_GROUPS"):
+    for name in ("MAX_BINDINGS", "MAX_NOTES", "MAX_SUGGESTIONS", "MAX_TARGETS", "MAX_DEPTH", "MAX_GROUPS",
+                 "MAX_PRESETS", "MAX_PRESET_TARGETS", "MAX_PRESET_CATEGORIES", "CATEGORY_DESCRIPTION_MAX"):
         assert int(constant(name)) == getattr(cm, name), name
     assert int(constant("LABEL_MAX")) == cm.LABEL_MAX and int(constant("NOTE_MAX")) == cm.NOTE_MAX
     assert constant("ID_RE") == "/" + cm.ID_RE.pattern + "/"

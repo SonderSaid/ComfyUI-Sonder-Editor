@@ -50,6 +50,9 @@ export const MAX_TARGETS = 64;
 export const MAX_GROUPS = 256;
 export const MAX_PRESETS = 32;
 export const MAX_PRESET_TARGETS = 64;
+// Controls Modes: categories of exclusive choices (presets).
+export const MAX_PRESET_CATEGORIES = 16;
+export const CATEGORY_DESCRIPTION_MAX = 300;
 export const MAX_DEPTH = 8;
 export const LABEL_MAX = 120;
 export const NOTE_MAX = 4000;
@@ -363,6 +366,12 @@ export function readViews(raw) {
     return {items: result, error: null};
 }
 
+// A name with nothing in it but whitespace by either language's rule: \s here
+// also covers U+FEFF, Python's isspace also \x1c-\x1f and \x85.
+// Mirrors control_manifest.blank_name.
+const BLANK_RE = /^[\s\x1c-\x1f\x85]*$/;
+export const blankName = text => BLANK_RE.test(text);
+
 // Mirrors control_manifest.read_presets; reads never rewrite saved metadata.
 export function readPresets(raw) {
     const result = {};
@@ -371,7 +380,7 @@ export function readPresets(raw) {
     for (const [id, entry] of Object.entries(raw)) {
         if (!validId(id) || !isPlainObject(entry)) continue;
         const {name, description = "", order = 0} = entry;
-        if (typeof name !== "string" || !name.trim() || [...name].length > LABEL_MAX
+        if (typeof name !== "string" || blankName(name) || [...name].length > LABEL_MAX
             || typeof description !== "string" || [...description].length > DESCRIPTION_MAX
             || !Number.isInteger(order) || Math.abs(order) > 9999) continue;
         const members = {};
@@ -410,7 +419,11 @@ export function applyPresetEdit(manifest, id, field, value) {
     if ((field === "create" || field === "capture") && Object.keys(value?.members || {}).some(member => Object.hasOwn(views, member)))
         throw new Error("A View can't be part of a preset.");
     if (field === "create" || field === "capture") presets[id] = structuredClone(value);
-    else if (field === "remove") delete presets[id];
+    else if (field === "remove") {
+        delete presets[id];
+        // A deleted choice leaves its categories in the same edit.
+        dropChoiceFromCategories(manifest, id);
+    }
     else if (field === "name" || field === "description") {
         if (!readPresets(presets)[id]) throw new Error("This preset no longer exists.");
         presets[id][field] = value;
@@ -422,6 +435,76 @@ export function applyPresetEdit(manifest, id, field, value) {
         ordered.forEach((key, order) => { presets[key].order = order; });
     } else throw new Error("This preset edit is unavailable.");
     if (field !== "remove" && !readPresets(presets)[id]) throw new Error("The preset would exceed its name, member or 32-preset cap.");
+}
+
+// The saved categories (Controls Modes), tolerant like
+// control_manifest.read_preset_categories (parity-tested): an unreadable
+// category is skipped, an invalid choice id dropped, duplicates kept, at most
+// MAX_PRESET_CATEGORIES valid entries. Whether a choice names a preset is the
+// server's to decide.
+export function readPresetCategories(raw) {
+    const result = {};
+    if (!isPlainObject(raw)) return result;
+    const validId = id => typeof id === "string" && ID_RE.test(id) && !FORBIDDEN_KEYS.has(id);
+    for (const [id, entry] of Object.entries(raw)) {
+        if (!validId(id) || !isPlainObject(entry)) continue;
+        const {name, description = "", order = 0, choices = []} = entry;
+        if (typeof name !== "string" || blankName(name) || [...name].length > LABEL_MAX
+            || typeof description !== "string" || [...description].length > CATEGORY_DESCRIPTION_MAX
+            || !Number.isInteger(order) || Math.abs(order) > 9999
+            || !Array.isArray(choices) || choices.length > MAX_PRESETS) continue;
+        if (Object.keys(result).length >= MAX_PRESET_CATEGORIES) break;
+        result[id] = {name, description, order, choices: choices.filter(validId)};
+    }
+    return result;
+}
+
+// Category ids by order, then position (control_preset_categories.ordered).
+const orderedCategories = valid => Object.keys(valid).sort((a, b) => valid[a].order - valid[b].order);
+
+// Removes a deleted choice from every category listing it
+// (control_preset_categories.drop_choice). A damaged section is left as saved.
+export function dropChoiceFromCategories(manifest, id) {
+    if (!isPlainObject(manifest.preset_categories)) return;
+    for (const entry of Object.values(manifest.preset_categories)) {
+        if (isPlainObject(entry) && Array.isArray(entry.choices) && entry.choices.includes(id))
+            entry.choices = entry.choices.filter(choice => choice !== id);
+    }
+}
+
+// One validated category edit (control_preset_categories.edit_categories).
+// Only an explicit edit may normalize a damaged section; every untouched entry
+// is kept as saved, and the edited one must still read afterwards.
+export function applyCategoryEdit(manifest, id, field, value) {
+    if (typeof id !== "string" || !ID_RE.test(id) || FORBIDDEN_KEYS.has(id)) throw new Error("This category edit is unavailable.");
+    if (!isPlainObject(manifest.preset_categories)) {
+        if (field === "remove") return; // nothing readable to remove; a damaged section stays as saved
+        manifest.preset_categories = {};
+    }
+    const categories = manifest.preset_categories;
+    const valid = readPresetCategories(categories);
+    // Own keys only: an id such as `toString` must never reach a prototype.
+    const known = Object.hasOwn(valid, id);
+    if (field === "create") {
+        // An unreadable entry under this id is replaced, as on the server,
+        // whose view never sees it. The cap is counted first: an index-like id
+        // sorts first and would otherwise push another category past it.
+        if (known) throw new Error("This category id is already in use.");
+        if (Object.keys(valid).length >= MAX_PRESET_CATEGORIES)
+            throw new Error(`At most ${MAX_PRESET_CATEGORIES} categories fit in one workflow.`);
+        categories[id] = structuredClone(value);
+    } else if (field === "remove") delete categories[id];
+    else if (field === "name" || field === "description" || field === "choices") {
+        if (!known) throw new Error("This category no longer exists. Refresh Controls.");
+        categories[id][field] = structuredClone(value);
+    } else if (field === "move") {
+        const ordered = orderedCategories(valid).filter(key => key !== id);
+        if (!known || (value?.before != null && !ordered.includes(value.before))) throw new Error("This category moved. Refresh Controls.");
+        ordered.splice(value.before == null ? ordered.length : ordered.indexOf(value.before), 0, id);
+        ordered.forEach((key, order) => { categories[key].order = order; });
+    } else throw new Error("This category edit is unavailable.");
+    if (field !== "remove" && !Object.hasOwn(readPresetCategories(categories), id))
+        throw new Error("This category would be unreadable. Check its name and description.");
 }
 
 // ── Resolve ──────────────────────────────────────────────────────────────────
@@ -806,7 +889,10 @@ export function applyCleanupPlan(manifest, plan) {
         if (!isPlainObject(preset?.[table])) throw new Error("The preset changed. Reopen the cleanup review.");
         delete preset[table][row.execution_id || row.binding_id];
         const left = table === "members" ? preset.execution : preset.members;
-        if (!Object.keys(preset[table]).length && !(isPlainObject(left) && Object.keys(left).length)) delete manifest.presets[row.preset_id];
+        if (!Object.keys(preset[table]).length && !(isPlainObject(left) && Object.keys(left).length)) {
+            delete manifest.presets[row.preset_id];
+            dropChoiceFromCategories(manifest, row.preset_id);
+        }
     }
 }
 

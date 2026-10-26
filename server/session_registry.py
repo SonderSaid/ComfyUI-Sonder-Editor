@@ -808,6 +808,27 @@ def _controls_gate_locked(key: HostKey, session_id: str, role: str, events: list
     return "" if owner.get("status", "active") == "active" else "session_orphaned"
 
 
+def _check_publication_categories(view: dict) -> None:
+    """Preset categories (Controls Modes) are optional: error views carry none."""
+    if "preset_categories" not in view:
+        return
+    manifest = control_descriptors.control_manifest
+    categories = view["preset_categories"]
+    if not isinstance(categories, list) or len(categories) > manifest.MAX_PRESET_CATEGORIES:
+        raise ValueError("Preset categories must be a list of at most 16.")
+    for row in categories:
+        if (not isinstance(row, dict) or not isinstance(row.get("id"), str) or not isinstance(row.get("name"), str)
+                or not isinstance(row.get("description", ""), str)):
+            raise ValueError("A category needs an id and a name.")
+        choices, warnings = row.get("choices", []), row.get("warnings", [])
+        if (not isinstance(choices, list) or len(choices) > manifest.MAX_PRESETS
+                or not all(isinstance(choice, str) for choice in choices)):
+            raise ValueError("A category's choices must be a list of ids.")
+        if not isinstance(warnings, list) or not all(
+                isinstance(w, dict) and isinstance(w.get("code"), str) and isinstance(w.get("message"), str) for w in warnings):
+            raise ValueError("A category's warnings must be a list of messages.")
+
+
 def _prepare_control_publication(body: Any) -> dict:
     """Validate/copy the wire snapshot off the loop; never retain caller objects."""
     if not isinstance(body, dict):
@@ -864,6 +885,7 @@ def _prepare_control_publication(body: Any) -> dict:
             raise ValueError("A View's feed must be output or sampling.")
     if view.get("views_error") is not None and not isinstance(view["views_error"], str):
         raise ValueError("The Views error must be text.")
+    _check_publication_categories(view)
     if len(view.get("candidates") or []) > control_descriptors.MAX_CANDIDATES:
         raise ValueError("Too many candidates.")
     if "candidates_truncated" in view and not isinstance(view["candidates_truncated"], bool):
