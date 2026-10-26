@@ -166,7 +166,7 @@ from . import scene_mutation_addressing
 from . import change_certificates
 from . import proxy_media
 from . import control_descriptors
-from .guide_collision import resolve_execution_window, resolve_guide_collisions
+from .guide_collision import driver_window_span, resolve_execution_window, resolve_guide_collisions
 
 logger = logging.getLogger("sonder_editor")
 _TIMELINE_EXPORTS = TimelineExportManager()
@@ -6857,9 +6857,14 @@ def _queue_guide_collision_prediction(project: TimelineProject, job: GenerationJ
     for raw in getattr(job, "driver_clip_snapshots", []) or []:
         if not isinstance(raw, dict) or str(raw.get("role") or "render") != "motion_driver":
             continue
-        overlap_start = max(int(raw.get("timeline_start_frame", 0) or 0), render_start)
-        overlap_end = min(int(raw.get("timeline_end_frame", 0) or 0), render_end)
-        if overlap_end <= overlap_start:
+        span = driver_window_span(
+            int(raw.get("timeline_start_frame", 0) or 0),
+            int(raw.get("timeline_end_frame", 0) or 0),
+            render_start,
+            render_end,
+            window["frame_count_padding"],
+        )
+        if span is None:
             continue
         asset_lookup = getattr(project, "asset_for_source_path", None)
         asset = asset_lookup(str(raw.get("source_path") or "")) if callable(asset_lookup) else None
@@ -6873,8 +6878,8 @@ def _queue_guide_collision_prediction(project: TimelineProject, job: GenerationJ
         drivers.append({
             "clip_id": str(raw.get("clip_id") or ""),
             "lane_index": int(raw.get("track_index", 0) or 0),
-            "local_idx": overlap_start - render_start,
-            "pixel_len": overlap_end - overlap_start,
+            "local_idx": span["local_idx"],
+            "pixel_len": span["real_len"] + span["tail_len"],
         })
 
     prediction = resolve_guide_collisions(

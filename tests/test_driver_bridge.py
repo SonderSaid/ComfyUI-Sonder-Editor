@@ -361,3 +361,267 @@ def test_driver_selector_treats_quarantined_source_path_as_absent(tmp_path, monk
     assert has_driver == 0
     assert driver_ref["has_driver"] == 0
     assert strength == pytest.approx(0.0)
+
+
+# --- Grid padding tail and short media ---
+# The Editor pads its render to the template grid at the tensor tail, after post-context,
+# holding its last frame. A Driver reaching the end of the real window carries the same
+# tail, so frame i of the Driver lines up with frame i of the render.
+
+
+def _window(project, start, end, frame_count, padding):
+    project._execution_context.update({
+        "context_start": start,
+        "context_end": end,
+        "frame_count": frame_count,
+        "frame_count_padding": padding,
+    })
+
+
+def _place_clip(scene, start, end, source_in=0):
+    clip = scene.clips[0]
+    clip.timeline_start_frame = start
+    clip.timeline_end_frame = end
+    clip.source_in_frame = source_in
+
+
+def _values(images):
+    return [round(float(images[index, 0, 0, 0]) * 255.0) for index in range(images.shape[0])]
+
+
+def _run(bridge, project):
+    driver_ref, has_driver = bridge.SonderDriverSelector().execute(project, driver_lane_index=0)
+    images, frame_idx, _strength = bridge.SonderDriverBridge().execute(driver_ref)
+    return driver_ref, has_driver, images, frame_idx
+
+
+@pytest.mark.parametrize(
+    ("real", "frame_count", "padding"),
+    [(10, 17, 7), (6, 22, 16)],  # LTX 8n+1 and H3 17n+5
+)
+def test_driver_reaching_the_window_end_holds_its_last_frame_over_the_padding(
+    tmp_path, monkeypatch, real, frame_count, padding,
+):
+    bridge, _timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _stub_decode(monkeypatch, bridge)
+    _window(project, 0, real, frame_count, padding)
+    _place_clip(scene, 0, real + 5)
+
+    driver_ref, has_driver, images, frame_idx = _run(bridge, project)
+
+    assert has_driver == 1
+    assert driver_ref["overlap_len"] == real
+    assert driver_ref["overlap_tail_len"] == padding
+    assert frame_idx == 0
+    assert images.shape[0] == frame_count
+    assert _values(images) == list(range(real)) + [real - 1] * padding
+
+
+def test_driver_ending_before_the_window_end_keeps_its_own_span(tmp_path, monkeypatch):
+    bridge, _timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _stub_decode(monkeypatch, bridge)
+    _window(project, 0, 10, 17, 7)
+    _place_clip(scene, 0, 6)
+
+    driver_ref, _has_driver, images, frame_idx = _run(bridge, project)
+
+    assert driver_ref["overlap_tail_len"] == 0
+    assert (frame_idx, images.shape[0]) == (0, 6)
+    assert _values(images) == list(range(6))
+
+
+def test_late_driver_reaching_the_window_end_fills_to_frame_count(tmp_path, monkeypatch):
+    bridge, _timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _stub_decode(monkeypatch, bridge)
+    _window(project, 0, 10, 17, 7)
+    _place_clip(scene, 4, 10, source_in=20)
+
+    _driver_ref, _has_driver, images, frame_idx = _run(bridge, project)
+
+    assert frame_idx == 4
+    assert frame_idx + images.shape[0] == 17
+    assert _values(images) == list(range(20, 26)) + [25] * 7
+
+
+def test_single_frame_overlap_at_the_window_end_stays_single(tmp_path, monkeypatch):
+    bridge, _timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _stub_decode(monkeypatch, bridge)
+    _window(project, 0, 10, 17, 7)
+    _place_clip(scene, 9, 14)
+
+    driver_ref, _has_driver, images, frame_idx = _run(bridge, project)
+
+    assert driver_ref["overlap_tail_len"] == 0
+    assert (frame_idx, images.shape[0]) == (9, 1)
+
+
+def test_mixed_fps_driver_holds_its_last_resampled_frame(tmp_path, monkeypatch):
+    bridge, timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _stub_decode(monkeypatch, bridge)
+    project.assets = [
+        timeline_state.Asset(
+            asset_id="driver-asset",
+            asset_type="video",
+            path=os.path.join("media", "driver.mp4"),
+            fps=30.0,
+            frame_count=100,
+        )
+    ]
+    _window(project, 0, 10, 17, 7)
+    _place_clip(scene, 0, 10)
+
+    _driver_ref, _has_driver, images, _frame_idx = _run(bridge, project)
+
+    assert _values(images) == [0, 1, 3, 4, 5, 6, 8, 9, 10, 11] + [11] * 7
+
+
+def test_queue_snapshot_driver_carries_the_padding_tail(tmp_path, monkeypatch):
+    bridge, timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _stub_decode(monkeypatch, bridge)
+    scene.clips = []
+    snapshot_clip = timeline_state.ClipReference(
+        clip_id="snapshot-driver",
+        source_path=os.path.join("media", "driver.mp4"),
+        timeline_start_frame=4,
+        timeline_end_frame=12,
+        source_in_frame=30,
+        track_index=0,
+        role="motion_driver",
+    )
+    project.generation_queue = [timeline_state.GenerationJob(
+        job_id="job-1",
+        scene_id="scene-1",
+        selection_start=4,
+        selection_end=10,
+        params={"snapshot_version": 1},
+        driver_clip_snapshots=[snapshot_clip.to_dict()],
+        driver_lane_count=1,
+        driver_lane_configs=[timeline_state.LaneConfig().to_dict()],
+    )]
+    project._execution_context["queue_job_ref_id"] = "job-1"
+    _window(project, 4, 10, 9, 3)
+
+    driver_ref, _has_driver, images, frame_idx = _run(bridge, project)
+
+    assert driver_ref["source"] != "live"
+    assert frame_idx == 0
+    assert _values(images) == list(range(30, 36)) + [35] * 3
+
+
+def test_missing_padding_key_means_no_tail_and_warns(tmp_path, monkeypatch, caplog):
+    bridge, _timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _stub_decode(monkeypatch, bridge)
+    project._execution_context.update({"context_start": 0, "context_end": 10, "frame_count": 17})
+    _place_clip(scene, 0, 10)
+
+    with caplog.at_level("WARNING"):
+        driver_ref, _has_driver, images, _frame_idx = _run(bridge, project)
+
+    assert driver_ref["overlap_tail_len"] == 0
+    assert images.shape[0] == 10
+    assert "does not match frame_count" in caplog.text
+
+
+def _short_media(monkeypatch, bridge, timeline_state, project, *, recorded, real, fail_after=None):
+    import numpy as np
+
+    project.assets = [
+        timeline_state.Asset(
+            asset_id="driver-asset",
+            asset_type="video",
+            path=os.path.join("media", "driver.mp4"),
+            fps=24.0,
+            frame_count=recorded,
+        )
+    ]
+    calls = []
+
+    def fake_decode(_path, start, end, **_kwargs):
+        # Mirrors decode_video_range: it stops quietly at the real end of the file,
+        # and raises after the last frame when ffmpeg exits nonzero.
+        calls.append((start, end))
+        for frame_no in range(start, min(end, real)):
+            yield np.full((2, 2, 3), frame_no, dtype=np.uint8)
+        if fail_after is not None:
+            raise RuntimeError(fail_after)
+
+    monkeypatch.setattr(bridge, "decode_video_range", fake_decode)
+    return calls
+
+
+def test_driver_media_a_frame_short_of_its_record_holds_its_last_frame(tmp_path, monkeypatch, caplog):
+    bridge, timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _short_media(monkeypatch, bridge, timeline_state, project, recorded=57, real=56)
+    scene.duration_frames = 57
+    _window(project, 0, 57, 57, 0)
+    _place_clip(scene, 0, 57)
+
+    with caplog.at_level("WARNING"):
+        _driver_ref, _has_driver, images, _frame_idx = _run(bridge, project)
+
+    assert images.shape[0] == 57
+    assert _values(images)[-2:] == [55, 55]
+    assert "decodes 56 frames but records 57" in caplog.text
+    assert project.assets[0].frame_count == 57
+
+
+def test_driver_overlap_starting_past_the_real_end_looks_back_for_the_last_frame(tmp_path, monkeypatch):
+    bridge, timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    calls = _short_media(monkeypatch, bridge, timeline_state, project, recorded=57, real=56)
+    scene.duration_frames = 57
+    _window(project, 56, 57, 57, 0)
+    _place_clip(scene, 0, 57)
+
+    _driver_ref, _has_driver, images, _frame_idx = _run(bridge, project)
+
+    assert calls == [(56, 57), (54, 56)]
+    assert _values(images) == [55]
+
+
+def test_driver_media_far_shorter_than_recorded_still_fails(tmp_path, monkeypatch):
+    bridge, timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _short_media(monkeypatch, bridge, timeline_state, project, recorded=57, real=50)
+    scene.duration_frames = 57
+    _window(project, 0, 57, 57, 0)
+    _place_clip(scene, 0, 57)
+
+    with pytest.raises(RuntimeError, match="decoded 50 of 57 recorded frames"):
+        _run(bridge, project)
+
+
+def test_driver_media_that_decodes_nothing_still_fails(tmp_path, monkeypatch):
+    bridge, timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _short_media(monkeypatch, bridge, timeline_state, project, recorded=57, real=0)
+    _window(project, 0, 10, 10, 0)
+    _place_clip(scene, 0, 10)
+
+    with pytest.raises(RuntimeError, match="Driver media ended before expected frame 0"):
+        _run(bridge, project)
+
+
+def test_driver_decoder_error_after_a_partial_read_still_fails(tmp_path, monkeypatch):
+    bridge, timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    _short_media(
+        monkeypatch, bridge, timeline_state, project,
+        recorded=57, real=56, fail_after="ffmpeg: corrupt packet",
+    )
+    scene.duration_frames = 57
+    _window(project, 0, 57, 57, 0)
+    _place_clip(scene, 0, 57)
+
+    with pytest.raises(RuntimeError, match="corrupt packet"):
+        _run(bridge, project)
+
+
+def test_driver_overlap_far_past_a_truncated_end_names_where_decoding_stopped(tmp_path, monkeypatch):
+    # Recorded 57, file truncated to 10, overlap from native 49: the look-back finds
+    # nothing either, so the error must not claim 47 frames decoded.
+    bridge, timeline_state, project, scene = _make_project(tmp_path, monkeypatch, lane_count=1)
+    calls = _short_media(monkeypatch, bridge, timeline_state, project, recorded=57, real=10)
+    scene.duration_frames = 57
+    _window(project, 49, 57, 8, 0)
+    _place_clip(scene, 0, 57)
+
+    with pytest.raises(RuntimeError, match="nothing decodes from frame 47; 57 frames recorded"):
+        _run(bridge, project)
+    assert calls == [(49, 57), (47, 49)]

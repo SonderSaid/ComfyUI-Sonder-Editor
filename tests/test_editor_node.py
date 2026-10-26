@@ -372,7 +372,8 @@ def test_execute_rounds_ltx_context_frame_count_up_and_pads_outputs(tmp_path, mo
     # Context-first alignment: requested pre=48 sits between LTX boundaries 41 and 49;
     # actual_pre expands by 1 to 49 so the in-point (mask_start) lands on grid without
     # the snap helper extending the mask into already-rendered pre-context.
-    # mask_end = 49 + 119 + 0 + padding(1) = 169 is already on the 8n+1 grid.
+    # mask_end = 49 + 119 + 0 = 168 is the last real frame, so the mask reaches the
+    # contiguous 1-frame pad: 169.
     assert result[11] == pytest.approx(49 / 24.0)
     assert result[12] == pytest.approx(169 / 24.0)
     assert audio["waveform"].shape[-1] >= int((169 / 24.0) * audio["sample_rate"])
@@ -556,7 +557,7 @@ def test_execute_expands_pre_context_to_align_mask_with_ltx_boundary(tmp_path, m
     # (independent of mask offset). mask_pre_offset(10) snaps to the valid set within
     # actual_pre=49 (= {0, 8, 16, 24, 32, 40, 48, 49}), next >= 10 is 16.
     # mask_start = 49 - 16 = 33; source = 49+119+0 = 168; target = 169; padding = 1;
-    # mask_end = 49+119+0+1 = 169 (on grid). No snap-helper fallback fires.
+    # mask_end = 49+119+0 = 168 reaches the last real frame, so it covers the pad: 169.
     assert result[11] == pytest.approx(33 / 24.0)
     assert result[12] == pytest.approx(169 / 24.0)
     assert project._execution_context["actual_pre_context_frames"] == 49
@@ -596,7 +597,8 @@ def test_execute_expands_both_sides_for_ltx_alignment(tmp_path, monkeypatch):
     # post=5, mask_pre=0, mask_post=0 on LTX 8n+1: actual_pre grows 8 -> 9
     # (desired mask_start=8, next grid 9); actual_post grows 5 -> 8 ((post-mask)%8=5,
     # so extension=3). source = 9+100+8 = 117; target = 121; padding = 4;
-    # mask_start = 9, mask_end = 9+100+0+4 = 113 (both on grid, no snap fires).
+    # mask_start = 9; mask_end = 9+100+0 = 109 ceil-snaps to 113 (the latent that
+    # straddles the generation end), short of the post-context, so the pad stays outside.
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     project = _FrameConstraintProject(
         tmp_path,
@@ -3284,7 +3286,7 @@ def test_save_video_take_trimmed_ignores_automatic_mask_snap(tmp_path, monkeypat
 
     # Authored Mask Pre=10 extends selection start 482 to 472.
     assert clip.timeline_start_frame == 472
-    # mask_end_frame=169 minus padding=2 -> visible_source_end=167; timeline 434+167=601.
+    # Available source is frame_count minus padding: 169-2 = 167; timeline 434+167=601.
     assert clip.timeline_end_frame == 601
     assert clip.source_in_frame == 38
     assert clip.source_out_frame == 167
@@ -3731,6 +3733,83 @@ def test_execute_applies_guide_driver_collision_manifest(tmp_path, monkeypatch):
     assert manifest["predicted_unresolved"] is False
 
 
+def test_collision_manifest_counts_the_driver_padding_tail(tmp_path, monkeypatch):
+    # LTX: 10 real frames round up to 17. The Driver from frame 2 reaches the window's
+    # end, so the Bridge holds its last frame over the 7-frame tail and the collision
+    # model counts that tail: coordinate 9 is the Driver's, and the guide there moves.
+    # tests/test_guide_collision_routes.py pins the same outcome for the enqueue prediction.
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    torch = pytest.importorskip("torch")
+
+    project_dir = tmp_path / "project"
+    media_dir = project_dir / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    (media_dir / "guide.png").write_bytes(b"guide")
+    (media_dir / "driver.mp4").write_bytes(b"driver")
+    project = timeline_state.TimelineProject(
+        project_dir=str(project_dir),
+        fps=24.0,
+        resolution=(8, 8),
+        template_id="ltx",
+        frame_constraint={"step": 8, "offset": 1},
+    )
+    project.assets = [
+        timeline_state.Asset(asset_id="guide-asset", asset_type="image", path="media/guide.png"),
+        timeline_state.Asset(asset_id="driver-asset", asset_type="video", path="media/driver.mp4"),
+    ]
+    scene = timeline_state.Scene(scene_id="scene", duration_frames=10)
+    scene.guide_frames = [
+        timeline_state.GuideFrame(guide_id="guide-1", frame_index=9, asset_id="guide-asset")
+    ]
+    scene.clips = [
+        timeline_state.ClipReference(
+            clip_id="driver-1",
+            source_path="media/driver.mp4",
+            timeline_start_frame=2,
+            timeline_end_frame=10,
+            role="motion_driver",
+            track_index=0,
+        )
+    ]
+    project.scenes = [scene]
+    monkeypatch.setattr(editor_node, "load_project", lambda _path: project)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_render_scene_frames",
+        lambda self, proj, active_scene, start, end, **kwargs: torch.zeros(end - start, 8, 8, 3),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda self, proj, active_scene, start, end: editor_node._make_silent_audio(1.0),
+    )
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_guide_image",
+        lambda self, *args, **kwargs: torch.zeros(8, 8, 3),
+    )
+
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=8,
+        height=8,
+        scene_id="scene",
+        selection_start=0,
+        selection_end=10,
+        render_queue_active=False,
+    )
+
+    manifest = result[0]._execution_context["guide_injection"]
+    assert manifest["frame_count"] == 17
+    assert manifest["driver_coords"][0]["pixel_len"] == 15
+    assert manifest["driver_coords"][0]["coords"] == [1, 9]
+    assert manifest["entries"][0]["original_local_idx"] == 9
+    assert manifest["entries"][0]["effective_local_idx"] == 10
+
+
 # --- Grid padding fill (frame_count_padding) ---
 # A SonderMasksBridge Freeze collapses a channel's mask, so the fabricated pad is
 # KEPT rather than regenerated. These lock the remedy - an in-distribution fill on
@@ -3954,67 +4033,68 @@ def test_pad_image_batch_tail_repeats_last_real_frame(tmp_path, monkeypatch):
     assert tuple(short.shape) == (0, 2, 2, 3)
 
 
-def test_padding_sits_outside_the_mask_once_post_context_is_present(tmp_path, monkeypatch):
-    editor_node = _import_editor_node(tmp_path, monkeypatch)
+H3 = {"step": 17, "offset": 5, "min": 1}
+LTX = {"step": 8, "offset": 1, "min": 1}
 
-    # Characterises the geometry logged in sonder_editor_bugs.md as "Grid padding lands
-    # outside the generation mask whenever post-context is present". The pad occupies the
-    # tail of the tensor, AFTER post-context, but mask_end_pixel adds frame_count_padding
-    # before it - so the mask overruns generation_end into real post-context frames while
-    # never reaching the pad. Every other padding test in this file uses post_context=0,
-    # which is the one case where the two coincide; that gap is why this went unnoticed.
-    # Update this test deliberately when the geometry is fixed - do not delete it.
-    project = _FrameConstraintProject(
-        tmp_path,
-        template_id="minimax-h3",
-        frame_constraint={"step": 17, "offset": 5, "min": 1},
-    )
+
+@pytest.mark.parametrize(
+    ("constraint", "scene", "selection", "pre", "post", "mask_post", "frame_count", "mask_end"),
+    [
+        # Aligned H3: post-context grew to the grid, so ceil-snapping the real end lands
+        # where the old "+ padding" term did. Values unchanged by the fix.
+        (H3, 601, (300, 400), 34, 34, 0, 175, 141),
+        (H3, 601, (300, 400), 34, 34, 17, 175, 158),
+        (H3, 601, (300, 400), 34, 34, 34, 175, 175),
+        # The scene end cuts post-context to 20 and padding grows to 16. The old term
+        # pushed the mask to 158 / 175 / 175, regenerating real post frames past Mask Post.
+        (H3, 420, (300, 400), 34, 34, 0, 175, 141),
+        (H3, 420, (300, 400), 34, 34, 17, 175, 158),
+        (H3, 420, (300, 400), 34, 34, 20, 175, 175),
+        # LTX, post cut to 5 at the scene end (padding 7): the old term reached 121.
+        (LTX, 205, (100, 200), 8, 5, 0, 121, 113),
+        (LTX, 205, (100, 200), 8, 5, 5, 121, 121),
+        # A `min` constraint pads past one grid step (28 real -> 41).
+        ({"step": 8, "offset": 1, "min": 41}, 601, (100, 120), 0, 7, 0, 41, 25),
+        ({"step": 8, "offset": 1, "min": 41}, 601, (100, 120), 0, 7, 8, 41, 41),
+    ],
+)
+def test_mask_reaches_the_padding_only_when_mask_post_covers_the_post_context(
+    tmp_path, monkeypatch, constraint, scene, selection, pre, post, mask_post, frame_count, mask_end,
+):
+    # The pad sits at the tensor tail AFTER post-context ([pre | gen | post | pad]), so a
+    # contiguous mask covers it only when it already reaches the last real frame. Before
+    # the fix, mask_end added frame_count_padding before post-context: harmless where
+    # post-context is on the grid, but wherever the scene end cut it short the mask ran
+    # past Mask Post into frames the user asked to keep (sonder_editor_bugs.md, "Grid
+    # padding lands outside the generation mask whenever post-context is present").
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    project = _FrameConstraintProject(tmp_path, template_id="test", frame_constraint=constraint)
+    project._scene.duration_frames = scene
     monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
     _patch_render_and_audio(editor_node, monkeypatch)
-    editor_node.SonderEditor().execute(
+    result = editor_node.SonderEditor().execute(
         project="Existing Project",
         project_name="Ignored",
         fps=24.0,
         width=768,
         height=512,
         scene_id="scene-1",
-        selection_start=300,
-        selection_end=400,
-        pre_context_frames=34,
-        post_context_frames=34,
+        selection_start=selection[0],
+        selection_end=selection[1],
+        pre_context_frames=pre,
+        post_context_frames=post,
+        mask_post_offset=mask_post,
     )
 
     ctx = project._execution_context
+    assert ctx["frame_count"] == frame_count
     assert ctx["frame_count_padding"] > 0
-    generation_end_pixel = ctx["actual_pre_context_frames"] + (400 - 300)
-
-    # The pad is never reached: the mask ends well short of the padded tensor.
-    assert ctx["mask_end_frame"] < ctx["frame_count"]
-    # And it overruns into real post-context by exactly the padding it meant to cover.
-    assert ctx["mask_end_frame"] == generation_end_pixel + ctx["frame_count_padding"]
-
-    # The zero-post case is the coincidence: there the two are the same frames.
-    zero_post = _FrameConstraintProject(
-        tmp_path,
-        template_id="minimax-h3",
-        frame_constraint={"step": 17, "offset": 5, "min": 1},
-    )
-    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: zero_post)
-    editor_node.SonderEditor().execute(
-        project="Existing Project",
-        project_name="Ignored",
-        fps=24.0,
-        width=768,
-        height=512,
-        scene_id="scene-1",
-        selection_start=300,
-        selection_end=400,
-        pre_context_frames=34,
-        post_context_frames=0,
-    )
-    zero_ctx = zero_post._execution_context
-    assert zero_ctx["frame_count_padding"] > 0
-    assert zero_ctx["mask_end_frame"] == zero_ctx["frame_count"]
+    assert ctx["mask_end_frame"] == mask_end
+    assert result[12] == pytest.approx(mask_end / 24.0)
+    # Covering the post-context always reaches the pad. The converse does not hold in
+    # general: a grid-snapped end can reach the last real frame with Mask Post short of it.
+    if ctx["mask_post_offset"] >= ctx["actual_post_context_frames"]:
+        assert mask_end == frame_count
 
 
 @pytest.mark.parametrize("preset", ["Compatible MP4", "Editing Master MP4"])
@@ -4722,3 +4802,61 @@ def test_execute_consumes_only_when_a_marked_save_runs(tmp_path, monkeypatch, ro
     runs.reset_for_tests()
     scope.reset_for_tests()
     assert seen[:1] == [expected]
+
+
+def test_post_frames_the_mask_now_preserves_make_color_drift_render(tmp_path, monkeypatch):
+    # H3, scene end at 429 cuts post-context to 29 and padding grows to 12 (129 -> 141).
+    # The mask now stops at 107 instead of running past Mask Post to 124, so real post
+    # frames 124..128 are preserved and become color-drift references: a color-correcting
+    # Save Video downstream now makes the Editor render. Before the fix there were none.
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    project = _FrameConstraintProject(tmp_path, template_id="minimax-h3", frame_constraint={"step": 17, "offset": 5})
+    project._scene.duration_frames = 429
+    monkeypatch.setattr(editor_node, "load_project", lambda _project_dir: project)
+    calls = {"render": 0, "stash": 0}
+
+    def render(_self, _project, _scene, start, end, **_kwargs):
+        calls["render"] += 1
+        return torch.zeros(max(1, end - start), 2, 2, 3, dtype=torch.float32)
+
+    def stash(*_args, **kwargs):
+        calls["stash"] += 1
+        return {"reference": True}
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_render_scene_frames", render)
+    monkeypatch.setattr(
+        editor_node.SonderEditor,
+        "_load_scene_audio",
+        lambda self, proj, scene, start, end: editor_node._make_silent_audio((end - start) / 24.0),
+    )
+    monkeypatch.setattr(editor_node, "build_context_reference_stash", stash)
+    prompt = _prompt_graph({
+        "editor-1": _prompt_node("SonderEditor"),
+        "collector-1": _prompt_node("SonderMetadataCollector", {"project": ["editor-1", 0]}),
+        "external-frames": _prompt_node("ExternalFrames"),
+        "save-1": _prompt_node("SonderSaveVideo", {
+            "project": ["collector-1", 0],
+            "frames": ["external-frames", 0],
+            "mark_queue_complete": False,
+        }),
+    })
+
+    editor_node.SonderEditor().execute(
+        project="Existing Project",
+        project_name="Ignored",
+        fps=24.0,
+        width=64,
+        height=48,
+        scene_id="scene-1",
+        selection_start=300,
+        selection_end=400,
+        pre_context_frames=0,
+        post_context_frames=34,
+        prompt=prompt,
+        unique_id="editor-1",
+    )
+
+    ctx = project._execution_context
+    assert (ctx["source_frame_count"], ctx["frame_count"], ctx["mask_end_frame"]) == (129, 141, 107)
+    assert calls == {"render": 1, "stash": 1}

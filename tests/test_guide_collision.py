@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from server.guide_collision import (
     check_frame_count_excess,
     driver_occupied_coords,
+    driver_window_span,
     resolve_execution_window,
     resolve_guide_collisions,
     snap_driver_start,
@@ -156,3 +157,47 @@ def test_execution_window_matches_constraint_expansion_and_scene_edge():
     assert edge["render_start"] == 0
     assert edge["render_end"] == 100
     assert edge["frame_count"] == 105
+
+
+def test_driver_window_span_carries_the_padding_tail_only_to_the_window_end():
+    # [pre | gen | post | pad]: the window is 10..30 (20 real frames) plus a 7-frame tail.
+    full = driver_window_span(0, 50, 10, 30, 7)
+    assert full == {"overlap_start": 10, "overlap_end": 30, "local_idx": 0, "real_len": 20, "tail_len": 7}
+    ends_at_window_end = driver_window_span(10, 30, 10, 30, 7)
+    assert (ends_at_window_end["real_len"], ends_at_window_end["tail_len"]) == (20, 7)
+    late_start = driver_window_span(22, 40, 10, 30, 7)
+    assert (late_start["local_idx"], late_start["real_len"], late_start["tail_len"]) == (12, 8, 7)
+    early_end = driver_window_span(0, 25, 10, 30, 7)
+    assert (early_end["local_idx"], early_end["real_len"], early_end["tail_len"]) == (0, 15, 0)
+    unpadded = driver_window_span(0, 50, 10, 30, 0)
+    assert unpadded["tail_len"] == 0
+    assert driver_window_span(30, 40, 10, 30, 7) is None
+    assert driver_window_span(0, 10, 10, 30, 7) is None
+
+
+def test_driver_window_span_keeps_a_single_frame_overlap_single():
+    # One frame keeps the single exact coordinate the collision model gives an image;
+    # with a tail the model would snap it to the grid like any longer span.
+    single = driver_window_span(29, 40, 10, 30, 7)
+    assert (single["local_idx"], single["real_len"], single["tail_len"]) == (19, 1, 0)
+    assert driver_occupied_coords(single["local_idx"], single["real_len"], 8, 1) == [19]
+
+
+def test_driver_tail_occupies_the_coordinates_the_guide_node_will_use():
+    # LTX: 10 real frames round up to 17. With its 7-frame tail the Driver from local 2
+    # spans 15 frames, so the collision model (conservative: it counts one latent more
+    # than LTXVAddGuide keeps for a mid-video guide) reserves coordinate 9 as well as 1.
+    window = resolve_execution_window(
+        scene_duration=10, selection_start=0, selection_end=10, frame_constraint=CONSTRAINT,
+    )
+    assert (window["frame_count"], window["frame_count_padding"]) == (17, 7)
+    span = driver_window_span(2, 10, 0, 10, window["frame_count_padding"])
+    pixel_len = span["real_len"] + span["tail_len"]
+    assert pixel_len == 15
+    assert driver_occupied_coords(span["local_idx"], pixel_len, 8, 1) == [1, 9]
+    result = _resolve(
+        [{"guide_id": "g", "local_idx": 9}],
+        [{"clip_id": "d", "local_idx": span["local_idx"], "pixel_len": pixel_len}],
+        frame_count=window["frame_count"],
+    )
+    assert result["entries"][0]["effective_local_idx"] == 10

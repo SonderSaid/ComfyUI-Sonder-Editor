@@ -157,7 +157,9 @@ appearing in output (their editing rules are in
 [Editor Basics](editor-basics.md#driver-clips)). Each Driver has a
 **strength** (0–1). In the graph, **Sonder Driver Selector** picks a Driver
 row from its lane menu and outputs `has_driver`; **Sonder Driver Bridge**
-outputs that row's frames for the generation window.
+outputs that row's frames for the generation window. When the template's frame
+rule adds frames to the end of the window, a Driver that runs to the window's
+end holds its last frame over them, so Driver and render frames stay lined up.
 
 ## References
 

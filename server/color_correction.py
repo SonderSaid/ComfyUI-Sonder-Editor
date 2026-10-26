@@ -258,8 +258,9 @@ def select_context_reference_indices(*, frame_count: int, source_frame_count: in
 
     Mask-protected head/tail regions, shrunk by a latent-block margin at each
     mask boundary (block blending contaminates the seam), and bounded above by
-    ``source_frame_count`` so padded frames (last-frame repeats; the padded
-    span is inside ``mask_end_frame`` by construction) are never selected.
+    ``source_frame_count`` so padded frames (last-frame repeats, which sit
+    inside ``mask_end_frame`` only when the mask reaches the tensor's end) are
+    never selected.
     """
     frame_count = max(0, _coerce_int(frame_count, 0))
     source_frame_count = max(0, _coerce_int(source_frame_count, 0))

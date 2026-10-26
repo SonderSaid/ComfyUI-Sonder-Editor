@@ -133,6 +133,42 @@ def snap_driver_start(idx: int, step: int, offset: int) -> int:
     return max(0, offset + ((idx - offset) // step) * step)
 
 
+def driver_window_span(
+    timeline_start: int,
+    timeline_end: int,
+    render_start: int,
+    render_end: int,
+    frame_count_padding: int = 0,
+) -> dict | None:
+    """Where a Driver clip lands in the padded execution tensor, or None.
+
+    The Editor appends ``frame_count_padding`` held frames after post-context
+    (``[pre | gen | post | pad]``). A Driver whose overlap reaches the end of
+    the real window shares the render's last frame, so it carries that tail
+    too; a Driver ending earlier keeps exactly its own span. A single-frame
+    overlap stays a single frame, so it keeps the one exact coordinate the
+    collision model gives a single image (``driver_occupied_coords`` snaps any
+    longer span to the grid). The single authority for the Driver Bridge, the
+    Editor's collision manifest and the enqueue collision prediction.
+    """
+
+    render_start = _as_int(render_start)
+    render_end = _as_int(render_end)
+    overlap_start = max(_as_int(timeline_start), render_start)
+    overlap_end = min(_as_int(timeline_end), render_end)
+    if overlap_end <= overlap_start:
+        return None
+    reaches_end = overlap_end == render_end and overlap_end - overlap_start > 1
+    tail_len = max(0, _as_int(frame_count_padding)) if reaches_end else 0
+    return {
+        "overlap_start": overlap_start,
+        "overlap_end": overlap_end,
+        "local_idx": overlap_start - render_start,
+        "real_len": overlap_end - overlap_start,
+        "tail_len": tail_len,
+    }
+
+
 def driver_occupied_coords(local_idx: int, pixel_len: int, step: int, offset: int) -> list[int]:
     local_idx = _as_int(local_idx)
     pixel_len = _as_int(pixel_len)

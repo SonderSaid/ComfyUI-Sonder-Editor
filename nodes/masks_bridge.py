@@ -181,7 +181,8 @@ def _pins_padding(result: dict, mask_frames) -> bool:
 
     The pad occupies the tail of the tensor, so it is regenerated only by a mask that
     reaches `frame_count`. A Freeze (zero-width window) never does; neither does an Edit
-    whose window ends before the tail, which is every render carrying post-context.
+    whose window ends before the tail, which happens when its grid-snapped end stops short
+    of the last real frame (Mask Post short of the post-context).
     """
     if _coerce_int(result.get("frame_count_padding"), 0) <= 0:
         return False
@@ -589,9 +590,9 @@ class SonderMasksBridge:
             "audio_latent_mask": audio_prov,
             # Provenance only - pinned padding is a correct, common configuration, so this
             # is never a warning. Derive it from the emitted window rather than the Edit/Freeze
-            # switch: the pad sits at the tensor tail, AFTER post-context, while mask_end_pixel
-            # adds the padding before it, so an Edit channel with any post-context also leaves
-            # the pad outside its mask. Freeze is only the zero-width special case.
+            # switch: the pad sits at the tensor tail, AFTER post-context, so an Edit channel
+            # whose grid-snapped end stops short of the last real frame also leaves the pad
+            # outside its mask. Freeze is only the zero-width special case.
             "frame_count_padding": result["frame_count_padding"],
             "video_pins_padding": _pins_padding(result, result["video_mask_frames"]),
             "audio_pins_padding": _pins_padding(result, result["audio_mask_frames"]),

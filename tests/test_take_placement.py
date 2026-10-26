@@ -443,3 +443,24 @@ console.log('ok');
     reset = panel[panel.index('"Reset Render Section"'):]
     assert "keepTakePadding: DEFAULT_EDITOR_SETTINGS.render.keepTakePadding" in reset[:800]
     assert 'createCheckbox(\n        renderSection,\n        "keepTakePadding"' in panel
+
+
+@pytest.mark.parametrize("mask_post,kept_end", [(0, 141), (17, 158), (20, 175)])
+def test_keep_padding_follows_the_editor_mask_at_a_clipped_scene_end(tmp_path, monkeypatch, mask_post, kept_end):
+    # H3 at the scene end: post-context cut to 20, padding 16. With Mask Post short of
+    # the post-context the mask stops short of the tail and the pad was never generated,
+    # so Keep padding keeps nothing extra; with Mask Post covering it the mask reaches 175.
+    # Mask Post 17 discriminates: the old padding-inflated end reached 175 and kept the pad.
+    from test_editor_node import _FrameConstraintProject, _import_editor_node, _patch_render_and_audio
+    editor = _import_editor_node(tmp_path, monkeypatch)
+    project = _FrameConstraintProject(tmp_path, template_id="minimax-h3", frame_constraint={"step": 17, "offset": 5})
+    project._scene.duration_frames = 420
+    monkeypatch.setattr(editor, "load_project", lambda _: project)
+    _patch_render_and_audio(editor, monkeypatch)
+    editor.SonderEditor().execute(project="Existing Project", project_name="Ignored", fps=24.0, width=32, height=32,
+        scene_id="scene-1", selection_start=300, selection_end=400, pre_context_frames=34, post_context_frames=34,
+        mask_post_offset=mask_post)
+    ctx = project._execution_context
+    assert (ctx["frame_count"], ctx["frame_count_padding"], ctx["mask_end_frame"]) == (175, 16, kept_end)
+    kept = calculate_take_placement(dict(ctx, take_placement_mode="untrimmed", take_keep_padding=True), 175)
+    assert kept["source_out_frame"] == (175 if kept_end == 175 else 159)

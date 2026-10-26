@@ -31,7 +31,7 @@ from ..server.session_registry import project_event_aliases
 from ..server.timeline_state import (
     ClipReference, GuideFrame, TimelineProject, Scene, effective_scene_fps,
 )
-from ..server.guide_collision import resolve_execution_window, resolve_guide_collisions
+from ..server.guide_collision import driver_window_span, resolve_execution_window, resolve_guide_collisions
 from ..server.media_helpers import (
     CROP_POSITIONS,
     DEFAULT_CROP_POSITION,
@@ -266,19 +266,6 @@ class SonderEditor:
         return None
 
     @staticmethod
-    def _round_up_frame_count(frame_count: int, frame_constraint: dict | None) -> int:
-        count = max(0, _coerce_int(frame_count, 0))
-        if not frame_constraint or "step" not in frame_constraint or count <= 0:
-            return count
-        step = max(1, _coerce_int(frame_constraint.get("step"), 1))
-        offset = _coerce_int(frame_constraint.get("offset"), 0)
-        minimum = max(1, _coerce_int(frame_constraint.get("min"), 1))
-        count = max(count, minimum)
-        if (count - offset) % step == 0:
-            return count
-        return offset + math.ceil((count - offset) / step) * step
-
-    @staticmethod
     def _snap_pixel_to_constraint(pixel: int, frame_constraint: dict | None, side: str) -> int:
         # Boundary set in pixel-frame space: {0} ∪ {step*k + offset : k ≥ 0}.
         # side="start" floors to boundary ≤ pixel; side="end" ceils to boundary ≥ pixel.
@@ -299,42 +286,6 @@ class SonderEditor:
         if side == "start":
             return offset + math.floor(k) * step
         return offset + math.ceil(k) * step
-
-    @staticmethod
-    def _snap_mask_pre_offset_up(value: int, actual_pre: int, step: int) -> int:
-        # Valid set: {0, step, 2*step, ..., k*step where k*step <= actual_pre} ∪ {actual_pre}.
-        # The "∪ {actual_pre}" full-mask option is needed because actual_pre on the LTX
-        # grid (e.g. 25 = step*3 + offset) is NOT itself a multiple of step.
-        # Returns 0 when actual_pre <= 0 or value <= 0. Clamps down to actual_pre when value > actual_pre.
-        value = _coerce_int(value, 0)
-        actual_pre = _coerce_int(actual_pre, 0)
-        step = max(1, _coerce_int(step, 1))
-        if actual_pre <= 0 or value <= 0:
-            return 0
-        if value >= actual_pre:
-            return actual_pre
-        snapped = math.ceil(value / step) * step
-        if snapped <= actual_pre:
-            return snapped
-        return actual_pre
-
-    @staticmethod
-    def _snap_mask_post_offset_up(value: int, actual_post: int, step: int) -> int:
-        # Valid set: {0, step, 2*step, ..., k*step where k*step <= actual_post}.
-        # Post side does not need the full-context include (actual_post is itself a
-        # multiple of step by construction since it doesn't carry the +1 offset).
-        # Returns 0 when actual_post <= 0 or value <= 0. Clamps down to actual_post when value > actual_post.
-        value = _coerce_int(value, 0)
-        actual_post = _coerce_int(actual_post, 0)
-        step = max(1, _coerce_int(step, 1))
-        if actual_post <= 0 or value <= 0:
-            return 0
-        if value >= actual_post:
-            return actual_post
-        snapped = math.ceil(value / step) * step
-        if snapped <= actual_post:
-            return snapped
-        return actual_post
 
     @staticmethod
     def _pad_image_batch_to_frame_count(frames: torch.Tensor, target_count: int) -> torch.Tensor:
@@ -364,9 +315,9 @@ class SonderEditor:
         # Grid padding is fabricated, and it is frequently KEPT rather than regenerated -
         # pinned as ground truth at every sampling step. Two ways in: a SonderMasksBridge
         # Freeze collapses that channel's mask to zero width, and, more commonly, the pad
-        # sits at the tensor tail AFTER post-context while mask_end_pixel adds the padding
-        # before it, so any render carrying post-context leaves the pad outside the mask
-        # with no Freeze involved. The fill must stay inside this channel's natural
+        # sits at the tensor tail AFTER post-context, so a render whose Mask Post stops
+        # short of the last real frame leaves the pad outside the mask with no Freeze
+        # involved. The fill must stay inside this channel's natural
         # statistics: mirror the tail, never append digital silence (a spectral cliff no
         # recording contains) and never hold one sample (constant DC). Confirmed by manual
         # test 2026-08-28: silence here really did corrupt the generated video's head.
@@ -1027,13 +978,15 @@ class SonderEditor:
             # Boundaries are snapped outward to the active template's frame constraint grid
             # (start floors, end ceils) so latent maskers like LTXVAudioVideoMask include the
             # full requested generation region without dropping the straddling boundary latent.
+            # The grid padding sits at the tensor tail after post-context, so the mask reaches it
+            # only when it already covers the last real frame; otherwise it stops at Mask Post.
             mask_start_pixel = generation_start - context_start - mask_pre_offset
-            mask_end_pixel = generation_end - context_start + mask_post_offset + frame_count_padding
+            mask_end_pixel = generation_end - context_start + mask_post_offset
             mask_start_pixel = max(0, self._snap_pixel_to_constraint(mask_start_pixel, frame_constraint, "start"))
-            mask_end_pixel = min(
-                self._snap_pixel_to_constraint(mask_end_pixel, frame_constraint, "end"),
-                source_frame_count + frame_count_padding,
-            )
+            mask_end_pixel = self._snap_pixel_to_constraint(mask_end_pixel, frame_constraint, "end")
+            if mask_end_pixel >= source_frame_count:
+                mask_end_pixel = target_frame_count
+            mask_end_pixel = min(mask_end_pixel, target_frame_count)
             mask_start_time = mask_start_pixel / proj_fps if proj_fps > 0 else 0.0
             mask_end_time = mask_end_pixel / proj_fps if proj_fps > 0 else 0.0
 
@@ -1149,9 +1102,14 @@ class SonderEditor:
             for driver in driver_source:
                 if getattr(driver, "role", "render") != "motion_driver":
                     continue
-                overlap_start = max(_coerce_int(getattr(driver, "timeline_start_frame", 0)), render_start)
-                overlap_end = min(_coerce_int(getattr(driver, "timeline_end_frame", 0)), render_end)
-                if overlap_end <= overlap_start:
+                span = driver_window_span(
+                    getattr(driver, "timeline_start_frame", 0),
+                    getattr(driver, "timeline_end_frame", 0),
+                    render_start,
+                    render_end,
+                    frame_count_padding,
+                )
+                if span is None:
                     continue
                 asset_lookup = getattr(proj, "asset_for_source_path", None)
                 asset = asset_lookup(getattr(driver, "source_path", "") or "") if callable(asset_lookup) else None
@@ -1166,8 +1124,8 @@ class SonderEditor:
                 structural_drivers.append({
                     "clip_id": str(getattr(driver, "clip_id", "") or ""),
                     "lane_index": _coerce_int(getattr(driver, "track_index", 0)),
-                    "local_idx": overlap_start - render_start,
-                    "pixel_len": overlap_end - overlap_start,
+                    "local_idx": span["local_idx"],
+                    "pixel_len": span["real_len"] + span["tail_len"],
                 })
 
             guide_injection = resolve_guide_collisions(

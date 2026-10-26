@@ -64,6 +64,9 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup counts a chip as attached to an item under MiniMax H3 when it cites one of the item's members, directly or through a Subject.
 
 ### Fixed
+- Drivers stay aligned with renders a model's frame rule pads: a Driver that reaches the end of the generation window now holds its last frame over the added frames, so the render's last frames keep their guidance (LTX's guide node used to cut a 120-frame Driver for a 121-frame render down to 113 frames).
+- A Driver whose video decodes a frame or two fewer than its recorded length no longer stops the run with "Driver media ended before expected frame"; it holds its last frame. A file missing more than that still fails.
+- Near the scene end, where post-context is cut short, the generation mask no longer runs further past **Mask Post** than the model's frame rule requires, into frames you asked to keep. Those kept frames now also serve as color-correction references, so Save Video's drift correction can apply where it didn't before.
 - Take placement: Save Video and timeline exports reuse usable empty tail lanes without counting Drivers; concurrent lane edits stay preserved, and a take no longer lands on top of a clip added to its row during generation. Trimmed takes and linked audio follow the Selection plus authored Mask Pre/Post extensions, without extra frames from automatic model alignment.
 - **Queue selected output nodes** no longer takes a Render Queue job for a Save that doesn't run. With Queue Active on, running only a preview leaves the next job pending.
 - A ProRes or FFV1 clip no longer paints the viewport black, latches Compare's play button on Pause, or leaves Crop, Trim & Preview black: each shows its proxy, or a notice saying what the clip waits for.

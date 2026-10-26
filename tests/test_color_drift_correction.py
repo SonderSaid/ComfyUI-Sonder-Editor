@@ -493,3 +493,15 @@ def test_schedule_application_ramps_between_transforms():
     assert np.all(out[15] == base)  # midpoint of the ramp
     means = [float(np.mean(out[i])) for i in range(10, 21)]
     assert all(means[k] >= means[k + 1] for k in range(len(means) - 1))  # monotonic ease
+
+
+def test_select_indices_uses_post_frames_preserved_before_a_clipped_tail():
+    # H3 at the scene end: post-context cut to 20 (source 159), padding 16 (175).
+    # With Mask Post 0 the mask ends at 141, so real post frame 158 is preserved
+    # and is a tail reference; the pad (159..174) never is.
+    indices = cc.select_context_reference_indices(
+        frame_count=175, source_frame_count=159,
+        mask_start_frame=39, mask_end_frame=141, step=17,
+        max_frames=10_000,
+    )
+    assert indices == list(range(0, 22)) + [158]

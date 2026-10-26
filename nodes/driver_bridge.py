@@ -16,12 +16,18 @@ from typing import Any
 import numpy as np
 import torch
 
+from ..server.guide_collision import driver_window_span
 from ..server.media_helpers import decode_video_range, fit_frame_to_canvas, resolve_source_color_interpretation
 from ..server import external_links
 from ..server.path_security import path_within, resolve_existing_project_path, resolve_project_path
 from ..server.timeline_state import ClipReference, GuideFrame, LaneConfig, effective_scene_fps
 
 logger = logging.getLogger(__name__)
+
+# A recorded frame count comes from container metadata and can overstate what decodes
+# (legacy Save Video outputs end one frame short). Within this many frames the Driver
+# holds its real last frame; a larger shortfall is a truncated or damaged file and fails.
+DRIVER_SHORT_MEDIA_TOLERANCE_FRAMES = 2
 
 
 def _coerce_int(value, default: int = 0) -> int:
@@ -88,6 +94,19 @@ def _resolve_output_frame_count(project, render_start: int, render_end: int) -> 
     ctx = getattr(project, "_execution_context", None) or {}
     frame_count = _coerce_int(ctx.get("frame_count"), render_end - render_start)
     return max(1, frame_count)
+
+
+def _resolve_frame_count_padding(project, render_start: int, render_end: int, frame_count: int) -> int:
+    # The Editor is the only producer of the execution context and always records
+    # its grid padding; without an Editor context there is no padded tail.
+    ctx = getattr(project, "_execution_context", None) or {}
+    padding = max(0, _coerce_int(ctx.get("frame_count_padding"), 0))
+    if "frame_count" in ctx and frame_count != (render_end - render_start) + padding:
+        logger.warning(
+            "driver bridge: execution window %s..%s plus padding %s does not match frame_count %s",
+            render_start, render_end, padding, frame_count,
+        )
+    return padding
 
 
 def _resolve_frame_constraint(project):
@@ -311,6 +330,7 @@ def _decode_driver_clip(
     *,
     rate_ratio: float = 1.0,
     native_frame_count: int = 0,
+    tail_len: int = 0,
 ) -> torch.Tensor:
     if overlap_len <= 0:
         raise RuntimeError("Driver media produced no frames")
@@ -340,21 +360,37 @@ def _decode_driver_clip(
     asset = asset_lookup(source_path) if callable(asset_lookup) else None
     interpretation = resolve_source_color_interpretation(asset, abs_path)
     try:
-        decoded = decode_video_range(
+        decoded_start = native_start
+        decoded_frames = list(decode_video_range(
             abs_path, native_start, native_end,
             color_interpretation=interpretation,
-        )
-        decoded_frames = []
-        for native_frame in range(native_start, native_end):
-            try:
-                frame_rgb = next(decoded)
-            except StopIteration as exc:
+        ))
+        if not decoded_frames and native_start > 0:
+            # The overlap starts at or past the file's real end: look back for its last frame.
+            decoded_start = max(0, native_start - DRIVER_SHORT_MEDIA_TOLERANCE_FRAMES)
+            decoded_frames = list(decode_video_range(
+                abs_path, decoded_start, native_start,
+                color_interpretation=interpretation,
+            ))
+        real_end = decoded_start + len(decoded_frames)
+        if real_end < native_end:
+            expected = native_count if native_count > 0 else native_end
+            if not decoded_frames and decoded_start < native_start:
                 raise RuntimeError(
-                    f"Driver media ended before expected frame {native_frame}: {source_path}"
-                ) from exc
-            decoded_frames.append(frame_rgb)
+                    f"Driver media ended before expected frame {native_start}: {source_path} "
+                    f"(nothing decodes from frame {decoded_start}; {expected} frames recorded)"
+                )
+            if not decoded_frames or expected - real_end > DRIVER_SHORT_MEDIA_TOLERANCE_FRAMES:
+                raise RuntimeError(
+                    f"Driver media ended before expected frame {real_end}: {source_path} "
+                    f"(decoded {real_end} of {expected} recorded frames)"
+                )
+            logger.warning(
+                "driver media %s decodes %d frames but records %d; holding its last frame",
+                source_path, real_end, expected,
+            )
         for native_frame in native_indices:
-            frame_rgb = decoded_frames[native_frame - native_start]
+            frame_rgb = decoded_frames[min(native_frame, real_end - 1) - decoded_start]
             placed, _bounds = fit_frame_to_canvas(
                 frame_rgb,
                 width,
@@ -370,6 +406,8 @@ def _decode_driver_clip(
 
     if not frames:
         raise RuntimeError(f"Driver media produced no frames: {source_path}")
+    # Hold the last frame over the render's grid padding, as the Editor pads its own tail.
+    frames.extend([frames[-1]] * max(0, _coerce_int(tail_len, 0)))
     return torch.from_numpy(np.stack(frames, axis=0).astype(np.float32) / 255.0)
 
 
@@ -428,6 +466,7 @@ def _base_driver_ref(
         "clip": None,
         "overlap_start": 0,
         "overlap_len": 0,
+        "overlap_tail_len": 0,
         "overlap_local_idx": int(fallback_idx),
         "rate_ratio": 1.0,
         "native_frame_count": 0,
@@ -440,6 +479,7 @@ def resolve_driver_ref(project, driver_lane_index=0, driver_selector_overrides_j
     scene = _resolve_active_scene(project)
     render_start, render_end, width, height = _resolve_render_window(project, scene)
     frame_count = _resolve_output_frame_count(project, render_start, render_end)
+    frame_count_padding = _resolve_frame_count_padding(project, render_start, render_end, frame_count)
     source_info = _resolve_driver_source(project, scene)
     frame_constraint = _resolve_frame_constraint(project)
     reserved_guides = _reserved_guide_indices(project, scene, source_info, render_start, render_end)
@@ -476,11 +516,17 @@ def resolve_driver_ref(project, driver_lane_index=0, driver_selector_overrides_j
         )
     clip = lane_clips[0]
 
-    overlap_start = max(_coerce_int(getattr(clip, "timeline_start_frame", 0), 0), render_start)
-    overlap_end = min(_coerce_int(getattr(clip, "timeline_end_frame", 0), 0), render_end)
-    overlap_len = max(0, overlap_end - overlap_start)
-    if overlap_len <= 0:
+    span = driver_window_span(
+        _coerce_int(getattr(clip, "timeline_start_frame", 0), 0),
+        _coerce_int(getattr(clip, "timeline_end_frame", 0), 0),
+        render_start,
+        render_end,
+        frame_count_padding,
+    )
+    if span is None:
         return ref
+    overlap_start = span["overlap_start"]
+    overlap_len = span["real_len"]
 
     override_state = _driver_override_state(driver_selector_overrides_json, lane_index)
     if override_state == "mute":
@@ -495,7 +541,7 @@ def resolve_driver_ref(project, driver_lane_index=0, driver_selector_overrides_j
     if not _driver_path_is_contained(project, getattr(clip, "source_path", "") or ""):
         return ref
 
-    local_idx = int(overlap_start - render_start)
+    local_idx = int(span["local_idx"])
     asset_lookup = getattr(project, "asset_for_source_path", None)
     asset = asset_lookup(getattr(clip, "source_path", "") or "") if callable(asset_lookup) else None
     source_fps = _coerce_float(getattr(asset, "fps", 0.0), 0.0) if asset else 0.0
@@ -509,6 +555,7 @@ def resolve_driver_ref(project, driver_lane_index=0, driver_selector_overrides_j
         "clip": _clip_to_dict(clip),
         "overlap_start": int(overlap_start),
         "overlap_len": int(overlap_len),
+        "overlap_tail_len": int(span["tail_len"]),
         "overlap_local_idx": local_idx,
         "driver_idx": local_idx,
         "strength": _coerce_float(getattr(clip, "strength", 1.0), 1.0),
@@ -553,6 +600,7 @@ def decode_driver_ref(driver_ref) -> dict[str, Any]:
         height,
         rate_ratio=_coerce_float(ref.get("rate_ratio"), 1.0),
         native_frame_count=_coerce_int(ref.get("native_frame_count"), 0),
+        tail_len=_coerce_int(ref.get("overlap_tail_len"), 0),
     )
     return {
         "images": images,
@@ -637,7 +685,8 @@ class SonderDriverBridge:
     RETURN_TYPES = ("IMAGE", "INT", "FLOAT")
     RETURN_NAMES = ("driver_images", "driver_idx", "driver_strength")
     OUTPUT_TOOLTIPS = (
-        "Driver frames for the selected driver lane, window-rebased to the editor output.",
+        "Driver frames for the selected driver lane, window-rebased to the editor output. "
+        "A Driver reaching the window's end holds its last frame over the editor's grid padding.",
         "Local output frame where the driver segment starts, or a deterministic fallback index.",
         "Driver conditioning strength. Emits 0 when no driver is active.",
     )
