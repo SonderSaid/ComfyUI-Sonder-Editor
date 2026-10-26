@@ -603,8 +603,12 @@ import {
     buildAssetRefreshPolicy,
     getProjectAssetMutationEpoch,
     markProjectAssetMutation,
+    requestProjectAssetDetails,
     requestProjectAssetRefresh,
 } from "./asset_refresh_coordinator.js";
+import {
+    restoreTakeGeometry, takeAudioCovers, takeRestorationSource, TAKE_RESTORATION_REASONS,
+} from "./take_restoration.js";
 import { ProjectMutationQueue } from "./project_mutation_queue.js";
 import { createPromptCompileCoordinator } from "./prompt_compile_coordinator.js";
 import {
@@ -14007,12 +14011,6 @@ export class EditorWidget {
             return;
         }
 
-        // Take-aware drop: if asset has take_metadata, auto-place at original position
-        const generation = asset.generation_summary || asset.generation_params;
-        if (generation?.selection_start !== undefined && generation?.scene_id === this.activeScene.scene_id) {
-            frame = generation.selection_start;
-        }
-
         if (asset.asset_type === "image" && this._isGuideTrackLocked()) {
             this._showToast("Guides track is locked");
             return;
@@ -14206,6 +14204,47 @@ export class EditorWidget {
             return null;
         };
 
+        // Take restoration resolves before anything is painted, so the
+        // collision checks, the paint and the request below all use the
+        // restored range. Only drops a zone below can accept are resolved:
+        // the ruler, or a video or audio lane for its own media.
+        const dropHasAudio = asset.asset_type === "audio"
+            || _findAsset(asset.asset_id)?.has_audio === true || asset?.has_audio === true;
+        const mediaZone = dropZone === "ruler" || (dropZone === "lane"
+            && ((dropEntry?.type === TRACK_TYPE.AUDIO && dropHasAudio)
+                || (dropEntry?.type === TRACK_TYPE.VIDEO && asset.asset_type === "video")));
+        let restoration = null;
+        let takeBaseline = null;
+        let ordinaryTakeNotice = "";
+        if ((asset.asset_type === "video" || asset.asset_type === "audio") && mediaZone
+                && this._settings?.timelineBehavior?.restoreTakePlacement !== false) {
+            takeBaseline = this._takeDropBaseline(dropContext);
+            restoration = await this._takeRestorationForDrop(asset, frame, takeBaseline);
+            if (restoration.kind === "abort") {
+                notifyError(restoration.message, { source: "timeline-drop" });
+                if (restoration.stale) this._deferProjectBackedRefresh(["assets"], "take_drop_stale");
+                return;
+            }
+            if (!this._takeDropBaselineHolds(takeBaseline)) {
+                // Never re-authored against a timeline the user did not drop on.
+                if (this.projectDir === takeBaseline.projectDir && this.activeSceneId === takeBaseline.sceneId) {
+                    notifyError("The timeline changed while the asset's record was being read, so nothing was placed. Drop it again.",
+                        { source: "timeline-drop" });
+                }
+                return;
+            }
+            // Said only once the drop lands: a zone check below can still refuse it.
+            if (restoration.kind === "ordinary" && restoration.reason) {
+                ordinaryTakeNotice = `${TAKE_RESTORATION_REASONS[restoration.reason] || "This take can't be restored"}, so it was placed whole at the cursor.`;
+            }
+            if (restoration.kind === "restore") {
+                frame = restoration.geometry.timeline_start_frame;
+            } else {
+                restoration = null;
+            }
+        }
+        const restored = restoration?.geometry || null;
+
         // Zone-model target resolution for media drops (images keep their
         // guides-only routing in the POST branches below).
         let targetVideoLane = -1;
@@ -14221,9 +14260,11 @@ export class EditorWidget {
                 ? laneAcceptsAssetType(dropEntry.type, asset.asset_type, { hasAudio: videoHasAudio })
                 : "reject";
             const dropFps = this._effectiveFps;
-            const dropFrames = asset.asset_type === "video"
-                ? this._mediaTimelineFrames(assetObjForZone || asset)
-                : Math.max(1, Math.round((assetObjForZone?.duration_sec || asset.duration_sec || 1) * dropFps));
+            const dropFrames = restored
+                ? restored.timeline_end_frame - restored.timeline_start_frame
+                : asset.asset_type === "video"
+                    ? this._mediaTimelineFrames(assetObjForZone || asset)
+                    : Math.max(1, Math.round((assetObjForZone?.duration_sec || asset.duration_sec || 1) * dropFps));
             const dropEndFrame = frame + dropFrames;
             const laneHasOverlap = (laneType, laneIndex) => {
                 if (laneType === TRACK_TYPE.VIDEO) {
@@ -14369,15 +14410,21 @@ export class EditorWidget {
                 const assetObj = _findAsset(asset.asset_id);
                 droppedVideoHasAudio = dualDrop;
                 const frameCount = this._mediaTimelineFrames(assetObj || asset);
+                // The same geometry the server will recompute for a restoring create.
+                const span = restored || {
+                    timeline_start_frame: frame, timeline_end_frame: frame + frameCount,
+                    source_in_frame: 0, source_out_frame: frameCount, total_source_frames: frameCount,
+                };
                 optimisticClipId = `temp-clip-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
                 const optimisticClip = {
                     clip_id: optimisticClipId,
                     source_path: assetObj?.path || asset.path || "",
-                    timeline_start_frame: frame,
-                    timeline_end_frame: frame + frameCount,
-                    source_in_frame: 0,
-                    source_out_frame: frameCount,
-                    total_source_frames: frameCount,
+                    timeline_start_frame: span.timeline_start_frame,
+                    timeline_end_frame: span.timeline_end_frame,
+                    source_in_frame: span.source_in_frame,
+                    source_out_frame: span.source_out_frame,
+                    total_source_frames: span.total_source_frames,
+                    source_origin_frame: 0,
                     track_index: targetVideoLane,
                     role: "render",
                     opacity: 1.0,
@@ -14392,10 +14439,11 @@ export class EditorWidget {
                     const optimisticAudio = {
                         track_id: optimisticAudioId,
                         source_path: "",
-                        timeline_start_frame: frame,
-                        timeline_end_frame: frame + frameCount,
-                        source_in_frame: 0,
-                        total_source_frames: frameCount,
+                        timeline_start_frame: span.timeline_start_frame,
+                        timeline_end_frame: span.timeline_end_frame,
+                        source_in_frame: span.source_in_frame,
+                        total_source_frames: span.total_source_frames,
+                        source_origin_frame: 0,
                         lane_index: targetAudioLane,
                         volume: 1.0,
                         muted: false,
@@ -14413,14 +14461,20 @@ export class EditorWidget {
                         type: "create_clip",
                         fields: {
                             asset_id: asset.asset_id,
-                            timeline_start_frame: frame,
+                            timeline_start_frame: span.timeline_start_frame,
                             track_index: targetVideoLane,
                             audio_lane_index: dualDrop ? targetAudioLane : 0,
                             dual_drop: dualDrop,
                             link_video_audio: this._settings?.timelineBehavior?.linkedVideoAudioDrop !== false,
                             fit_mode: this._defaultFitMode(),
                             crop_position: this._defaultCropPosition(),
+                            ...(restored ? { restore_take: true } : {}),
                         },
+                        ...(restored ? {
+                            expected: this._takeRestorationExpected(asset, restored, takeBaseline, {
+                                videoLane: targetVideoLane, audioLane: dualDrop ? targetAudioLane : -1,
+                            }),
+                        } : {}),
                     },
                 });
                 if (!clipOutcome?.ok) {
@@ -14429,6 +14483,7 @@ export class EditorWidget {
                     console.warn("[Sonder] Clip creation failed:", error?.status, message);
                     notifyError(message, { source: "timeline-drop" });
                     this._discardUnstampableUndoEntry(assetUndoEntry);
+                    if (restored) this._deferProjectBackedRefresh(["assets"], "take_restore_refused");
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_clip_error" });
                     return;
                 }
@@ -14451,9 +14506,21 @@ export class EditorWidget {
                         this.activeScene.audio_tracks = (this.activeScene.audio_tracks || []).filter((track) => track.track_id !== optimisticAudioId);
                     }
                 }
+                // The server removed the audio lane this drop added for audio
+                // that never landed; drop the optimistic one now rather than
+                // when a deferred refresh adopts the scene.
+                if (clipResult?.take_restoration?.removed_audio_lane === true
+                        && this.activeScene[audioCountField] === targetAudioLane + 1) {
+                    this.activeScene[audioCountField] = targetAudioLane;
+                    this._buildTrackLayout();
+                }
                 this._renderSceneAfterLocalMutation();
                 this._reconcileActiveSceneFromMutation(
                     clipOutcome, { reason: "asset_drop_reconcile" });
+                for (const warning of clipResult?.take_restoration?.warnings || []) {
+                    notifyWarning(warning, { source: "timeline-drop" });
+                }
+                if (ordinaryTakeNotice) notifyInfo(ordinaryTakeNotice, { source: "timeline-drop" });
             } else if (asset.asset_type === "audio" || audioFromVideo) {
                 // Drop audio = create audio track on target audio lane.
                 // audioFromVideo: a video asset dropped on an audio lane places
@@ -14465,13 +14532,18 @@ export class EditorWidget {
                     droppedVideoHasAudio = true; // extraction registers a derived audio asset
                 }
                 optimisticAudioId = `temp-audio-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+                const span = restored || {
+                    timeline_start_frame: frame, timeline_end_frame: frame + durationFrames,
+                    source_in_frame: 0, total_source_frames: durationFrames,
+                };
                 const optimisticAudio = {
                     track_id: optimisticAudioId,
                     source_path: audioFromVideo ? "" : (assetObj?.path || asset.path || ""),
-                    timeline_start_frame: frame,
-                    timeline_end_frame: frame + durationFrames,
-                    source_in_frame: 0,
-                    total_source_frames: durationFrames,
+                    timeline_start_frame: span.timeline_start_frame,
+                    timeline_end_frame: span.timeline_end_frame,
+                    source_in_frame: span.source_in_frame,
+                    total_source_frames: span.total_source_frames,
+                    source_origin_frame: 0,
                     lane_index: targetAudioLane,
                     volume: 1.0,
                     muted: false,
@@ -14488,9 +14560,15 @@ export class EditorWidget {
                         type: "create_audio_track",
                         fields: {
                             asset_id: asset.asset_id,
-                            timeline_start_frame: frame,
+                            timeline_start_frame: span.timeline_start_frame,
                             lane_index: targetAudioLane,
+                            ...(restored ? { restore_take: true } : {}),
                         },
+                        ...(restored ? {
+                            expected: this._takeRestorationExpected(asset, restored, takeBaseline, {
+                                audioLane: targetAudioLane,
+                            }),
+                        } : {}),
                     },
                 });
                 if (!audioOutcome?.ok) {
@@ -14499,6 +14577,7 @@ export class EditorWidget {
                     console.warn("[Sonder] Audio track creation failed:", error?.status, message);
                     notifyError(message, { source: "timeline-drop" });
                     this._discardUnstampableUndoEntry(assetUndoEntry);
+                    if (restored) this._deferProjectBackedRefresh(["assets"], "take_restore_refused");
                     await this._fetchScenes({ ignoreMutationGate: true, reason: "drop_audio_error" });
                     return;
                 }
@@ -14512,6 +14591,7 @@ export class EditorWidget {
                 this._renderSceneAfterLocalMutation();
                 this._reconcileActiveSceneFromMutation(
                     audioOutcome, { reason: "asset_drop_reconcile" });
+                if (ordinaryTakeNotice) notifyInfo(ordinaryTakeNotice, { source: "timeline-drop" });
             }
 
             if (droppedVideoHasAudio) {
@@ -14522,6 +14602,109 @@ export class EditorWidget {
             await this._fetchScenes({ ignoreMutationGate: true, reason: "asset_drop_error" });
             console.warn("[Sonder] Failed to drop asset:", e);
         }
+    }
+
+    // What a restoring drop is authored against, taken before it reads the
+    // take's record: the scene, its clock, and both media lane families.
+    _takeDropBaseline(dropContext) {
+        const scene = this.activeScene;
+        return {
+            projectDir: this.projectDir,
+            sceneId: dropContext.sceneId,
+            fps: this._effectiveFps,
+            video_lane_count: laneCountFor(scene, TRACK_TYPE.VIDEO),
+            audio_lane_count: laneCountFor(scene, TRACK_TYPE.AUDIO),
+            video_lane_configs: structuredClone(scene?.video_lane_configs || []),
+            audio_lane_configs: structuredClone(scene?.audio_lane_configs || []),
+        };
+    }
+
+    // Whether the timeline still matches what the drop was authored against.
+    // The read can advance the shared version without this scene adopting the
+    // change, so the drop compares its own snapshot rather than any token.
+    _takeDropBaselineHolds(baseline) {
+        if (this.projectDir !== baseline.projectDir || this.activeSceneId !== baseline.sceneId) return false;
+        const now = this._takeDropBaseline({ sceneId: baseline.sceneId });
+        return now.fps === baseline.fps
+            && now.video_lane_count === baseline.video_lane_count
+            && now.audio_lane_count === baseline.audio_lane_count
+            && JSON.stringify(now.video_lane_configs) === JSON.stringify(baseline.video_lane_configs)
+            && JSON.stringify(now.audio_lane_configs) === JSON.stringify(baseline.audio_lane_configs);
+    }
+
+    /** Resolve a dropped take before anything is painted.
+     *  Returns {kind: "restore", geometry, sameScene}, {kind: "ordinary",
+     *  reason?} for a full-media drop at the cursor (with why, when it was a
+     *  take), or {kind: "abort", message} when the record could not be read
+     *  consistently; the ordinary drop is never a fallback for that. */
+    async _takeRestorationForDrop(asset, cursorFrame, baseline) {
+        if (!asset?.has_provenance || !asset.provenance_revision) return { kind: "ordinary" };
+        let params = asset._provenance?.revision === asset.provenance_revision
+            ? asset._provenance.params : null;
+        if (!params) {
+            const { promise } = requestProjectAssetDetails({
+                projectId: this.projectDir.split(/[/\\]/).pop(),
+                kind: "provenance",
+                assetIds: [asset.asset_id],
+                priority: "selected",
+                ownerId: "timeline-drop",
+            });
+            const result = (await promise).get(asset.asset_id);
+            if (result?.status !== "ok") {
+                return { kind: "abort", message: "Couldn't read this asset's record, so nothing was placed. Drop it again." };
+            }
+            if (result.revision !== asset.provenance_revision) {
+                return { kind: "abort", stale: true,
+                    message: "This asset changed while its record was being read, so nothing was placed. Drop it again." };
+            }
+            params = result.value && typeof result.value === "object" ? result.value : {};
+        }
+        const source = takeRestorationSource(params, asset.asset_type);
+        if (source.status === "not_take") return { kind: "ordinary" };
+        if (source.status !== "supported") return { kind: "ordinary", reason: source.reason };
+        if (asset.media_replaced_at) return { kind: "ordinary", reason: "replaced" };
+        if (asset.trashed_at) return { kind: "ordinary", reason: "trashed" };
+        if (asset.missing) return { kind: "ordinary", reason: "missing" };
+        const encoded = asset.asset_type === "video"
+            ? Math.max(0, Math.trunc(Number(asset.frame_count) || 0))
+            : source.encoded_frame_count;
+        if (encoded <= 0) return { kind: "ordinary", reason: "incomplete" };
+        const sameScene = source.scene_id === baseline.sceneId;
+        const geometry = restoreTakeGeometry(source, encoded, {
+            sameScene, destinationFps: baseline.fps, cursorFrame,
+        });
+        if (geometry.reason) return { kind: "ordinary", reason: geometry.reason };
+        if (asset.asset_type === "audio" && !takeAudioCovers(asset.duration_sec, baseline.fps, geometry)) {
+            return { kind: "ordinary", reason: "audio_short" };
+        }
+        return { kind: "restore", geometry, sameScene };
+    }
+
+    // The `expected` bag a restoring create carries: the identity the record was
+    // read for and the geometry painted, which the server recomputes and
+    // compares (`TAKE_RESTORATION_EXPECTED_KEYS`), plus the lanes it targets.
+    _takeRestorationExpected(asset, geometry, baseline, { videoLane = -1, audioLane = -1 } = {}) {
+        const config = (configs, index) => (index >= 0 && index < configs.length ? configs[index] : null);
+        return {
+            asset_id: asset.asset_id,
+            provenance_revision: asset.provenance_revision,
+            path: asset.path || "",
+            media_probe_signature: asset.media_probe_signature || "",
+            frame_count: asset.frame_count || 0,
+            duration_sec: asset.duration_sec || 0,
+            media_replaced_at: asset.media_replaced_at || "",
+            scene_fps: baseline.fps,
+            source_in_frame: geometry.source_in_frame,
+            source_out_frame: geometry.source_out_frame,
+            total_source_frames: geometry.total_source_frames,
+            timeline_end_frame: geometry.timeline_end_frame,
+            lane_baseline: {
+                video_lane_count: baseline.video_lane_count,
+                audio_lane_count: baseline.audio_lane_count,
+                video_lane_config: config(baseline.video_lane_configs, videoLane),
+                audio_lane_config: config(baseline.audio_lane_configs, audioLane),
+            },
+        };
     }
 
     // ── Lane Management ────────────────────────────────────────────────

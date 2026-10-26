@@ -260,6 +260,7 @@ function syncSettingsPanelControls() {
     if (controls.controlsShowAdvanced) controls.controlsShowAdvanced.checked = !!this._settings.controls.showAdvanced;
     if (controls.controlsShowNotes) controls.controlsShowNotes.checked = this._settings.controls.showNotes !== false;
     if (controls.linkedVideoAudioDrop) controls.linkedVideoAudioDrop.checked = this._settings.timelineBehavior.linkedVideoAudioDrop !== false;
+    if (controls.restoreTakePlacement) controls.restoreTakePlacement.checked = this._settings.timelineBehavior.restoreTakePlacement !== false;
     if (controls.snappingEnabled) controls.snappingEnabled.checked = !!this._settings.timelineBehavior.snappingEnabled;
     if (controls.snapThreshold) controls.snapThreshold.value = String(this._settings.timelineBehavior.snapThreshold);
     if (controls.snapPlayhead) controls.snapPlayhead.checked = !!this._settings.timelineBehavior.snapPlayhead;
@@ -1247,6 +1248,14 @@ function showSettingsPanel() {
     );
     createCheckbox(
         timelineSection,
+        "restoreTakePlacement",
+        "Restore Take Placement",
+        "A take dragged from Assets returns to where it was generated: its original time in its own scene, or its trim at the drop point in another scene. Drop on the ruler to bring its audio too. Off, a take drops whole at the cursor like any other media.",
+        () => this._settings.timelineBehavior.restoreTakePlacement !== false,
+        (checked) => updateCategory("timelineBehavior", "restoreTakePlacement", checked)
+    );
+    createCheckbox(
+        timelineSection,
         "snappingEnabled",
         "Enable Snapping By Default",
         "Snap moved and trimmed edges to nearby targets (S toggles it). The playhead and Razor cuts snap only when their settings below are on.",
@@ -1312,7 +1321,7 @@ function showSettingsPanel() {
     addSectionReset(
         timelineSection,
         "Reset Timeline Section",
-        "Restore snapping, snap targets, and time display defaults.",
+        "Reset drop linking, take placement restoring, snapping, snap targets, and time display defaults.",
         () => this._updateSettings({ timelineBehavior: DEFAULT_EDITOR_SETTINGS.timelineBehavior })
     );
 
@@ -1599,7 +1608,7 @@ function showSettingsPanel() {
     addSectionReset(
         renderSection,
         "Reset Render Section",
-        "Restore take placement, save preset, render cache, and batch-frame defaults.",
+        "Reset take placement, save preset, render cache, and batch-frame defaults.",
         () => this._updateSettings({
             render: {
                 takePlacementMode: DEFAULT_EDITOR_SETTINGS.render.takePlacementMode,

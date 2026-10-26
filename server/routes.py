@@ -5288,6 +5288,7 @@ TAKE_RESTORATION_EXPECTED_KEYS = (
     "asset_id", "provenance_revision", "path", "media_probe_signature",
     "frame_count", "duration_sec", "media_replaced_at", "scene_fps",
     "source_in_frame", "source_out_frame", "total_source_frames", "timeline_end_frame",
+    "lane_baseline",
 )
 
 
@@ -5355,6 +5356,38 @@ def _resolve_take_restoration(project: TimelineProject, scene: Scene, asset: Ass
     if asset.asset_type == "audio" and not _take_audio_covers(asset, geometry, fps):
         _take_restoration_unavailable("audio_short")
     return source, geometry
+
+
+def _validate_take_restoration_lanes(scene: Scene, expected: dict, batch_start: dict | None,
+                                     targets: list[tuple[str, int]]) -> None:
+    """The lanes the drop was authored against, as this batch found them.
+
+    Lane indices in a drop are positional. The browser authors them before it
+    reads the take's record, and that read can advance the shared version
+    without the scene being adopted, so the server compares what the drop saw:
+    each family's lane count before this batch added any, and the config of a
+    target lane that already existed. Any difference refuses as stale; a
+    reorder of two lanes with identical configs is indistinguishable here.
+    """
+    baseline = expected.get("lane_baseline")
+    if not isinstance(baseline, dict):
+        _mutation_error("A restoring create requires expected lane_baseline", 400, "missing_expected")
+    start = batch_start or {}
+    stale = []
+    for lane_type, lane_index in targets:
+        count = int(start.get(f"{lane_type}_lane_count", _scene_lane_count(scene, lane_type)))
+        if baseline.get(f"{lane_type}_lane_count") != count:
+            stale.append(f"{lane_type}_lane_count")
+            continue
+        if lane_index < count:
+            wanted = baseline.get(f"{lane_type}_lane_config")
+            actual = _lane_config(scene, lane_type, lane_index).to_dict()
+            # No config on record is a default lane, as `_lane_config` pads it.
+            if LaneConfig.from_dict(wanted if isinstance(wanted, dict) else {}).to_dict() != actual:
+                stale.append(f"{lane_type}_lane_config")
+    if stale:
+        _mutation_error("The timeline's lanes changed since the take was dropped; the timeline was refreshed.",
+                        409, "take_restoration_stale", {"fields": stale})
 
 
 def _validate_take_restoration_geometry(expected: dict, fields: dict, geometry: dict) -> None:
@@ -5517,7 +5550,7 @@ def _apply_create_clip(
         _validate_take_restoration_identity(project, scene, asset, expected)
         restoration = _resolve_take_restoration(project, scene, asset, start_frame)
         _validate_take_restoration_geometry(expected, fields, restoration[1])
-        return _apply_restored_clip(project, scene, asset, fields, restoration, batch_start)
+        return _apply_restored_clip(project, scene, asset, fields, restoration, batch_start, expected)
     native_frame_count = _valid_source_frame_count(asset)
     frame_count = media_timeline_frames(asset, effective_scene_fps(project, scene))
     if (asset.asset_type == "video" and native_frame_count <= 0
@@ -5606,7 +5639,7 @@ def _apply_create_clip(
 
 
 def _apply_restored_clip(project: TimelineProject, scene: Scene, asset: Asset, fields: dict,
-                         restoration: tuple[dict, dict], batch_start: dict | None,
+                         restoration: tuple[dict, dict], batch_start: dict | None, expected: dict,
                          ) -> tuple[ClipReference, AudioTrack | None, Asset | None, dict]:
     """Place a video take at its restored geometry, with its audio when dual.
 
@@ -5632,6 +5665,9 @@ def _apply_restored_clip(project: TimelineProject, scene: Scene, asset: Asset, f
                         or DEFAULT_CROP_POSITION).strip().lower()
     if crop_position not in CROP_POSITIONS:
         _mutation_error(f"Invalid crop_position: {crop_position}", 400, "invalid_crop_position")
+    _validate_take_restoration_lanes(
+        scene, expected, batch_start,
+        [("video", track_index)] + ([("audio", audio_lane_idx)] if dual_drop else []))
     _require_lane_unlocked(scene, "video", track_index)
     if dual_drop:
         _require_lane_unlocked(scene, "audio", audio_lane_idx)
@@ -5683,6 +5719,7 @@ def _apply_restored_clip(project: TimelineProject, scene: Scene, asset: Asset, f
 
 def _apply_create_audio_track(
         project: TimelineProject, scene: Scene, fields: dict, expected=None,
+        batch_start: dict | None = None,
 ) -> tuple[AudioTrack, Asset | None, dict | None]:
     if not isinstance(fields, dict):
         _mutation_error("create_audio_track requires fields", 400)
@@ -5704,6 +5741,7 @@ def _apply_create_audio_track(
         _validate_take_restoration_identity(project, scene, asset, expected)
         source, geometry = _resolve_take_restoration(project, scene, asset, start_frame)
         _validate_take_restoration_geometry(expected, fields, geometry)
+        _validate_take_restoration_lanes(scene, expected, batch_start, [("audio", lane_index)])
         probe = _restored_audio_track(asset, geometry, lane_index)
         _require_media_target_bounds_fit(scene, [(probe, geometry["timeline_start_frame"],
                                                   geometry["timeline_end_frame"], "audio", lane_index)])
@@ -5884,7 +5922,7 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         return result
     if op_type == "create_audio_track":
         track, audio_asset, restoration = _apply_create_audio_track(
-            project, scene, op.get("fields", {}), op.get("expected"))
+            project, scene, op.get("fields", {}), op.get("expected"), batch_start)
         result = {
             "type": op_type,
             "track_id": track.track_id,
@@ -6284,7 +6322,8 @@ def _apply_scene_mutation_batch(project: TimelineProject, scene_id: str,
 
     # What the batch started from, so a create can undo exactly the lane an
     # earlier operation of this same batch added for it.
-    batch_start = {"audio_lane_count": scene.audio_lane_count,
+    batch_start = {"video_lane_count": _scene_lane_count(scene, "video"),
+                   "audio_lane_count": _scene_lane_count(scene, "audio"),
                    "audio_lane_configs": copy.deepcopy(list(scene.audio_lane_configs))}
     results = [
         _apply_scene_mutation_operation(project, scene, operation, batch_start=batch_start)

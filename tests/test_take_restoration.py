@@ -83,8 +83,10 @@ def take_project(tmp_path, monkeypatch):
                   path="media/take_audio.wav", duration_sec=40 / 24, sample_rate=48000,
                   generation_params={**copy.deepcopy(BASE), "encoded_frame_count": 40,
                                      "source_video_asset_id": "v1"})
-    s1 = Scene(scene_id="s1", name="One", fps=24.0, duration_frames=96)
-    s2 = Scene(scene_id="s2", name="Two", fps=30.0, duration_frames=120)
+    s1 = Scene(scene_id="s1", name="One", fps=24.0, duration_frames=96,
+               video_lane_configs=[LaneConfig()], audio_lane_configs=[LaneConfig()])
+    s2 = Scene(scene_id="s2", name="Two", fps=30.0, duration_frames=120,
+               video_lane_configs=[LaneConfig()], audio_lane_configs=[LaneConfig()])
     project = TimelineProject(project_dir=str(tmp_path), name="Takes", scenes=[s1, s2])
     project.assets = [video, audio]
     calls = {"extract": 0}
@@ -100,7 +102,16 @@ def take_project(tmp_path, monkeypatch):
     return project, calls
 
 
-def _expected(project, scene, asset, geometry):
+def _lane_baseline(scene, video_lane=0, audio_lane=0):
+    """What a drop authored against: lane counts, and its target lanes' configs."""
+    def config(configs, index):
+        return configs[index].to_dict() if index < len(configs) else None
+    return {"video_lane_count": scene.video_lane_count, "audio_lane_count": scene.audio_lane_count,
+            "video_lane_config": config(scene.video_lane_configs, video_lane),
+            "audio_lane_config": config(scene.audio_lane_configs, audio_lane)}
+
+
+def _expected(project, scene, asset, geometry, **lanes):
     return {
         "asset_id": asset.asset_id,
         "provenance_revision": routes._asset_summary_and_revision(asset)[1],
@@ -111,6 +122,7 @@ def _expected(project, scene, asset, geometry):
         "media_replaced_at": asset.media_replaced_at,
         "scene_fps": effective_scene_fps(project, scene),
         **{key: geometry[key] for key in GEOMETRY_KEYS if key != "timeline_start_frame"},
+        "lane_baseline": _lane_baseline(scene, **lanes),
     }
 
 
@@ -265,7 +277,8 @@ def test_an_occupied_range_refuses_the_whole_create(take_project, family):
     op = {"type": "create_clip",
           "fields": {"asset_id": "v1", "timeline_start_frame": 20, "track_index": 1,
                      "audio_lane_index": 1, "dual_drop": True, "restore_take": True},
-          "expected": _expected(project, scene, project.get_asset("v1"), geometry)}
+          "expected": _expected(project, scene, project.get_asset("v1"), geometry,
+                                video_lane=1, audio_lane=1)}
     error = _refusal(lambda: routes._apply_scene_mutation_batch(project, "s1", [op]))
     assert (error.status, error.code) == (409, "lane_collision")
     assert calls["extract"] == 0
@@ -317,7 +330,7 @@ def test_lost_audio_never_removes_a_lane_that_was_already_there(take_project, mo
     op = {"type": "create_clip",
           "fields": {"asset_id": "v1", "timeline_start_frame": 20, "track_index": 0,
                      "audio_lane_index": 1, "dual_drop": True, "restore_take": True},
-          "expected": _expected(project, scene, project.get_asset("v1"), geometry)}
+          "expected": _expected(project, scene, project.get_asset("v1"), geometry, audio_lane=1)}
     _committed, payload = routes._apply_scene_mutation_batch(project, "s1", [op])
     assert payload["results"][0]["take_restoration"]["removed_audio_lane"] is False
     assert scene.audio_lane_count == 2
@@ -597,3 +610,46 @@ def test_an_ordinary_drop_is_unchanged_by_a_takes_record(take_project):
     clip = scene.clips[0]
     assert (clip.timeline_start_frame, clip.source_in_frame, clip.source_out_frame) == (5, 0, 40)
     assert "take_restoration" not in payload["results"][0]
+
+
+@pytest.mark.parametrize("change,field", [
+    (lambda scene: setattr(scene, "video_lane_count", 2) or scene.video_lane_configs.append(LaneConfig()),
+     "video_lane_count"),
+    (lambda scene: setattr(scene, "audio_lane_count", 2) or scene.audio_lane_configs.append(LaneConfig()),
+     "audio_lane_count"),
+])
+def test_a_lane_added_elsewhere_after_authoring_refuses(take_project, change, field):
+    """The drop's lane indices were authored against the counts it saw."""
+    project, _calls = take_project
+    scene = project.get_scene("s1")
+    geometry = _geometry([17, 30, 40, 20, 33])
+    expected = _expected(project, scene, project.get_asset("v1"), geometry)
+    change(scene)  # another writer, after the browser authored the drop
+    error = _refusal(lambda: _ruler_restore(project, scene, project.get_asset("v1"), geometry,
+                                            expected=expected))
+    assert (error.status, error.code) == (409, "take_restoration_stale")
+    assert error.details["fields"] == [field]
+
+
+def test_a_target_lane_that_changed_refuses(take_project):
+    project, _calls = take_project
+    scene = project.get_scene("s1")
+    geometry = _geometry([17, 30, 40, 20, 33])
+    op = {"type": "create_clip",
+          "fields": {"asset_id": "v1", "timeline_start_frame": 20, "track_index": 0, "restore_take": True},
+          "expected": _expected(project, scene, project.get_asset("v1"), geometry)}
+    scene.video_lane_configs[0] = LaneConfig(name="renamed elsewhere")
+    error = _refusal(lambda: routes._apply_scene_mutation_batch(project, "s1", [op]))
+    assert error.details["fields"] == ["video_lane_config"]
+    assert scene.clips == []
+
+
+def test_a_restoring_create_needs_its_lane_baseline(take_project):
+    project, _calls = take_project
+    scene = project.get_scene("s1")
+    geometry = _geometry([17, 30, 40, 20, 33])
+    expected = _expected(project, scene, project.get_asset("v1"), geometry)
+    del expected["lane_baseline"]
+    error = _refusal(lambda: _ruler_restore(project, scene, project.get_asset("v1"), geometry,
+                                            expected=expected))
+    assert (error.status, error.code) == (400, "missing_expected")

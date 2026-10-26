@@ -112,6 +112,33 @@ toolbar) **▸ Render**. **Takes start muted**, **Link take video + audio** and
   to see and hear them. A take that is queued keeps the choice it was queued
   with.
 
+### Placing a take again
+
+Drag a take's row from **Assets** onto the timeline to put it back the way it
+was generated. **Restore Take Placement** (**Settings** ▸ **Timeline
+Behavior**, on by default) controls this:
+
+- **In the take's own scene**, it lands at its original time with its
+  original trim, wherever along the row you drop it.
+- **On the ruler**, its sound comes back too, on a new Audio row. The two are
+  linked when **Link Dropped Video + Audio** (**Settings** ▸ **Timeline
+  Behavior**) is on.
+- **On an Audio row**, only its sound comes back, with the same trim. If the
+  take has no sound that can be recovered, nothing is placed.
+- **In another scene**, it starts where you drop it, with the same trim. If
+  that scene has another frame rate, the trim is converted to keep the same
+  seconds.
+- The frames outside the trim stay in the clip: drag its edges to show them.
+- Older takes that don't record their placement, and takes whose media was
+  swapped with **Replace File…**, drop whole at the cursor.
+- If its sound can't be recovered on a ruler drop, the picture is placed and
+  a message says so.
+- If the take or the timeline changes while the drop reads the take, nothing
+  is placed; drop it again.
+
+With **Restore Take Placement** off, a take drops whole at the cursor like any
+other media, in its own scene too.
+
 ### Which takes should start muted
 
 The timeline renders what is visible, so an unmuted take in front becomes the

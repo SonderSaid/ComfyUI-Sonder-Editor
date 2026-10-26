@@ -1202,8 +1202,9 @@ GUARD_EXEMPT_REASONS = {
                          "the item id set, and those are durable.",
     "create_clip": "Additive: there is no prior row for an `expected` to "
                    "describe. Its `track_index` is the rebase question, not this "
-                   "one, and `case \"create_clip\"` retargets it.",
-    "create_audio_track": "As create_clip; its lane_index is likewise rebased.",
+                   "one, and `case \"create_clip\"` retargets it. A restoring "
+                   "media drop carries a guard; ordinary media drops and the "
+                   "Driver drop are additive and unguarded.",
     "create_prompt_section": "Additive; carries client-computed start/end frames "
                              "with no prior row to compare them against, and "
                              "`_require_no_prompt_overlap` refuses a range that "
@@ -1284,12 +1285,8 @@ GUARD_EXEMPT_SITES = {
     "editor_widget.js:_deleteSelectedItemsWithinGesture:bulk_delete_items": [
         ('apply_linked', 'items', 'items.<opaque>', 'type'),
     ],
-    "editor_widget.js:_handleAssetDropWithinGesture:create_audio_track": [
-        ('fields', 'fields.asset_id', 'fields.lane_index', 'fields.timeline_start_frame', 'type'),
-    ],
     "editor_widget.js:_handleAssetDropWithinGesture:create_clip": [
         ('fields', 'fields.asset_id', 'fields.crop_position', 'fields.dual_drop', 'fields.fit_mode', 'fields.role', 'fields.strength', 'fields.timeline_start_frame', 'fields.track_index', 'type'),
-        ('fields', 'fields.asset_id', 'fields.audio_lane_index', 'fields.crop_position', 'fields.dual_drop', 'fields.fit_mode', 'fields.link_video_audio', 'fields.timeline_start_frame', 'fields.track_index', 'type'),
     ],
     "editor_widget.js:_moveItemToFrameWithinGesture:update_audio_track": [
         ('apply_linked', 'fields', 'fields.timeline_start_frame', 'track_id', 'type'),
@@ -2467,6 +2464,13 @@ OPAQUE_GUARD_SITES = {
        "readable and correct; listing the site keeps the readable half from "
        "certifying the half that is not."
        for scope in ("_commitItemMove", "_moveGuideToFrameWithinGesture")},
+    **{"editor_widget.js:_handleAssetDropWithinGesture:%s" % op_type:
+       "`expected` is `_takeRestorationExpected(...)` inside a conditional spread, "
+       "sent only by a restoring drop; an ordinary drop sends none. The builder "
+       "reads the dropped asset's listed identity and the pre-read lane baseline. "
+       "`test_the_take_restoration_guard_matches_its_contract` runs it and "
+       "compares its keys with `TAKE_RESTORATION_EXPECTED_KEYS`."
+       for op_type in ("create_clip", "create_audio_track")},
     **{"editor_widget.js:%s:create_guide" % scope:
        "`expected` is `_guideReplacementGuard(...)`, one builder shared by both "
        "guide-creating gestures. It must be read BEFORE the local apply, which "
@@ -3177,12 +3181,11 @@ GUARD_SITE_DISPOSITIONS = {
 
     # -- creates that really are additive ------------------------------------
     "editor_widget.js:_handleAssetDropWithinGesture:create_clip": (_FAIR,
-        "Two fingerprints, both additive: no prior row exists for an `expected` "
-        "to describe. Its `track_index` and `audio_lane_index` are the rebase "
-        "question, and `case \"create_clip\"` retargets both."),
-    "editor_widget.js:_handleAssetDropWithinGesture:create_audio_track": (_FAIR,
-        "Additive; no prior row exists. Its `lane_index` is the rebase question "
-        "rather than this one, and `case \"create_audio_track\"` retargets it."),
+        "The Driver drop: additive, no prior row exists for an `expected` to "
+        "describe. Its `track_index` is the rebase question, and "
+        "`case \"create_clip\"` retargets it. Ordinary media drops are "
+        "additive too; a restoring media drop carries a take restoration "
+        "guard and is catalogued in OPAQUE_GUARD_SITES."),
     "editor_widget.js:_saveNewPromptSectionWithinGesture:create_prompt_section": (_FAIR,
         "Additive, and a stale range does not apply silently: "
         "`_require_no_prompt_overlap` refuses a range history has since occupied. "
@@ -3334,7 +3337,9 @@ def test_the_dispositions_hold_the_findings_the_trace_established():
 
     # And these are fair at every site: additive, or a whole-value set where
     # last-write-wins is the correct semantic.
-    for op_type in ("create_clip", "create_audio_track", "create_prompt_section",
+    # `create_audio_track` left this list when the asset drop gained the take
+    # restoration guard; its one emission is now catalogued as opaque.
+    for op_type in ("create_clip", "create_prompt_section",
                     "create_prompt_semantic_unit", "consolidate_items",
                     "import_prompt_context_dependencies"):
         assert by_op.get(op_type) == {_FAIR}, (
@@ -4955,3 +4960,38 @@ def test_the_hidden_operand_scan_finds_the_helper_chain_it_was_written_for():
     found = _sites_with_operations_built_elsewhere((("fixture.js", fixture),))
     assert list(found) == ["fixture.js:gesture"], (
         f"the predicate did not fire on a delegating coalescing site: {found}")
+
+
+def test_the_take_restoration_guard_matches_its_contract():
+    """The drop's opaque `expected` builder, run: it must send exactly the keys
+    the server requires, and a lane baseline naming only the lanes it targets."""
+    import json
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for browser module tests")
+    widget = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
+    start = widget.index("    _takeRestorationExpected(")
+    end = widget.index("\n    // \u2500\u2500 Lane Management", start)
+    method = widget[start:end]
+    script = (
+        "class H {\n" + method + "\n}\n"
+        "const baseline = {fps: 30, video_lane_count: 2, audio_lane_count: 1,"
+        " video_lane_configs: [{name: 'a'}, {name: 'b'}], audio_lane_configs: [{name: 'x'}]};\n"
+        "const geometry = {source_in_frame: 1, source_out_frame: 5, total_source_frames: 9,"
+        " timeline_start_frame: 3, timeline_end_frame: 7};\n"
+        "const asset = {asset_id: 'v', provenance_revision: 'r', path: 'p', media_probe_signature: 's',"
+        " frame_count: 9, duration_sec: 0.3, media_replaced_at: ''};\n"
+        "console.log(JSON.stringify([new H()._takeRestorationExpected(asset, geometry, baseline,"
+        " {videoLane: 1, audioLane: 1}), new H()._takeRestorationExpected(asset, geometry, baseline,"
+        " {audioLane: 0})]));\n")
+    ruler, lane = json.loads(subprocess.run([node, "--input-type=module", "-e", script],
+                                            capture_output=True, text=True, check=True).stdout)
+    assert set(ruler) == set(_TAKE_RESTORATION_KEYS)
+    assert ruler["scene_fps"] == 30 and ruler["timeline_end_frame"] == 7
+    # A new lane (index at the count) has no config to compare; an existing one does.
+    assert ruler["lane_baseline"] == {"video_lane_count": 2, "audio_lane_count": 1,
+                                      "video_lane_config": {"name": "b"}, "audio_lane_config": None}
+    assert lane["lane_baseline"]["audio_lane_config"] == {"name": "x"}
+    assert lane["lane_baseline"]["video_lane_config"] is None

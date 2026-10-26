@@ -327,6 +327,8 @@ export const DEFAULT_EDITOR_SETTINGS = {
     },
     timelineBehavior: {
         linkedVideoAudioDrop: true,
+        // A take dropped from Assets returns to its recorded time and trim.
+        restoreTakePlacement: true,
         snappingEnabled: true,
         snapThreshold: 5,
         // Pointer placements, off by default: the frame threshold can pull
@@ -1313,6 +1315,9 @@ export function normalizeEditorSettings(source = null) {
             linkedVideoAudioDrop: stored?.timelineBehavior?.linkedVideoAudioDrop == null
                 ? defaults.timelineBehavior.linkedVideoAudioDrop
                 : !!stored.timelineBehavior.linkedVideoAudioDrop,
+            restoreTakePlacement: stored?.timelineBehavior?.restoreTakePlacement == null
+                ? defaults.timelineBehavior.restoreTakePlacement
+                : !!stored.timelineBehavior.restoreTakePlacement,
             snappingEnabled: stored?.timelineBehavior?.snappingEnabled == null
                 ? defaults.timelineBehavior.snappingEnabled
                 : !!stored.timelineBehavior.snappingEnabled,

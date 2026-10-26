@@ -256,6 +256,9 @@ Where you drop a gallery asset decides what happens:
 - **The Guides track** → an image dropped there becomes a guide frame.
 - Locked lanes, overlaps, and dead space refuse with a toast pointing at the
   ruler gesture. A type-aware highlight always shows where the drop will land.
+- A take keeps the trim it was generated with, and in its own scene its
+  original time; see
+  [Placing a take again](assets-and-gallery.md#placing-a-take-again).
 
 ## The viewport
 

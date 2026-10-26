@@ -780,6 +780,20 @@ export function mountSharedAssetGallery(container, options = {}) {
         peekDetail: (assetId, revision) => detailLoader.peek(assetId, revision),
     });
 
+    // What a timeline drop receives. A take restores from the provenance this
+    // gallery already holds at the listed revision, so dropping a take the user
+    // has looked at needs no read; otherwise the timeline asks for it.
+    function assetDragPayload(asset) {
+        const revision = asset?.provenance_revision || "";
+        const params = asset?.has_provenance && revision
+            ? detailLoader.peek(asset.asset_id, revision) : undefined;
+        return JSON.stringify({
+            ...asset,
+            _projectDir: projectIdFromDir(currentProjectDir()),
+            ...(params ? { _provenance: { revision, params } } : {}),
+        });
+    }
+
     function detailProjectId() {
         return projectIdFromDir(currentProjectDir()) || "";
     }
@@ -7789,7 +7803,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                 event.dataTransfer.setData("text/plain", moveIds.length > 1 ? `${moveIds.length} assets` : assetDisplayName(asset));
                 return;
             }
-            const payload = JSON.stringify({ ...asset, _projectDir: projectIdFromDir(currentProjectDir()) });
+            const payload = assetDragPayload(asset);
             event.dataTransfer.effectAllowed = "copy";
             event.dataTransfer.setData("application/x-sonder-asset", payload);
             event.dataTransfer.setData("text/plain", assetDisplayName(asset));
@@ -8014,7 +8028,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                         event.dataTransfer.setData("text/plain", moveIds.length > 1 ? `${moveIds.length} assets` : assetDisplayName(asset));
                         return;
                     }
-                    const payload = JSON.stringify({ ...asset, _projectDir: projectIdFromDir(currentProjectDir()) });
+                    const payload = assetDragPayload(asset);
                     event.dataTransfer.effectAllowed = "copy";
                     event.dataTransfer.setData("application/x-sonder-asset", payload);
                     event.dataTransfer.setData("text/plain", assetDisplayName(asset));

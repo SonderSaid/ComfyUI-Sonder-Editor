@@ -1345,6 +1345,16 @@ MIRRORED_MODULES = {
             "expiry": "Remove when one fixture corpus compares JS and Python collision decisions directly.",
         },
     },
+    "take_restoration.js": {
+        "scope": ("What a dropped take's record resolves to, the geometry it restores at "
+                  "the destination FPS, and whether its audio covers that range."),
+        "authorities": ("server/take_placement.py::calculate_take_placement",
+                        "server/take_placement.py::take_restoration_source",
+                        "server/take_placement.py::restore_take_geometry",
+                        "server/routes.py::_take_audio_covers"),
+        "tests": ("test_take_restoration_js.py::test_the_mirror_matches_the_fixture_table",
+                  "test_take_restoration_js.py::test_the_mirror_matches_the_server_on_generated_records"),
+    },
     "metadata_collector_shape.js": {
         "scope": "Legacy value_N, V3 values.value_N and label_N slot naming only, not capacity policy.",
         "authorities": ("nodes/metadata_collector.py::collect_metadata",
@@ -1588,7 +1598,7 @@ def test_declared_mirror_headers_match_the_inventory_both_ways():
 
 def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
-    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 67
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 71
 
 @pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
 def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):
