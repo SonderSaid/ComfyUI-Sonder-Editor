@@ -37,6 +37,7 @@ from ..server.media_helpers import (
     DEFAULT_CROP_POSITION,
     DEFAULT_FIT_MODE,
     FIT_MODES,
+    MediaOperationCancelled,
     apply_rgb_color_correction,
     color_correction_for_interpretation,
     decode_video_frame,
@@ -55,7 +56,7 @@ from ..server.path_security import (
     resolve_existing_project_path,
     safe_route_token,
 )
-from ..server.timeline_renderer import render_scene_frames
+from ..server.timeline_renderer import TimelineRenderCancelled, render_scene_frames
 
 logger = logging.getLogger("sonder_editor")
 
@@ -67,6 +68,94 @@ def _make_silent_audio(duration_sec: float, sample_rate: int = 48000) -> dict:
     return {"waveform": waveform, "sample_rate": sample_rate}
 
 CREATE_NEW = "+ Create New"
+
+
+def _comfy_model_management():
+    """ComfyUI's interrupt flag owner, or None outside ComfyUI (tests, tools)."""
+    try:
+        import comfy.model_management as model_management
+    except Exception:
+        return None
+    return model_management
+
+
+def _is_comfy_interrupt(exc: BaseException, model_management) -> bool:
+    interrupt_type = getattr(model_management, "InterruptProcessingException", None)
+    return isinstance(interrupt_type, type) and isinstance(exc, interrupt_type)
+
+
+class _ComfyInterruptSignal:
+    """``is_set`` for the renderer and audio mix: whether ComfyUI was asked to
+    interrupt. Reading it leaves the request in place for the Editor to raise."""
+
+    def __init__(self, model_management):
+        self.model_management = model_management
+
+    def is_set(self) -> bool:
+        if self.model_management is None:
+            return False
+        try:
+            return bool(self.model_management.processing_interrupted())
+        except Exception:
+            return False
+
+    def raise_if_set(self) -> None:
+        """Raise ComfyUI's interrupt now if one was requested (clearing it, as native nodes do)."""
+        if self.model_management is not None:
+            self.model_management.throw_exception_if_processing_interrupted()
+
+    def raise_cancelled(self, cancelled: BaseException) -> None:
+        """Turn a renderer or audio cancellation caused by this signal into ComfyUI's interrupt."""
+        if self.model_management is None:
+            raise cancelled
+        self.raise_if_set()
+        # The request was cleared between the check that cancelled and here.
+        raise self.model_management.InterruptProcessingException() from cancelled
+
+
+class _RenderProgressBar:
+    """The Editor node's native progress bar for its render.
+
+    Below max while frames are rendering; max only once the render and its
+    padding are done, so "max while the node still runs" means preparing graph
+    inputs. A restarted count gets a new bar, because ComfyUI's throttle would
+    hold a reused one at its old value. Never fails a render; ComfyUI's
+    progress hook raising its interrupt is let through.
+    """
+
+    def __init__(self, model_management):
+        self.model_management = model_management
+        self.bar = None
+        self.done = -1
+        self.total = 0
+        self.unavailable = False
+
+    def _send(self, value: int, total: int, *, restart: bool) -> None:
+        if self.unavailable:
+            return
+        try:
+            if self.bar is None or restart:
+                import comfy.utils
+
+                self.bar = comfy.utils.ProgressBar(max(1, int(total)))
+            self.bar.update_absolute(int(value), max(1, int(total)))
+        except Exception as exc:
+            if _is_comfy_interrupt(exc, self.model_management):
+                # Expiry: cores before ComfyUI 0.20 derive the interrupt from
+                # Exception; drop once the pack requires 0.20 or later.
+                raise
+            self.unavailable = True
+            logger.debug("Editor render progress unavailable", exc_info=True)
+
+    def __call__(self, done: int, total: int) -> None:
+        restart = done < self.done
+        self.done = done
+        self.total = total
+        self._send(min(done, max(0, total - 1)), total, restart=restart)
+
+    def finish(self, total: int) -> None:
+        total = self.total or total
+        self._send(total, total, restart=False)
 
 
 def _coerce_int(value, default: int = 0) -> int:
@@ -758,8 +847,13 @@ class SonderEditor:
         proj = None
         queue_job = None
         queue_job_consumed = False
+        # ComfyUI checks for an interrupt only between nodes; the Editor checks
+        # at its own stages and inside the render and audio mix.
+        interrupt = _ComfyInterruptSignal(_comfy_model_management())
 
         try:
+            # Before a project is created or a Sonder App run token is consumed.
+            interrupt.raise_if_set()
             # --- Load or create project ---
             if project == CREATE_NEW:
                 proj = create_project(
@@ -782,6 +876,8 @@ class SonderEditor:
             unmarked_save_reached = self._execution_targets_unmarked_save(prompt, unique_id, execution_scope)
             queue_length = len(getattr(proj, "generation_queue", []) or [])
             queue_job_mode = ""
+            # Before a claim, so an interrupted run never saves one only to return it.
+            interrupt.raise_if_set()
             if render_queue_active and terminal_save_reached:
                 if not run_key:
                     logger.warning(
@@ -803,6 +899,8 @@ class SonderEditor:
                 # completing, or otherwise mutating the job or the project.
                 queue_job = self._peek_queue_job(proj)
                 queue_job_mode = "peek" if queue_job else ""
+            # After a claim, the run's release returns the leased job to pending.
+            interrupt.raise_if_set()
             snapshot_version = self._queue_snapshot_version(queue_job)
             if queue_job:
                 execution_base_modified_at = getattr(queue_job, "base_modified_at", "") or getattr(proj, "modified_at", "")
@@ -1014,20 +1112,31 @@ class SonderEditor:
 
             # --- Render composited frames ---
             if render_needed:
+                interrupt.raise_if_set()
                 render_started_at = time.perf_counter()
                 logger.info("render start: scene_id=%s range=%d-%d", scene.scene_id, render_start, render_end)
-                rendered_frames = self._render_scene_frames(
-                    proj,
-                    scene,
-                    render_start,
-                    render_end,
-                    use_cache=render_cache_active,
-                    cache_max_bytes=render_cache_budget,
-                )
+                logger.info("render stage=rendering scene_id=%s frames=%d elapsed=%.2fs",
+                            scene.scene_id, render_end - render_start,
+                            render_started_at - execute_started_at)
+                progress_bar = _RenderProgressBar(interrupt.model_management)
+                try:
+                    rendered_frames = self._render_scene_frames(
+                        proj,
+                        scene,
+                        render_start,
+                        render_end,
+                        use_cache=render_cache_active,
+                        cache_max_bytes=render_cache_budget,
+                        cancel_event=interrupt,
+                        progress=progress_bar,
+                    )
+                except TimelineRenderCancelled as cancelled:
+                    interrupt.raise_cancelled(cancelled)
                 if frame_count_padding > 0:
                     rendered_frames = self._pad_image_batch_to_frame_count(
                         rendered_frames, target_frame_count
                     )
+                progress_bar.finish(render_end - render_start)
                 logger.info(
                     "render end: scene_id=%s frames=%d duration=%.2fs",
                     scene.scene_id,
@@ -1036,6 +1145,9 @@ class SonderEditor:
                 )
             else:
                 rendered_frames = self._minimal_image_output()
+            interrupt.raise_if_set()
+            logger.info("render stage=preparing_inputs scene_id=%s elapsed=%.2fs",
+                        scene.scene_id, time.perf_counter() - execute_started_at)
 
             # --- Gather guide frames within render range ---
             guide_images = []
@@ -1206,6 +1318,7 @@ class SonderEditor:
                                 purpose=f"guide asset {getattr(asset, 'asset_id', '') or '(unknown)'}",
                             )
                             if os.path.isfile(asset_path):
+                                interrupt.raise_if_set()
                                 img = self._load_guide_image(
                                     asset_path, asset.asset_type, proj_w, proj_h,
                                     fit_mode=getattr(guide, "fit_mode", "pad_edge"),
@@ -1304,7 +1417,11 @@ class SonderEditor:
 
             # --- Load audio from scene's audio tracks for the render range ---
             if audio_needed:
-                audio = self._load_scene_audio(proj, scene, render_start, render_end)
+                interrupt.raise_if_set()
+                try:
+                    audio = self._load_scene_audio(proj, scene, render_start, render_end, cancel_event=interrupt)
+                except MediaOperationCancelled as cancelled:
+                    interrupt.raise_cancelled(cancelled)
                 if frame_count_padding > 0:
                     audio = self._pad_audio_to_frame_count(audio, frame_count, proj_fps)
             else:
@@ -1323,6 +1440,7 @@ class SonderEditor:
             # context frames, paired by index at save time (never persisted — the
             # `_` prefix is stripped by _public_execution_context).
             drift_stash = None
+            interrupt.raise_if_set()
             if render_needed:
                 try:
                     drift_stash = build_context_reference_stash(
@@ -1336,6 +1454,8 @@ class SonderEditor:
                 except Exception as e:
                     logger.warning("color drift stash failed: scene_id=%s error=%s", scene.scene_id, e)
 
+            # Last check before this run's context is published to downstream nodes.
+            interrupt.raise_if_set()
             # --- Attach execution context for downstream nodes (e.g., SonderSaveVideo Take mode) ---
             proj._execution_context = {
                 "scene_id": scene.scene_id,
@@ -1434,6 +1554,11 @@ class SonderEditor:
                 mask_end_time,
             )
         except Exception as e:
+            if _is_comfy_interrupt(e, interrupt.model_management):
+                # A cancellation is not a failure: the run's release returns a
+                # claimed job to pending. Expiry: only cores before ComfyUI 0.20
+                # derive the interrupt from Exception; drop once 0.20 is required.
+                raise
             logger.warning(
                 "execute failed: scene_id=%s duration=%.2fs error=%s",
                 scene_id or "",
@@ -1455,7 +1580,8 @@ class SonderEditor:
     def _render_scene_frames(self, proj: TimelineProject, scene: Scene,
                               render_start: int, render_end: int,
                               *, use_cache: bool = True,
-                              cache_max_bytes: int | None = None) -> torch.Tensor:
+                              cache_max_bytes: int | None = None,
+                              cancel_event=None, progress=None) -> torch.Tensor:
         """Composite all visible video clips into frames for the given range.
 
         Returns (N, H, W, 3) float32 RGB tensor. Uses caching to skip
@@ -1468,6 +1594,8 @@ class SonderEditor:
             render_end,
             use_cache=use_cache,
             cache_max_bytes=cache_max_bytes,
+            cancel_event=cancel_event,
+            progress=progress,
         )
 
     @staticmethod
@@ -1525,8 +1653,8 @@ class SonderEditor:
             return None
 
     def _load_scene_audio(self, proj: TimelineProject, scene: Scene,
-                          sel_start: int, sel_end: int) -> dict:
+                          sel_start: int, sel_end: int, *, cancel_event=None) -> dict:
         """Use the same unbounded float mix and sample clock as timeline export."""
         from ..server.audio_pipeline import scene_audio_samples
-        samples, sample_rate = scene_audio_samples(proj, scene, sel_start, sel_end)
+        samples, sample_rate = scene_audio_samples(proj, scene, sel_start, sel_end, cancel_event=cancel_event)
         return {"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": sample_rate}

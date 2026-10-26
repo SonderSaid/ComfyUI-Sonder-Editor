@@ -48,6 +48,7 @@ a fresh `[Unreleased]` block.
 - Sonder Control Relay node: a workflow's Controls menu. It exposes existing node settings, a Sonder Selector's feature list included, in the Controls sidebar with labels, groups and Markdown notes, and the Sonder App reads the same menu from an Export (API) workflow. The settings stay on their own nodes, and a copied node is never exposed twice.
 
 ### Changed
+- The Sonder Editor node shows ComfyUI's progress bar while it renders frames, filling only when the render is done; the Sonder App's progress shows the Editor's frame count too.
 - Reorganized the documentation around step-by-step goals, with new pages for Controls and the Sonder App.
 - Prompt: the warning about a typed label such as `[Shot 1]` or `<Picture 1>` now says what to do instead: insert it as a chip (Shot, Reference or Vocal Event) or an @handle, so its number follows staging.
 - A mounted editor tab is titled after its project ("Project · Sonder Editor") and follows a project switch.
@@ -64,6 +65,8 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup counts a chip as attached to an item under MiniMax H3 when it cites one of the item's members, directly or through a Subject.
 
 ### Fixed
+- Cancel stops an Editor render within about a frame instead of waiting for the whole render to finish; a queued job it had claimed still goes back to Pending to run again.
+- A Save Bridge run that errors or is cancelled after the Editor returns its queued job to Pending, with the failing node named after an error, instead of marking it Failed with "Bridge terminal produced no files". Later jobs of its batch stay Pending.
 - Editor renders and timeline exports read each clip's frames in order instead of jumping to every frame, so clips play through at decoding speed: a scene with a large Lossless FFV1 upscale went from about 1.5 s to about 0.13 s per frame in our tests. The render cache starts fresh once after updating.
 - Drivers stay aligned with renders a model's frame rule pads: a Driver that reaches the end of the generation window now holds its last frame over the added frames, so the render's last frames keep their guidance (LTX's guide node used to cut a 120-frame Driver for a 121-frame render down to 113 frames).
 - A Driver whose video decodes a frame or two fewer than its recorded length no longer stops the run with "Driver media ended before expected frame"; it holds its last frame. A file missing more than that still fails.

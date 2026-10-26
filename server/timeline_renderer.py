@@ -81,7 +81,9 @@ class _SourceReader:
     """One open capture and where its decoder stands.
 
     ``next_pos`` is the frame the next ``read()`` returns, or None when unknown
-    (fresh capture, failed seek, grab or read), which forces a seek. The last
+    (after a failed seek, grab or read), which forces a seek. A fresh capture
+    that reports frame 0 starts there, so a clip near its source's start skips
+    the seek, which alone costs about a second on a large FFV1 file. The last
     decoded frame is kept so a repeated index (rate up-conversion, the end clamp,
     two layers on one frame) costs no decode.
     """
@@ -90,10 +92,20 @@ class _SourceReader:
 
     def __init__(self, cap, frame_index):
         self.cap = cap
-        self.next_pos = None
+        self.next_pos = 0 if self._reports_start(cap) else None
         self.last_index = None
         self.last_bgr = None
         self.last_used = frame_index
+
+    @staticmethod
+    def _reports_start(cap) -> bool:
+        get = getattr(cap, "get", None)
+        if not callable(get):
+            return False
+        try:
+            return get(cv2.CAP_PROP_POS_FRAMES) == 0
+        except Exception:
+            return False
 
     def holds(self, target: int) -> bool:
         return self.last_index == target and self.last_bgr is not None

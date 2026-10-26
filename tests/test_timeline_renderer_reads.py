@@ -58,6 +58,9 @@ class DecoderCapture:
         self.position = 0
         log.opened.append(self.name)
 
+    def get(self, _prop):
+        return float(self.position)  # CAP_PROP_POS_FRAMES, the only property the renderer reads
+
     def isOpened(self):
         if self.log.fail_open_from is not None and self.index >= self.log.fail_open_from:
             return False
@@ -134,14 +137,38 @@ def _kinds(log):
     return [kind for _index, kind, _frame in log.ops]
 
 
-def test_in_order_frames_seek_once_then_read(tmp_path, used_frames):
+def test_a_fresh_reader_starts_at_frame_zero_and_reads_on_without_seeking(tmp_path, used_frames):
     project, scene = _project(tmp_path, [("a.mp4", 24.0, 48)], duration=12)
     scene.clips = [_clip("a.mp4", 0, 12, source_in=5)]
     log = DecoderLog()
     _render(project, scene, log)
-    assert log.ops[0] == (0, "set", 5)
-    assert _kinds(log)[1:] == ["read"] * 12
+    assert _kinds(log) == ["grab"] * 5 + ["read"] * 12
     assert used_frames == list(range(5, 17))
+
+
+def test_a_fresh_capture_that_does_not_report_frame_zero_seeks(tmp_path, used_frames):
+    project, scene = _project(tmp_path, [("a.mp4", 24.0, 48)], duration=4)
+    scene.clips = [_clip("a.mp4", 0, 4, source_in=2)]
+    log = DecoderLog()
+
+    class Elsewhere(DecoderCapture):
+        def get(self, _prop):
+            return -1.0
+
+    list(iter_scene_frames(project, scene, 0, 4, video_capture_factory=lambda path: Elsewhere(log, path)))
+    assert log.ops[0] == (0, "set", 2)
+    assert used_frames == [2, 3, 4, 5]
+
+
+def test_a_fresh_reader_seeks_to_a_start_past_the_grab_limit(tmp_path, used_frames):
+    start = SEQUENTIAL_GRAB_LIMIT + 4
+    project, scene = _project(tmp_path, [("a.mp4", 24.0, 100)], duration=6)
+    scene.clips = [_clip("a.mp4", 0, 6, source_in=start)]
+    log = DecoderLog()
+    _render(project, scene, log)
+    assert log.ops[0] == (0, "set", start)
+    assert _kinds(log)[1:] == ["read"] * 6
+    assert used_frames == list(range(start, start + 6))
 
 
 def test_repeated_index_from_rate_up_conversion_reuses_the_decoded_frame(tmp_path, used_frames):
@@ -153,7 +180,7 @@ def test_repeated_index_from_rate_up_conversion_reuses_the_decoded_frame(tmp_pat
     expected = [int(np.floor((u + 0.5) * 0.8)) for u in range(20)]
     assert used_frames == expected
     assert _kinds(log).count("read") == len(set(expected))
-    assert _kinds(log).count("set") == 1
+    assert _kinds(log).count("set") == 0
 
 
 def test_small_forward_gap_grabs_instead_of_seeking(tmp_path, used_frames):
@@ -163,7 +190,7 @@ def test_small_forward_gap_grabs_instead_of_seeking(tmp_path, used_frames):
     log = DecoderLog()
     _render(project, scene, log)
     assert used_frames == [int(np.floor((u + 0.5) * 2.5)) for u in range(20)]
-    assert _kinds(log).count("set") == 1
+    assert _kinds(log).count("set") == 0
     assert "grab" in _kinds(log)
 
 
@@ -178,7 +205,7 @@ def test_large_forward_jump_and_backward_jump_seek(tmp_path, used_frames):
     log = DecoderLog()
     _render(project, scene, log)
     assert used_frames == [0, 1, 2, 3, 4 + jump, 5 + jump, 6 + jump, 7 + jump, 2, 3, 4, 5]
-    assert [frame for _i, kind, frame in log.ops if kind == "set"] == [0, 4 + jump, 2]
+    assert [frame for _i, kind, frame in log.ops if kind == "set"] == [4 + jump, 2]
     assert len(log.opened) == 1
 
 
@@ -188,7 +215,7 @@ def test_contiguous_cut_of_one_source_continues_without_a_seek(tmp_path, used_fr
     log = DecoderLog()
     _render(project, scene, log)
     assert used_frames == list(range(10))
-    assert _kinds(log).count("set") == 1
+    assert _kinds(log).count("set") == 0
     assert len(log.opened) == 1
 
 
@@ -209,18 +236,19 @@ def test_two_layers_at_different_positions_get_a_reader_each(tmp_path, used_fram
     _render(project, scene, log)
     assert used_frames == [value for frame in range(8) for value in (frame, frame + 20)]
     assert len(log.opened) == 2
-    assert [(index, frame) for index, kind, frame in log.ops if kind == "set"] == [(0, 0), (1, 20)]
+    assert [(index, frame) for index, kind, frame in log.ops if kind == "set"] == [(1, 20)]
 
 
 def test_failed_seek_is_marked_and_the_next_request_seeks_again(tmp_path, used_frames):
-    project, scene = _project(tmp_path, [("a.mp4", 24.0, 48)], duration=4)
-    scene.clips = [_clip("a.mp4", 0, 4)]
-    log = DecoderLog(seek_fail={0})
+    project, scene = _project(tmp_path, [("a.mp4", 24.0, 100)], duration=4)
+    scene.clips = [_clip("a.mp4", 0, 4, source_in=30)]
+    log = DecoderLog(seek_fail={30})
     status = {}
     _render(project, scene, log, status=status)
     assert [reason for _block, _path, reason in status["failures"]] == ["seek_failed"]
     # The frame read after the failed seek is still used, as before, but not trusted.
-    assert [frame for _i, kind, frame in log.ops if kind == "set"] == [0, 1]
+    assert [frame for _i, kind, frame in log.ops if kind == "set"] == [30, 31]
+    assert used_frames == [30, 31, 32, 33]
 
 
 @pytest.mark.parametrize("failure", ["read", "grab"])
@@ -240,7 +268,7 @@ def test_failed_in_order_read_or_grab_is_marked_and_retried_with_a_seek(tmp_path
     # The block stays out of the cache, but the frame is recovered as the old
     # seek-every-frame path would have recovered it.
     assert [reason for _block, _path, reason in status["failures"]] == ["read_failed"]
-    assert [frame for _i, kind, frame in log.ops if kind == "set"][1:] == [retried]
+    assert [frame for _i, kind, frame in log.ops if kind == "set"] == [retried]
     assert used_frames == expected
 
 
@@ -257,10 +285,10 @@ def test_a_read_that_fails_again_after_the_seek_drops_the_layer(tmp_path, used_f
 def test_a_seek_landing_off_by_k_shifts_frames_as_before(tmp_path, used_frames):
     # Decode order follows wherever the seek landed, as the old path did on each frame.
     project, scene = _project(tmp_path, [("a.mp4", 24.0, 100)], duration=8)
-    scene.clips = [_clip("a.mp4", 0, 8, source_in=10)]
+    scene.clips = [_clip("a.mp4", 0, 8, source_in=30)]
     log = DecoderLog(seek_offset=1)
     _render(project, scene, log)
-    assert used_frames == list(range(11, 19))
+    assert used_frames == list(range(31, 39))
 
 
 def test_an_open_failure_is_tried_once_per_source(tmp_path, used_frames):
@@ -306,7 +334,7 @@ def test_a_cut_on_one_layer_does_not_take_the_reader_another_layer_continues_on(
     ]
     log = DecoderLog()
     _render(project, scene, log)
-    assert [frame for _i, kind, frame in log.ops if kind == "set"] == [0, 100, 200]
+    assert [frame for _i, kind, frame in log.ops if kind == "set"] == [100, 200]
     upper = next(index for index, kind, frame in log.ops if kind == "set" and frame == 100)
     assert [frame for index, kind, frame in log.ops if index == upper and kind == "read"] == list(range(100, 108))
 
@@ -549,6 +577,6 @@ def test_real_media_uses_decode_order_across_cuts_jumps_and_layers(tmp_path, mon
             units = clip.source_in_frame + frame - clip.timeline_start_frame
             expected.append(min(119, int(np.floor((units + 0.5) * 30.0 / 24.0))))
     assert seen == expected
-    # One seek per reader start and per jump: the start, the far jump, the
-    # backward cut and the layered repeat's own reader. The 10-frame cut grabs.
-    assert sorted(sets) == [0, 4, 13, 75]
+    # Seeks only for the far jump and the backward cut: the opening clip and the
+    # layered repeat's new reader start near frame 0, and the 10-frame cut grabs.
+    assert sorted(sets) == [4, 75]

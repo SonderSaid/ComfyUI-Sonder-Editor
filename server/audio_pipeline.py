@@ -170,10 +170,10 @@ def mix_scene_audio_to_wav(project, scene, start_frame, end_frame, output_wav, *
     return contributors
 
 
-def scene_audio_samples(project, scene, start, end, *, work_dir=None):
+def scene_audio_samples(project, scene, start, end, *, work_dir=None, cancel_event=None):
     with tempfile.TemporaryDirectory(prefix="sonder_audio_context_", dir=work_dir or media.transient_temp_dir()) as directory:
         path = os.path.join(directory, "mix.wav")
-        mix_scene_audio_to_wav(project, scene, start, end, path)
+        mix_scene_audio_to_wav(project, scene, start, end, path, cancel_event=cancel_event)
         with mapped_float_wav(path) as (rate, samples):
             # Copy before closing the Windows mapping, including mono/empty inputs.
             return np.array(samples.T, dtype=np.float32, order="C", copy=True), rate

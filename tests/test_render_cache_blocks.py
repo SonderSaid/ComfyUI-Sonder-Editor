@@ -559,6 +559,9 @@ def test_source_access_failures_return_fallback_without_cache_commit(tmp_path, f
                 super().set(_prop, value)
                 return False
 
+        # Start past the grab limit: a fresh reader reaches nearer frames without a seek.
+        project.assets[0].frame_count = 100
+        scene.clips[0].source_in_frame = 40
         capture_factory = lambda path: SeekFailureCapture(path, [])
 
     result = render_scene_frames(project, scene, 0, 8, video_capture_factory=capture_factory)

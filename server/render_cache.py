@@ -22,10 +22,11 @@ from .path_security import PathSecurityError, path_within, resolve_project_path,
 logger = logging.getLogger("sonder_editor")
 
 CACHE_FORMAT_VERSION = 3
-# cm3: frames are read on from each run's first seek instead of seeking before
-# every frame. Identical wherever OpenCV's seeks land exactly (constant- and
-# variable-rate media); on timestamp-gapped media a run keeps its first seek's offset.
-CACHE_PIPELINE_VERSION = "cm3"
+# cm4: frames are read on in decode order, from a fresh capture's start or from a
+# seek, instead of seeking before every frame (cm3 always seeked a fresh capture).
+# Identical wherever OpenCV's seeks land exactly (constant- and variable-rate
+# media); on timestamp-gapped media a run keeps the offset of its first seek, if any.
+CACHE_PIPELINE_VERSION = "cm4"
 MAX_BLOCK_FRAMES = 32
 MAX_BLOCK_BYTES = 256 * 1024 * 1024
 STALE_TEMP_SECONDS = 24 * 60 * 60

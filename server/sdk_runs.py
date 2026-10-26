@@ -204,6 +204,14 @@ def take_lease(key: Any, project_dir: str, job_id: str) -> bool:
     return True
 
 
+def holds_lease(project_dir: str, job_id: str) -> bool:
+    """Whether an open run holds the lease on this job, so its release will return it."""
+    project_dir, job_id = str(project_dir or ""), str(job_id or "")
+    with _LOCK:
+        return any(lease["project_dir"] == project_dir and lease["job_id"] == job_id
+                   for record in _RELEASES.values() for lease in record["leases"])
+
+
 def settle_lease(project_dir: str, job_id: str) -> bool:
     """Drop the lease on a job a save node just completed or failed in memory.
 

@@ -1409,8 +1409,14 @@ def _install_bridge_prompt_queue_hooks() -> bool:
                     # The grace period counts from a prompt's end, not its start.
                     comfy_idle.note_busy()
                     if prompt_key:
+                        status = _status_from_task_done_call(args, kwargs)
                         try:
-                            _finalize_prompt_bridges(prompt_key, source="task_done")
+                            outcome = _run_outcome(status)[0]
+                        except Exception:
+                            logger.exception("Classifying the run outcome failed for %s", prompt_key)
+                            outcome = ""
+                        try:
+                            _finalize_prompt_bridges(prompt_key, source="task_done", outcome=outcome)
                         except Exception:
                             logger.exception("Bridge finalization failed from prompt queue task_done for %s", prompt_key)
                         # Before the release closes: the observer reads the run's
@@ -1423,7 +1429,7 @@ def _install_bridge_prompt_queue_hooks() -> bool:
                         # job inside finalization, and only then may a still-running
                         # leased job be returned to pending.
                         try:
-                            _release_prompt_run(prompt_key, _status_from_task_done_call(args, kwargs))
+                            _release_prompt_run(prompt_key, status)
                         except Exception:
                             logger.exception("Run release failed from prompt queue task_done for %s", prompt_key)
 
@@ -1665,7 +1671,9 @@ def _upgrade_bridge_placeholder_asset(project, source_asset: Asset) -> tuple[Ass
     return source_asset, False
 
 
-def _finalize_bridge_entry(entry: dict) -> list[Asset]:
+def _finalize_bridge_entry(entry: dict, outcome: str = "") -> list[Asset]:
+    """Register a Bridge's files. ``outcome`` is how the run ended (``_run_outcome``),
+    or empty when unknown (the watcher fallback)."""
     project = load_project(entry["project_dir"])
     _pre_item_ids = snapshot_item_ids(project)
     queue_job_id = str(entry.get("queue_job_id") or "")
@@ -1869,6 +1877,20 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
     elif registered_assets and entry.get("mark_queue_complete"):
         first_asset = registered_assets[0][1]
         changed = _mark_queue_job_completed(project, queue_job_id, first_asset.asset_id) or changed
+    elif (entry.get("mark_queue_complete") and not registered_assets and outcome in ("error", "interrupted")
+          and sdk_runs.holds_lease(entry.get("project_dir", ""), queue_job_id)):
+        # The run did not finish, so no files is not the Bridge's failure: leave
+        # the leased job running for the run's release to return it to pending
+        # with its note, as a direct Save Video run does. An unleased job keeps
+        # the old rule, since no release would return it.
+        logger.info(
+            "Bridge produced no files because the run ended %s; leaving queue job %s for its release. "
+            "prompt=%s node=%s",
+            outcome,
+            queue_job_id or "(none)",
+            entry.get("prompt_key"),
+            entry.get("bridge_node_id"),
+        )
     elif entry.get("mark_queue_complete") and not registered_assets:
         changed = _mark_queue_job_failed(project, queue_job_id, "Bridge terminal produced no files") or changed
     elif not registered_assets:
@@ -1943,7 +1965,7 @@ def _finalize_bridge_entry(entry: dict) -> list[Asset]:
     return [asset for _rel_path, asset in registered_assets]
 
 
-def _finalize_prompt_bridges(prompt_key: str, source: str = "unknown") -> None:
+def _finalize_prompt_bridges(prompt_key: str, source: str = "unknown", outcome: str = "") -> None:
     with _BRIDGE_REGISTRY_LOCK:
         entries = [
             dict(entry)
@@ -1965,7 +1987,7 @@ def _finalize_prompt_bridges(prompt_key: str, source: str = "unknown") -> None:
 
     for entry in entries:
         try:
-            _finalize_bridge_entry(entry)
+            _finalize_bridge_entry(entry, outcome)
         except Exception:
             logger.exception(
                 "Bridge finalization failed for prompt=%s node=%s",

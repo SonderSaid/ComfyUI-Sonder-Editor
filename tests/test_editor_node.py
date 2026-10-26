@@ -131,7 +131,7 @@ def test_execute_coerces_context_widgets_to_ints(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
 
     node = editor_node.SonderEditor()
@@ -218,7 +218,7 @@ def test_live_prompt_blockers_follow_output_demand_gate(
         lambda self, proj, scene, start, end, **_kwargs:
             torch.zeros(max(1, end - start), 2, 2, 3))
     monkeypatch.setattr(editor_node.SonderEditor, "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0))
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0))
     graph = None if demand == "unknown" else _prompt_graph({
         "editor": _prompt_node("SonderEditor"),
         "consumer": _prompt_node("Consumer", {
@@ -285,7 +285,7 @@ def _patch_render_and_audio(editor_node, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio((end - start) / 24.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio((end - start) / 24.0),
     )
 
 
@@ -1523,7 +1523,7 @@ def test_execute_emits_guide_strengths_and_empty_csvs(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -1795,7 +1795,7 @@ def test_execute_peeks_pending_queue_job_without_downstream_save(tmp_path, monke
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
 
     node = editor_node.SonderEditor()
@@ -1918,7 +1918,7 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -2040,7 +2040,7 @@ def test_consumed_queue_job_renders_snapshot_range(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
 
     result = editor_node.SonderEditor().execute(
@@ -2135,7 +2135,7 @@ def test_unmarked_save_with_active_queue_peeks_without_completion(tmp_path, monk
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
 
     result = editor_node.SonderEditor().execute(
@@ -2237,7 +2237,7 @@ def test_render_queue_inactive_ignores_terminal_save_queue(tmp_path, monkeypatch
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
 
     result = editor_node.SonderEditor().execute(
@@ -2392,7 +2392,7 @@ def test_no_active_queue_runs_full_scene(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
 
     result = editor_node.SonderEditor().execute(
@@ -2480,7 +2480,7 @@ def test_bridge_terminal_consumes_queue_job(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
 
     node = editor_node.SonderEditor()
@@ -2931,7 +2931,7 @@ def test_stale_running_job_recovered_on_second_execute(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
 
     node = editor_node.SonderEditor()
@@ -3711,7 +3711,7 @@ def test_execute_applies_guide_driver_collision_manifest(tmp_path, monkeypatch):
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, active_scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, active_scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -3787,7 +3787,7 @@ def test_collision_manifest_counts_the_driver_padding_tail(tmp_path, monkeypatch
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, active_scene, start, end: editor_node._make_silent_audio(1.0),
+        lambda self, proj, active_scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0),
     )
     monkeypatch.setattr(
         editor_node.SonderEditor,
@@ -3981,7 +3981,7 @@ def test_execute_padded_audio_tail_is_not_fabricated_silence(tmp_path, monkeypat
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end:
+        lambda self, proj, scene, start, end, **_kwargs:
             _ramp_audio(torch, int(((end - start) / 24.0) * 44100)),
     )
 
@@ -4481,7 +4481,7 @@ def test_queue_hooks_open_a_release_and_close_it_after_bridge_finalization(tmp_p
     calls = []
     queue = _install_hooks_on_fake_queue(io_nodes, monkeypatch, calls)
     monkeypatch.setattr(io_nodes, "_finalize_prompt_bridges",
-                        lambda key, source="": calls.append(("finalize", key)))
+                        lambda key, source="", outcome="": calls.append(("finalize", key)))
     original_release = io_nodes._release_prompt_run
     monkeypatch.setattr(io_nodes, "_release_prompt_run",
                         lambda key, status: (calls.append(("release", key)), original_release(key, status)))
@@ -4737,7 +4737,7 @@ def test_a_raising_task_done_still_releases_the_run(tmp_path, monkeypatch):
     monkeypatch.setattr(io_nodes, "_load_prompt_server_instance", lambda: types.SimpleNamespace(prompt_queue=queue))
     monkeypatch.setattr(io_nodes, "_BRIDGE_HOOKED_PROMPT_QUEUE_ID", None)
     assert io_nodes._install_bridge_prompt_queue_hooks()
-    monkeypatch.setattr(io_nodes, "_finalize_prompt_bridges", lambda key, source="": calls.append("finalize"))
+    monkeypatch.setattr(io_nodes, "_finalize_prompt_bridges", lambda key, source="", outcome="": calls.append("finalize"))
     monkeypatch.setattr(io_nodes, "_release_prompt_run", lambda key, status: calls.append("release"))
     queue.get()
     with pytest.raises(RuntimeError):
@@ -4833,7 +4833,7 @@ def test_post_frames_the_mask_now_preserves_make_color_drift_render(tmp_path, mo
     monkeypatch.setattr(
         editor_node.SonderEditor,
         "_load_scene_audio",
-        lambda self, proj, scene, start, end: editor_node._make_silent_audio((end - start) / 24.0),
+        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio((end - start) / 24.0),
     )
     monkeypatch.setattr(editor_node, "build_context_reference_stash", stash)
     prompt = _prompt_graph({

@@ -730,6 +730,111 @@ def test_bridge_uses_hidden_unique_id_and_backend_prompt_key(tmp_path, monkeypat
     assert entry["naming_stem"].startswith("Bridge_Test_")
 
 
+def _leased_bridge_run(tmp_path, monkeypatch, *, with_file=False, job_status="running", leased=True):
+    """A Bridge with Mark queue complete whose run leased job-1 of a 2-job batch."""
+    io_nodes, timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes, "schedule_project_event", lambda *args, **kwargs: None)
+    runs = importlib.import_module(f"{TEST_PACKAGE}.server.sdk_runs")
+    runs.reset_for_tests()
+    project.generation_queue = [
+        timeline_state.GenerationJob(job_id="job-1", scene_id="s", status=job_status, batch_id="b",
+                                     batch_index=0, batch_total=2),
+        timeline_state.GenerationJob(job_id="job-2", scene_id="s", status="pending", batch_id="b",
+                                     batch_index=1, batch_total=2),
+    ]
+    project._execution_context = {"queue_job_id": "job-1"}
+    project_manager.save_project(project)
+    output_dir, _ = io_nodes.SonderSaveBridge().prepare_output(
+        project, mark_queue_complete=True, prompt={}, unique_id="bridge-1")
+    if with_file:
+        _write_png(Path(output_dir) / "partial.png")
+    key = next(iter(io_nodes._BRIDGE_REGISTRY.keys()))[0]
+    runs.open_release(key, "prompt-x")
+    runs.note_project(key, project.project_dir, ["p"])
+    if leased:
+        runs.take_lease(key, project.project_dir, "job-1")
+    return io_nodes, project_manager, project, key
+
+
+def _end_run(io_nodes, key, status):
+    """What the task_done wrap does: finalize Bridges with the outcome, then release."""
+    io_nodes._finalize_prompt_bridges(key, source="task_done", outcome=io_nodes._run_outcome(status)[0])
+    io_nodes._release_prompt_run(key, status)
+
+
+def _queue_state(project_manager, project):
+    return {job.job_id: (job.status, job.error)
+            for job in _load_saved_project(project_manager, project).generation_queue}
+
+
+@pytest.mark.parametrize("messages,note", [
+    ([("execution_error", {"node_type": "KSampler"})], "The run failed in KSampler before this job completed."),
+    ([("execution_interrupted", {})], "The run was interrupted before this job completed."),
+])
+def test_a_bridge_run_that_errors_or_is_interrupted_returns_its_job_to_pending(tmp_path, monkeypatch, messages, note):
+    io_nodes, project_manager, project, key = _leased_bridge_run(tmp_path, monkeypatch)
+    _end_run(io_nodes, key, types.SimpleNamespace(status_str="error", messages=messages))
+    assert _queue_state(project_manager, project) == {"job-1": ("pending", note), "job-2": ("pending", "")}
+
+
+def test_an_unleased_job_keeps_the_old_rule_when_its_run_errors(tmp_path, monkeypatch):
+    # No release would return an unleased job, so failing it stays the visible outcome.
+    io_nodes, project_manager, project, key = _leased_bridge_run(tmp_path, monkeypatch, leased=False)
+    _end_run(io_nodes, key, types.SimpleNamespace(status_str="error", messages=[("execution_interrupted", {})]))
+    assert _queue_state(project_manager, project)["job-1"] == ("failed", "Bridge terminal produced no files")
+
+
+def test_a_bridge_run_that_succeeds_without_files_still_fails_its_job(tmp_path, monkeypatch):
+    io_nodes, project_manager, project, key = _leased_bridge_run(tmp_path, monkeypatch)
+    _end_run(io_nodes, key, types.SimpleNamespace(status_str="success", messages=[]))
+    state = _queue_state(project_manager, project)
+    assert state["job-1"] == ("failed", "Bridge terminal produced no files")
+    assert state["job-2"][0] == "failed"
+
+
+def test_bridge_files_complete_the_job_even_when_the_run_is_interrupted_after(tmp_path, monkeypatch):
+    io_nodes, project_manager, project, key = _leased_bridge_run(tmp_path, monkeypatch, with_file=True)
+    _end_run(io_nodes, key, types.SimpleNamespace(status_str="error", messages=[("execution_interrupted", {})]))
+    assert _queue_state(project_manager, project)["job-1"][0] == "completed"
+
+
+def test_a_job_the_editor_already_failed_stays_failed_through_bridge_finalization(tmp_path, monkeypatch):
+    io_nodes, project_manager, project, key = _leased_bridge_run(tmp_path, monkeypatch, job_status="failed")
+    _end_run(io_nodes, key, types.SimpleNamespace(status_str="error",
+                                                  messages=[("execution_error", {"node_type": "SonderEditor"})]))
+    assert _queue_state(project_manager, project)["job-1"][0] == "failed"
+
+
+def test_the_task_done_hook_passes_the_run_outcome_to_bridge_finalization(tmp_path, monkeypatch):
+    seen = []
+
+    class FakePromptQueue:
+        currently_running = {}
+
+        def get(self):
+            return ((0, "prompt-err", {}, {}, []), "prompt-err")
+
+        def task_done(self, item_id, *_args, **_kwargs):
+            return item_id
+
+    fake_queue = FakePromptQueue()
+    fake_server = types.ModuleType("server")
+    fake_server.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(prompt_queue=fake_queue))
+    monkeypatch.setitem(sys.modules, "server", fake_server)
+    sys.modules.pop(f"{TEST_PACKAGE}.nodes.io_nodes", None)
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_finalize_prompt_bridges",
+                        lambda key, source="unknown", outcome="": seen.append((key, source, outcome)))
+    monkeypatch.setattr(io_nodes, "_release_prompt_run", lambda *args, **kwargs: None)
+    assert io_nodes._install_bridge_prompt_queue_hooks() is True
+    fake_queue.task_done("prompt-err", None,
+                         types.SimpleNamespace(status_str="error", messages=[("execution_interrupted", {})]))
+    assert seen == [("prompt-err", "task_done", "interrupted")]
+
+
 def test_bridge_uses_prompt_queue_task_done_hook(tmp_path, monkeypatch):
     prompt = {
         "editor-1": {
