@@ -7,7 +7,7 @@
 // (Sonder App), already filtered and never greyed out.
 import { mountWorkflowDescription } from "./controls_workflow_description.js";
 import { mountCleanup } from "./controls_cleanup.js";
-import { mountPresetsManage } from "./controls_presets_manage.js";
+import { mountModesManage } from "./controls_modes_manage.js";
 import { mountViewsManage } from "./controls_views_manage.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { groupNameError } from "./control_targets.js";
@@ -103,7 +103,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     noteBox.style.cssText = `display:none;flex-direction:column;gap:${SPACE.s1}px;`;
     footer.append(addSetting, addNote, addGroup);
     const description = mountWorkflowDescription(host, { track });
-    const presets = mountPresetsManage(host, {track, notify, flushPending, changed});
+    const modes = mountModesManage(host, {track, notify, flushPending, changed});
     const views = mountViewsManage(host, {track, notify});
     const cleanup = mountCleanup(host, {track, notify, flushPending});
     // What Export (API) would leave out: settings and switches whose nodes are
@@ -114,7 +114,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         + `padding:${SPACE.s1 + 2}px ${SPACE.s2}px;border:1px solid ${COLORS.warningBorder};border-radius:${RADIUS.r2}px;background:${COLORS.warningSoft};`;
     // The action row comes first, so "+ Setting" opens its picker below it.
     // The note editor opens right under its button, above an open picker.
-    el.append(description.el, readiness, presets.el, views.el, footer, noteBox, heading, filterInput, banner, list, cleanup.el);
+    el.append(description.el, readiness, modes.el, views.el, footer, noteBox, heading, filterInput, banner, list, cleanup.el);
 
     function apply(changes, button) {
         return track(applyNow(changes, button), changes);
@@ -135,7 +135,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         if (destroyed) return false;
         if (button) setButtonDisabled(button, false);
         if (!result?.ok) notify(result?.rejected?.[0]?.reason || "The change could not be saved.");
-        else if (affected.length) notify(`Rebound Control belongs to: ${affected.map(p => p.name).join(", ")}. Review their captured values in Manage.`);
+        else if (affected.length) notify(`Rebound Control is in these choices: ${affected.map(p => p.name).join(", ")}. Review their captured values in Manage.`);
         render();
         return !!result?.ok;
     }
@@ -179,7 +179,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         title.style.cssText = `font-weight:${TYPE.fwBold};color:${COLORS.warningText};`;
         const names = off.slice(0, 6).map(item => `“${item.label}”`).join(", ") + (off.length > 6 ? ` and ${off.length - 6} more` : "");
         const body = make("div", `${names} ${off.length === 1 ? "is" : "are"} on nodes that are off now, so an export leaves them out. `
-            + "Enable them before Export (API) so the Sonder App can set and switch them. Presets keep your disabled setups.");
+            + "Enable them before Export (API) so the Sonder App can set and switch them. Modes keep your switched-off setups.");
         readiness.replaceChildren(title, body);
     }
 
@@ -215,7 +215,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         if (destroyed) return;
         lastView = view;
         description.render(view);
-        presets.render(view);
+        modes.render(view);
         views.render(view);
         cleanup.render(view);
         renderReadiness(view);
@@ -472,22 +472,26 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         el,
         render,
         setRebind,
-        memberControl: spec => presets.memberControl(spec),
-        canLeave: () => { if (cleanup.busy) { notify("Wait for cleanup to finish."); return false; } return presets.canLeave(); },
+        memberControl: spec => modes.memberControl(spec),
+        canLeave: () => { if (cleanup.busy) { notify("Wait for cleanup to finish."); return false; } return modes.canLeave(); },
+        revealModes: () => modes.revealModes(),
         addNote: group => openDraft(typeof group === "string" ? group : ""),
         addGroup: then => openGroupDraft(typeof then === "function" ? then : null),
         get rebinding() { return rebind?.binding_id || null; },
-        // An unsaved note or description draft (a preset draft asks in canLeave).
+        // An unsaved note or description draft (a category or choice draft asks in canLeave).
         get hasDraft() { return !!draft || !!description.dirty; },
-        get presetSaving() { return presets.busy || cleanup.busy; },
-        get editing() { return !!draft || cleanup.editing || presets.editing || views.editing || description.editing || document.activeElement === filterInput; },
+        get modesSaving() { return modes.busy || cleanup.busy; },
+        // Done waits for queued Modes writes rather than refusing the click.
+        get modesQueued() { return modes.busy; },
+        whenIdle: () => modes.whenIdle(),
+        get editing() { return !!draft || cleanup.editing || modes.editing || views.editing || description.editing || document.activeElement === filterInput; },
         destroy() {
             destroyed = true;
             clearTimeout(filterTimer);
             if (draft) closeDraft(false);
             unregister();
             description.destroy();
-            presets.destroy();
+            modes.destroy();
             views.destroy();
             cleanup.destroy();
             el.remove();

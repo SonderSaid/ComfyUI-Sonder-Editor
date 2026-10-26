@@ -310,22 +310,25 @@ export function setButtonVariant(button, variant = "secondary", options = {}) {
     // express `:disabled`, so without this a disabled control still lights up
     // on hover and depresses on click — it reads as an enabled button that
     // silently does nothing, which is exactly how it gets reported as broken.
+    // `aria-disabled` counts too: a button that keeps focus while busy (the
+    // Modes choices) cannot use `disabled`, which would blur it.
+    const inert = () => button.disabled || button.getAttribute?.("aria-disabled") === "true";
     button.onmouseenter = () => {
-        if (button.disabled) return;
+        if (inert()) return;
         button.style.background = palette.hoverBackground;
     };
     button.onmouseleave = () => {
-        if (button.disabled) return;
+        if (inert()) return;
         button.style.background = palette.background;
         button.style.color = palette.text;
     };
     button.onmousedown = () => {
-        if (button.disabled) return;
+        if (inert()) return;
         button.style.background = palette.activeBackground;
         button.style.color = palette.activeText;
     };
     button.onmouseup = () => {
-        if (button.disabled) return;
+        if (inert()) return;
         button.style.background = palette.hoverBackground;
         button.style.color = palette.text;
     };

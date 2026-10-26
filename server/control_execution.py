@@ -260,7 +260,7 @@ def coerce_mode(descriptor: dict, field: str, raw: Any, *, expanded: bool) -> An
         raise ControlValueError("This target is unavailable. Refresh the Controls panel.")
     paths = {m["path"] for m in descriptor.get("members", [])}
     if not isinstance(raw, dict) or set(raw) != paths or any(mode not in cm.EXECUTION_MODES for mode in raw.values()):
-        raise ControlValueError("The group's nodes changed. Update the preset.")
+        raise ControlValueError("The group's nodes changed. Update the choice in Manage.")
     return dict(raw)
 
 

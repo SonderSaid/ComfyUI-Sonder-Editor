@@ -1,4 +1,6 @@
 // Standalone host adapters; callers own identity and connection lifecycle.
+import { freshWithin } from "./controls_fresh_view.js";
+
 const idle = () => ({ state: "idle", bindings: [], notes: [], error: null });
 // The Sonder App has no graph to add a Relay to: Manage adds app-only Controls.
 const SDK_EMPTY = "This workflow exposes no Controls. Choose Manage to add some for this app.";
@@ -18,7 +20,9 @@ export function createSdkControlsHost(owner) {
         read = null,
         reread = false,
         manage = { on: false, filter: "" },
-        tail = Promise.resolve();
+        tail = Promise.resolve(),
+        // Counts views adopted from the server, so freshView can tell its own read landed.
+        adoptions = 0;
     const listeners = new Set();
     const emit = () => {
         for (const cb of listeners) cb(view);
@@ -29,6 +33,7 @@ export function createSdkControlsHost(owner) {
         if (Number(payload.seq) >= seq) {
             seq = Number(payload.seq);
             view = { ...payload.view, state: "ready", error: payload.view?.error || null };
+            adoptions++;
             emit();
         }
     };
@@ -47,8 +52,8 @@ export function createSdkControlsHost(owner) {
         if (!response.ok) owner._noteRefusal(result);
         return result;
     };
-    async function refresh() {
-        if (destroyed || (!visible && !viewsDemand)) return view;
+    async function refresh(force = false) {
+        if (destroyed || (!visible && !viewsDemand && !force)) return view;
         if (read) {
             reread = true; // a Manage change during a read needs a fresh one
             return read;
@@ -109,6 +114,16 @@ export function createSdkControlsHost(owner) {
             if (viewsDemand) void refresh();
         },
         refresh,
+        // The session's Controls read after this call: a read already running
+        // started before it, so it is awaited first and never counts.
+        freshView(options) {
+            return freshWithin(() => view, async () => {
+                if (read) await read;
+                const before = adoptions;
+                const next = await refresh(true);
+                return adoptions > before ? next : null;
+            }, options);
+        },
         applyChanges(changes) {
             const owned = { ...changes };
             // The workflow this edit was made on, whatever happens while it queues.
@@ -140,7 +155,7 @@ export function createSdkControlsHost(owner) {
         async flush() {
             await tail;
         },
-        // The Sonder App's Workflow menu (controls_presets.js renders it).
+        // The Sonder App's Workflow menu (controls_workflow_header.js renders it).
         workflows: {
             current: () => ({ template_id: owner.templateId, name: owner.templateName }),
             busy: () => !!owner.busy,
@@ -181,7 +196,9 @@ export function createMountedControlsHost({
         posting = 0,
         reporting = null,
         reportRequested = false,
-        postTail = Promise.resolve();
+        postTail = Promise.resolve(),
+        // Counts publications adopted, so freshView can tell its own read landed.
+        adoptions = 0;
     const listeners = new Set(),
         waiting = new Map(),
         seen = new Set();
@@ -257,6 +274,7 @@ export function createMountedControlsHost({
                     // The canvas publishes an error view when it cannot send its controls.
                     const error = payload.view.error || null;
                     view = { ...payload.view, state: error ? "error" : "ready", error };
+                    adoptions++;
                     emit();
                 } else {
                     seq = 0;
@@ -322,6 +340,17 @@ export function createMountedControlsHost({
             void report();
         },
         refresh,
+        // The canvas's publication read after this call. A publication the
+        // canvas marked `view_stale` (its describe after a write was not
+        // adopted) is not fresh: it may predate the write it acknowledges.
+        freshView(options) {
+            return freshWithin(() => view, async () => {
+                if (read) await read;
+                const before = adoptions;
+                const next = await refresh(true);
+                return adoptions > before ? next : null;
+            }, options);
+        },
         presence(payload = {}) {
             if (payload.host_id && payload.host_id !== hostId) return;
             const next = String(payload.host?.session_id || "");

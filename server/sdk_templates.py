@@ -599,7 +599,7 @@ def export_curated(template_id: str) -> bytes:
         if generate_refusals(view):
             raise TemplateError(" ".join(generate_refusals(view)), "invalid_controls")
         if len(view.get("_presets", {})) > cm.MAX_PRESETS:
-            raise TemplateError("At most 32 presets fit in one workflow. Remove an app preset before exporting.", "invalid_controls")
+            raise TemplateError("At most 32 choices fit in one workflow. Delete an app choice before exporting.", "invalid_controls")
         if len(view.get("_preset_categories", {})) > cm.MAX_PRESET_CATEGORIES:
             raise TemplateError(f"At most {cm.MAX_PRESET_CATEGORIES} categories fit in one workflow. Delete one before exporting.",
                                 "invalid_controls")
@@ -1239,7 +1239,7 @@ def _check_manifest_projection(prompt, data, describe=None):
             and not control_views.stored_views(data)):
         return
     if len(effective) > cm.MAX_PRESETS:
-        raise TemplateError("At most 32 presets fit in one workflow. Remove an app preset before replacing this workflow.", "invalid_controls")
+        raise TemplateError("At most 32 choices fit in one workflow. Delete an app choice before replacing this workflow.", "invalid_controls")
     if len(categories) > cm.MAX_PRESET_CATEGORIES:
         raise TemplateError(f"At most {cm.MAX_PRESET_CATEGORIES} categories fit in one workflow. Delete one first.", "invalid_controls")
     projected_prompt = copy.deepcopy(prompt or {})

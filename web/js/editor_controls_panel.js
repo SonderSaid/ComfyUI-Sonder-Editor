@@ -1,5 +1,7 @@
 import { mountRestore } from "./controls_restore.js";
-import { mountPresets } from "./controls_presets.js";
+import { mountWorkflowHeader } from "./controls_workflow_header.js";
+import { mountModes } from "./controls_modes.js";
+import { placeInOrder } from "./controls_dom_order.js";
 import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
 import { mountRowsEditor, NO_ROWS_NOTICE } from "./controls_rows_editor.js";
 import { mountExecutionRow, switchScope } from "./controls_execution_row.js";
@@ -64,25 +66,6 @@ const setShown = (el, shown) => {
     if (!shown) el.style.display = "none";
     else if (el.style.display === "none") el.style.display = "";
 };
-
-// Puts `wanted` in order inside `body` without moving the element that holds
-// focus: moving it blurs it, which ends a rename or discards a draft. Its
-// siblings move around it instead.
-function placeInOrder(body, wanted) {
-    const active = document.activeElement;
-    const anchor = wanted.find(el => el.parentElement === body && el.contains(active));
-    if (!anchor) {
-        for (const el of wanted) body.append(el);
-        return;
-    }
-    const at = wanted.indexOf(anchor);
-    for (const el of wanted.slice(0, at)) anchor.before(el);
-    let previous = anchor;
-    for (const el of wanted.slice(at + 1)) {
-        previous.after(el);
-        previous = el;
-    }
-}
 
 export function mountControlsPanel(container, host) {
     const panelId = ++nextPanel,
@@ -202,20 +185,25 @@ export function mountControlsPanel(container, host) {
     const quietRow = make("div");
     quietRow.style.cssText = `flex-wrap:wrap;align-items:baseline;column-gap:${SPACE.s3}px;row-gap:${SPACE.s1}px;`;
     quietRow.append(quietLine, notesLine);
-    const presets = mountPresets(host, {flushPending: () => flushPending(), track, notify: reason => warning(reason),
+    const workflowHeader = mountWorkflowHeader(host, {flushPending: () => flushPending(), notify: reason => warning(reason),
         // Switching workflows remounts the panel: Manage drafts would be lost.
         canSwitch: () => {
-            if (restore.busy || manage?.presetSaving) {
+            if (restore.busy || manage?.modesSaving) {
                 warning("Wait for the Manage change to save, then switch workflows.");
                 return false;
             }
             return !manage || (manage.canLeave() && (!manage.hasDraft
                 || globalThis.confirm("Discard your unsaved Manage edits and switch workflows?")));
         }});
+    // Modes above the Individual Controls; a choice applies through the host.
+    const modes = mountModes(host, {flushPending: () => flushPending(), track, notify: (reason, detail) => warning(reason, detail),
+        inform: message => host.inform?.(message),
+        openManage: () => { setManage(true); manage?.revealModes(); }});
     header.append(headerTop);
     container.append(header);
-    header.after(presets.el);
-    presets.el.after(quietRow);
+    header.after(workflowHeader.el);
+    workflowHeader.el.after(modes.el);
+    modes.el.after(quietRow);
     const restore = mountRestore(host, {flushPending: () => flushPending(), track: work => track(work),
         notify: reason => warning(reason), rebind: row => { setManage(true); manage?.setRebind(row); }});
     header.after(restore.el);
@@ -229,7 +217,7 @@ export function mountControlsPanel(container, host) {
     mainDrop.dataset.panelDropGroup = "";
     mainDrop.style.cssText = `font-size:${TYPE.t11}px;color:${COLORS.textSecondary};padding:${SPACE.s1}px 0;grid-column:1 / -1;`;
     container.append(message, editorGroup.el, workflowBody);
-    const warning = reason => host.notify?.(reason || "The change could not be saved.");
+    const warning = (reason, detail) => host.notify?.(reason || "The change could not be saved.", detail);
 
     function writeSetting(key, value) {
         try {
@@ -651,7 +639,7 @@ export function mountControlsPanel(container, host) {
                 if (destroyed) return false;
                 if (button) button.disabled = false;
                 if (!result?.ok) warning(result?.rejected?.[0]?.reason);
-                else if (affected.length) warning(`Removed Control is still a member of: ${affected.map(p => p.name).join(", ")}. Repair in Manage.`);
+                else if (affected.length) warning(`Removed Control is still in these choices: ${affected.map(p => p.name).join(", ")}. Repair them in Manage.`);
                 render();
                 return !!result?.ok;
             });
@@ -1282,7 +1270,8 @@ export function mountControlsPanel(container, host) {
         const empty = !allSpecs.some(d => manageOn || !d.hidden);
         restore.render(view);
         manage?.render(view);
-        presets.render(view, manageOn);
+        workflowHeader.render(view, {manage: manageOn});
+        modes.render(view, {manage: manageOn, query});
         const entries = [];
         for (const spec of [...(view.bindings || []), ...(view.notes || []), ...(view.execution || []).map(d => ({ ...d, source: "execution" }))]) {
             const source = sourceOf(spec);
@@ -1448,9 +1437,21 @@ export function mountControlsPanel(container, host) {
                 ? query && !shownTotal && !editorVisible ? `No settings match “${query.trim()}”. Search looks at names, groups and choices.` : ""
                 : view.state === "ready" ? host.emptyMessage || CANVAS_EMPTY : "Loading controls…");
     }
+    let closing = null;
     function setManage(on) {
         if (destroyed || on === manageOn) return;
         if (restore.busy) return;
+        // Done while a Modes write is queued (often by the blur this press
+        // caused): close once the queue settles, instead of dropping the click.
+        if (!on && manage?.modesQueued) {
+            if (closing) return;
+            const waiting = manage;
+            closing = waiting.whenIdle().catch(() => {}).then(() => {
+                closing = null;
+                if (manage === waiting) setManage(false);
+            });
+            return;
+        }
         if (!on && manage?.canLeave && !manage.canLeave()) return;
         if (!on) {
             for (const row of rows.values()) if (row.renameInput) closeRename(row, true);
@@ -1546,7 +1547,7 @@ export function mountControlsPanel(container, host) {
     // Saves the focused field or note, then waits for every save. Only a
     // run-value save still in flight now can refuse the caller's run: an
     // older refusal already reverted its row to the stored value. Saves
-    // started after the call (a tracked preset apply) are not awaited.
+    // started after the call (a tracked choice apply) are not awaited.
     async function flushPending() {
         // A focused row-list field commits on blur, before the snapshot.
         for (const row of rows.values()) row.editor?.flush();
@@ -1583,7 +1584,8 @@ export function mountControlsPanel(container, host) {
             destroyed = true;
             container.removeEventListener("mouseover", valueTitle);
             arrangement.destroy();
-            presets.destroy();
+            workflowHeader.destroy();
+            modes.destroy();
             restore.destroy();
             for (const row of rows.values()) {
                 row.picker?.destroy();

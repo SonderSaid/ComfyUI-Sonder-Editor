@@ -417,7 +417,7 @@ export function applyPresetEdit(manifest, id, field, value) {
     // A View is inspection only: never a preset member (server _capture_preset).
     const views = readViews(manifest.views).items;
     if ((field === "create" || field === "capture") && Object.keys(value?.members || {}).some(member => Object.hasOwn(views, member)))
-        throw new Error("A View can't be part of a preset.");
+        throw new Error("A View can't be part of a choice.");
     if (field === "create" || field === "capture") presets[id] = structuredClone(value);
     else if (field === "remove") {
         delete presets[id];
@@ -425,16 +425,16 @@ export function applyPresetEdit(manifest, id, field, value) {
         dropChoiceFromCategories(manifest, id);
     }
     else if (field === "name" || field === "description") {
-        if (!readPresets(presets)[id]) throw new Error("This preset no longer exists.");
+        if (!Object.hasOwn(readPresets(presets), id)) throw new Error("This choice no longer exists.");
         presets[id][field] = value;
     } else if (field === "move") {
         const valid = readPresets(presets);
         const ordered = Object.keys(valid).sort((a, b) => valid[a].order - valid[b].order).filter(key => key !== id);
-        if (!valid[id] || (value.before != null && !ordered.includes(value.before))) throw new Error("This preset moved. Refresh Controls.");
+        if (!valid[id] || (value.before != null && !ordered.includes(value.before))) throw new Error("This choice moved. Refresh Controls.");
         ordered.splice(value.before == null ? ordered.length : ordered.indexOf(value.before), 0, id);
         ordered.forEach((key, order) => { presets[key].order = order; });
-    } else throw new Error("This preset edit is unavailable.");
-    if (field !== "remove" && !readPresets(presets)[id]) throw new Error("The preset would exceed its name, member or 32-preset cap.");
+    } else throw new Error("This choice edit is unavailable.");
+    if (field !== "remove" && !Object.hasOwn(readPresets(presets), id)) throw new Error("The choice would exceed its name, setting or 32-choice cap.");
 }
 
 // The saved categories (Controls Modes), tolerant like
@@ -886,7 +886,7 @@ export function applyCleanupPlan(manifest, plan) {
     for (const row of plan.preset_members || []) {
         const preset = manifest.presets?.[row.preset_id];
         const table = row.execution_id ? "execution" : "members";
-        if (!isPlainObject(preset?.[table])) throw new Error("The preset changed. Reopen the cleanup review.");
+        if (!isPlainObject(preset?.[table])) throw new Error("The choice changed. Reopen the cleanup review.");
         delete preset[table][row.execution_id || row.binding_id];
         const left = table === "members" ? preset.execution : preset.members;
         if (!Object.keys(preset[table]).length && !(isPlainObject(left) && Object.keys(left).length)) {

@@ -5,9 +5,10 @@ from pathlib import Path
 
 import pytest
 from test_controls_host_canvas_js import HARNESS
-from test_controls_presets_js import PRELUDE
+from test_controls_panel_js import SCRIPT
 
 ROOT = Path(__file__).resolve().parents[1]
+PRELUDE = SCRIPT[:SCRIPT.index("if(SCENARIO==='markdown')")]
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -59,7 +60,7 @@ const cleanup=mountCleanup(host,{track:p=>{tracked.push(p);return p;},notify:m=>
 document.body.append(cleanup.el);cleanup.render();
 const button=text=>walk(cleanup.el).find(n=>n.tagName==='BUTTON'&&n.textContent===text);
 button('Clean up unavailable…').dispatch('click');assert.equal(calls.length,0);assert.equal(cleanup.editing,true);
-assert.match(cleanup.el.textContent,/Replace back/);assert.match(cleanup.el.textContent,/last member/);
+assert.match(cleanup.el.textContent,/Replace back/);assert.match(cleanup.el.textContent,/last setting also deletes that choice/);assert.match(cleanup.el.textContent,/Settings in choices/);
 const checks=walk(cleanup.el).filter(n=>n.tagName==='INPUT');assert.ok(checks.every(c=>c.checked));
 checks[0].checked=false;checks[0].dispatch('change');assert.equal(checks[2].disabled,true);
 checks[3].checked=false;

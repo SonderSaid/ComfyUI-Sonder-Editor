@@ -238,7 +238,7 @@ def test_views_never_enter_presets_provenance_or_seeds():
     prompt["90"] = relay({"a": view_entry("9")}, bindings={"seed": {"label": "", "status": "ok", "targets": [{"path": "6", "input": "seed"}]}})
     view = describe(prompt, authoring={})
     _, rejected = cd.validate_binding_changes(view, {"preset:p1:create": {"name": "P", "members": ["a"]}}, prompt=prompt, structural="canvas")
-    assert rejected and "View can't be part of a preset" in rejected[0]["reason"]
+    assert rejected and "View can't be part of a choice" in rejected[0]["reason"]
     # Controls at run: a saved asset's provenance names its settings, never a View.
     prompt["9"]["inputs"]["images"] = ["6", 0]
     snapshot = controls_snapshot.controls_snapshot(prompt, ["9"], class_lookup=CLASSES.get)

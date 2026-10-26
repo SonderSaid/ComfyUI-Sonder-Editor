@@ -71,7 +71,7 @@ What you can do from the editor:
 | Describe what happens | [Global text and timed Prompt sections](docs/prompts.md), from a plain text field to structured instructions |
 | Guide the result | [Guides and Drivers](docs/generating.md#guides), or [reusable References](docs/references.md) staged where they apply |
 | Choose what to generate or change | [In/Out, surrounding context and picture/sound masks](docs/generating.md#the-generation-window) |
-| Generate, review and try again | Workflow [Controls and presets](docs/controls.md), [takes](docs/assets-and-gallery.md#takes), [inspection and A/B comparison](docs/assets-and-gallery.md#compare-mode) |
+| Generate, review and try again | Workflow [Controls and Modes](docs/controls.md), [takes](docs/assets-and-gallery.md#takes), [inspection and A/B comparison](docs/assets-and-gallery.md#compare-mode) |
 | Prepare several generations | The [Render Queue and Batch](docs/generating.md#the-render-queue) controls |
 | Export the finished scene | [Timeline Export](docs/assets-and-gallery.md#export-timeline), which combines the arranged picture and sound into a file |
 | Generate from a page of its own | The [Sonder App](docs/sonder-app.md) (experimental, optional) |
@@ -241,7 +241,7 @@ on Hugging Face, the project behind the western showcase, and needs Sonder
 Editor 0.6.0 or newer.
 
 **[Sonder LTX 2.5 Edit & VFX](example_workflows/sonder_ltx_2_5_edit_vfx.json)** —
-LTX 2.5 editing and effects, each one a **Preset** in [Controls](docs/controls.md):
+LTX 2.5 editing and effects, each one a choice in [Modes](docs/controls.md#modes):
 edit footage with a prompt or an edited picture, remove people, make a subject
 mask, follow a video's layout, body movement or outlines, add sound to a video,
 or make new video and sound. Its notes in Controls list the node packs and model
@@ -267,7 +267,7 @@ version and opening instructions, is on
   lanes and recipes, Reference prompting, and the Reference nodes.
 - **[Assets & Gallery](docs/assets-and-gallery.md)** — asset lifecycle,
   tracked metadata, takes, inspect/compare, timeline export, and audio fidelity.
-- **[Controls](docs/controls.md)** — workflow settings and presets in the
+- **[Controls](docs/controls.md)** — workflow settings and Modes in the
   editor, Manage, and sharing Controls.
 - **[Sonder App](docs/sonder-app.md)** (experimental, optional) — setup, the
   Launcher, and generating without the canvas.

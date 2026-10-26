@@ -5,7 +5,7 @@ import { register, PRIORITY } from "./keyboard_ownership.js";
 const GROUPS = {
     bindings: "Missing Controls", suggestions: "Exposed before",
     definition_anchors: "Anchors inside subgraphs", values: "Saved values from earlier versions of this workflow",
-    hidden: "Hidden items no longer in the workflow", execution: "Missing node switches", preset_members: "Preset members",
+    hidden: "Hidden items no longer in the workflow", execution: "Missing node switches", preset_members: "Settings in choices",
 };
 let nextId = 0;
 const make = (tag, text) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; return el; };
@@ -59,7 +59,7 @@ export function mountCleanup(host, {track = work => work, notify = () => {}, flu
         const view = host.getView();
         if (!ready(view) || busy) return;
         opened = true;
-        const intro = make("div", "Only checked items will be removed. Kept preset members remain repairable in Manage. Removing a preset’s last member also deletes that preset.");
+        const intro = make("div", "Only checked items will be removed. Kept settings stay repairable in Manage. Removing a choice’s last setting also deletes that choice.");
         intro.style.cssText = `font-size:${TYPE.t11}px;color:${COLORS.textSecondary};overflow-wrap:anywhere;`;
         const restoreCount = view.restore?.restorable?.length || 0;
         if (restoreCount) intro.textContent += ` ${restoreCount} Controls can be reconnected instead — use Restore Controls.`;

@@ -886,6 +886,9 @@ def _prepare_control_publication(body: Any) -> dict:
     if view.get("views_error") is not None and not isinstance(view["views_error"], str):
         raise ValueError("The Views error must be text.")
     _check_publication_categories(view)
+    # The canvas marks a view whose describe after its writes was not adopted.
+    if "view_stale" in view and not isinstance(view["view_stale"], bool):
+        raise ValueError("The stale view flag must be boolean.")
     if len(view.get("candidates") or []) > control_descriptors.MAX_CANDIDATES:
         raise ValueError("Too many candidates.")
     if "candidates_truncated" in view and not isinstance(view["candidates_truncated"], bool):

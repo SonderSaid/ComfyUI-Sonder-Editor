@@ -4870,7 +4870,10 @@ export class EditorWidget {
             getEditorSettings: () => this._settings,
             // Typed and whitelisted (editor_settings.js): throws on a refused value.
             setEditorSetting: (key, value) => this._updateSettings(controlsPanelSettingPatch(key, value)),
-            notify: message => notifyWarning(message, { source: "controls-save" }),
+            // A thrown error's text rides in `detail`, never in the message.
+            notify: (message, detail) => notifyWarning(message, { source: "controls-save", detail: detail || null }),
+            // What a Modes choice also changed. One source: a click builds one whole message.
+            inform: message => notifyInfo(message, { source: "controls-modes" }),
         });
     }
 

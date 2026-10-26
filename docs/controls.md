@@ -21,7 +21,7 @@ A workflow without Controls says *No Controls yet*. Click
 [Manage](#manage) and add a setting; on the canvas, the editor adds the
 **Sonder Control Relay** node to the graph for you (one per workflow).
 
-For a workflow that already has Controls, presets and notes, open
+For a workflow that already has Controls, [Modes](#modes) and notes, open
 **Sonder LTX 2.5 Edit & VFX** from [Examples](../README.md#examples).
 
 ## Change a setting
@@ -39,8 +39,8 @@ A setting that can't be used — its node was removed or is linked to another
 node — says why and is skipped, so the workflow's own value runs.
 
 To see only the settings, click **Hide notes** in the small line near the top
-of the Controls tab, under the search box (and under the **Preset** picker when
-the workflow has presets). The workflow's notes disappear, both the standalone
+of the Controls tab, under the search box (and under the **Modes** table when
+the workflow has one). The workflow's notes disappear, both the standalone
 ones and the ones under a setting; it then reads **2 notes hidden** (your
 count), which you click to bring them back. Settings the workflow marks Advanced start
 hidden the same way: the line reads **1 advanced hidden** (your count); click
@@ -76,27 +76,79 @@ reverts the switch.
 
 To add one, see [Manage](#manage).
 
-## Presets
+## Modes
 
-A preset is a named set of Controls that sets up one job (text-to-video,
-detailing, and so on) in one choice. It can include switches: for example, a
-**Skip first pass** preset that sets the second pass's input and mutes the
-first pass's group. Its values and switches apply together, as one Undo step
-on the canvas.
+A workflow can group whole setups into **Modes**. Each row of the **Modes**
+table is a **category**, such as *Task* or *Look*, and its buttons are the
+**choices** in it, such as *Text to video* and *Image to video*. One choice
+sets several Controls at once, and can switch nodes on and off too: for
+example, a **Skip** choice in a *First pass* category that mutes the first
+pass's group and sets the second pass's input. A Mode is not a node switch's
+**Enabled** / **Muted** / **Bypassed**: those are single
+[switches](#switch-nodes-and-groups-on-and-off).
 
-- **Apply one:** choose it in the **Preset** picker near the top of the
-  Controls tab (below the workflow description). Controls outside the preset
-  keep their values. The picker reads **Custom** once you change a member.
-- **Create one:** click **Manage**, then **+ Preset**. Tick **In preset** on
-  each Control it should set, then click **Create**.
-- **Update one:** in **Manage**, choose the preset and click **Update from
-  current values**.
+### Choose a choice
 
-A preset whose Control is gone or refused is greyed out and names it; fix it
-in **Manage**. So is a preset whose group switch now covers different nodes:
-choose it in **Manage** and click **Update from current values**. Presets are saved in the workflow and in its API export. In the
-Sonder App, editing a preset keeps your copy when you re-import the workflow;
-**Reset to workflow's version** brings back the imported one.
+1. [Open the Controls tab](#open-the-controls-tab). The **Modes** table is at
+   the top, above the **Individual Controls** heading.
+2. Click a choice's button. Its Controls change together; Controls outside the
+   choice keep their values. On the canvas, one Undo reverts it.
+
+- The highlighted button is the choice whose values the Controls hold now. If
+  you change one of those Controls by hand, the row reads **Custom** and no
+  button is highlighted.
+- Hover over a button, or Tab to it, for a short description. Click **?** on
+  the row for the full descriptions of the category and its choices.
+- A choice can change another row too, when both set the same Control. A
+  notice then says what else changed, for example *“Remove People” also set
+  Edit to “Video only”; Look is now Custom.*
+- A greyed choice can't be used now (a Control it sets is gone or refused):
+  click it to see why, and fix it in **Manage**.
+- Two outlined buttons with *“A” and “B” both match* mean the workflow's
+  author gave two choices the same values: fix it in **Manage** (see below).
+- A row reading **Unavailable** has no usable choice.
+
+The table is hidden while you search, and while **Manage** is open.
+
+### Make Modes
+
+1. Click **Manage** at the top right of the Controls tab. The **Modes**
+   section is at the top.
+2. Click **+ Category** at the bottom of the **Modes** section, under
+   **Not in a category**. Type its name (and a description if you like), then
+   click **Create**.
+3. Click **+ Choice** under the category and type the choice's name. Each
+   setting and switch in the Controls tab now has an **In this choice**
+   checkbox: set each Control to the value this choice should give it, tick
+   its **In this choice**, then click **Create**. Add at least two choices.
+4. Click **Done**.
+
+To change a choice later, click it in **Manage**:
+
+- **Update from current values** saves what the ticked Controls hold now.
+- **Category** moves it to another category, or to **Not in a category**.
+- **Delete** removes it from the workflow.
+
+Click **Edit** on a category to rename it, change its description or
+**Delete** it; its choices stay, under **Not in a category**. **↑** / **↓**
+reorder categories and choices. Choices **Not in a category** don't show in the
+Controls tab: the tab says how many there are, and its **Manage** link opens
+this section.
+
+**Manage** warns under a category when something needs a fix:
+
+- *“A” and “B” can both match*: give them a shared setting with different
+  values, so each choice is told apart.
+- *Shares Steps with Look*: a choice in one category can change the other. That
+  is fine when intended; the notice tells you when it happens.
+- A choice listed twice, or one that no longer exists: **Remove from this
+  category**, **Remove the repeat** or **Remove missing** fixes it. Editing
+  that category's choices fixes it too.
+
+Modes are saved in the workflow and in its API export. In the Sonder App,
+editing a category or a choice keeps your copy when you re-import the
+workflow; **Reset to workflow's version** (in the category's or choice's
+editor) brings back the imported one.
 
 ## Manage
 
@@ -135,7 +187,7 @@ Click **Manage** at the top right of the Controls tab. Click **Done** to leave.
   [Panes and Output Views](editor-basics.md#panes-and-output-views).
 - **Clean up unavailable…** lists what no longer resolves in this workflow (a
   setting whose node was deleted, saved app values from an older version,
-  preset members pointing at those). It removes only what you leave ticked.
+  settings in choices pointing at those). It removes only what you leave ticked.
   Controls that **Restore Controls** can reconnect are not listed. On the
   canvas the cleanup is one Undo step.
 
@@ -179,22 +231,22 @@ lists.
 
 ## Share Controls
 
-- **From the canvas:** save the workflow (it carries the Controls and presets),
+- **From the canvas:** save the workflow (it carries the Controls and Modes),
   or use ComfyUI's **Export (API)** for the Sonder App. **Export (API)** leaves
   out nodes that are muted or bypassed, so first turn on every node a switch
   or setting needs. **Manage** lists them under **Before Export (API) for the
-  Sonder App** while any is off. Presets keep your switched-off setups.
+  Sonder App** while any is off. Modes keep your switched-off setups.
 - **From the Sonder App:** in the Launcher, open the workflow's **⋮** menu and
   click **Export as API**. The file carries current values, seed modes, labels,
   notes, group order, **Advanced** flags, the description and active app-only
   Controls. Hidden entries are left out; disabled Controls stay disabled.
   Every switch's nodes stay on in the file, so your current switch choices are
-  not in it: save them in a preset first if you want to keep them. If a
+  not in it: save them in a choice first if you want to keep them. If a
   Relay can't be read or the file would be too large to import, Export says so
   instead of downloading.
 
 **Re-importing** a workflow into the Sonder App keeps your values, seed modes,
-app-only Controls, hidden settings and edited presets. It resets labels, notes,
+app-only Controls, hidden settings and edited categories and choices. It resets labels, notes,
 order, groups, **Advanced** flags and the description to the workflow's. A
 saved value whose setting now points somewhere else resets to the workflow's
 value. The Launcher lists what was kept and what was reset.
@@ -213,7 +265,7 @@ next section.
    searching for **Control Relay** if it is off-screen, and click **Restore N
    Controls from this file**; the editor doesn't need to be open.)
 3. Restore reconnects every setting it can match and leaves values, labels and
-   presets as they are. To undo it, click the canvas and press **Ctrl+Z**
+   Modes as they are. To undo it, click the canvas and press **Ctrl+Z**
    (**⌘+Z** on macOS) once.
 4. If the message says some Controls **need Rebind**, click **Manage**, then
    **Rebind** beside each one and choose its setting.

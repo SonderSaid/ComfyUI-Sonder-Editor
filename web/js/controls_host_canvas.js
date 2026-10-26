@@ -9,6 +9,7 @@ import {
     restoreViewAnchors, setViewAnchor, viewAnchorSnapshot,
 } from "./control_bindings.js";
 import { syncRelayRows } from "./control_relay_rows.js";
+import { freshWithin } from "./controls_fresh_view.js";
 import { canonical, readRows, writeRows } from "./control_rows.js";
 import { twoLaneHash } from "./text_hash.js";
 
@@ -138,10 +139,14 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         if (!response.ok) throw new Error("The workflow controls could not be read.");
         return response.json();
     };
-    const adopt = raw => {
+    // Each describe takes a number when it starts; `adopted` is the newest one
+    // adopted, so freshView can tell a read started after its call.
+    let readSerial = 0, adopted = 0;
+    const adopt = (raw, started) => {
         // Canvas seeds follow the native mode; the export mirrored it.
         const bindings = raw.bindings || [];
         view = {...raw, bindings, state: "ready", error: raw.error || null};
+        adopted = Math.max(adopted, started);
         notify();
     };
 
@@ -152,7 +157,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
             await active;
             return refresh(true);
         }
-        const id = identity(), stamp = epoch;
+        const id = identity(), stamp = epoch, started = ++readSerial;
         active = (async () => {
             try {
                 const shot = await snapshot(id);
@@ -163,7 +168,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
                 // Graph edits that miss the event still cannot land an old view.
                 if ((await snapshot(id)).hash !== shot.hash || !isCurrent(id, stamp)) return view;
                 lastHash = shot.hash;
-                adopt(raw);
+                adopt(raw, started);
             } catch (error) {
                 if (isCurrent(id, stamp)) { view = {...view, state: "error", error: error.message}; notify(); }
             }
@@ -408,7 +413,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
                 throw new Error("This switch changed. Refresh the Controls panel.");
             }
             if (field === "modes" && !samePaths(live.members, Object.keys(value).map(path => ({path})))) {
-                throw new Error("The group's nodes changed. Update the preset.");
+                throw new Error("The group's nodes changed. Update the choice in Manage.");
             }
             for (const member of live.members) setMode(member.node, field === "modes" ? value[member.path] : value);
             return;
@@ -664,6 +669,15 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         // The workflow owns its Controls here: remove, never hide.
         capabilities: {hide: false, removeAuthored: true},
         refresh,
+        // A view described after this call: refresh(true) awaits a read already
+        // running and starts its own, and only a read numbered after the call counts.
+        freshView(options) {
+            const call = readSerial;
+            return freshWithin(() => view, async () => {
+                const next = await refresh(true);
+                return adopted > call ? next : null;
+            }, options);
+        },
         getPromptHash: async () => promptHash((await snapshot(identity())).graphHash),
         applyChanges(changes, options) {
             const owned = { ...changes };

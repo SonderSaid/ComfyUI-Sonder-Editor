@@ -361,7 +361,7 @@ def test_matching_drift_and_conflicts():
     drifted, _ = preset_view({"p": skip_preset(group_modes={"6": "muted"})})
     row = drifted["presets"][0]
     assert row["state"] == "unavailable" and "g" in row["unavailable"]
-    assert "changed since this preset was captured. Update the preset" in row["reason"]
+    assert "changed since this choice was captured. Update the choice" in row["reason"]
     moved, _ = preset_view({"p": skip_preset(path="8", group_modes={"6": "muted", "8": "muted"})})
     assert "a" in moved["presets"][0]["unavailable"]
     # A node one switch mutes and its group bypasses: unreadable, never half-applied.

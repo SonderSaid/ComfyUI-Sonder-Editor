@@ -101,7 +101,12 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
         trailing = false,
         publication = null,
         lastHash = null,
-        mountedVisible = false;
+        mountedVisible = false,
+        // The canvas view when a describe after this relay's writes was not
+        // adopted in time: it may predate them, so its publication says so
+        // (view_stale) until the canvas adopts a newer view.
+        staleView = null,
+        publishedStale = false;
     const processed = new Map(),
         allowedHashes = new Set();
     const path = suffix => {
@@ -153,17 +158,21 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
             for (const rid of publication.applied) processed.delete(rid);
             for (const row of publication.rejected) processed.delete(row.request_id);
             seq = publication.view_seq;
+            publishedStale = publication.view?.view_stale === true;
             publication = null;
         }
         const view = host.getView();
         if (view.state !== "ready") return true;
+        if (staleView !== view) staleView = null;
+        const stale = staleView !== null;
         const hash = await host.getPromptHash();
         if (!current(stamp, id)) return false;
         if (hash !== lastHash) {
             allowedHashes.clear();
             allowedHashes.add(hash);
         }
-        if (hash === lastHash && !processed.size && seq > 0) return true;
+        // A stale publication is replaced once the canvas has a newer view.
+        if (hash === lastHash && !processed.size && seq > 0 && !(publishedStale && !stale)) return true;
         const applied = [],
             rejected = [];
         for (const [rid, outcome] of processed) {
@@ -178,7 +187,7 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
             applied,
             rejected,
         };
-        publication = { ...envelope, view: fitPublicationView(view, envelope) };
+        publication = { ...envelope, view: fitPublicationView(stale ? { ...view, view_stale: true } : view, envelope) };
         let result = await request("PUT", "controls", publication);
         if (!current(stamp, id)) return false;
         if (!result.ok && UNSENDABLE_CODES.includes(result.payload.code)) {
@@ -187,6 +196,7 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
         }
         if (result.ok) {
             lastHash = hash;
+            publishedStale = stale;
             for (const rid of applied) processed.delete(rid);
             for (const row of rejected) processed.delete(row.request_id);
             publication = null;
@@ -266,7 +276,12 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
                         allowedHashes.add(lastHash);
                     }
                 }
-                if (processed.size) await host.refresh(true);
+                // Acknowledge with a view described after these writes when one
+                // is adopted in time; otherwise the publication says it may be older.
+                if (processed.size) {
+                    const after = host.freshView ? await host.freshView() : { view: await host.refresh(true), fresh: true };
+                    staleView = after.fresh ? null : host.getView();
+                }
                 if (current(stamp, id) && (mountedVisible || processed.size))
                     await publish(stamp, id, queue.payload.controls_view_seq);
             } catch (_) {

@@ -419,7 +419,7 @@ if(SCENARIO==='markdown'){
     if(SCENARIO==='group-note'){
         toggleManage();const section=walk(container).find(n=>n.dataset.controlsManage==='true');
         walk(group('Advanced').children[0]).find(n=>n.dataset.groupAction==='note').dispatch('click');
-        const area=walk(section).find(n=>n.tagName==='TEXTAREA'&&!n.dataset.workflowDescription&&!n.dataset.presetDescription);area.value='Seeds';key('Enter',{ctrlKey:true});await settle();
+        const area=walk(section).find(n=>n.tagName==='TEXTAREA'&&!n.dataset.workflowDescription&&!n.dataset.modesDescription);area.value='Seeds';key('Enter',{ctrlKey:true});await settle();
         const [target,value]=Object.entries(calls.at(-1))[0];assert.match(target,/^note:[A-Za-z0-9_-]{12}:create$/);assert.deepEqual(value,{text:'Seeds',group:'Advanced'});
     }
     if(SCENARIO==='focus'){
@@ -670,7 +670,7 @@ if(SCENARIO==='markdown'){
             button(byTarget('binding:lost:value'),'Remove').dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'binding:lost:remove':true});
         }
         // A new standalone note.
-        button(section,'+ Note').dispatch('click');const area=walk(section).find(n=>n.tagName==='TEXTAREA'&&!n.dataset.workflowDescription&&!n.dataset.presetDescription);area.value='**Tip**';
+        button(section,'+ Note').dispatch('click');const area=walk(section).find(n=>n.tagName==='TEXTAREA'&&!n.dataset.workflowDescription&&!n.dataset.modesDescription);area.value='**Tip**';
         key('Enter',{ctrlKey:true});await settle();const [noteTarget,noteValue]=Object.entries(calls.at(-1))[0];
         assert.match(noteTarget,/^note:[A-Za-z0-9_-]{12}:create$/);assert.deepEqual(noteValue,{text:'**Tip**',group:''});
         // The filter reaches the host, debounced; Escape clears it.

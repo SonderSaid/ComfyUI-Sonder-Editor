@@ -105,7 +105,7 @@ def validate(view, raw, *, mode):
         found = members.get(_member_key(row))
         if (found is None or (found.get("requires_binding") and found["requires_binding"] not in cleaned["bindings"])
                 or (found.get("requires_execution") and found["requires_execution"] not in cleaned["execution"])):
-            raise ControlValueError("A preset member is no longer eligible. Reopen the cleanup review.")
+            raise ControlValueError("A setting in a choice is no longer eligible. Reopen the cleanup review.")
     return cleaned
 
 

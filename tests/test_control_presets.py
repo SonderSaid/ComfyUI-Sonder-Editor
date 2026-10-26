@@ -338,7 +338,7 @@ def test_app_preset_caps_fail_before_persistence(app_template):
     manifest.pop("future")
     manifest["presets"]["new"] = definition(name="New authored")
     prompt["9"]["inputs"]["manifest"] = json.dumps(manifest)
-    with pytest.raises(st.TemplateError, match="32 presets"):
+    with pytest.raises(st.TemplateError, match="32 choices"):
         st.replace_template(identity, json.dumps(prompt).encode(), validate=validation)
     assert st.read_control_values(identity) == before
     assert Path(st.template_source_path(identity)).read_bytes() == source
@@ -346,7 +346,7 @@ def test_app_preset_caps_fail_before_persistence(app_template):
     assert len(exported) == 32 and "p30" in exported
     # Externally corrupted/over-cap storage must refuse export, never truncate.
     st.update_control_values(identity, lambda data: data["presets"].update(extra=definition()))
-    with pytest.raises(st.TemplateError, match="32 presets"):
+    with pytest.raises(st.TemplateError, match="32 choices"):
         st.export_curated(identity)
 
 

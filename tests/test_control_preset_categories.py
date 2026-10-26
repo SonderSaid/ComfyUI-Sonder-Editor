@@ -136,12 +136,12 @@ def test_remove_category_leaves_choices_and_preset_remove_drops_the_id():
 
 
 @pytest.mark.parametrize("changes,reason", [
-    ({"preset:a:apply": True, "preset_category:task:name": "X"}, "Apply one preset"),
+    ({"preset:a:apply": True, "preset_category:task:name": "X"}, "Apply one choice"),
     ({"preset_category:t2:create": {"name": "T", "choices": ["zz"]}}, "no longer exists"),
     ({"preset_category:ghost:name": "X"}, "no longer exists"),
     ({"preset_category:task:reset": True}, "Sonder App"),
     ({"preset_category:task:name": "﻿"}, "category name"),
-    ({"preset:a:name": "﻿"}, "preset name"),
+    ({"preset:a:name": "﻿"}, "choice name"),
     ({"preset_category:task:description": "d" * 301}, "at most 300"),
     ({"preset_category:task:choices": ["a", "a"]}, "different choices"),
     ({"preset_category:task:move": {"before": "task"}}, "another category"),
@@ -321,6 +321,14 @@ def test_publication_checks_categories_only_when_present():
                    {"preset_categories": [{**row, "warnings": "x"}]}):
         with pytest.raises(ValueError):
             publish(broken)
+
+
+def test_publication_carries_a_boolean_stale_flag():
+    # The canvas marks an acknowledgement whose view may predate its write.
+    assert publish({"view_stale": True})["view"]["view_stale"] is True
+    assert "view_stale" not in publish({})["view"]
+    with pytest.raises(ValueError):
+        publish({"view_stale": "yes"})
 
 
 # ── Differential: two choices that both match are always warned ──────────────

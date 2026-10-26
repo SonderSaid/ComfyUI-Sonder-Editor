@@ -87,7 +87,7 @@ def _reason(view, identities, preset=None):
         parts.append("Unavailable Controls: " + ", ".join(labels.get(i, i) for i in others) + ". Repair them in Manage.")
     if drifted:
         parts.append(", ".join(f"“{labels.get(i, i)}”" for i in drifted)
-                     + " changed since this preset was captured. Update the preset in Manage.")
+                     + " changed since this choice was captured. Update the choice in Manage.")
     return " ".join(parts)
 
 
@@ -255,7 +255,7 @@ def _capture_execution(view, identities, previous=None):
     result = {}
     for eid in identities:
         if not isinstance(eid, str) or not cm.ID_RE.fullmatch(eid) or eid in cm.FORBIDDEN_KEYS:
-            raise cd.ControlValueError("A preset member id is invalid.")
+            raise cd.ControlValueError("A setting id in this choice is invalid.")
         descriptor = switches.get(eid, {})
         if descriptor.get("status") != "ok" or descriptor.get("read_only") or descriptor.get("hidden"):
             if previous and eid in (previous.get("execution") or {}):
@@ -285,9 +285,9 @@ def _capture_preset(view, members, previous=None, execution=()):
     result = {}
     for bid in members:
         if not isinstance(bid, str) or not cm.ID_RE.fullmatch(bid) or bid in cm.FORBIDDEN_KEYS:
-            raise cd.ControlValueError("A preset member id is invalid.")
+            raise cd.ControlValueError("A setting id in this choice is invalid.")
         if bid in views and bid not in bindings:
-            raise cd.ControlValueError("A View can't be part of a preset.")
+            raise cd.ControlValueError("A View can't be part of a choice.")
         descriptor = bindings.get(bid, {})
         if descriptor.get("status") != "ok" or descriptor.get("hidden"):
             if previous and bid in previous["members"]:
@@ -301,9 +301,9 @@ def _capture_preset(view, members, previous=None, execution=()):
     switched = _capture_execution(view, execution, previous)
     effects = cm.execution_effects(switched)
     if effects is None:
-        raise cd.ControlValueError("Two switches in this preset set the same node differently.")
+        raise cd.ControlValueError("Two switches in this choice set the same node differently.")
     if sum(1 + ("seed_mode" in entry) for entry in result.values()) + len(effects) > cm.MAX_PRESET_TARGETS:
-        raise cd.ControlValueError("A preset may hold at most 64 targets; a seed with a mode counts as two, "
+        raise cd.ControlValueError("A choice may hold at most 64 targets; a seed with a mode counts as two, "
                                    "and each node a switch sets counts as one.")
     return result, switched
 
@@ -348,11 +348,11 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
         _, identity, field = parsed
         try:
             if identity in cm.FORBIDDEN_KEYS or structural not in ("canvas", "sdk", "relay"):
-                raise cd.ControlValueError("This preset target is unavailable.")
+                raise cd.ControlValueError("This choice target is unavailable.")
             if view.get("error") or (view.get("relay") or {}).get("status") == "error":
                 raise cd.ControlValueError("The Sonder Control Relay cannot be read.")
             if field == "apply" and (len(changes) != 1 or raw is not True):
-                raise cd.ControlValueError("Apply one preset by itself with true.")
+                raise cd.ControlValueError("Apply one choice by itself with true.")
             if field in ("create", "capture"):
                 switches = raw.get("execution", []) if isinstance(raw, dict) else None
                 if not isinstance(raw, dict) or not isinstance(raw.get("members"), list) or not isinstance(switches, list):
@@ -361,26 +361,26 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                 if not chosen or len(chosen) > 64 or any(not isinstance(x, str) for x in chosen):
                     raise cd.ControlValueError("Choose 1 to 64 Controls.")
             if field in ("remove", "reset") and raw is not True:
-                raise cd.ControlValueError(f"Send true to {field} a preset.")
+                raise cd.ControlValueError(f"Send true to {field} a choice.")
             if field == "reset" and structural != "sdk":
                 raise cd.ControlValueError("Reset to the workflow's version is available in the Sonder App.")
             if field == "move" and (not isinstance(raw, dict) or (raw.get("before") is not None and not isinstance(raw["before"], str))):
-                raise cd.ControlValueError("Choose a preset to move before.")
+                raise cd.ControlValueError("Name the choice to move before.")
             if field == "name" and isinstance(raw, str):
                 raw = raw.strip()  # stored trimmed; names saved earlier are not rewritten
             if field in ("name", "description"):
                 limit = cm.LABEL_MAX if field == "name" else cm.DESCRIPTION_MAX
                 if not isinstance(raw, str) or len(raw) > limit or (field == "name" and cm.blank_name(raw)):
-                    raise cd.ControlValueError(f"A preset {field} must be text of 1–{limit} characters." if field == "name" else f"A preset description may hold at most {limit} characters.")
+                    raise cd.ControlValueError(f"A choice {field} must be text of 1–{limit} characters." if field == "name" else f"A choice description may hold at most {limit} characters.")
             if field not in {"create", "capture", "apply", "name", "description", "move", "remove", "reset"}:
-                raise cd.ControlValueError("This preset target is unavailable.")
+                raise cd.ControlValueError("This choice target is unavailable.")
             if structural == "relay":
                 cleaned[target] = copy.deepcopy(raw)
                 continue
             existing = definitions.get(identity)
             if field == "apply":
                 if not existing:
-                    raise cd.ControlValueError("This preset no longer exists. Open Manage.")
+                    raise cd.ControlValueError("This choice no longer exists. Open Manage.")
                 expanded, unavailable = _expand(view, existing)
                 if unavailable:
                     raise cd.ControlValueError(_reason(view, unavailable, existing))
@@ -393,20 +393,20 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                 return values, []
             if field == "create":
                 if existing:
-                    raise cd.ControlValueError("This preset id is already in use.")
+                    raise cd.ControlValueError("This choice id is already in use.")
                 if len(definitions) >= cm.MAX_PRESETS:
-                    raise cd.ControlValueError("At most 32 presets fit in one workflow.")
+                    raise cd.ControlValueError("At most 32 choices fit in one workflow.")
                 name = raw.get("name")
                 entry = _entry({"name": name.strip() if isinstance(name, str) else name, "description": raw.get("description", ""),
                                 "order": min(cm.ORDER_LIMIT, max((p["order"] for p in definitions.values()), default=-1) + 1)},
                                *_capture_preset(view, raw["members"], execution=raw.get("execution", [])))
                 if identity not in cm.read_presets({identity: entry}):
-                    raise cd.ControlValueError("A preset needs a name of 1–120 characters and a description of at most 1000 characters.")
+                    raise cd.ControlValueError("A choice needs a name of 1–120 characters and a description of at most 1000 characters.")
                 definitions[identity] = entry
                 cleaned[target] = entry
                 continue
             if not existing and field not in ("remove", "reset"):
-                raise cd.ControlValueError("This preset no longer exists. Open Manage.")
+                raise cd.ControlValueError("This choice no longer exists. Open Manage.")
             if field == "capture":
                 entry = _entry(existing, *_capture_preset(view, raw["members"], existing, raw.get("execution", [])))
                 definitions[identity] = entry
@@ -415,12 +415,12 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                 definitions[identity][field] = raw
                 # Every writer stores what this accepts; refuse what its reader would drop.
                 if identity not in cm.read_presets({identity: definitions[identity]}):
-                    raise cd.ControlValueError("A preset needs a name of 1–120 characters and a description of at most 1000 characters.")
+                    raise cd.ControlValueError("A choice needs a name of 1–120 characters and a description of at most 1000 characters.")
                 cleaned[target] = raw
             elif field == "move":
                 before = raw.get("before")
                 if before == identity or (before is not None and before not in definitions):
-                    raise cd.ControlValueError("Choose another preset to move before.")
+                    raise cd.ControlValueError("Choose another choice to move before.")
                 cleaned[target] = {"before": before}
             else:
                 cleaned[target] = True

@@ -95,6 +95,27 @@ export function renderPanelMarkdown(text) {
     return fragment;
 }
 
+// The text of a node, with line breaks and list items as spaces.
+function plainText(node) {
+    if (node.tagName === "BR") return " ";
+    if (node.tagName === "#TEXT" || node.nodeType === 3) return node.textContent;
+    const children = [...(node.childNodes || node.children || [])];
+    const inner = children.length ? children.map(plainText).join("") : node.textContent || "";
+    return node.tagName === "LI" ? ` ${inner} ` : inner;
+}
+
+/**
+ * The first paragraph of panel Markdown as one plain line, at most `max`
+ * code points: a short description for a tooltip or an accessible name.
+ */
+export function panelMarkdownPlainText(text, max = 200) {
+    const fragment = renderPanelMarkdown(text);
+    const first = fragment.children[0];
+    const line = first ? plainText(first).replace(/\s+/g, " ").trim() : "";
+    const points = [...line];
+    return points.length > max ? points.slice(0, max - 1).join("").trimEnd() + "…" : line;
+}
+
 const TITLE_HEADING = /^(#{1,3})\s+(.+)$/;
 const TITLE_BOLD = /^\s*\*\*([^*\n]+)\*\*\s*$/;
 

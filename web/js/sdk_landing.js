@@ -173,7 +173,8 @@ async function importFile(file, template = null) {
         if (payload.template.notes_reset) reset.push(`${payload.template.notes_reset} panel notes reset`);
         if (payload.template.layout_reset) reset.push('layout reset');
         if (payload.template.description_reset) reset.push('description reset');
-        if (payload.template.presets_kept) reset.push(`${payload.template.presets_kept} edited presets kept`);
+        if (payload.template.presets_kept) reset.push(`${payload.template.presets_kept} edited choice${payload.template.presets_kept === 1 ? '' : 's'} kept`);
+        if (payload.template.categories_kept) reset.push(`${payload.template.categories_kept} edited categor${payload.template.categories_kept === 1 ? 'y' : 'ies'} kept`);
         // App-only Controls survive a replace; say which ones now need a look in Manage.
         const offline = (payload.template.local_missing || 0) + (payload.template.local_shadowed || 0);
         if (offline) reset.push(`${offline} app-only Control${offline === 1 ? '' : 's'} off (see Manage)`);
