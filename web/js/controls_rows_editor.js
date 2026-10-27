@@ -10,6 +10,7 @@
 import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
 import { smallButton } from "./controls_manage.js";
 import { canonical, pluralName, summary } from "./control_rows.js";
+import { setText } from "./controls_dom_order.js";
 import * as S from "./controls_panel_style.js";
 import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE } from "./editor_theme.js";
 
@@ -44,6 +45,10 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
 
     let spec = null, value = [], editable = false, expanded = false, editing = false, rendered = "";
     let pickers = [], removes = [], cancelling = false;
+    // A press inside the list holds repaints until it ends. A save that lands
+    // between mousedown and mouseup (a field's blur-save, often) would replace
+    // the pressed button, and Chromium then sends it no click.
+    let pressed = false, deferred = false;
 
     const noun = () => spec?.group_name || "row";
     const setEditing = next => {
@@ -55,6 +60,24 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
     // rows must repaint after a removal, or later clicks hit the wrong row.
     const isField = target => !!target && list.contains(target) && target.tagName !== "BUTTON";
     list.addEventListener("focusin", e => setEditing(isField(e.target)));
+    const release = () => {
+        document.removeEventListener("pointerup", release, true);
+        document.removeEventListener("pointercancel", release, true);
+        window.removeEventListener?.("blur", release);
+        pressed = false;
+        // After the click this press makes, which runs in the same task.
+        if (deferred) setTimeout(() => { deferred = false; if (spec) paint(); }, 0);
+    };
+    list.addEventListener("pointerdown", () => {
+        if (pressed) return;
+        pressed = true;
+        // A native popup (a <select>) or another window can take the pointerup:
+        // leaving the list or the window ends the press too.
+        document.addEventListener("pointerup", release, true);
+        document.addEventListener("pointercancel", release, true);
+        window.addEventListener?.("blur", release);
+    });
+    list.addEventListener("focusout", e => { if (pressed && !list.contains(e.relatedTarget)) release(); });
     list.addEventListener("focusout", e => { if (!isField(e.relatedTarget)) setEditing(false); });
 
     function send(next) {
@@ -156,19 +179,21 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
     }
 
     function paintSummary() {
-        summaryText.textContent = summary(value, spec);
+        setText(summaryText, summary(value, spec));
         header.title = expanded ? `Hide the ${pluralName(noun())}` : `Show the ${pluralName(noun())}`;
     }
 
     function paint() {
-        caret.textContent = expanded ? "▾" : "▸";
+        setText(caret, expanded ? "▾" : "▸");
         header.setAttribute("aria-expanded", String(expanded));
         paintSummary();
         list.style.display = expanded ? "flex" : "none";
         add.style.display = expanded && editable ? "" : "none";
-        add.textContent = `+ Add ${noun()}`;
+        setText(add, `+ Add ${noun()}`);
         add.disabled = !editable || value.length >= (spec.max ?? 20);
-        if (expanded && !isField(document.activeElement) && rendered !== canonical([value, spec.fields, editable])) paintRows();
+        if (!expanded || isField(document.activeElement) || rendered === canonical([value, spec.fields, editable])) return;
+        if (pressed) deferred = true;
+        else paintRows();
     }
 
     header.addEventListener("click", () => { expanded = !expanded; paint(); });
@@ -181,6 +206,8 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
     return {
         el,
         get editing() { return editing; },
+        // Where a description of the whole Control (why it is off) belongs.
+        get describeTargets() { return [header]; },
         contains: target => el.contains(target),
         update(nextSpec, nextValue, { canEdit = true, unavailable = "" } = {}) {
             spec = nextSpec;
@@ -213,9 +240,11 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
             const hadFocus = list.contains(document.activeElement);
             value = Array.isArray(nextValue) ? nextValue.map(row => ({ ...row })) : [];
             rendered = "";
-            if (expanded) paintRows();
+            // A press in the list keeps its button; the repaint follows the press.
+            if (pressed) deferred = true;
+            else if (expanded) paintRows();
             paintSummary();
-            if (hadFocus) header.focus();
+            if (hadFocus && !pressed) header.focus();
             setEditing(false);
         },
         // A focused number or text field commits on blur (its change event).
@@ -224,6 +253,9 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
             if (el.contains(field) && field.tagName === "INPUT") field.blur();
         },
         destroy() {
+            release();
+            deferred = false;
+            spec = null;
             for (const picker of pickers) picker.destroy();
             pickers = [];
             el.remove();

@@ -411,48 +411,73 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
         const absent = choice ? (current?.members || []).filter(m => !ids.has(m.binding_id)) : [];
         const switchIds = new Set((view.execution || []).map(d => d.execution_id));
         const gone = choice ? (current?.execution || []).filter(m => !switchIds.has(m.execution_id)) : [];
-        missing.replaceChildren();
-        if (absent.length || gone.length) missing.append(make("div", "Settings without a Control"));
-        for (const member of absent) missing.append(memberControl({binding_id: member.binding_id, status: "missing", absent: true}));
-        for (const member of gone) missing.append(switchControl({execution_id: member.execution_id, status: "missing", absent: true}));
+        // Kept lines, updated in place, like the rows' own (a press keeps its click).
+        const lines = absent.length || gone.length ? [missingTitle] : [];
+        for (const member of absent) lines.push(memberControl({binding_id: member.binding_id, status: "missing", absent: true},
+            missingLines.get(`binding:${member.binding_id}`)));
+        for (const member of gone) lines.push(switchControl({execution_id: member.execution_id, status: "missing", absent: true},
+            missingLines.get(`execution:${member.execution_id}`)));
+        missingLines = new Map(lines.filter(line => line !== missingTitle).map(line => [line.dataset.controlsMember, line]));
+        for (const child of [...missing.children]) if (!lines.includes(child)) child.remove();
+        placeInOrder(missing, lines);
     }
 
-    // A node switch member: its captured modes against the current ones.
-    function switchControl(spec) {
-        const eid = spec.execution_id, stored = (choiceRow(sel.id)?.execution || []).find(m => m.execution_id === eid);
+    const missingTitle = make("div", "Settings without a Control");
+    let missingLines = new Map();
+    // One "In this choice" line per member. `previous`, the line this row
+    // showed last, is updated in place when it is for the same member: the
+    // panel repaints rows on every view, and a checkbox replaced between
+    // mousedown and mouseup gets no click.
+    // Only a line this Manage made is reused: one left from an earlier Manage
+    // (a row kept alive across Done and reopen) closes over that one's state.
+    const madeLines = new WeakSet();
+    function memberLine(key, previous, onChange) {
+        if (previous && madeLines.has(previous) && previous.dataset.controlsMember === key) return previous;
         const label = make("label"), checkbox = make("input"), text = make("span");
-        checkbox.type = "checkbox"; checkbox.checked = switches.has(eid);
-        checkbox.disabled = (!stored && !checkbox.checked) && (spec.status !== "ok" || spec.read_only);
-        checkbox.setAttribute("aria-label", `Include ${spec.label || eid} in this choice`);
-        text.textContent = spec.absent ? `${eid} · In this choice` : "In this choice";
-        if (stored && stored.status !== "ok") text.textContent += " · Changed since captured: update the choice";
-        else if (stored) text.textContent += ` · Choice: ${stored.preview}`;
+        madeLines.add(label);
+        checkbox.type = "checkbox";
+        label.dataset.controlsMember = key;
         label.style.cssText = `display:flex;gap:${SPACE.s1}px;align-items:center;${smallText}`;
-        checkbox.addEventListener("change", () => { checkbox.checked ? switches.add(eid) : switches.delete(eid); membershipDirty = true; });
+        checkbox.addEventListener("change", () => { onChange(checkbox.checked); membershipDirty = true; });
         label.append(checkbox, text);
         return label;
     }
-    function memberControl(spec) {
+    function paintMemberLine(label, {checked, disabled, name, text}) {
+        const [checkbox, span] = label.children;
+        checkbox.checked = checked;
+        checkbox.disabled = disabled;
+        checkbox.setAttribute("aria-label", `Include ${name} in this choice`);
+        setText(span, text);
+        return label;
+    }
+    // A node switch member: its captured modes against the current ones.
+    function switchControl(spec, previous) {
+        const eid = spec.execution_id, stored = (choiceRow(sel.id)?.execution || []).find(m => m.execution_id === eid);
+        const checked = switches.has(eid);
+        let text = spec.absent ? `${eid} · In this choice` : "In this choice";
+        if (stored && stored.status !== "ok") text += " · Changed since captured: update the choice";
+        else if (stored) text += ` · Choice: ${stored.preview}`;
+        const line = memberLine(`execution:${eid}`, previous, on => { on ? switches.add(eid) : switches.delete(eid); });
+        return paintMemberLine(line, {checked, text, name: spec.label || eid,
+            disabled: (!stored && !checked) && (spec.status !== "ok" || spec.read_only)});
+    }
+    function memberControl(spec, previous = null) {
         if (!isChoice()) return null;
-        if (spec.execution_id) return switchControl(spec);
+        if (spec.execution_id) return switchControl(spec, previous);
         if (!spec.binding_id) return null;
         const bid = spec.binding_id, stored = (choiceRow(sel.id)?.members || []).find(m => m.binding_id === bid);
-        const label = make("label"), checkbox = make("input"), text = make("span");
-        checkbox.type = "checkbox"; checkbox.checked = members.has(bid);
-        checkbox.disabled = (!stored && !checkbox.checked) && (spec.status !== "ok" || spec.hidden);
-        checkbox.setAttribute("aria-label", `Include ${spec.label || bid} in this choice`);
+        const checked = members.has(bid);
         // An absent member has no descriptor to label it, so the line names its id.
-        text.textContent = spec.absent ? `${bid} · In this choice` : "In this choice";
+        let text = spec.absent ? `${bid} · In this choice` : "In this choice";
         // A row list previews as its summary, which two lists can share, so the
         // server compares the rows themselves (control_presets.preset_states).
         const differs = spec.kind === "ROWS" ? stored?.differs === true : stored?.preview !== String(spec.value);
         if (stored && (differs || (stored.seed_mode && stored.seed_mode !== spec.seed_mode)))
-            text.textContent += ` · Choice: ${stored.preview}${stored.seed_mode ? ` (${stored.seed_mode})` : ""}`;
-        if (stored?.seed_mode && spec.seed_mode == null) text.textContent += " · Seed mode is skipped on this host";
-        label.style.cssText = `display:flex;gap:${SPACE.s1}px;align-items:center;${smallText}`;
-        checkbox.addEventListener("change", () => { checkbox.checked ? members.add(bid) : members.delete(bid); membershipDirty = true; });
-        label.append(checkbox, text);
-        return label;
+            text += ` · Choice: ${stored.preview}${stored.seed_mode ? ` (${stored.seed_mode})` : ""}`;
+        if (stored?.seed_mode && spec.seed_mode == null) text += " · Seed mode is skipped on this host";
+        const line = memberLine(`binding:${bid}`, previous, on => { on ? members.add(bid) : members.delete(bid); });
+        return paintMemberLine(line, {checked, text, name: spec.label || bid,
+            disabled: (!stored && !checked) && (spec.status !== "ok" || spec.hidden)});
     }
 
     addCategory.addEventListener("click", () => {

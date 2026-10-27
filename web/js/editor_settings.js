@@ -1670,7 +1670,6 @@ const readBool = value => {
 export const CONTROLS_PANEL_SETTINGS = Object.freeze({
     "render.takePlacementMuted": readBool,
     "render.linkedTakePlacement": readBool,
-    "render.keepTakePadding": readBool,
     "batchRender.maxFramesPerChunk": value => {
         const text = typeof value === "number" ? String(value) : String(value ?? "").trim();
         if (!/^\d+$/.test(text) || Number(text) > BATCH_FRAMES_MAX) {

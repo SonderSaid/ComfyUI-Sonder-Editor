@@ -170,6 +170,7 @@ export function mountReferenceLanePicker({ commit, onEditing = () => {} }) {
     return {
         el,
         get editing() { return open; },
+        get describeTargets() { return [add]; },
         contains: target => el.contains(target),
         update(nextSpec, nextValue, { canEdit = true, choices: nextChoices = null, retry: nextRetry = () => {} } = {}) {
             spec = nextSpec;
@@ -275,6 +276,7 @@ export function mountDriverLanePicker({ commit, onEditing = () => {} }) {
     return {
         el,
         get editing() { return editing; },
+        get describeTargets() { return [select, typed]; },
         contains: target => el.contains(target),
         update(_spec, nextValue, { canEdit = true, choices = null, retry: nextRetry = () => {} } = {}) {
             onRetry = nextRetry;

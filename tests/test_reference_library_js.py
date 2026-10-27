@@ -200,6 +200,10 @@ def test_reference_sidebar_refresh_and_settings_contracts_are_wired():
 
 def test_fullscreen_queue_lifecycle_is_wired_to_enter_and_exit():
     widget = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
+    # Panels first mounted after the queue docked go above it.
+    for method in ("    _ensureControlsPanelMounted() {", "    _ensureReferenceLibraryMounted() {"):
+        body = widget.split(method, 1)[1][:600]
+        assert "appendAboveQueue(this._fsSidebar," in body, method
     assert "this._queueSection = queueSection;" in widget
 
     enter = widget.split("    _enterFullscreen() {", 1)[1].split(
@@ -219,7 +223,7 @@ def test_fullscreen_queue_lifecycle_executes_twice_and_preserves_state():
     lifecycle = (ROOT / "web" / "js" / "fullscreen_queue_lifecycle.js").as_uri()
     _run_node(f"""
         import assert from 'node:assert/strict';
-        import {{ dockQueueInFullscreen, restoreQueueFromFullscreen }} from {lifecycle!r};
+        import {{ appendAboveQueue, dockQueueInFullscreen, restoreQueueFromFullscreen }} from {lifecycle!r};
 
         class Element {{
             constructor(name) {{
@@ -286,6 +290,18 @@ def test_fullscreen_queue_lifecycle_executes_twice_and_preserves_state():
             assert.deepEqual(gallery.children.map((child) => child.name), ['assets', 'queue']);
             gallery.style.display = '';
         }}
+
+        // A panel mounted on its first visit, after the queue docked, goes
+        // above the queue; before docking (or once restored) it appends.
+        const late = new Element('sidebar-late');
+        late.appendChild(new Element('header'));
+        dockQueueInFullscreen(queue, late);
+        appendAboveQueue(late, new Element('controls'), queue);
+        appendAboveQueue(late, new Element('library'), queue);
+        assert.deepEqual(late.children.map((child) => child.name), ['header', 'controls', 'library', 'queue']);
+        const early = new Element('sidebar-early');
+        appendAboveQueue(early, new Element('controls'), queue);
+        assert.deepEqual(early.children.map((child) => child.name), ['controls']);
     """)
 
 

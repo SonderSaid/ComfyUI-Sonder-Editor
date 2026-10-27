@@ -214,12 +214,13 @@ if(SCENARIO.startsWith('mounted')){
     host.destroy();
 }
 if(SCENARIO.startsWith('relay')){
-    let queue={ok:true,pending:[{request_id:'r',prompt_hash:'before',changes:{'binding:n:value':'31'}}],controls_visible:true,controls_view_seq:1,
+    let queue={ok:true,pending:SCENARIO==='relay-retry-idle'?[]:[{request_id:'r',prompt_hash:'before',changes:{'binding:n:value':'31'}}],controls_visible:true,controls_view_seq:1,
         controls_manage:SCENARIO==='relay-manage',controls_filter:SCENARIO==='relay-manage'?'cfg':''};
-    let hash='before',writes=0,puts=0,failPut=['relay-retry','relay-owner-observation'].includes(SCENARIO),published=null;
+    let hash='before',writes=0,puts=0,failPut=['relay-retry','relay-retry-idle','relay-owner-observation'].includes(SCENARIO),published=null;
     const callbacks=new Set();
     const managed=[];
-    const host={getView:()=>controlsView,setMountedVisible(){},setMountedManage(on,filter){managed.push([on,filter]);},refresh:async()=>controlsView,getPromptHash:async()=>hash,
+    let canvasView=controlsView;
+    const host={getView:()=>canvasView,setMountedVisible(){},setMountedManage(on,filter){managed.push([on,filter]);},refresh:async()=>controlsView,getPromptHash:async()=>hash,
         subscribe(cb){callbacks.add(cb);return()=>callbacks.delete(cb);},async applyChanges(changes,options){assert.equal(await options.canApply(),true);assert.equal(options.expectedPromptHash,hash);writes++;hash='after';return{ok:true,rejected:[]};}};
     if(SCENARIO==='relay-stale')hash='external';
     const relay=createCanvasControlsRelay({host,identity:()=>({projectId:'P',hostId:'h',sessionId:'canvas'}),connected:()=>true,api:{fetchApi:async(path,init)=>{
@@ -234,7 +235,31 @@ if(SCENARIO.startsWith('relay')){
     }}});
     // getView needs ready to publish; raw renderer flags are not durable state.
     controlsView.state='ready';await relay.cycle();
-    if(SCENARIO==='relay-retry'){assert.equal(writes,1);await relay.cycle();assert.equal(writes,1);assert.equal(puts,2);assert.deepEqual(published.applied,['r']);}
+    if(SCENARIO==='relay-retry'){assert.equal(writes,1);await relay.cycle();assert.equal(writes,1);assert.equal(puts,2);assert.deepEqual(published.applied,['r']);
+        // The retried publication was this view: nothing new to send.
+        await relay.cycle();assert.equal(puts,2);}
+    if(SCENARIO==='relay-retry-idle'){
+        // A retried publication with no write behind it records its hash: the
+        // next cycle has nothing to send.
+        assert.equal(puts,1);await relay.cycle();await settle();assert.equal(puts,2);
+        await relay.cycle();await settle();assert.equal(puts,2);
+    }
+    if(SCENARIO==='relay-listing'){
+        // Published and acknowledged; an unchanged view and hash send nothing.
+        assert.equal(puts,1);await relay.cycle();assert.equal(puts,1);
+        // Manage opened in the tab: the canvas adopts a view with candidates.
+        // The prompt hash leaves Manage out, so only the new view says so.
+        canvasView={...controlsView,state:'ready',candidates:[{path:'3',input:'cfg'}]};
+        await relay.cycle();assert.equal(puts,2);assert.deepEqual(published.view.candidates,[{path:'3',input:'cfg'}]);
+        await relay.cycle();assert.equal(puts,2);
+        // A narrower filter is another adoption: it republishes once.
+        canvasView={...canvasView,candidates:[]};
+        await relay.cycle();assert.equal(puts,3);assert.deepEqual(published.view.candidates,[]);
+        await relay.cycle();assert.equal(puts,3);
+        // A forced re-read adopts an equal view: it republishes exactly once.
+        canvasView={...canvasView};
+        await relay.cycle();assert.equal(puts,4);await relay.cycle();assert.equal(puts,4);
+    }
     if(SCENARIO==='relay-owner-observation'){
         const {readFileSync}=await import('node:fs');const source=readFileSync(CONTROLLER_PATH,'utf8');
         const method=source.slice(source.indexOf('    _applyOwnerState('),source.indexOf('    _stopOwnerPolling()'));
@@ -335,7 +360,7 @@ if(SCENARIO==='canvas-http'||SCENARIO==='relay-error-recovery'||SCENARIO==='canv
 }
 console.log('ok');
 '''
-@pytest.mark.parametrize('scenario',['sdk-adopt-status','sdk-adopt-refusal','sdk-lost-answer','sdk-switching','sdk-hold','sdk-switch','sdk-stale-view','sdk-captures','sdk-busy','sdk-manage','mounted-manage','relay-manage','sdk-order','sdk-refusal','sdk-flush','mounted-restore','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','relay-invalid-view'])
+@pytest.mark.parametrize('scenario',['sdk-adopt-status','sdk-adopt-refusal','sdk-lost-answer','sdk-switching','sdk-hold','sdk-switch','sdk-stale-view','sdk-captures','sdk-busy','sdk-manage','mounted-manage','relay-manage','sdk-order','sdk-refusal','sdk-flush','mounted-restore','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','relay-invalid-view','relay-listing','relay-retry-idle'])
 def test_controls_transport(scenario):
     node=shutil.which('node')
     if not node:pytest.skip('node required for host adapter tests')

@@ -1,7 +1,7 @@
 import { mountRestore } from "./controls_restore.js";
 import { mountWorkflowHeader } from "./controls_workflow_header.js";
 import { mountModes } from "./controls_modes.js";
-import { placeInOrder } from "./controls_dom_order.js";
+import { VISUALLY_HIDDEN_CSS, describedBy, placeInOrder, setText } from "./controls_dom_order.js";
 import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
 import { mountRowsEditor, NO_ROWS_NOTICE } from "./controls_rows_editor.js";
 import { mountExecutionRow, switchScope } from "./controls_execution_row.js";
@@ -20,6 +20,7 @@ import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, applyNativeControlTheme, setButtonVariant } from "./editor_theme.js";
 
 let nextPanel = 0;
+let nextDescription = 0;
 const SEED_MODES = ["fixed", "increment", "decrement", "randomize"];
 const editable = d => d.status === "ok" && !d.read_only;
 const identified = d => !!(d.binding_id || d.note_id || d.execution_id);
@@ -47,8 +48,6 @@ const LONG_VALUE = 18; // a choice longer than this gets a wide card
 const MIRRORS = [
     { key: "render.takePlacementMuted", label: "Takes start muted", kind: "BOOLEAN" },
     { key: "render.linkedTakePlacement", label: "Link take video + audio", kind: "BOOLEAN" },
-    { key: "render.keepTakePadding", label: "Keep take padding", kind: "BOOLEAN",
-        title: "Place new takes with the extra frames a model renders to meet its frame rule, when the render generated them. Queued jobs keep the choice they were queued with." },
     { key: "batchRender.maxFramesPerChunk", label: "Max frames per batch", kind: "INT",
         title: "Total frames per + Batch job, context included; 0 uses the built-in size. Snaps up to the model's frame rule." },
 ];
@@ -176,6 +175,10 @@ export function mountControlsPanel(container, host) {
     quietLine.dataset.controlsAdvancedLine = "true";
     quietLine.style.cssText = S.quietLineCss;
     quietLine.addEventListener("click", () => writeSetting("controls.showAdvanced", !showAdvanced()));
+    // Kept spans written in place: a replaced text node under the pointer drops its click.
+    const quietMain = make("span"), quietChanged = make("span");
+    quietChanged.style.color = COLORS.warningBorder;
+    quietLine.append(quietMain, quietChanged);
     const notesLine = make("button");
     notesLine.type = "button";
     notesLine.dataset.controlsNotesLine = "true";
@@ -377,12 +380,12 @@ export function mountControlsPanel(container, host) {
     }
     function paintGroup(group, visibleCount) {
         const open = !!query || group.open;
-        group.toggle.textContent = open ? "v" : ">";
+        setText(group.toggle, open ? "v" : ">");
         group.toggle.title = `${open ? "Collapse" : "Expand"} ${group.title.textContent}`;
         group.toggle.setAttribute("aria-expanded", String(open));
         group.content.style.cssText = S.groupContentCss(cards());
         setShown(group.content, open);
-        group.count.textContent = String(visibleCount);
+        setText(group.count, String(visibleCount));
     }
 
     // ── Your editor settings (the Editor group's first rows) ────────────────
@@ -766,6 +769,7 @@ export function mountControlsPanel(container, host) {
         edit.row.editing = false;
         const next = edit.area.value;
         edit.box.replaceChildren();
+        edit.row.noteRendered = null; // the editor took the box: render it again
         if (!save || next === edit.before) {
             render();
             return Promise.resolve(true);
@@ -794,6 +798,7 @@ export function mountControlsPanel(container, host) {
         if (row.noteHeader) row.noteHeader.style.display = "none";
         if (row.noteFrame) row.noteFrame.style.display = "flex";
         box.replaceChildren(area, done);
+        row.noteRendered = null;
         row.editing = true;
         const edit = { row, box, target, area, before: String(text ?? ""), composing: false, unregister: null };
         noteEditor = edit;
@@ -875,22 +880,27 @@ export function mountControlsPanel(container, host) {
         row.note.style.cursor = manageOn ? "text" : "default";
         row.note.title = manageOn ? "Double-click to edit" : "";
         if (text) {
-            row.note.replaceChildren(renderPanelMarkdown(split ? split.body : text));
+            // Rebuilt only when the text changes: a link or a double-click
+            // mid-gesture loses its target when the box is replaced.
+            const body = split ? split.body : text;
+            if (row.noteRendered !== body) row.note.replaceChildren(renderPanelMarkdown(body));
+            row.noteRendered = body;
             row.note.style.fontStyle = "normal";
         } else {
             // A standalone note is never empty in practice; Manage invites one.
-            row.note.textContent = manageOn ? EMPTY_NOTE : "";
+            setText(row.note, manageOn ? EMPTY_NOTE : "");
+            row.noteRendered = null;
             row.note.style.fontStyle = "italic";
         }
         row.note.style.display = open ? "" : "none";
         row.noteFrame.style.display = text || manageOn ? "flex" : "none";
         row.noteHeader.style.display = split ? "flex" : "none";
         if (!split) return;
-        row.noteTitle.textContent = split.title;
+        setText(row.noteTitle, split.title);
         row.noteTitle.title = manageOn ? "Double-click to edit" : "";
         row.noteTitle.style.cursor = manageOn ? "text" : "pointer";
         row.noteHeader.style.cursor = manageOn ? "default" : "pointer";
-        row.noteToggle.textContent = open ? "v" : ">";
+        setText(row.noteToggle, open ? "v" : ">");
         row.noteToggle.title = `${open ? "Collapse" : "Expand"} ${split.title}`;
         row.noteToggle.setAttribute("aria-expanded", String(open));
     }
@@ -930,7 +940,23 @@ export function mountControlsPanel(container, host) {
             row.labelText.style.cssText = S.labelTextCss;
             row.tags = make("span");
             row.tags.style.cssText = `display:inline-flex;align-items:center;gap:${SPACE.s1}px;flex:0 0 auto;`;
+            // Kept and updated in place: the label is pressable, and a node
+            // replaced under the pointer drops the click.
+            row.tagAdv = make("span", "Adv");
+            row.tagAdv.title = "Advanced: shown only when Show advanced is on; its value still applies";
+            row.tagAdv.style.cssText = S.tagCss;
+            row.tagOff = make("span");
+            row.tagOff.style.cssText = S.tagCss;
+            row.tagDot = make("span");
+            row.tagDot.title = "Differs from the workflow's own value";
+            row.tagDot.style.cssText = S.changedDotCss;
+            row.tags.append(row.tagAdv, row.tagOff, row.tagDot);
             row.label.append(row.labelText, row.tags);
+            // Why the setting is off, for screen readers; outside the label so
+            // it never joins the setting's name.
+            row.offReason = make("span");
+            row.offReason.id = `controls-${panelId}-off-${++nextDescription}`;
+            row.offReason.style.cssText = VISUALLY_HIDDEN_CSS;
             row.control = make("div");
             const onEditing = on => {
                 row.editing = on;
@@ -1033,7 +1059,7 @@ export function mountControlsPanel(container, host) {
                 row.control.append(row.mode);
             }
             row.line.append(row.label, row.control);
-            row.el.append(row.line);
+            row.el.append(row.line, row.offReason);
             row.note = noteBox(row, `${baseOf(spec)}:note`, false);
             row.el.append(row.note);
         }
@@ -1049,9 +1075,10 @@ export function mountControlsPanel(container, host) {
     function styleRow(row, spec) {
         const isCards = cards();
         const value = row.optimistic ?? spec.value;
-        // A row list stacks under its label and takes a full-width card.
+        // A row list stacks under its label and takes a full-width card. So does
+        // a node switch: its three choices then fit one equal row at most widths.
         const stacked = (spec.kind === "STRING" && !!spec.multiline) || spec.kind === "ROWS"
-            || row.editorKind === "reference_lanes";
+            || row.editorKind === "reference_lanes" || row.editorKind === "execution";
         // A Control's note no longer widens its card (#11): it clamps inside it.
         const wide = spec.source === "note" || stacked
             || (spec.kind === "COMBO" && String(value ?? "").length > LONG_VALUE);
@@ -1078,35 +1105,26 @@ export function mountControlsPanel(container, host) {
         row.input.style.cssText = row.spec.kind === "BOOLEAN" ? "margin:0;cursor:pointer;" : S.numberInputCss(isCards);
     }
     function paintTags(row, spec) {
-        const tags = [];
         const advanced = effectiveAdvanced(row);
-        if (advanced && (showAdvanced() || query || manageOn)) {
-            const tag = make("span", "Adv");
-            tag.title = "Advanced: shown only when Show advanced is on; its value still applies";
-            tag.style.cssText = S.tagCss;
-            tags.push(tag);
-        }
-        if (spec.source === "binding" && ["inactive", "partial"].includes(spec.participation)) {
-            const mode = spec.inactive_reason?.mode === "bypassed" ? "Bypassed" : "Muted";
-            const tag = make("span", spec.participation === "partial" ? "Partly off" : mode);
-            tag.title = participationNote(spec);
-            tag.dataset.controlsInactive = spec.participation;
-            tag.style.cssText = S.tagCss;
-            tags.push(tag);
-        }
-        if (advanced && spec.overridden) {
-            const dot = make("span");
-            dot.title = "Differs from the workflow's own value";
-            dot.style.cssText = S.changedDotCss;
-            tags.push(dot);
-        }
-        row.tags.replaceChildren(...tags);
+        setShown(row.tagAdv, advanced && (showAdvanced() || query || manageOn));
+        const off = spec.source === "binding" && ["inactive", "partial"].includes(spec.participation);
+        const mode = spec.inactive_reason?.mode === "bypassed" ? "Bypassed" : "Muted";
+        const reason = off ? participationNote(spec) : "";
+        setText(row.tagOff, off ? (spec.participation === "partial" ? "Partly off" : mode) : "");
+        row.tagOff.title = reason;
+        if (off) row.tagOff.dataset.controlsInactive = spec.participation;
+        else delete row.tagOff.dataset.controlsInactive;
+        setShown(row.tagOff, off);
+        setShown(row.tagDot, advanced && !!spec.overridden);
+        setText(row.offReason, reason);
+        const targets = row.input ? [row.input, row.mode] : row.editor?.describeTargets || [];
+        for (const target of targets) describedBy(target, row.offReason.id, off);
     }
     function update(row, spec, fresh) {
         row.spec = spec;
         if (!row.presetMember) { row.presetMember = make("div"); row.el.prepend(row.presetMember); }
-        const membership = manage?.memberControl(spec);
-        row.presetMember.replaceChildren(...(membership ? [membership] : []));
+        const membership = manage?.memberControl(spec, row.presetMember.children[0]) || null;
+        if (row.presetMember.children[0] !== membership) row.presetMember.replaceChildren(...(membership ? [membership] : []));
         if (row.grip) {
             const base = baseOf(spec);
             const allowed = manageOn && !spec.read_only && canArrange({ ...spec, base });
@@ -1124,7 +1142,7 @@ export function mountControlsPanel(container, host) {
         if (fresh && !row.mutations.get(advancedTarget)?.pending) row.advancedOptimistic = undefined;
         if (row.label) {
             const label = row.labelOptimistic || spec.label || "";
-            row.labelText.textContent = label;
+            setText(row.labelText, label);
             row.label.title = label;
             row.input?.setAttribute("aria-label", label || "Control value");
             paintTags(row, spec);
@@ -1136,19 +1154,20 @@ export function mountControlsPanel(container, host) {
         const failure = [row.target, modeTarget, noteTarget, labelTarget, advancedTarget]
             .map(target => failed.get(target))
             .find(Boolean);
-        row.status.textContent = failure
+        // Why a setting is off is on its pill (title and description), not repeated here.
+        const status = failure
             ? `Not saved: ${failure}`
             : spec.note_truncated
               ? "Edit this longer note on the canvas."
               : spec.reason ||
                 (rowsNotice ? "" : spec.error) ||
-                participationNote(spec) ||
                 (spec.source === "execution" ? switchScope(spec) : "") ||
                 pickerNote(spec) ||
                 // A folder is any label by design; the run-time check says nothing new.
                 (spec.checked_at_run && !spec.picker ? "Checked by the node when the run starts." : "");
+        setText(row.status, status);
         row.status.style.color = failure ? COLORS.warningText : COLORS.textDim;
-        row.status.style.display = row.status.textContent ? "" : "none";
+        row.status.style.display = status ? "" : "none";
         if (row.editing) {
             // An authoritative view seen mid-edit still retires settled
             // optimistic values once the edit ends, so the next edit builds on it.
@@ -1201,7 +1220,8 @@ export function mountControlsPanel(container, host) {
             row.noteText = row.noteOptimistic ?? (spec.source === "note" ? spec.text : spec.note) ?? "";
             if (spec.source === "note") paintStandaloneNote(row);
             else {
-                row.note.replaceChildren(renderPanelMarkdown(row.noteText));
+                if (row.noteRendered !== row.noteText) row.note.replaceChildren(renderPanelMarkdown(row.noteText));
+                row.noteRendered = row.noteText;
                 row.note.style.cursor = manageOn ? "text" : "default";
                 row.note.title = manageOn ? "Double-click to edit" : "";
                 // A binding's empty note takes no space (Manage adds one through its Note action).
@@ -1239,7 +1259,7 @@ export function mountControlsPanel(container, host) {
         }
         if (clamp && !manageOn) note.title = note.textContent || "";
         if (!row.noteMore) return;
-        row.noteMore.textContent = row.noteExpanded ? "Less" : "More";
+        setText(row.noteMore, row.noteExpanded ? "Less" : "More");
         row.noteMore.setAttribute("aria-expanded", String(!!row.noteExpanded));
         row.noteMore.hidden = true;
         if (!clamp) return;
@@ -1313,16 +1333,8 @@ export function mountControlsPanel(container, host) {
         search.style.visibility = manageOn ? "hidden" : "";
         const hidden = hiddenAdvanced(allSpecs, filter);
         const anyAdvanced = hasAdvanced(allSpecs);
-        quietLine.textContent = "";
-        if (filter.showAdvanced) quietLine.textContent = "Hide advanced settings";
-        else if (hidden.count) {
-            quietLine.append(make("span", `${hidden.count} advanced hidden`));
-            if (hidden.changed) {
-                const changed = make("span", ` · ${hidden.changed} changed`);
-                changed.style.color = COLORS.warningBorder;
-                quietLine.append(changed);
-            }
-        }
+        setText(quietMain, filter.showAdvanced ? "Hide advanced settings" : hidden.count ? `${hidden.count} advanced hidden` : "");
+        setText(quietChanged, !filter.showAdvanced && hidden.count && hidden.changed ? ` · ${hidden.changed} changed` : "");
         setShown(quietLine, !manageOn && anyAdvanced && (filter.showAdvanced || hidden.count > 0));
         quietLine.title = filter.showAdvanced
             ? "Hide the settings this workflow marks Advanced (their values still apply)"
@@ -1330,7 +1342,7 @@ export function mountControlsPanel(container, host) {
         // No aria-pressed: the label already states what a click does, and
         // "pressed" beside "Hide …" would read as the opposite.
         const notesHidden = hiddenNotes(allSpecs, filter);
-        notesLine.textContent = filter.showNotes ? "Hide notes" : `${notesHidden} ${notesHidden === 1 ? "note" : "notes"} hidden`;
+        setText(notesLine, filter.showNotes ? "Hide notes" : `${notesHidden} ${notesHidden === 1 ? "note" : "notes"} hidden`);
         setShown(notesLine, !manageOn && hasNotes(allSpecs, filter));
         notesLine.title = filter.showNotes
             ? "Hide the workflow's notes (Manage shows them; a search shows a matching setting's note)"
@@ -1430,12 +1442,12 @@ export function mountControlsPanel(container, host) {
                 group.el.remove();
                 groups.delete(name);
             }
-        message.textContent =
+        setText(message,
             view.error ||
             view.relay?.error ||
             (!empty
                 ? query && !shownTotal && !editorVisible ? `No settings match “${query.trim()}”. Search looks at names, groups and choices.` : ""
-                : view.state === "ready" ? host.emptyMessage || CANVAS_EMPTY : "Loading controls…");
+                : view.state === "ready" ? host.emptyMessage || CANVAS_EMPTY : "Loading controls…"));
     }
     let closing = null;
     function setManage(on) {

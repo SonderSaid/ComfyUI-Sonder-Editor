@@ -6,7 +6,7 @@
 // module owns its DOM and listeners and returns cleanup. Which choice shows is
 // derived from each view (controls_modes_model.js), never stored.
 import { ambiguityText, deriveModes, followNotice, rowOf } from "./controls_modes_model.js";
-import { placeInOrder, setText } from "./controls_dom_order.js";
+import { VISUALLY_HIDDEN_CSS, placeInOrder, setText } from "./controls_dom_order.js";
 import { panelMarkdownPlainText, renderPanelMarkdown } from "./panel_markdown.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { EDITOR_COLORS as COLORS, RADIUS, SPACE, TYPE, setButtonVariant } from "./editor_theme.js";
@@ -36,7 +36,7 @@ function plainText(description) {
 }
 const asHeading = el => { el.setAttribute("role", "heading"); el.setAttribute("aria-level", "3"); return el; };
 // Read by assistive technology, never drawn.
-const hiddenCss = "position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;";
+const hiddenCss = VISUALLY_HIDDEN_CSS;
 const editable = el => !!el && (["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) || el.isContentEditable === true);
 // A key a button never uses: it goes on to the editor's shortcuts.
 const shortcutKey = e => !!(e.ctrlKey || e.metaKey || e.altKey) || e.key === "Escape";
@@ -69,7 +69,9 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         setButtonVariant(button, selected ? "active" : "secondary", { padding: `2px ${SPACE.s2}px`, fontSize: `${TYPE.t11}px` });
         // setButtonVariant rewrites the whole style; these follow it.
         Object.assign(button.style, {
-            whiteSpace: "normal", overflowWrap: "anywhere", width: "100%", minWidth: "0",
+            // Every button of a category fills its grid cell, so all share one
+            // width and the tallest one's height (grid-auto-rows:1fr).
+            whiteSpace: "normal", overflowWrap: "anywhere", width: "100%", height: "100%", minWidth: "0",
             outline: outlined ? `1px solid ${COLORS.accent}` : "", outlineOffset: outlined ? "1px" : "",
             opacity: dim || busy ? "0.42" : "", cursor: busy ? "progress" : "pointer",
         });
@@ -105,7 +107,9 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         row.el.dataset.controlsModeCategory = id;
         row.el.style.cssText = `position:relative;display:flex;flex-wrap:wrap;gap:${SPACE.s2}px;align-items:flex-start;`
             + `border:1px solid ${COLORS.border};border-radius:${RADIUS.r2}px;padding:${SPACE.s2}px;min-width:0;`;
-        row.lead.style.cssText = `flex:1 1 140px;min-width:0;display:flex;flex-direction:column;gap:2px;`;
+        // The name above its choices at every width: beside them, the name's
+        // column left the choices less room than stacking does.
+        row.lead.style.cssText = `flex:1 1 100%;min-width:0;display:flex;flex-direction:column;gap:2px;`;
         row.top.style.cssText = `display:flex;align-items:flex-start;gap:${SPACE.s1}px;`;
         row.name.id = domId();
         row.name.style.cssText = `flex:1;min-width:0;font-weight:${TYPE.fwBold};overflow-wrap:anywhere;`;
@@ -131,7 +135,10 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         row.lead.append(row.top, row.description, row.status);
         row.choices.setAttribute("role", "group");
         row.choices.setAttribute("aria-labelledby", row.name.id);
-        row.choices.style.cssText = `flex:2 1 200px;min-width:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:${SPACE.s1}px;`;
+        // Columns share the width and rows share the tallest button's height; a
+        // lone last button keeps the column width.
+        row.choices.style.cssText = `flex:1 1 100%;min-width:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));`
+            + `grid-auto-rows:1fr;gap:${SPACE.s1}px;`;
         row.block.dataset.controlsModeDetails = "true";
         row.block.style.cssText = `flex:1 1 100%;min-width:0;display:none;flex-direction:column;gap:${SPACE.s1}px;`
             + `font-size:${TYPE.t11}px;color:${COLORS.textSecondary};overflow-wrap:anywhere;`;

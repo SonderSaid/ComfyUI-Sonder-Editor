@@ -14,7 +14,7 @@ a fresh `[Unreleased]` block.
 ### Added
 - One notification per run, the same on the canvas, in fullscreen, in a mounted tab and in the Sonder App: it shows what the run is doing (Queued, Rendering frames 40/144, Preparing graph inputs, Encoding frames, Saving the take) with a ticking elapsed time, then turns into how it ended, with a short receipt: the range it rendered, whether the Render Queue was off or which queued job ran, and the Modes in effect. A batch keeps one live notification with how many runs are waiting, and each finished run leaves a receipt.
 - **Restore Take Placement** (Settings ▸ Timeline Behavior, on by default): drag a take from Assets onto the timeline and it comes back with its original trim, at its original time in its own scene or where you drop it in another (converted to that scene's frame rate). Drop on the ruler to bring its sound back too. Older takes that don't record their placement, and takes whose media was replaced, drop whole at the cursor. This replaces the old same-scene drop, which put the whole file at the Selection's start; with the setting off a take now drops whole at the cursor. Works in fullscreen, mounted tabs and the Sonder App.
-- **Keep take padding** (Settings ▸ Render, and the Controls tab's Editor group): place a new take with the extra frames a model renders to meet its frame rule, when the render generated them, from the take's start to the end of the file. A take whose kept frames run past the scene's end says so. Off by default; a queued job keeps the choice it was queued with.
+- **Keep take padding** (Settings ▸ Render): place a new take with the extra frames a model renders to meet its frame rule, when the render generated them, from the take's start to the end of the file. A take whose kept frames run past the scene's end says so. Off by default; a queued job keeps the choice it was queued with.
 - Output Views can show a sampler's live preview: pick a sampler or KJNodes Model Preview Override from a pane's **Sampling previews** list and watch its newest preview, labelled with the step, while the workflow runs. Works in fullscreen, mounted tabs and the Sonder App.
 - Output Views can follow the timeline: a Save Video take, or an output with timing you set in Manage, plays and scrubs with the editor, says when the playhead is outside what it generated, catches up after a stall, marks when the scene changed in its range since it ran, and can take over the sound from the timeline.
 - Viewport panes: show up to four sources side by side (one pane, two or three columns, or 2×2): the composite, Guides, a Driver lane, or a named output View. Pick an output node from a pane to create its View; run that output alone, cancel it, hold a result to compare with the next, and rename, reorder or delete Views in Manage. Works in fullscreen, mounted tabs and the Sonder App.
@@ -49,6 +49,8 @@ a fresh `[Unreleased]` block.
 - Sonder Control Relay node: a workflow's Controls menu. It exposes existing node settings, a Sonder Selector's feature list included, in the Controls sidebar with labels, groups and Markdown notes, and the Sonder App reads the same menu from an Export (API) workflow. The settings stay on their own nodes, and a copied node is never exposed twice.
 
 ### Changed
+- Controls: a setting on a muted or bypassed node shows only its **Muted** / **Bypassed** tag, with the reason on hover, instead of repeating it under every setting. A node switch's **Enabled / Muted / Bypassed** buttons sit under its name, all the same size, in one row or one per line, never two and one. Modes show each category's name above its choices, and every choice in a category has the same width and height.
+- Controls no longer repeats **Keep take padding** in the Editor group; it stays in Settings ▸ Render.
 - The Sonder Editor node shows ComfyUI's progress bar while it renders frames, filling only when the render is done; the Sonder App's progress shows the Editor's frame count too.
 - Reorganized the documentation around step-by-step goals, with new pages for Controls and the Sonder App.
 - Prompt: the warning about a typed label such as `[Shot 1]` or `<Picture 1>` now says what to do instead: insert it as a chip (Shot, Reference or Vocal Event) or an @handle, so its number follows staging.
@@ -66,6 +68,9 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup counts a chip as attached to an item under MiniMax H3 when it cites one of the item's members, directly or through a Subject.
 
 ### Fixed
+- In a mounted tab, Controls → Manage → **+ Setting** no longer stays on *Loading settings…*, and its filter results follow what you type.
+- Opening Controls in fullscreen or a mounted tab after Assets or References no longer puts the Render Queue above it.
+- Controls buttons pressed right after editing another field, such as a LoRA row's remove button, respond to the first click.
 - A queued job's guides now render with their own fit and crop, as a live run's do (jobs queued before this update keep the defaults they were queued with).
 - Notifications that change between a warning and an error on one subject no longer stack up: each kind keeps one notification that counts its repeats.
 - Cancel stops an Editor render within about a frame instead of waiting for the whole render to finish; a queued job it had claimed still goes back to Pending to run again.

@@ -472,7 +472,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
         el,
         render,
         setRebind,
-        memberControl: spec => modes.memberControl(spec),
+        memberControl: (spec, previous) => modes.memberControl(spec, previous),
         canLeave: () => { if (cleanup.busy) { notify("Wait for cleanup to finish."); return false; } return modes.canLeave(); },
         revealModes: () => modes.revealModes(),
         addNote: group => openDraft(typeof group === "string" ? group : ""),

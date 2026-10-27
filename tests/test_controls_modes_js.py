@@ -112,6 +112,11 @@ const status=id=>walk(rowOf(id)).find(n=>n.dataset.controlsModeStatus==='true');
 // The table: one row per drawn category, selection derived, no tie-break.
 assert.deepEqual(walk(modes.el).filter(n=>n.dataset.controlsModeCategory).map(n=>n.dataset.controlsModeCategory),['a-b','y','z']);
 assert.equal(choice('a').attributes['aria-pressed'],'true');assert.equal(choice('b').attributes['aria-pressed'],'false');
+// Name above the choices; every button fills its grid cell, so a category's
+// buttons share one width and the tallest one's height, even after a repaint.
+{const cells=walk(rowOf('a-b')).find(n=>n.attributes?.role==='group');
+assert.match(cells.style.cssText,/grid-auto-rows:1fr/);assert.match(cells.style.cssText,/flex:1 1 100%/);
+for(const id of ['a','b'])assert.equal(choice(id).style.height,'100%');}
 assert.equal(choice('a').textContent,'Text to video','a description never joins the button name');
 assert.equal(status('y').textContent,'“C” and “H” both match. Fix in Manage.');
 assert.equal(choice('c').attributes['aria-pressed'],'false');assert.match(choice('c').style.outline,/1px solid/);assert.equal(choice('b').style.outline,'');
@@ -323,6 +328,13 @@ walk(container).find(n=>n.dataset.controlsModesUncategorized==='true').dispatch(
 const manage=walk(container).find(n=>n.dataset.controlsModesManage==='true');assert.ok(manage,'the uncategorized line opens Manage');
 walk(manage).find(n=>n.dataset.controlsModesChoice==='a').children[0].dispatch('click');await settle();
 assert.ok(walk(container).some(n=>n.attributes?.['aria-label']==='Include Steps in this choice'));
+// The In this choice line is kept across repaints, ticked state included: a
+// checkbox replaced between mousedown and mouseup gets no click.
+{const box=()=>walk(container).find(n=>n.attributes?.['aria-label']==='Include Steps in this choice');
+const first=box(),line=first.parentElement;first.checked=!first.checked;first.dispatch('change');const ticked=first.checked;
+panel.render();await settle();
+assert.equal(box(),first);assert.equal(box().parentElement,line);assert.equal(box().checked,ticked);
+first.checked=!first.checked;first.dispatch('change');}
 wording(container,'Manage');
 walk(container).find(n=>n.tagName==='BUTTON'&&n.textContent==='Clean up unavailable…').dispatch('click');await settle();
 assert.match(container.textContent,/Settings in choices/);

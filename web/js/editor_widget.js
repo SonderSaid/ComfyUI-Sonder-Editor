@@ -427,6 +427,7 @@ import {
 } from "./prompt_channel_templates.js";
 import { mountSharedRenderQueue, queueBatchIds, formatQueueTime } from "./shared_render_queue.js";
 import {
+    appendAboveQueue,
     dockQueueInFullscreen,
     restoreQueueFromFullscreen,
 } from "./fullscreen_queue_lifecycle.js";
@@ -4862,7 +4863,7 @@ export class EditorWidget {
     _ensureControlsPanelMounted() {
         if (!this._fsSidebar || this._controlsPanelHandle) return;
         this._controlsPanelEl = document.createElement("div");
-        this._fsSidebar.append(this._controlsPanelEl);
+        appendAboveQueue(this._fsSidebar, this._controlsPanelEl, this._queueSection);
         const adapter = this._controlsHost || { getView: () => ({ bindings: [], notes: [], error: "Open a connected workflow to edit its controls." }), subscribe: () => () => {}, applyChanges: async () => ({ ok: false }) };
         this._controlsPanelHandle = mountControlsPanel(this._controlsPanelEl, {
             ...adapter,
@@ -4881,7 +4882,7 @@ export class EditorWidget {
         if (!this._fsSidebar || this._referenceLibraryHandle) return;
         this._referenceLibraryEl = document.createElement("div");
         this._referenceLibraryEl.style.cssText = "display:none;flex:1;min-height:0;overflow:hidden;";
-        this._fsSidebar.appendChild(this._referenceLibraryEl);
+        appendAboveQueue(this._fsSidebar, this._referenceLibraryEl, this._queueSection);
         this._referenceLibraryHandle = mountReferenceLibrary(this._referenceLibraryEl, {
             getData: () => this._referenceLibraryData(),
             mutate: (operations) => this._withMutationGesture(

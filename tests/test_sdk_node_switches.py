@@ -124,6 +124,25 @@ def test_a_switch_mutes_its_node_in_the_run_and_its_settings_stay_editable(world
     assert sdk_templates.read_control_values(world.template_id)["node_modes"] == {}
 
 
+def test_an_advanced_setting_stays_advanced_when_its_node_is_switched_off(world):
+    # F05 (live workflow 2026-10-26): Advanced is presentation, independent of
+    # whether its node runs. Authored Advanced and the app's own Advanced both
+    # survive a bypass, so the panel keeps hiding them while Show advanced is off.
+    prompt = template()
+    manifest = json.loads(prompt["8"]["inputs"]["manifest"])
+    manifest["bindings"]["steps"]["advanced"] = True
+    prompt["8"]["inputs"]["manifest"] = json.dumps(manifest)
+    install(world, prompt)
+    session = open_session(world)
+    change(world, session, {"binding:seed:advanced": True})
+    view = change(world, session, {"execution:pass:mode": "bypassed"})["view"]
+    for binding_id in ("steps", "seed"):
+        row = by_id(view, "bindings", binding_id)
+        assert row["participation"] == "inactive" and row["inactive_reason"]["mode"] == "bypassed"
+        assert row["advanced"] is True, binding_id
+    assert by_id(view, "bindings", "steps2")["advanced"] is False
+
+
 def test_bypass_routes_through_and_a_group_sets_every_node(world):
     install(world, template())
     session = open_session(world)

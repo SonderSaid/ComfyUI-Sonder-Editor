@@ -122,11 +122,14 @@ for(const fresh of [false,true]){
     // The acknowledgement always goes out; it says when its view may predate the write.
     assert.deepEqual(published[0].applied,['r']);
     assert.equal(published[0].view.view_stale,fresh?undefined:true);
-    // The canvas then adopts a newer view: a stale publication is replaced.
+    // The view the acknowledgement carried is not sent again.
+    for(const cb of callbacks)cb(current);await relay.cycle();assert.equal(published.length,1,'nothing new to say');
+    // The canvas then adopts a newer view: a stale publication is replaced, and
+    // a fresh one is followed by it once, since its hash alone can't tell
+    // (Manage's candidates and filter are outside the hash; Phase 4 D10).
     current={...current,mark:'after'};for(const cb of callbacks)cb(current);await relay.cycle();
-    if(fresh)assert.equal(published.length,1,'nothing new to say');
-    else{assert.equal(published.length,2);assert.equal(published[1].view.view_stale,undefined);assert.equal(published[1].view.mark,'after');}
-    await relay.cycle();assert.equal(published.length,fresh?1:2,'and then quiet');
+    assert.equal(published.length,2);assert.equal(published[1].view.view_stale,undefined);assert.equal(published[1].view.mark,'after');
+    await relay.cycle();assert.equal(published.length,2,'and then quiet');
     relay.destroy();
 }
 console.log('ok');

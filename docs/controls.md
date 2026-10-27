@@ -32,8 +32,9 @@ seed shows its mode beside it (fixed, increment, decrement, randomize).
 In the Sonder App, values are saved for that imported workflow.
 
 A setting whose node is muted or bypassed (or sits inside a muted or bypassed
-subgraph) shows **Muted** or **Bypassed** beside its name. You can still change
-it: the node stays off, and the value applies once the node runs again.
+subgraph) shows **Muted** or **Bypassed** beside its name; hold the pointer over
+that tag to see which node is off. You can still change it: the node stays off,
+and the value applies once the node runs again.
 
 A setting that can't be used — its node was removed or is linked to another
 node — says why and is skipped, so the workflow's own value runs.

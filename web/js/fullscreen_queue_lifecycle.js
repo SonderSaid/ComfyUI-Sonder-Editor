@@ -13,6 +13,16 @@ export function dockQueueInFullscreen(queueSection, sidebar) {
     return placement;
 }
 
+/**
+ * Add a sidebar panel mounted after the queue docked (Controls or the
+ * Reference Library on its first visit): above the queue, which stays last.
+ */
+export function appendAboveQueue(sidebar, panel, queueSection) {
+    if (!sidebar || !panel) return;
+    const docked = queueSection?.parentElement === sidebar ? queueSection : null;
+    sidebar.insertBefore(panel, docked);
+}
+
 export function restoreQueueFromFullscreen(queueSection, placement) {
     const parent = placement?.parent;
     if (!queueSection || !parent) return false;

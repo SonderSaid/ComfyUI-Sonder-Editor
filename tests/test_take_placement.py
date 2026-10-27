@@ -431,8 +431,8 @@ assert.equal(s.DEFAULT_EDITOR_SETTINGS.render.keepTakePadding, false);
 assert.equal(s.normalizeEditorSettings().render.keepTakePadding, false);
 assert.equal(s.normalizeEditorSettings({ render: { keepTakePadding: 'yes' } }).render.keepTakePadding, false);
 assert.equal(s.normalizeEditorSettings({ render: { keepTakePadding: true } }).render.keepTakePadding, true);
-assert.deepEqual(s.controlsPanelSettingPatch('render.keepTakePadding', true), { render: { keepTakePadding: true } });
-assert.throws(() => s.controlsPanelSettingPatch('render.keepTakePadding', 'true'), /on or off/);
+// A browser preference in Settings ▸ Render only: Controls doesn't mirror it.
+assert.throws(() => s.controlsPanelSettingPatch('render.keepTakePadding', true), /can't be changed from Controls/);
 console.log('ok');
 """.replace("SETTINGS_URL", json.dumps((root / "editor_settings.js").as_uri()))
     path = tmp_path / "keep_padding_settings.mjs"

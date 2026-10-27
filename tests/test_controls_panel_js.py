@@ -26,6 +26,7 @@ class El {
     set innerHTML(t){throw Error('HTML parsing is forbidden');}
     get options(){return this.children;}
     setAttribute(k,v){this.attributes[k]=String(v);}
+    getAttribute(k){return this.attributes[k]??null;}
     removeAttribute(k){if(k==='title')delete this.title;delete this.attributes[k];}
     closest(sel){for(let n=this;n;n=n.parentElement){for(const part of sel.split(',').map(x=>x.trim())){if(part==='[data-control-target]'?n.dataset?.controlTarget!==undefined:n.tagName===part.toUpperCase())return n;}}return null;}
     addEventListener(k,f){(this.listeners[k]||=[]).push(f);}
@@ -40,8 +41,9 @@ globalThis.requestAnimationFrame=f=>f();
 // Collapsed notes are remembered: that scenario reads its own writes back.
 const noteStore=new Map();
 globalThis.localStorage={getItem:k=>SCENARIO==='note-titles'?noteStore.get(k)??null:null,setItem(k,v){noteStore.set(k,String(v));}};
+const docEvents={};
 globalThis.document={createElement:t=>new El(t),createTextNode:t=>new El('#TEXT',String(t)),createDocumentFragment:()=>new El('#FRAGMENT'),body:new El('body'),activeElement:null,
-    addEventListener(){},removeEventListener(){}};
+    addEventListener(k,f){(docEvents[k]||=[]).push(f);},removeEventListener(k,f){docEvents[k]=(docEvents[k]||[]).filter(x=>x!==f);}};
 document.activeElement=document.body;
 globalThis.Option=class extends El{constructor(text,value){super('option',text);this.value=value;}};
 globalThis.Event=class{constructor(type){this.type=type;}};
@@ -276,7 +278,7 @@ if(SCENARIO==='markdown'){
         // Editor-section bindings sit in the Editor group after your settings; their drag handle shows only in Manage (#7).
         const adv=byTarget('binding:adv:value');assert.ok(editor.contains(adv));
         const editorRows=walk(editor.children[1]).filter(n=>n.dataset.controlsMirror||n.dataset.controlTarget).map(n=>n.dataset.controlsMirror||n.dataset.controlTarget);
-        assert.deepEqual(editorRows,['render.takePlacementMuted','render.linkedTakePlacement','render.keepTakePadding','batchRender.maxFramesPerChunk','binding:adv:value']);
+        assert.deepEqual(editorRows,['render.takePlacementMuted','render.linkedTakePlacement','batchRender.maxFramesPerChunk','binding:adv:value']);
         assert.equal(walk(adv).find(n=>n.dataset.panelDragHandle==='true').hidden,true);assert.equal(input('binding:adv:value').checked,false);
         input('binding:adv:value').checked=true;input('binding:adv:value').dispatch('change');await settle();
         assert.deepEqual(calls,[{'binding:adv:value':true}]);
@@ -327,7 +329,8 @@ if(SCENARIO==='markdown'){
         assert.match(line.textContent,/1 advanced hidden · 1 changed/);
         // Search still finds a hidden Advanced setting, tagged.
         const box=walk(container).find(n=>n.dataset.controlsSearch==='true');box.value='steps';box.dispatch('input');
-        assert.equal(byTarget('binding:steps:value').hidden,false);assert.match(byTarget('binding:steps:value').textContent,/Adv/);
+        const advPill=()=>walk(byTarget('binding:steps:value')).find(n=>n.tagName==='SPAN'&&n._text==='Adv');
+        assert.equal(byTarget('binding:steps:value').hidden,false);assert.equal(advPill().hidden,false);
         box.value='';box.dispatch('input');
         line.dispatch('click');assert.deepEqual(settingWrites.at(-1),['controls.showAdvanced',true]);panel.render();
         assert.equal(byTarget('binding:steps:value').hidden,false);assert.match(line.textContent,/Hide advanced settings/);
@@ -905,6 +908,23 @@ if(SCENARIO==='markdown'){
                 assert.equal(strength().value,String(row.dataset.controlTarget&&first[0].strength));
                 strength().focus();strength().value='4';strength().dispatch('change');await settle();
                 assert.deepEqual(calls.at(-1)['binding:stack:value'].base,first);
+                // The App LoRA case: a press on Remove right after editing a field.
+                // The field's blur-save re-renders; a repaint replacing the
+                // pressed button would lose its click, so it waits for the press.
+                {
+                    const pressedRemove=buttons().find(n=>n.attributes['aria-label']==='Remove LoRA 1');
+                    const list=pressedRemove.parentElement.parentElement;
+                    walk(row).filter(n=>n.tagName==='INPUT'&&n.type==='checkbox')[0].focus();
+                    list.dispatch('pointerdown');pressedRemove.focus();
+                    const stored=calls.at(-1)['binding:stack:value'].rows;
+                    publish({...view,bindings:[...view.bindings,{...stack,value:stored.map((r,i)=>i?r:{...r,strength:0.25})}]});await settle();
+                    assert.ok(row.contains(pressedRemove),'the pressed Remove stays until the press ends');
+                    for(const f of [...(docEvents.pointerup||[])])f({});
+                    await new Promise(r=>setTimeout(r,5));await settle();
+                    assert.ok(!row.contains(pressedRemove),'then the rows repaint');
+                    assert.equal((docEvents.pointerup||[]).length,0);
+                    publish({...view,bindings:[...view.bindings,{...stack,value:stored}]});await settle();
+                }
             }else{
                 // The Sonder App edits rows a frontend never built: Add works from empty.
                 buttons().find(n=>n.textContent==='+ Add LoRA').dispatch('click');await settle();
@@ -932,6 +952,10 @@ if(SCENARIO==='markdown'){
             members:[{path:'3',mode:'enabled'},{path:'4',mode:'enabled'}],member_count:2,order:5,group:'',advanced:false,note:''}]});
         await settle();
         assert.equal(seg('enabled').attributes['aria-checked'],'true');
+        // All three or one per line, never two plus one: each button's basis
+        // survives the variant restyle on every paint.
+        for(const mode of ['enabled','muted','bypassed'])assert.match(seg(mode).style.flex,/^1 1 calc\(\(\d+px - 100%\) \* 999\)$/);
+        assert.equal(seg('muted').style.minWidth,'0');
         publish({...view, bindings:[...view.bindings, {source:'binding',binding_id:'off',label:'Pass 2 steps',kind:'INT',value:'8',status:'ok',
             order:4,group:'',section:'workflow',note:'',participation:'inactive',inactive_reason:{mode:'muted',by:'self',label:'Pass 2'}}],
             execution:[{source:'execution',execution_id:'x',label:'First pass',kind:'group',status:'ok',mode:'muted',value:'muted',
@@ -939,10 +963,24 @@ if(SCENARIO==='markdown'){
         await settle();
         // Generate and preset capture flush every row editor; a switch holds nothing to flush.
         assert.equal(await panel.flushPending(),true);
-        // A muted setting keeps its row, says why and stays editable.
+        // A muted setting keeps its row and stays editable. Its pill says why
+        // (title, and a description the value points at); no paragraph repeats it.
         const off=byTarget('binding:off:value');
-        assert.match(off.textContent,/Off: its node is muted/);
-        assert.ok(walk(off).some(n=>n.dataset.controlsInactive==='inactive'));
+        const pill=walk(off).find(n=>n.dataset.controlsInactive==='inactive');
+        assert.equal(pill.textContent,'Muted');assert.match(pill.title,/Off: its node is muted/);
+        const described=input('binding:off:value').getAttribute('aria-describedby');
+        assert.match(walk(off).find(n=>n.id===described).textContent,/Off: its node is muted/);
+        const statusLine=walk(off).find(n=>n.tagName==='DIV'&&/Off: its node/.test(n.textContent)&&!n.children.length);
+        assert.equal(statusLine,undefined);
+        // A repaint with the same view keeps the label's pill and text nodes, and
+        // writes no text: a node replaced under a press loses its click.
+        const label=walk(off).find(n=>n.tagName==='LABEL'),labelText=label.children[0];
+        let writes=0;const proto=Object.getPrototypeOf(labelText),setter=Object.getOwnPropertyDescriptor(proto,'textContent').set;
+        Object.defineProperty(labelText,'textContent',{get(){return Object.getOwnPropertyDescriptor(proto,'textContent').get.call(this);},set(v){writes++;setter.call(this,v);}});
+        publish({...view});await settle();
+        assert.equal(walk(byTarget('binding:off:value')).find(n=>n.dataset.controlsInactive==='inactive'),pill);
+        assert.equal(walk(byTarget('binding:off:value')).find(n=>n.tagName==='LABEL').children[0],labelText);
+        assert.equal(writes,0);
         assert.equal(input('binding:off:value').disabled,false);
         // Search finds a switch by its mode; Manage gives it a setting's actions.
         toggleManage();await settle();

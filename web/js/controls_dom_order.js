@@ -6,6 +6,20 @@ export function setText(el, text) {
     if (el.textContent !== next) el.textContent = next;
 }
 
+// Read by screen readers, never seen: descriptions an element points at.
+export const VISUALLY_HIDDEN_CSS = "position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;";
+
+// Adds or removes one id in an element's aria-describedby, keeping the others:
+// several descriptions (why a setting is off, the node's own help) share it.
+export function describedBy(el, id, on) {
+    if (!el || !id) return;
+    const ids = (el.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
+    const next = on ? (ids.includes(id) ? ids : [...ids, id]) : ids.filter(item => item !== id);
+    if (next.join(" ") === ids.join(" ")) return;
+    if (next.length) el.setAttribute("aria-describedby", next.join(" "));
+    else el.removeAttribute("aria-describedby");
+}
+
 // Puts `wanted` in order inside `body` without moving the element that holds
 // focus: moving it blurs it, which ends a rename or discards a draft, and a
 // click whose mousedown blurred a field would land on a moved button. Its

@@ -6,10 +6,19 @@
 // its DOM and listeners. A group whose nodes differ shows Mixed: no segment is
 // selected, and choosing one sets every node.
 import { smallButton } from "./controls_manage.js";
+import { setText } from "./controls_dom_order.js";
 import { EDITOR_COLORS as COLORS, SPACE, TYPE, setButtonVariant } from "./editor_theme.js";
 
 export const EXECUTION_MODES = ["enabled", "muted", "bypassed"];
 export const MODE_LABELS = { enabled: "Enabled", muted: "Muted", bypassed: "Bypassed" };
+// The three choices share one row in equal thirds while each third holds the
+// widest label ("Bypassed", 11px with its padding, about 70px); narrower, each
+// takes the whole width, stacked. Never two plus one. The basis is negative
+// above the threshold (so the three grow equally) and huge below it (so each
+// wraps alone). The panel's zoom scales the labels and the threshold together.
+const SEGMENT_MIN = 76;
+const ROW_THRESHOLD = 3 * SEGMENT_MIN + 2 * SPACE.s1;
+export const SEGMENT_FLEX = `1 1 calc((${ROW_THRESHOLD}px - 100%) * 999)`;
 
 const make = (tag, text) => {
     const el = document.createElement(tag);
@@ -42,9 +51,10 @@ export function switchScope(spec) {
 export function mountExecutionRow({ commit }) {
     const el = make("div");
     el.setAttribute("role", "radiogroup");
-    el.style.cssText = `display:flex;flex-direction:column;gap:2px;min-width:0;width:100%;align-items:flex-end;`;
+    el.style.cssText = `display:flex;flex-direction:column;gap:2px;min-width:0;width:100%;align-items:stretch;`;
     const segments = make("div");
-    segments.style.cssText = `display:inline-flex;gap:${SPACE.s1}px;flex-wrap:wrap;justify-content:flex-end;`;
+    // A definite width: the thirds' basis is measured against it.
+    segments.style.cssText = `display:flex;gap:${SPACE.s1}px;flex-wrap:wrap;width:100%;min-width:0;`;
     const mixed = make("div");
     mixed.style.cssText = `font-size:${TYPE.t10}px;color:${COLORS.textDim};`;
     el.append(segments, mixed);
@@ -68,6 +78,8 @@ export function mountExecutionRow({ commit }) {
         for (const button of buttons) {
             const chosen = button.dataset.executionMode === value;
             setButtonVariant(button, chosen ? "active" : "secondary", { padding: `2px ${SPACE.s2}px`, fontSize: `${TYPE.t11}px` });
+            // After the variant, which rewrites the whole cssText.
+            Object.assign(button.style, { flex: SEGMENT_FLEX, minWidth: "0" });
             button.setAttribute("aria-checked", String(chosen));
             button.disabled = !editable;
         }
@@ -78,7 +90,7 @@ export function mountExecutionRow({ commit }) {
         update(spec, next, { canEdit = true } = {}) {
             value = next ?? spec?.mode ?? null;
             editable = !!canEdit;
-            mixed.textContent = value === "mixed" ? modeSummary(spec, value) : "";
+            setText(mixed, value === "mixed" ? modeSummary(spec, value) : "");
             mixed.style.display = mixed.textContent ? "" : "none";
             el.setAttribute("aria-label", spec?.label || "Node switch");
             paint();

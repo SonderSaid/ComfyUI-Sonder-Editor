@@ -90,9 +90,8 @@ unlocked and visible; otherwise they add a row.
 ![A generated take placed on its own linked video and audio lanes](images/take-placed.webp)
 
 How takes land is set in **Settings** (the **⚙** at the right end of the
-toolbar) **▸ Render**. **Takes start muted**, **Link take video + audio** and
-**Keep take padding** also appear in the **Editor** group of the
-[Controls](controls.md) tab:
+toolbar) **▸ Render**. **Takes start muted** and **Link take video + audio**
+also appear in the **Editor** group of the [Controls](controls.md) tab:
 
 - **Take Placement Mode:** **Trimmed** places the Selection plus any context
   you deliberately include with **Mask Pre/Post**. Automatic model alignment
