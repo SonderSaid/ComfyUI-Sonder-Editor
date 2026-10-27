@@ -170,6 +170,7 @@ export function mountReferenceLanePicker({ commit, onEditing = () => {} }) {
     return {
         el,
         get editing() { return open; },
+        get open() { return open; },
         get describeTargets() { return [add]; },
         contains: target => el.contains(target),
         update(nextSpec, nextValue, { canEdit = true, choices: nextChoices = null, retry: nextRetry = () => {} } = {}) {

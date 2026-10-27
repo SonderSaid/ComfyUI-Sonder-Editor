@@ -252,3 +252,204 @@ panel.destroy();console.log('ok');
 
 def test_update_from_current_values_saves_the_focused_row_first(tmp_path):
     run(PRELUDE + CAPTURE, tmp_path, 'modes-capture')
+
+
+LOAD = r'''
+// plans/live-workflow-phase-4-controls-modes.md D8 and D9: selecting a saved
+// choice loads it before its editor edits it; deliberate saves confirm.
+const {mountModesManage}=await import(MANAGE_URL);
+const m=(id,preview)=>[{binding_id:id,preview,status:'ok'}];
+let view={state:'ready',execution:[],bindings:[{binding_id:'steps',label:'Steps',kind:'INT',value:'20',status:'ok'}],
+    presets:[P('a','match',{name:'Refine',members:m('steps','20')}),P('b','differs',{name:'Refine and Upscale',members:m('steps','40')}),
+        P('c','differs',{name:'Draft',members:m('steps','8')}),P('u','differs',{name:'Loose',members:m('steps','9')})],
+    preset_categories:[C('pass','Passes',['a','b','c'])]};
+const calls=[],notices=[],details=[],toasts=[],tracked=[],confirms=[],fresh=[];
+let flushOk=true,confirmAnswer=true,applyGate=null,nextResult=null;
+globalThis.confirm=message=>{confirms.push(message);return confirmAnswer;};
+// Applying a choice makes it the match, as the server's preset_states would.
+const host={getView:()=>view,freshView:async()=>{const next=fresh.shift();return next?await next():{view,fresh:true};},
+    async applyChanges(changes){calls.push(changes);if(applyGate)await applyGate.promise;
+        const result=nextResult;nextResult=null;if(result)return result;
+        for(const [target,value] of Object.entries(changes)){const [source,id,field]=target.split(':');
+            if(source==='preset'&&field==='apply')view={...view,presets:view.presets.map(p=>({...p,state:p.id===id?'match':'differs'}))};
+            if(source==='preset'&&field==='name')view={...view,presets:view.presets.map(p=>p.id===id?{...p,name:value}:p)};
+            if(source==='preset_category'&&field==='name')view={...view,preset_categories:view.preset_categories.map(c=>c.id===id?{...c,name:value}:c)};}
+        return {ok:true,rejected:[]};}};
+const manage=mountModesManage(host,{track:(work,changes)=>{tracked.push([work,changes]);return work;},
+    notify:(message,detail)=>{notices.push(message);details.push(detail);},success:message=>toasts.push(message),
+    flushPending:async()=>flushOk});
+document.body.append(manage.el);manage.render(view);
+const pick=id=>walk(manage.el).find(n=>n.dataset.controlsModesChoice===id).children[0];
+const status=()=>walk(manage.el).find(n=>n.dataset.controlsModesLoad==='true');
+const editor=()=>walk(manage.el).find(n=>n.dataset.controlsModesEditor==='true');
+const siblings=()=>walk(manage.el).find(n=>n.dataset.controlsModesSiblings==='true');
+const sib=id=>walk(manage.el).find(n=>n.dataset.controlsModesSibling===id);
+const btn=(within,text)=>walk(within).find(n=>n.tagName==='BUTTON'&&(n.textContent===text||n.attributes['aria-label']===text));
+const field=label=>walk(manage.el).find(n=>n.attributes['aria-label']===label);
+const update=()=>btn(editor(),'Update from current values');
+const LOADED='Loaded: the Controls show this choice.';
+
+// A fresh match is already loaded: nothing is written, so an advancing seed keeps its number.
+pick('a').dispatch('click');
+assert.equal(status().textContent,'Loading this choice into the Controls…');assert.equal(editor().attributes['aria-busy'],'true');
+assert.equal(manage.busy,true,'a load counts as busy: Done waits and a workflow switch is refused');
+await settle();assert.equal(calls.length,0);assert.equal(status().textContent,LOADED);assert.equal(editor().attributes['aria-busy'],undefined);
+assert.deepEqual(tracked.at(-1)[1],{'preset:a:apply':true},'a load blocks a run while it runs');assert.equal(await tracked.at(-1)[0],true);
+// Choices in its category, in the category's order, the edited one marked.
+assert.equal(siblings().children[0].textContent,'Choices in “Passes” (3)');
+assert.deepEqual(walk(siblings()).filter(n=>n.dataset.controlsModesSibling).map(n=>n.dataset.controlsModesSibling),['a','b','c']);
+assert.equal(sib('a').attributes['aria-current'],'true');assert.equal(sib('b').attributes['aria-current'],undefined);
+// A sibling selects like the main list, and a differing choice applies.
+const keptSibling=sib('c');sib('b').dispatch('click');await settle();
+assert.deepEqual(calls,[{'preset:b:apply':true}]);assert.equal(status().textContent,LOADED);
+assert.equal(sib('b').attributes['aria-current'],'true');assert.equal(sib('c'),keptSibling,'kept, updated in place');
+// An uncategorized choice loads too, and lists no siblings.
+pick('u').dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'preset:u:apply':true});assert.equal(siblings().style.display,'none');
+
+// A stale view decides nothing: its match still applies.
+view={...view,presets:view.presets.map(p=>p.id==='c'?{...p,state:'match'}:p)};manage.render(view);
+fresh.push(async()=>({view,fresh:false}));pick('c').dispatch('click');await settle();
+assert.deepEqual(calls.at(-1),{'preset:c:apply':true});assert.equal(status().textContent,LOADED);
+
+// Refused: Not loaded with the reason, a warning, still editable; a run never refused for it.
+nextResult={ok:false,rejected:[{reason:'Steps: too high.'}]};pick('b').dispatch('click');await settle();
+assert.equal(status().textContent,'Not loaded: Steps: too high. Controls still show your current settings.');
+assert.equal(notices.at(-1),'“Refine and Upscale” was not loaded: Steps: too high.');
+assert.equal(await tracked.at(-1)[0],true);assert.equal(field('Choice name').disabled,undefined);
+// Update asks first; declined, nothing is captured.
+confirmAnswer=false;let n=calls.length;update().dispatch('click');await settle();
+assert.equal(calls.length,n);assert.equal(confirms.at(-1),"The Controls may not hold this choice's settings. Update “Refine and Upscale” from them anyway?");
+confirmAnswer=true;update().dispatch('click');await settle();assert.deepEqual(calls.at(-1),{'preset:b:capture':{members:['steps']}});
+assert.equal(toasts.at(-1),'Choice “Refine and Upscale” updated from current values.');
+
+// A failed flush writes nothing.
+flushOk=false;n=calls.length;pick('c').dispatch('click');await settle();flushOk=true;
+assert.equal(calls.length,n);assert.equal(status().textContent,'Not loaded: A Control could not be saved. Controls still show your current settings.');
+// A lost answer is Not confirmed, never Not loaded, and Update asks too.
+nextResult={ok:false,unconfirmed:true,rejected:[{reason:'The canvas reconnected before it confirmed this change.'}]};
+pick('b').dispatch('click');await settle();
+assert.equal(status().textContent,"Couldn't confirm “Refine and Upscale” loaded. Check the Controls before updating it.");
+confirmAnswer=false;n=calls.length;update().dispatch('click');await settle();assert.equal(calls.length,n);confirmAnswer=true;
+
+// A mounted tab's canvas reconnecting mid-load: its view lists nothing for a
+// moment; the editor stays, and a lost answer reads Not confirmed.
+view={...view,presets:view.presets.map(p=>({...p,state:'differs'}))};manage.render(view);
+applyGate=deferred();pick('c').dispatch('click');await settle();const listedView=view;
+view={state:'loading',bindings:[],notes:[],error:null};manage.render(view);
+assert.notEqual(editor().style.display,'none','an empty view keeps the editor');
+nextResult={ok:false,unconfirmed:true,rejected:[{reason:'The canvas closed before it confirmed this change.'}]};
+applyGate.resolve();applyGate=null;await settle();view=listedView;manage.render(view);
+assert.equal(status().textContent,"Couldn't confirm “Draft” loaded. Check the Controls before updating it.");
+// A fresh view listing no presets decides nothing: the host's answer does.
+n=calls.length;fresh.push(async()=>({view:{state:'ready',bindings:[]},fresh:true}));pick('u').dispatch('click');await settle();
+assert.deepEqual(calls.slice(n),[{'preset:u:apply':true}]);
+// Update waiting on a load whose selection moved on runs nowhere, and says so.
+view={...view,presets:view.presets.map(p=>({...p,state:'differs'}))};manage.render(view);
+applyGate=deferred();pick('c').dispatch('click');await settle();update().dispatch('click');await settle();
+sib('b').dispatch('click');applyGate.resolve();applyGate=null;await settle();await settle();
+assert.equal(notices.at(-1).startsWith("Update didn't run"),true);
+assert.ok(!calls.some(c=>'preset:c:capture' in c&&c===calls.at(-1)),'nothing captured into another choice');
+// Update waits for a load still running, then captures without asking.
+view={...view,presets:view.presets.map(p=>({...p,state:'differs'}))};manage.render(view);
+applyGate=deferred();pick('c').dispatch('click');await settle();
+n=calls.length;let asked=confirms.length;update().dispatch('click');await settle();assert.equal(calls.length,n,'waits for the load');
+applyGate.resolve();applyGate=null;await settle();
+assert.deepEqual(calls.at(-1),{'preset:c:capture':{members:['steps']}});assert.equal(confirms.length,asked,'a Loaded choice never asks');
+
+// Supersession: a load whose selection moved on writes nothing.
+let release;fresh.push(()=>new Promise(resolve=>{release=()=>resolve({view,fresh:true});}));
+n=calls.length;pick('b').dispatch('click');await settle();
+let idle=false;manage.whenIdle().then(()=>idle=true);
+pick('a').dispatch('click');await settle();assert.equal(manage.busy,true,'the superseded load still runs');assert.equal(idle,false);
+release();await settle();
+assert.ok(!calls.slice(n).some(c=>'preset:b:apply' in c),'a superseded load never writes');
+assert.deepEqual(calls.at(-1),{'preset:a:apply':true});assert.equal(status().textContent,LOADED);assert.equal(sib('a').attributes['aria-current'],'true');
+assert.equal(idle,true,'whenIdle waits for every load');assert.equal(manage.busy,false);
+
+// Unsaved ticks ask before they are dropped, by a selection and by Done.
+const tick=walk(manage.memberControl(view.bindings[0])).find(n=>n.tagName==='INPUT');tick.checked=false;tick.dispatch('change');
+confirmAnswer=false;pick('c').dispatch('click');assert.equal(confirms.at(-1),'Discard the unsaved setting changes to “Refine”?');
+assert.equal(sib('a').attributes['aria-current'],'true','declined: the editor stays');assert.equal(manage.canLeave(),false);
+confirmAnswer=true;pick('c').dispatch('click');await settle();assert.equal(status().textContent,LOADED);
+// Values tuned since the load ask before another load overwrites them; a category edit doesn't ask.
+view={...view,presets:view.presets.map(p=>p.id==='c'?{...p,state:'differs'}:p)};manage.render(view);
+confirmAnswer=false;n=calls.length;pick('b').dispatch('click');
+assert.equal(confirms.at(-1),"Your Controls changed since loading “Draft” and aren't saved to it. Load “Refine and Upscale” anyway?");
+assert.equal(calls.length,n);assert.equal(sib('c').attributes['aria-current'],'true');confirmAnswer=true;
+assert.equal(manage.canLeave(),true,'Done overwrites nothing, so it never asks about tuned values');
+asked=confirms.length;btn(manage.el,'Edit category Passes').dispatch('click');await settle();assert.equal(confirms.length,asked);
+assert.equal(status().textContent,'','a category loads nothing');assert.equal(calls.length,n);
+// Editing a category in between never disarms the question.
+confirmAnswer=false;pick('b').dispatch('click');
+assert.equal(confirms.at(-1),"Your Controls changed since loading “Draft” and aren't saved to it. Load “Refine and Upscale” anyway?");
+assert.equal(calls.length,n);confirmAnswer=true;
+
+// Toasts: one per deliberate save once it is accepted.
+field('Category name').focus();field('Category name').value='Pass';field('Category name').blur();await settle();
+assert.equal(toasts.at(-1),'Renamed to “Pass”.');
+field('Category description').focus();field('Category description').value='Which passes run';field('Category description').blur();await settle();
+assert.equal(toasts.at(-1),'Description of “Pass” saved.');
+btn(manage.el,'+ Category').dispatch('click');field('Category name').value='Look';btn(editor(),'Create').dispatch('click');await settle();
+assert.equal(toasts.at(-1),'Category “Look” created.');
+btn(manage.el,'+ Choice').dispatch('click');field('Choice name').value='Half';btn(editor(),'Create').dispatch('click');await settle();
+assert.equal(toasts.at(-1),'Choice “Half” created in “Pass”.');
+// Update with an edited name: one click, one toast.
+pick('a').dispatch('click');await settle();let count=toasts.length;
+field('Choice name').focus();field('Choice name').value='Refine Only';update().dispatch('mousedown');update().dispatch('click');await settle();
+assert.equal(toasts.length,count+1);assert.equal(toasts.at(-1),'Choice “Refine Only” renamed and updated from current values.');
+assert.deepEqual(calls.slice(-2),[{'preset:a:name':'Refine Only'},{'preset:a:capture':{members:['steps']}}]);
+// A blur-save still queued is not sent (or announced) again by Update.
+applyGate=deferred();count=toasts.length;n=calls.length;
+field('Choice name').focus();field('Choice name').value='Refine Twice';field('Choice name').blur();await settle();
+update().dispatch('click');await settle();applyGate.resolve();applyGate=null;await settle();
+assert.equal(calls.slice(n).filter(c=>'preset:a:name' in c).length,1,'one rename');
+assert.deepEqual(toasts.slice(count),['Renamed to “Refine Twice”.','Choice “Refine Twice” updated from current values.']);
+// A refused save shows only its warning.
+count=toasts.length;nextResult={ok:false,rejected:[{reason:'Too many choices.'}]};update().dispatch('click');await settle();
+assert.equal(toasts.length,count);assert.equal(notices.at(-1),'Too many choices.');
+field('Choice name').focus();field('Choice name').value='Again';nextResult={ok:false,rejected:[{reason:'Name refused.'}]};field('Choice name').blur();await settle();
+assert.equal(toasts.length,count,'a refused rename shows no toast');
+
+// Destroyed mid-load: nothing paints, nothing throws.
+applyGate=deferred();pick('b').dispatch('click');await settle();const said=notices.length;
+manage.destroy();applyGate.resolve();applyGate=null;await settle();assert.equal(notices.length,said);
+console.log('ok');
+'''
+
+
+def test_manage_loads_a_choice_before_editing_it(tmp_path):
+    run(PRELUDE + LOAD, tmp_path, 'modes-manage-load')
+
+
+PANEL_LOAD = r'''
+// The real panel: a refused load never fails the next selection's flush or a
+// run, and Done waits for a load to land.
+let view={state:'ready',notes:[],execution:[],bindings:[{source:'binding',binding_id:'steps',label:'Steps',kind:'INT',value:'20',status:'ok',section:'workflow',order:0,group:'',note:''}],
+    presets:[P('a','differs',{name:'A',members:[{binding_id:'steps',preview:'1',status:'ok'}]}),P('b','differs',{name:'B',members:[{binding_id:'steps',preview:'2',status:'ok'}]})],
+    preset_categories:[C('x','X',['a','b'])]};
+const calls=[];let gate=null,refuseA=false;
+const host={getView:()=>view,subscribe:()=>()=>{},freshView:async()=>({view,fresh:true}),notify:()=>{},
+    async applyChanges(changes){calls.push(changes);if(gate)await gate.promise;
+        if(refuseA&&'preset:a:apply' in changes)return {ok:false,rejected:[{reason:'A is broken.'}]};return {ok:true,rejected:[]};}};
+const box=document.createElement('div');document.body.append(box);const panel=mountControlsPanel(box,host);
+const toggle=()=>walk(box).find(n=>n.dataset.controlsManageToggle==='true');
+const manageOpen=()=>walk(box).some(n=>n.dataset.controlsModesManage==='true');
+const pick=id=>walk(box).find(n=>n.dataset.controlsModesChoice===id).children[0];
+const status=()=>walk(box).find(n=>n.dataset.controlsModesLoad==='true');
+toggle().dispatch('click');
+// A is refused while B is selected: B's flush still passes and B loads.
+gate=deferred();refuseA=true;pick('a').dispatch('click');await settle();
+const run=panel.flushPending();pick('b').dispatch('click');await settle();
+gate.resolve();gate=null;await settle();await settle();
+assert.deepEqual(calls,[{'preset:a:apply':true},{'preset:b:apply':true}]);assert.equal(status().textContent,'Loaded: the Controls show this choice.');
+assert.equal(await run,true,'a run waited for the load and was not refused by it');
+// Done during a load closes once it lands, on that one click.
+gate=deferred();refuseA=false;pick('a').dispatch('click');await settle();
+toggle().dispatch('click');await settle();assert.equal(manageOpen(),true,'waits for the load');
+gate.resolve();gate=null;await settle();await settle();assert.equal(manageOpen(),false);
+panel.destroy();console.log('ok');
+'''
+
+
+def test_a_refused_load_never_blocks_the_next_selection_or_done(tmp_path):
+    run(PRELUDE + PANEL_LOAD, tmp_path, 'modes-manage-panel-load')

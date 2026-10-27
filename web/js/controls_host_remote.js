@@ -8,6 +8,9 @@ const failure = (changes, reason) => ({
     ok: false,
     rejected: Object.keys(changes || {}).map(target => ({ target, reason })),
 });
+// No answer arrived, so the change may have landed: a caller reports it as
+// not confirmed, never as not applied (controls_choice_apply.js).
+const unconfirmed = (changes, reason) => ({ ...failure(changes, reason), unconfirmed: true });
 
 export function createSdkControlsHost(owner) {
     let view = idle(),
@@ -144,7 +147,7 @@ export function createSdkControlsHost(owner) {
                         rejected: result.payload.rejected || failure(owned, "The change could not be saved.").rejected,
                     };
                 } catch (_) {
-                    return failure(owned, "The change could not be confirmed.");
+                    return unconfirmed(owned, "The change could not be confirmed.");
                 }
             });
             tail = work.catch(() => {});
@@ -209,7 +212,7 @@ export function createMountedControlsHost({
     // The server dropped this host's relay (release, eviction or a new canvas
     // session), so no acknowledgement can arrive for requests still waiting.
     const abandon = reason => {
-        for (const pending of waiting.values()) pending.resolve(failure(pending.changes, reason));
+        for (const pending of waiting.values()) pending.resolve(unconfirmed(pending.changes, reason));
         waiting.clear();
     };
     const mutation = async (suffix, body) => {
@@ -405,7 +408,7 @@ export function createMountedControlsHost({
                     void refresh(true);
                 });
                 postTail = post
-                    .catch(() => resolve(failure(owned, "The change could not be confirmed.")))
+                    .catch(() => resolve(unconfirmed(owned, "The change could not be confirmed.")))
                     .finally(() => {
                         posting--;
                         if (waiting.size) void refresh(true);

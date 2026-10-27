@@ -163,6 +163,10 @@ choice('a').dispatch('mouseleave');
 document.body.focus?.();document.activeElement=document.body;
 choice('a').dispatch('mouseenter');modes.el.offsetParent=null;e=key('Escape');
 assert.ok(!e.stopped,'hidden: Escape goes on');assert.equal(tip().style.display,'none');delete modes.el.offsetParent;
+// A click focuses the button; leaving it still closes the hover tip.
+choice('a').dispatch('mouseenter');for(const f of events.pointerdown||[])f({target:choice('a')});choice('a').focus();
+assert.equal(tip().style.display,'block');choice('a').dispatch('mouseleave');assert.equal(tip().style.display,'none','closed on leave');
+choice('a').blur();
 // Both headings are headings to assistive technology.
 for(const h of [walk(modes.el)[1],walk(modes.el).find(n=>n.dataset.controlsIndividualHeading==='true')]){
     assert.equal(h.attributes.role,'heading');assert.equal(h.attributes['aria-level'],'3');}
@@ -210,13 +214,13 @@ choice('b').focus();choice('b').dispatch('click');await settle();
 assert.equal(choice('a').attributes['aria-disabled'],'true');assert.equal(choice('b').disabled,undefined);assert.equal(document.activeElement,choice('b'));
 assert.equal(walk(rowOf('a-b')).find(n=>n.attributes.role==='group').attributes['aria-busy'],'true');
 // The theme's hover reads aria-disabled: a busy button doesn't light up.
-El.prototype.getAttribute=function(k){return k in this.attributes?this.attributes[k]:null;};
+const shimGetAttribute=El.prototype.getAttribute;El.prototype.getAttribute=function(k){return k in this.attributes?this.attributes[k]:null;};
 const resting=choice('a').style.background;choice('a').onmouseenter();assert.equal(choice('a').style.background,resting);
 choice('a').dispatch('click');await settle();assert.equal(calls.length,2,'a second click waits for none');assert.equal(tracked.length,3);
 applyGate.resolve();applyGate=null;await settle();assert.equal(choice('a').attributes['aria-disabled'],undefined);
 assert.equal(walk(rowOf('a-b')).find(n=>n.attributes.role==='group').attributes['aria-busy'],undefined);
 choice('a').onmouseenter();assert.notEqual(choice('a').style.background,resting,'idle: hover lights it');choice('a').onmouseleave();
-delete El.prototype.getAttribute;
+El.prototype.getAttribute=shimGetAttribute;
 
 // 4: a failed flush applies nothing and refuses the run.
 flushOk=false;choice('b').dispatch('click');await settle();assert.equal(calls.length,2);

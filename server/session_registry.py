@@ -902,6 +902,18 @@ def _prepare_control_publication(body: Any) -> dict:
             if isinstance(text, str) and len(text) > control_descriptors.PANEL_NOTE_MAX_CHARS:
                 descriptor[field] = text[:control_descriptors.PANEL_NOTE_MAX_CHARS]
                 descriptor["note_truncated"] = True
+    # A node's help is display text: an over-long one is cut and a malformed
+    # one dropped, never a reason to refuse the Controls.
+    for descriptor in view["bindings"]:
+        fields = descriptor.get("fields") if isinstance(descriptor.get("fields"), list) else []
+        for spec in [descriptor, *(f for f in fields if isinstance(f, dict))]:
+            tooltip = spec.get("tooltip")
+            if tooltip is None:
+                continue
+            if not isinstance(tooltip, str) or not tooltip:
+                del spec["tooltip"]
+            elif len(tooltip) > control_descriptors.CONTROL_TOOLTIP_MAX_CHARS:
+                spec["tooltip"] = tooltip[:control_descriptors.CONTROL_TOOLTIP_MAX_CHARS - 1] + "…"
     applied, rejected = body.get("applied", []), body.get("rejected", [])
     if not isinstance(applied, list) or len(applied) > CONTROLS_MAX_PENDING or not all(isinstance(r, str) for r in applied):
         raise ValueError("applied must list up to 32 request ids.")

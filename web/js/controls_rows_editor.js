@@ -10,7 +10,7 @@
 import { mountComboPicker, wantsComboPicker } from "./controls_combo_picker.js";
 import { smallButton } from "./controls_manage.js";
 import { canonical, pluralName, summary } from "./control_rows.js";
-import { setText } from "./controls_dom_order.js";
+import { VISUALLY_HIDDEN_CSS, describedBy, setText } from "./controls_dom_order.js";
 import * as S from "./controls_panel_style.js";
 import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE } from "./editor_theme.js";
 
@@ -22,8 +22,10 @@ const make = (tag, text) => {
     if (text !== undefined) el.textContent = text;
     return el;
 };
+let nextHelp = 0;
 
-export function mountRowsEditor({ commit, onEditing = () => {} }) {
+// `attachTip(el, getText, options)` shows a field's help on hover and focus and returns detach.
+export function mountRowsEditor({ commit, onEditing = () => {}, attachTip = () => () => {} }) {
     const el = make("div");
     el.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;min-width:0;width:100%;`;
     const header = make("button");
@@ -44,7 +46,7 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
     el.append(header, notice, list, add);
 
     let spec = null, value = [], editable = false, expanded = false, editing = false, rendered = "";
-    let pickers = [], removes = [], cancelling = false;
+    let pickers = [], removes = [], tipDetach = [], cancelling = false;
     // A press inside the list holds repaints until it ends. A save that lands
     // between mousedown and mouseup (a field's blur-save, often) would replace
     // the pressed button, and Chromium then sends it no click.
@@ -91,7 +93,22 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
         send(value.map((row, i) => (i === index ? { ...row, [field]: fieldValue } : row)));
     };
 
-    function fieldInput(field, index, current) {
+    // "<field>: <its help>", or nothing: the field's own name stays its title.
+    // Screen readers hear the help through a hidden description in the line.
+    function fieldTip(target, field, line, suppressed = null) {
+        const help = typeof field.tooltip === "string" ? field.tooltip : "";
+        if (!help) { target.title = field.label || field.id; return; }
+        target.removeAttribute("title");
+        const description = make("span", help);
+        description.id = `controls-rows-help-${++nextHelp}`;
+        description.style.cssText = VISUALLY_HIDDEN_CSS;
+        line.append(description);
+        describedBy(target, description.id, true);
+        const text = `${field.label || field.id}: ${help}`;
+        tipDetach.push(attachTip(target, () => text, { suppressed }));
+    }
+
+    function fieldInput(field, index, current, line) {
         const label = `${spec.group_name || "Row"} ${index + 1} ${field.label || field.id}`;
         if (field.kind === "COMBO" && wantsComboPicker(field)) {
             const picker = mountComboPicker({
@@ -103,6 +120,8 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
             picker.update({ ...field, status: editable ? "ok" : "off" });
             picker.setValue(current);
             picker.input.setAttribute("aria-label", label);
+            // Never over its open option list.
+            fieldTip(picker.input, field, line, () => picker.open);
             picker.box.style.cssText = "flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:2px;";
             pickers.push(picker);
             return picker.box;
@@ -140,14 +159,16 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
             });
         }
         input.disabled = !editable;
-        input.title = field.label || field.id;
+        fieldTip(input, field, line);
         input.setAttribute("aria-label", label);
         return input;
     }
 
     function paintRows() {
         for (const picker of pickers) picker.destroy();
+        for (const detach of tipDetach) detach();
         pickers = [];
+        tipDetach = [];
         removes = [];
         const lines = value.map((row, index) => {
             const line = make("div");
@@ -155,7 +176,7 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
                 + `padding:2px ${SPACE.s1}px;border:1px solid ${COLORS.border};border-radius:${RADIUS.r2}px;`;
             // An on/off field leads its row, as a checkbox does in a list.
             const fields = [...(spec.fields || [])].sort((a, b) => (b.kind === "BOOLEAN") - (a.kind === "BOOLEAN"));
-            for (const field of fields) line.append(fieldInput(field, index, row?.[field.id]));
+            for (const field of fields) line.append(fieldInput(field, index, row?.[field.id], line));
             const remove = make("button", "×");
             remove.type = "button";
             remove.title = `Remove ${noun()} ${index + 1}`;
@@ -257,7 +278,9 @@ export function mountRowsEditor({ commit, onEditing = () => {} }) {
             deferred = false;
             spec = null;
             for (const picker of pickers) picker.destroy();
+            for (const detach of tipDetach) detach();
             pickers = [];
+            tipDetach = [];
             el.remove();
         },
     };

@@ -12,6 +12,8 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- Controls show a node's own help for its settings: hover a setting's name, or Tab to its value, to read what the node says about it (a LoRA list's fields too). Works in fullscreen, mounted tabs and the Sonder App.
+- Controls Modes: in Manage, a choice's editor lists the other **Choices in** its category, so you can step between them, and creating a category or choice, updating a choice and saving its name or description each confirm with a short notice.
 - One notification per run, the same on the canvas, in fullscreen, in a mounted tab and in the Sonder App: it shows what the run is doing (Queued, Rendering frames 40/144, Preparing graph inputs, Encoding frames, Saving the take) with a ticking elapsed time, then turns into how it ended, with a short receipt: the range it rendered, whether the Render Queue was off or which queued job ran, and the Modes in effect. A batch keeps one live notification with how many runs are waiting, and each finished run leaves a receipt.
 - **Restore Take Placement** (Settings ▸ Timeline Behavior, on by default): drag a take from Assets onto the timeline and it comes back with its original trim, at its original time in its own scene or where you drop it in another (converted to that scene's frame rate). Drop on the ruler to bring its sound back too. Older takes that don't record their placement, and takes whose media was replaced, drop whole at the cursor. This replaces the old same-scene drop, which put the whole file at the Selection's start; with the setting off a take now drops whole at the cursor. Works in fullscreen, mounted tabs and the Sonder App.
 - **Keep take padding** (Settings ▸ Render): place a new take with the extra frames a model renders to meet its frame rule, when the render generated them, from the take's start to the end of the file. A take whose kept frames run past the scene's end says so. Off by default; a queued job keeps the choice it was queued with.
@@ -68,6 +70,7 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup counts a chip as attached to an item under MiniMax H3 when it cites one of the item's members, directly or through a Subject.
 
 ### Fixed
+- Controls Modes: selecting a choice in Manage now loads its settings and node switches first, so the editor shows that choice and **Update from current values** can no longer overwrite it with another choice's setup. A choice that can't load says why, and Update asks first.
 - In a mounted tab, Controls → Manage → **+ Setting** no longer stays on *Loading settings…*, and its filter results follow what you type.
 - Opening Controls in fullscreen or a mounted tab after Assets or References no longer puts the Render Queue above it.
 - Controls buttons pressed right after editing another field, such as a LoRA row's remove button, respond to the first click.

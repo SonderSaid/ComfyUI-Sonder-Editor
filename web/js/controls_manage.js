@@ -45,7 +45,8 @@ export const kindName = kind => KIND_NAMES[kind] || "";
 // The server's locator for a node or group candidate (control_execution).
 const switchLocator = c => (c.kind === "group" ? { kind: "group", group_id: c.group_id } : { kind: c.kind, path: c.path });
 
-export function mountManageSection(host, { notify = () => {}, track = work => work, flushPending = async () => true, changed = () => {} } = {}) {
+export function mountManageSection(host, { notify = () => {}, success = () => {}, track = work => work, flushPending = async () => true,
+    changed = () => {} } = {}) {
     const id = ++nextManage;
     let destroyed = false,
         rebind = null, // {binding_id | execution_id, label} while choosing a new target for a Control
@@ -103,7 +104,7 @@ export function mountManageSection(host, { notify = () => {}, track = work => wo
     noteBox.style.cssText = `display:none;flex-direction:column;gap:${SPACE.s1}px;`;
     footer.append(addSetting, addNote, addGroup);
     const description = mountWorkflowDescription(host, { track });
-    const modes = mountModesManage(host, {track, notify, flushPending, changed});
+    const modes = mountModesManage(host, {track, notify, success, flushPending, changed});
     const views = mountViewsManage(host, {track, notify});
     const cleanup = mountCleanup(host, {track, notify, flushPending});
     // What Export (API) would leave out: settings and switches whose nodes are

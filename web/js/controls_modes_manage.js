@@ -2,6 +2,10 @@
 // category and choice editors (plans/controls-modes-phase-b.md §6). DOM only:
 // the validating host captures values and stores every edit.
 //
+// Selecting a saved choice loads it first, through the Modes table's own apply
+// (controls_choice_apply.js), so its editor edits what the choice sets
+// (plans/live-workflow-phase-4-controls-modes.md D8).
+//
 // The list is keyed and updated in place, and a queued write never disables a
 // button: a click whose mousedown blurred a field (whose save re-renders this)
 // must still land on the button it pressed.
@@ -9,6 +13,7 @@ import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { EDITOR_COLORS as COLORS, RADIUS, SPACE, TYPE, chromeInputCss, setButtonVariant } from "./editor_theme.js";
 import { blankName, mintBindingId } from "./control_bindings.js";
 import { deriveModes } from "./controls_modes_model.js";
+import { applyChoice } from "./controls_choice_apply.js";
 import { placeInOrder, setText } from "./controls_dom_order.js";
 
 let serial = 0;
@@ -26,13 +31,15 @@ const inert = el => el.attributes?.["aria-disabled"] === "true" || el.getAttribu
 const smallText = `font-size:${TYPE.t11}px;color:${COLORS.textSecondary};overflow-wrap:anywhere;`;
 const STATE_TEXT = { match: " · current values", unavailable: " · unavailable", refused: " · unavailable" };
 const ORIGIN_TEXT = { app_copy: "App copy", app: "App only" };
+// A reason as the middle of a sentence: no closing stop of its own.
+const clause = text => String(text || "").trim().replace(/[.\s]+$/, "");
 
-export function mountModesManage(host, { track, notify, flushPending = async () => true, changed = () => {} }) {
+export function mountModesManage(host, { track, notify, success = () => {}, flushPending = async () => true, changed = () => {} }) {
     const el = make("section"), heading = make("div", "Modes"), list = make("div"), loose = make("div"),
         looseTitle = make("div", "Not in a category"), looseList = make("div"), addCategory = button("+ Category"),
-        editor = make("div"), editorTitle = make("div"), name = make("input"), description = make("textarea"), counter = make("div"),
-        categoryLabel = make("label"), categorySelect = make("select"), missing = make("div"),
-        actions = make("div"), save = button("Create"), remove = button("Delete"), reset = button("Reset to workflow's version");
+        editor = make("div"), editorTitle = make("div"), loadLine = make("div"), name = make("input"), description = make("textarea"), counter = make("div"),
+        categoryLabel = make("label"), categorySelect = make("select"), siblings = make("div"), siblingsTitle = make("div"), siblingsList = make("div"),
+        missing = make("div"), actions = make("div"), save = button("Create"), remove = button("Delete"), reset = button("Reset to workflow's version");
     el.dataset.controlsModesManage = "true";
     el.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s2}px;`;
     heading.tabIndex = -1;
@@ -48,6 +55,9 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
     editor.style.cssText = `display:none;flex-direction:column;gap:${SPACE.s1}px;padding:${SPACE.s2}px;`
         + `border:1px solid ${COLORS.border};border-radius:${RADIUS.r2}px;`;
     editorTitle.style.cssText = `${smallText}font-weight:${TYPE.fwBold};`;
+    loadLine.dataset.controlsModesLoad = "true";
+    loadLine.setAttribute("role", "status");
+    loadLine.style.cssText = smallText;
     for (const input of [name, description]) { input.style.cssText = chromeInputCss({minWidth: "0"}) + "width:100%;box-sizing:border-box;"; input.dataset.sonderTextUndo = "true"; }
     description.dataset.modesDescription = "true";
     counter.style.cssText = `${smallText}align-self:flex-end;`;
@@ -55,9 +65,15 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
     categorySelect.style.cssText = chromeInputCss({minWidth: "0"}) + "flex:1;";
     categorySelect.setAttribute("aria-label", "Category");
     categoryLabel.append(make("span", "Category"), categorySelect);
+    // The other choices of the edited one's category, to move between them.
+    siblings.dataset.controlsModesSiblings = "true";
+    siblings.style.cssText = `display:none;flex-direction:column;gap:2px;`;
+    siblingsTitle.style.cssText = `${smallText}font-weight:${TYPE.fwBold};`;
+    siblingsList.style.cssText = `display:flex;flex-wrap:wrap;gap:${SPACE.s1}px;`;
+    siblings.append(siblingsTitle, siblingsList);
     actions.style.cssText = `display:flex;flex-wrap:wrap;gap:${SPACE.s1}px;`;
     actions.append(save, remove, reset);
-    editor.append(editorTitle, name, description, counter, categoryLabel, missing, actions);
+    editor.append(editorTitle, loadLine, name, description, counter, categoryLabel, siblings, missing, actions);
     el.append(heading, list, loose, addCategory, editor);
 
     // `sel`: what the editor holds. {kind: "category"|"choice", id, draft, category?}
@@ -67,7 +83,16 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
     // `staleView`: the view a write left behind when no read after it was
     // adopted; a `choices` list built from it would undo that write.
     let tail = Promise.resolve(), queued = 0, creating = null, staleView = null;
-    const pendingText = new Map(), blocks = new Map(), looseRows = new Map();
+    // The edited choice's load: {id, status: loading|loaded|not_loaded|not_confirmed,
+    // reason, view (the view its outcome came with), work}. Each selection takes
+    // a new `token`, so a load it superseded writes nothing.
+    let load = null, token = 0;
+    // The choice last loaded and the view its load left: kept while a category
+    // or a draft is edited, so tuning values and then loading another choice
+    // still asks. Replaced by the next load.
+    let lastLoaded = null;
+    const loads = new Set(); // loads still running, superseded ones included
+    const pendingText = new Map(), blocks = new Map(), looseRows = new Map(), siblingButtons = new Map();
     const categories = () => Array.isArray(view.preset_categories) ? view.preset_categories : [];
     const presets = () => Array.isArray(view.presets) ? view.presets : [];
     const choiceRow = id => presets().find(p => p.id === id);
@@ -80,27 +105,95 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
     // A draft whose Create is queued is no longer unsaved.
     const dirty = () => !!sel?.draft && creating !== sel.id
         && (!!name.value || !!description.value || (isChoice() && (members.size > 0 || switches.size > 0)));
-    const busy = () => queued > 0;
-    // Asks only about a draft: a queued write is no reason to refuse a click
-    // (its blur-save is often what queued it). The panel waits for the queue
+    const busy = () => queued > 0 || loads.size > 0;
+    // The last loaded choice no longer matches the live values: they were
+    // tuned after it loaded (a view adopted since then says so).
+    const diverged = () => !!lastLoaded && view !== lastLoaded.view && choiceRow(lastLoaded.id)?.state === "differs";
+    // Asks about a draft, unsaved ticks of a saved choice, and, before loading
+    // `next`, live values tuned since the last choice loaded (the Sonder App
+    // has no Undo). A queued write is no reason to refuse a click (its
+    // blur-save is often what queued it). The panel waits for the queue
     // before closing Manage, and refuses a workflow switch while it runs.
-    const canLeave = () => !dirty() || globalThis.confirm(isChoice() ? "Discard this unsaved choice?" : "Discard this unsaved category?");
+    function canLeave(next = null) {
+        if (sel?.draft) return !dirty() || globalThis.confirm(isChoice() ? "Discard this unsaved choice?" : "Discard this unsaved category?");
+        const current = isChoice() ? choiceRow(sel.id)?.name || name.value : "";
+        if (isChoice() && membershipDirty && !globalThis.confirm(`Discard the unsaved setting changes to “${current}”?`)) return false;
+        const loading = next?.kind === "choice" && !next.draft;
+        if (loading && diverged() && !globalThis.confirm(`Your Controls changed since loading “${choiceRow(lastLoaded.id)?.name || lastLoaded.id}” `
+            + `and aren't saved to it. Load “${choiceRow(next.id)?.name || next.id}” anyway?`)) return false;
+        return true;
+    }
 
     function select(next) {
-        if (!canLeave()) return false;
+        if (!canLeave(next)) return false;
         sel = next; membershipDirty = false; creating = null;
         const row = next?.kind === "choice" ? choiceRow(next.id) : next ? categoryRow(next.id) : null;
         name.value = next?.draft ? "" : row?.name || "";
         description.value = next?.draft ? "" : row?.description || "";
         members = new Set(isChoice() && !next.draft ? (row?.members || []).map(m => m.binding_id) : []);
         switches = new Set(isChoice() && !next.draft ? (row?.execution || []).map(m => m.execution_id) : []);
+        // A category or a draft edits only; a saved choice loads first.
+        const mine = ++token;
+        load = null;
+        if (isChoice() && !next.draft) startLoad(next.id, mine);
         render(view); changed(); return true;
+    }
+
+    // Writes the choice's saved values and node switches into the Controls, as
+    // its Modes button does: one native Undo step on the canvas. Never captures.
+    function startLoad(id, mine) {
+        const current = () => !destroyed && token === mine;
+        lastLoaded = null;
+        const work = applyChoice(host, id, {
+            flushPending,
+            // Runs wait for a load, but it never refuses one: a load that
+            // fails leaves the Controls as they were, and says so. So it never
+            // blocks the next selection's flush either.
+            track: outcome => track(outcome.then(() => true), {[`preset:${id}:apply`]: true}),
+            isCurrent: current,
+            // Only a fresh view's match skips the write: a stale one might
+            // show a match the Controls no longer hold. Skipping never
+            // rewrites an advancing seed's number.
+            decide: (read, fresh) => {
+                // A view listing no presets says nothing about this one: the
+                // host's own answer decides.
+                if (!fresh || !Array.isArray(read.presets)) return true;
+                const row = read.presets.find(p => p.id === id);
+                if (!row) return {status: "gone", reason: "This choice no longer exists"};
+                return row.state === "match" ? {status: "already"} : true;
+            },
+        });
+        load = {id, status: "loading", reason: "", view: null, work};
+        const mineLoad = load;
+        loads.add(work);
+        void work.then(outcome => {
+            loads.delete(work);
+            if (destroyed) return;
+            if (current() && load === mineLoad && sel?.id === id) {
+                const label = choiceRow(id)?.name || name.value || id;
+                if (outcome.status === "applied" || outcome.status === "already") {
+                    load = {...mineLoad, status: "loaded", view: host.getView()};
+                    lastLoaded = {id, view: load.view};
+                } else if (outcome.status === "not_confirmed") {
+                    load = {...mineLoad, status: "not_confirmed"};
+                    notify(`Couldn't confirm “${label}” loaded. Check the Controls before updating it.`);
+                } else if (outcome.status !== "superseded") {
+                    const reason = clause(outcome.status === "flush_failed" ? "A Control could not be saved"
+                        : outcome.reason || "It could not be applied");
+                    load = {...mineLoad, status: "not_loaded", reason};
+                    notify(`“${label}” was not loaded: ${reason}.`, outcome.detail);
+                }
+            }
+            render(host.getView()); changed();
+        });
     }
 
     // Every edit queues behind the last one and is built when its turn comes,
     // from the view the previous edit produced (it waits for a fresh one), so
     // two quick edits of one list never build on the same stale list.
-    function enqueue(what, build, { flush = false, text = null, after = null } = {}) {
+    // `done`: the success message (or a function giving it) for a write
+    // accepted by the canvas or stored by the app, announced once.
+    function enqueue(what, build, { flush = false, text = null, after = null, done = null } = {}) {
         if (destroyed) return Promise.resolve(false);
         if (text) pendingText.set(text.target, text.value);
         // Snapshot saves before this edit joins the panel's gate.
@@ -120,6 +213,8 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
                 const result = await host.applyChanges(changes);
                 if (!result?.ok) { notify(result?.rejected?.[0]?.reason || `The ${what} could not be saved.`); return false; }
                 after?.();
+                const message = typeof done === "function" ? done() : done;
+                if (message) success(message);
                 if (host.freshView && !destroyed) staleView = (await host.freshView()).fresh ? null : host.getView();
                 return true;
             } catch (error) { notify(`The ${what} could not be saved.`, error?.message); return false; }
@@ -143,19 +238,27 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
         return {[`preset_category:${cid}:choices`]: edit([...(row.choices || [])])};
     }
 
-    function saveText(field, input) {
-        if (!sel || sel.draft) return;
+    // A saved entry's name or description, queued. Its own toast unless the
+    // caller announces it (`quiet`); null when nothing changed.
+    function saveText(field, input, { quiet = false } = {}) {
+        if (!sel || sel.draft) return null;
         const row = isChoice() ? choiceRow(sel.id) : categoryRow(sel.id);
-        if (!row || input.value === (row[field] || "")) return;
-        if (field === "name" && blankName(input.value)) { notify("A name can't be empty."); input.value = row.name; return; }
-        const target = `${isChoice() ? "preset" : "preset_category"}:${sel.id}:${field}`, value = input.value;
-        void enqueue(isChoice() ? "choice" : "category", () => ({[target]: value}), {text: {target, value}});
+        if (!row) return null;
+        const prefix = `${isChoice() ? "preset" : "preset_category"}:${sel.id}`, target = `${prefix}:${field}`, value = input.value;
+        // Compared with a save still queued, so a blur-save then Update never
+        // sends (or announces) the same text twice.
+        if (value === (pendingText.has(target) ? pendingText.get(target) : row[field] || "")) return null;
+        if (field === "name" && blankName(value)) { notify("A name can't be empty."); input.value = row.name; return null; }
+        const shown = pendingText.get(`${prefix}:name`) ?? row.name;
+        const done = quiet ? null : field === "name" ? `Renamed to “${value}”.` : `Description of “${shown}” saved.`;
+        return enqueue(isChoice() ? "choice" : "category", () => ({[target]: value}), {text: {target, value}, done});
     }
-    name.addEventListener("blur", () => saveText("name", name));
-    description.addEventListener("blur", () => saveText("description", description));
+    name.addEventListener("blur", () => void saveText("name", name));
+    description.addEventListener("blur", () => void saveText("description", description));
     description.addEventListener("input", () => paintCounter());
     save.addEventListener("mousedown", e => e.preventDefault());
-    save.addEventListener("click", () => {
+    save.addEventListener("click", () => void saveEditor());
+    async function saveEditor() {
         if (!sel) return;
         if (sel.draft) {
             if (creating === sel.id) return; // a second click on the same draft
@@ -163,24 +266,46 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
             creating = sel.id;
         }
         const id = sel.id, draft = !!sel.draft, into = sel.category || null;
-        if (!draft) { saveText("name", name); saveText("description", description); }
+        if (!draft && isChoice()) {
+            // Update captures what the Controls hold: wait for this choice's
+            // load, and ask when it didn't load (a Loaded choice never asks).
+            const pending = load?.id === id && load.status === "loading" ? load : null;
+            if (pending) await pending.work.catch(() => {});
+            if (destroyed) return;
+            // Never captured into another choice: the click is dropped, and says so.
+            if (sel?.id !== id || sel.draft) { notify("Update didn't run: another choice was selected while this one loaded."); return; }
+            if (load?.id === id && ["not_loaded", "not_confirmed"].includes(load.status)
+                && !globalThis.confirm(`The Controls may not hold this choice's settings. Update “${choiceRow(id)?.name || name.value}” from them anyway?`)) return;
+        }
+        // One click, one toast: the capture's message names a rename.
+        let renamed = false;
+        if (!draft) {
+            saveText("name", name, {quiet: isChoice()})?.then(ok => { renamed = ok; });
+            saveText("description", description, {quiet: isChoice()});
+        }
         const done = () => { if (sel?.id === id) { sel = {...sel, draft: false}; delete sel.category; membershipDirty = false; creating = null; } };
         if (!isChoice()) {
             if (!draft) return;
             const fields = {name: name.value, description: description.value};
-            void enqueue("category", () => ({[`preset_category:${id}:create`]: fields}), {after: done})
+            void enqueue("category", () => ({[`preset_category:${id}:create`]: fields}), {after: done, done: `Category “${fields.name}” created.`})
                 .then(ok => { if (!ok && creating === id) creating = null; });
             return;
         }
         const capture = {members: [...members], ...(switches.size ? {execution: [...switches]} : {})};
         const fields = draft ? {...capture, name: name.value, description: description.value} : capture;
+        const label = name.value;
+        const message = () => {
+            if (!draft) return `Choice “${label}” ${renamed ? "renamed and updated" : "updated"} from current values.`;
+            const category = into && categoryRow(into)?.name;
+            return category ? `Choice “${label}” created in “${category}”.` : `Choice “${label}” created.`;
+        };
         void enqueue("choice", current => {
             const changes = {[`preset:${id}:${draft ? "create" : "capture"}`]: fields};
             if (!draft || !into) return changes;
             const listed = choicesChange(current, into, choices => [...choices, id]);
             return listed && {...changes, ...listed};
-        }, {flush: true, after: done}).then(ok => { if (!ok && creating === id) creating = null; });
-    });
+        }, {flush: true, after: done, done: message}).then(ok => { if (!ok && creating === id) creating = null; });
+    }
     remove.addEventListener("click", () => {
         if (!sel || sel.draft) return;
         const id = sel.id;
@@ -318,8 +443,11 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
     function render(next = host.getView()) {
         if (destroyed) return;
         view = next || {};
-        // An edited entry gone from the view (deleted elsewhere, Undo) leaves the editor.
-        if (sel && !sel.draft && !(isChoice() ? choiceRow(sel.id) : categoryRow(sel.id))) { sel = null; membershipDirty = false; }
+        // An edited entry gone from the view (deleted elsewhere, Undo) leaves the
+        // editor. A view that lists none (loading, an error, a mounted tab's
+        // canvas reconnecting) says nothing about it: the editor and its load stay.
+        const listed = Array.isArray(isChoice() ? view.presets : view.preset_categories);
+        if (sel && !sel.draft && listed && !(isChoice() ? choiceRow(sel.id) : categoryRow(sel.id))) { sel = null; membershipDirty = false; }
         const current = sel && !sel.draft ? (isChoice() ? choiceRow(sel.id) : categoryRow(sel.id)) : null;
         if (isChoice() && current && !membershipDirty) {
             members = new Set((current.members || []).map(m => m.binding_id));
@@ -406,6 +534,8 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
             categorySelect.disabled = twice;
             categorySelect.title = twice ? "Listed in two categories. Remove it from one first." : "";
         }
+        paintSiblings(choice ? categoryRow(sel.draft ? sel.category : homeOf(sel.id)?.id) : null);
+        paintLoad(choice && !sel.draft);
 
         const ids = new Set((view.bindings || []).map(b => b.binding_id));
         const absent = choice ? (current?.members || []).filter(m => !ids.has(m.binding_id)) : [];
@@ -420,6 +550,51 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
         missingLines = new Map(lines.filter(line => line !== missingTitle).map(line => [line.dataset.controlsMember, line]));
         for (const child of [...missing.children]) if (!lines.includes(child)) child.remove();
         placeInOrder(missing, lines);
+    }
+
+    // Choices in “<category>” (N), in the category's own order (its `choices`
+    // are the one membership authority). The edited one is marked, the others
+    // select like the main list. Kept buttons, updated in place.
+    function paintSiblings(category) {
+        const ids = category ? (category.choices || []).filter(pid => choiceRow(pid)) : [];
+        siblings.style.display = ids.length ? "flex" : "none";
+        if (!ids.length) return;
+        setText(siblingsTitle, `Choices in “${category.name}” (${ids.length})`);
+        for (const pid of ids) {
+            let pick = siblingButtons.get(pid);
+            if (!pick) {
+                siblingButtons.set(pid, pick = button(""));
+                pick.dataset.controlsModesSibling = pid;
+                Object.assign(pick.style, {whiteSpace: "normal", overflowWrap: "anywhere", textAlign: "left"});
+                pick.addEventListener("click", () => {
+                    if (sel?.kind === "choice" && sel.id === pid) return;
+                    select({kind: "choice", id: pid, draft: false});
+                });
+            }
+            const current = isChoice() && sel.id === pid;
+            setText(pick, choiceRow(pid)?.name || pid);
+            setButtonVariant(pick, current ? "active" : "secondary", {padding: `2px ${SPACE.s2}px`, fontSize: `${TYPE.t11}px`});
+            Object.assign(pick.style, {whiteSpace: "normal", overflowWrap: "anywhere", textAlign: "left"});
+            if (current) pick.setAttribute("aria-current", "true");
+            else pick.removeAttribute("aria-current");
+        }
+        const shown = new Set(ids);
+        for (const [pid, pick] of siblingButtons) if (!shown.has(pid)) { pick.remove(); siblingButtons.delete(pid); }
+        placeInOrder(siblingsList, ids.map(pid => siblingButtons.get(pid)));
+    }
+
+    function paintLoad(saved) {
+        const mine = saved && load?.id === sel.id ? load : null;
+        const text = !mine ? ""
+            : mine.status === "loading" ? "Loading this choice into the Controls…"
+                : mine.status === "loaded" ? "Loaded: the Controls show this choice."
+                    : mine.status === "not_loaded" ? `Not loaded: ${mine.reason}. Controls still show your current settings.`
+                        : `Couldn't confirm “${choiceRow(sel.id)?.name || name.value}” loaded. Check the Controls before updating it.`;
+        // Always in the tree, so a screen reader announces its first text.
+        setText(loadLine, text);
+        loadLine.style.color = mine && ["not_loaded", "not_confirmed"].includes(mine.status) ? COLORS.warningText : COLORS.textSecondary;
+        if (mine?.status === "loading") editor.setAttribute("aria-busy", "true");
+        else editor.removeAttribute("aria-busy");
     }
 
     const missingTitle = make("div", "Settings without a Control");
@@ -501,8 +676,8 @@ export function mountModesManage(host, { track, notify, flushPending = async () 
     return {
         el, render, memberControl, canLeave,
         get busy() { return busy(); },
-        // Settles when every queued write has (the queue's tail never rejects).
-        whenIdle: () => tail,
+        // Settles when every queued write and load has (neither ever rejects).
+        whenIdle: () => Promise.all([tail, ...loads]).then(() => {}),
         get editing() { return dirty() || [name, description].includes(document.activeElement); },
         // The panel's "N choices aren't in a category · Manage" lands here.
         revealModes() {

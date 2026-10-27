@@ -208,6 +208,26 @@ def test_a_group_binding_describes_as_one_rows_control():
     assert d["fields"][0]["options"] == LORAS and d["min"] == 1 and d["max"] == 20
 
 
+class HelpLoras(_Internal):
+    @classmethod
+    def INPUT_TYPES(cls):
+        template = _template()
+        template["required"]["strength"] = ("FLOAT", {**template["required"]["strength"][1], "tooltip": "How strongly\tit applies."})
+        return {"required": {"model": ("MODEL",), "loras": ("COMFY_DYNAMICGROUP_V3", {
+            "template": template, "min": 1, "max": 20, "group_name": "LoRA", "tooltip": "LoRAs applied in order."})}}
+
+
+def test_a_row_list_and_its_fields_carry_their_declared_help(monkeypatch):
+    monkeypatch.setitem(CLASSES, "HelpLoras", HelpLoras)
+    p = prompt()
+    p["2"]["class_type"] = "HelpLoras"
+    d = stack(describe(p))
+    assert d["status"] == "ok" and d["tooltip"] == "LoRAs applied in order."
+    assert {f["id"]: f.get("tooltip") for f in d["fields"]} == {
+        "lora_name": None, "strength": "How strongly it applies.", "enabled": None}
+    assert "tooltip" not in stack(describe(prompt())), "no help, no key"
+
+
 def test_zero_rows_stay_ok_with_an_error_so_the_app_can_store_rows():
     # A frontend without rows (1.55) exports none; finalization would raise.
     d = stack(describe(prompt([])))

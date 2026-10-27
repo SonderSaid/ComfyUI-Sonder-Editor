@@ -6,7 +6,9 @@
 // module owns its DOM and listeners and returns cleanup. Which choice shows is
 // derived from each view (controls_modes_model.js), never stored.
 import { ambiguityText, deriveModes, followNotice, rowOf } from "./controls_modes_model.js";
-import { VISUALLY_HIDDEN_CSS, placeInOrder, setText } from "./controls_dom_order.js";
+import { CHOICE_FAILURES, applyChoice } from "./controls_choice_apply.js";
+import { createHoverTip } from "./controls_hover_tip.js";
+import { VISUALLY_HIDDEN_CSS, describedBy, placeInOrder, setText } from "./controls_dom_order.js";
 import { panelMarkdownPlainText, renderPanelMarkdown } from "./panel_markdown.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { EDITOR_COLORS as COLORS, RADIUS, SPACE, TYPE, setButtonVariant } from "./editor_theme.js";
@@ -37,7 +39,6 @@ function plainText(description) {
 const asHeading = el => { el.setAttribute("role", "heading"); el.setAttribute("aria-level", "3"); return el; };
 // Read by assistive technology, never drawn.
 const hiddenCss = VISUALLY_HIDDEN_CSS;
-const editable = el => !!el && (["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) || el.isContentEditable === true);
 // A key a button never uses: it goes on to the editor's shortcuts.
 const shortcutKey = e => !!(e.ctrlKey || e.metaKey || e.altKey) || e.key === "Escape";
 
@@ -63,7 +64,9 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
 
     const rows = new Map(); // category id -> row parts
     const open = new Set(); // category ids whose ? block is open
-    let view = {}, options = {}, busy = false, destroyed = false, tip = null;
+    let view = {}, options = {}, busy = false, destroyed = false;
+    // A choice's short description on hover and focus (controls_hover_tip.js).
+    const tips = createHoverTip(el, { register, mark: "controlsModeTip" });
 
     function paintChoice(button, { selected, outlined, dim }) {
         setButtonVariant(button, selected ? "active" : "secondary", { padding: `2px ${SPACE.s2}px`, fontSize: `${TYPE.t11}px` });
@@ -81,28 +84,9 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         else button.removeAttribute("aria-disabled");
     }
 
-    function hideTip() {
-        if (!tip) return;
-        tip.row.tip.style.display = "none";
-        tip = null;
-    }
-    function showTip(row, presetId) {
-        const choice = row.buttons.get(presetId);
-        const text = choice?.text || "";
-        if (!text || destroyed) { if (tip?.row === row) hideTip(); return; }
-        if (tip && tip.row !== row) hideTip();
-        setText(row.tip, text);
-        row.tip.style.display = "block";
-        // Inside the row, so the panel's zoom and sticky header can't misplace it.
-        row.tip.style.top = `${(choice.button.offsetTop || 0) + (choice.button.offsetHeight || 0) + 2}px`;
-        const room = Math.max(0, (row.el.clientWidth || 0) - (row.tip.offsetWidth || 0) - SPACE.s2);
-        row.tip.style.left = `${Math.min(choice.button.offsetLeft || 0, room)}px`;
-        tip = { row, presetId };
-    }
-
     function buildRow(id) {
         const row = { id, el: make("div"), lead: make("div"), top: make("div"), name: make("div"), description: make("div"),
-            status: make("div"), more: make("button", "?"), choices: make("div"), described: make("div"), block: make("div"), tip: make("div"),
+            status: make("div"), more: make("button", "?"), choices: make("div"), described: make("div"), block: make("div"),
             buttons: new Map(), key: null, blockKey: null };
         row.el.dataset.controlsModeCategory = id;
         row.el.style.cssText = `position:relative;display:flex;flex-wrap:wrap;gap:${SPACE.s2}px;align-items:flex-start;`
@@ -142,21 +126,16 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         row.block.dataset.controlsModeDetails = "true";
         row.block.style.cssText = `flex:1 1 100%;min-width:0;display:none;flex-direction:column;gap:${SPACE.s1}px;`
             + `font-size:${TYPE.t11}px;color:${COLORS.textSecondary};overflow-wrap:anywhere;`;
-        row.tip.setAttribute("aria-hidden", "true");
-        row.tip.dataset.controlsModeTip = "true";
-        row.tip.style.cssText = `position:absolute;display:none;z-index:2;max-width:calc(100% - ${SPACE.s2 * 2}px);pointer-events:none;`
-            + `padding:${SPACE.s1}px ${SPACE.s2}px;border:1px solid ${COLORS.border};border-radius:${RADIUS.r2}px;`
-            + `background:${COLORS.panelRaised};color:${COLORS.text};font-size:${TYPE.t11}px;line-height:1.4;`;
         // Descriptions the buttons point at (aria-describedby): outside them,
         // so they never join a button's name.
         row.described.style.cssText = hiddenCss;
-        row.el.append(row.lead, row.choices, row.block, row.tip, row.described);
+        row.el.append(row.lead, row.choices, row.block, row.described);
         return row;
     }
 
     // The choice buttons are rebuilt only when the row's choice list changes.
     function buildChoices(row, choices) {
-        if (tip?.row === row) hideTip();
+        for (const parts of row.buttons.values()) parts.detach();
         row.buttons.clear();
         row.choices.replaceChildren();
         row.described.replaceChildren();
@@ -169,12 +148,10 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
             row.described.append(description);
             const presetId = choice.id;
             button.addEventListener("click", () => void choose(presetId));
-            button.addEventListener("mouseenter", () => showTip(row, presetId));
-            button.addEventListener("mouseleave", () => { if (tip?.row === row && tip.presetId === presetId) hideTip(); });
-            button.addEventListener("focus", () => showTip(row, presetId));
-            button.addEventListener("blur", () => { if (tip?.row === row && tip.presetId === presetId) hideTip(); });
+            // Inside the row, so the panel's zoom and sticky header can't misplace it.
+            const detach = tips.attach(button, () => row.buttons.get(presetId)?.text || "", { anchor: row.el });
             row.choices.append(button);
-            row.buttons.set(presetId, { button, label, description, text: "" });
+            row.buttons.set(presetId, { button, label, description, text: "", detach });
         }
     }
 
@@ -202,12 +179,10 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
             setText(parts.label, choice.name);
             parts.text = unusable(choice) ? choice.reason || UNAVAILABLE : plainText(choice.description);
             setText(parts.description, parts.text);
-            if (parts.text) parts.button.setAttribute("aria-describedby", parts.description.id);
-            else parts.button.removeAttribute("aria-describedby");
+            describedBy(parts.button, parts.description.id, !!parts.text);
             paintChoice(parts.button, { selected: mode.selected?.id === choice.id,
                 outlined: mode.status === "ambiguous" && matching.has(choice.id), dim: unusable(choice) });
         }
-        if (tip?.row === row) showTip(row, tip.presetId);
         row.block.style.display = isOpen ? "flex" : "none";
         const blockKey = isOpen ? JSON.stringify([mode.description, mode.selected?.id || null,
             mode.choices.map(choice => [choice.id, choice.name, choice.description, choice.state, choice.reason])]) : null;
@@ -246,7 +221,7 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         }
         for (const [id, row] of rows) {
             if (alive.has(id)) continue;
-            if (tip?.row === row) hideTip();
+            for (const parts of row.buttons.values()) parts.detach();
             row.el.remove();
             rows.delete(id);
         }
@@ -260,7 +235,9 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         heading.style.display = table.style.display = individual.style.display = drawn ? "" : "none";
         if (drawn) table.style.display = "flex";
         el.style.display = drawn || count ? "flex" : "none";
-        if (!drawn && !count) hideTip();
+        if (!drawn && !count) tips.hide();
+        // Once per render: the open tip's text or place may have changed.
+        else tips.refresh();
     }
     const repaint = () => render(view, options);
 
@@ -274,53 +251,40 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         const startedOn = workflow();
         busy = true;
         repaint();
-        let applied = false, fresh = false, before = null;
-        // Before tracking: the panel's flush waits for tracked work, so
-        // tracking first would make this click wait for itself.
-        const flushed = flushPending();
-        const work = (async () => {
-            try {
-                if (!await flushed) {
-                    if (!destroyed) notify("The choice was not applied because a Control could not be saved.");
-                    return false;
-                }
-                if (destroyed) return false;
-                const read = host.freshView ? await host.freshView() : { view: host.getView(), fresh: false };
-                fresh = !!read.fresh;
-                if (destroyed) return false;
-                // A view that isn't fresh decides nothing: the click applies.
-                const modes = deriveModes(fresh ? read.view : host.getView());
+        let before = null;
+        const outcome = await applyChoice(host, presetId, {
+            flushPending,
+            // The click states what the run should use: a choice that didn't
+            // apply refuses a run waiting on it.
+            track: work => track(work.then(result => !CHOICE_FAILURES.has(result.status)), true),
+            isCurrent: () => !destroyed,
+            // A view that isn't fresh decides nothing: the click applies.
+            decide: (read, fresh) => {
+                const modes = deriveModes(fresh ? read : host.getView());
                 const row = fresh ? rowOf(modes, presetId) : clickRow;
-                if (!row) { notify("This choice is no longer in a category. Open Manage."); return true; }
+                if (!row) { notify("This choice is no longer in a category. Open Manage."); return { status: "gone" }; }
                 const choice = row.choices.find(item => item.id === presetId) || clicked;
-                if (fresh && unusable(choice)) { notify(choice.reason || UNAVAILABLE); return true; }
+                if (fresh && unusable(choice)) { notify(choice.reason || UNAVAILABLE); return { status: "gone" }; }
                 // Already the row's only match: applying again would only
                 // rewrite an advancing seed's number.
-                if (fresh && row.status === "selected" && row.selected.id === presetId) return true;
+                if (fresh && row.status === "selected" && row.selected.id === presetId) return { status: "already" };
                 if (fresh && row.status === "ambiguous" && row.matches.some(item => item.id === presetId)) {
                     notify(ambiguityText(row));
-                    return true;
+                    return { status: "already" };
                 }
                 before = modes;
-                const result = await host.applyChanges({ [`preset:${presetId}:apply`]: true });
-                if (!result?.ok) {
-                    if (!destroyed) notify(result?.rejected?.[0]?.reason || "The choice could not be applied.");
-                    return false;
-                }
-                applied = true;
                 return true;
-            } catch (error) {
-                if (!destroyed) notify("The choice could not be applied.", error?.message);
-                return false;
-            }
-        })();
-        track(work, true);
-        await work;
+            },
+        });
         busy = false;
         if (destroyed) return;
+        if (outcome.status === "flush_failed") notify("The choice was not applied because a Control could not be saved.");
+        else if (outcome.status === "refused" || outcome.status === "not_confirmed") {
+            notify(outcome.reason || "The choice could not be applied.", outcome.detail);
+        }
         repaint();
         // Not tracked: Generate never waits for the notice's read.
-        if (!applied || !fresh || workflow() !== startedOn) return;
+        if (outcome.status !== "applied" || !outcome.fresh || workflow() !== startedOn) return;
         const after = await host.freshView();
         if (destroyed || !after.fresh || workflow() !== startedOn) return;
         const message = followNotice(before, deriveModes(after.view), presetId, after.view);
@@ -331,14 +295,7 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         const active = document.activeElement;
         const inside = el.contains(active);
         if (e.isComposing || e.keyCode === 229) return inside ? PRESERVE_DEFAULT : false;
-        // The panel was hidden under a tooltip (no mouseleave came): drop it.
-        if (tip && el.offsetParent === null) hideTip();
-        // A hover tooltip takes Escape only while its table is on screen and
-        // focus is on nothing that edits.
-        if (e.key === "Escape" && tip && (inside || !editable(active))) {
-            hideTip();
-            return true;
-        }
+        // An open tooltip's Escape is the tip's own (controls_hover_tip.js).
         if (!inside) return false;
         // Shortcuts (Ctrl+Z, Ctrl+S) and Escape keep working from a choice.
         if (shortcutKey(e)) return false;
@@ -353,7 +310,7 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         get busy() { return busy; },
         destroy() {
             destroyed = true;
-            hideTip();
+            tips.destroy();
             unregister();
             rows.clear();
             el.remove();

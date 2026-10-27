@@ -4875,6 +4875,9 @@ export class EditorWidget {
             notify: (message, detail) => notifyWarning(message, { source: "controls-save", detail: detail || null }),
             // What a Modes choice also changed. One source: a click builds one whole message.
             inform: message => notifyInfo(message, { source: "controls-modes" }),
+            // A Modes save in Manage. No source: an identical repeat counts up,
+            // different saves stack and fade (plans/live-workflow-phase-4-controls-modes.md D9).
+            success: message => notifySuccess(message),
         });
     }
 

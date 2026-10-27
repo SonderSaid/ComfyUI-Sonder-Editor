@@ -932,6 +932,88 @@ if(SCENARIO==='markdown'){
             }
         }
     }
+    if(SCENARIO==='tooltips'){
+        // plans/live-workflow-phase-4-controls-modes.md D6: a node's own help on
+        // hover of the label and on keyboard focus of the value, once each.
+        const help='The number of steps.\nMore is slower.';
+        const b=(id,label,extra)=>({source:'binding',binding_id:id,label,kind:'INT',value:'20',status:'ok',order:1,group:'',section:'workflow',note:'',...extra});
+        publish({...view,bindings:[b('steps','Steps',{tooltip:help}),b('plain','Plain',{order:2}),
+            b('off','Pass 2',{order:3,tooltip:'Its own help.',participation:'inactive',inactive_reason:{mode:'muted',by:'self',label:'Pass 2'}}),
+            {source:'binding',binding_id:'stack',label:'LoRAs',kind:'ROWS',status:'ok',order:4,group:'',section:'workflow',note:'',
+                value:[{lora_name:'a',strength:1}],group_name:'LoRA',min:0,max:3,new_row:{lora_name:'a',strength:1},tooltip:'The stack.',
+                fields:[{id:'lora_name',label:'lora_name',kind:'COMBO',options:['a','b']},{id:'strength',label:'strength',kind:'FLOAT',tooltip:'How strong.'}]}]});
+        await settle();
+        const tip=t=>walk(byTarget(t)).find(n=>n.dataset.controlsTip==='true');
+        const label=t=>walk(byTarget(t)).find(n=>n.tagName==='LABEL');
+        assert.equal(label('binding:steps:value').title,undefined,'the help tip replaces the label title');
+        assert.equal(label('binding:plain:value').title,'Plain','no help: the label keeps its title');
+        // Hover: "<label> — <help>", kept line breaks, never read by a screen reader.
+        label('binding:steps:value').dispatch('mouseenter');
+        assert.equal(tip('binding:steps:value').style.display,'block');assert.equal(tip('binding:steps:value').textContent,'Steps — '+help);
+        assert.equal(tip('binding:steps:value').attributes['aria-hidden'],'true');assert.equal(tip('binding:steps:value').style.whiteSpace,undefined);
+        assert.match(tip('binding:steps:value').style.cssText,/white-space:pre-line/);
+        label('binding:steps:value').dispatch('mouseleave');assert.equal(tip('binding:steps:value').style.display,'none');
+        label('binding:plain:value').dispatch('mouseenter');assert.equal(tip('binding:plain:value')?.style.display??'none','none','no help, no tip');
+        // Keyboard focus: the help, without the label; typing hides it.
+        const steps=input('binding:steps:value');steps.focus();
+        assert.equal(tip('binding:steps:value').style.display,'block');assert.equal(tip('binding:steps:value').textContent,help);
+        steps.dispatch('input');assert.equal(tip('binding:steps:value').style.display,'none');
+        // A press into a field shows nothing, though Chromium's :focus-visible
+        // matches a clicked text field; a clicked button fails :focus-visible.
+        steps.blur();for(const f of events.pointerdown||[])f({});steps.focus();assert.equal(tip('binding:steps:value').style.display,'none');
+        steps.blur();const now=Date.now;Date.now=()=>now()+2000;
+        steps.matches=sel=>sel!==':focus-visible';steps.focus();assert.equal(tip('binding:steps:value').style.display,'none');
+        delete steps.matches;steps.blur();steps.focus();assert.equal(tip('binding:steps:value').style.display,'block','the keyboard, later');
+        steps.blur(); // the clock stays past the press
+        // A press on another element, then Tab: the keyboard's focus shows it.
+        Date.now=now;for(const f of events.pointerdown||[])f({target:label('binding:plain:value')});steps.focus();
+        assert.equal(tip('binding:steps:value').style.display,'block','a press elsewhere never hides a Tab tip');
+        // A key that does something (not Tab) hides it, as typing does.
+        steps.dispatch('keydown',{key:'Tab'});assert.equal(tip('binding:steps:value').style.display,'block');
+        steps.dispatch('keydown',{key:'ArrowUp'});assert.equal(tip('binding:steps:value').style.display,'none');
+        steps.blur();Date.now=()=>now()+2000;
+        // A screen reader hears the help; an off setting's reason joins it, in the tip too.
+        const ids=el=>(el.getAttribute('aria-describedby')||'').split(' ').filter(Boolean);
+        const text=(t,id)=>walk(byTarget(t)).find(n=>n.id===id)?.textContent;
+        assert.deepEqual(ids(steps).map(id=>text('binding:steps:value',id)),[help]);
+        const off=input('binding:off:value');
+        assert.deepEqual(ids(off).map(id=>text('binding:off:value',id)).map(t=>t.slice(0,8)),['Off: its','Its own '],'merged, never replaced');
+        off.focus();assert.match(tip('binding:off:value').textContent,/^Its own help\.\nOff: its node is muted/);
+        // Escape in a text field is the field's draft, never the tip's.
+        off.value='99';const e=key('Escape');assert.equal(off.value,'20','the draft reverted');assert.ok(e.stopped);
+        assert.equal(tip('binding:off:value').style.display,'none','its blur hid the tip');
+        // An open tip with focus on nothing that edits takes Escape.
+        label('binding:steps:value').dispatch('mouseenter');const esc=key('Escape');assert.ok(esc.stopped&&esc.prevented);
+        assert.equal(tip('binding:steps:value').style.display,'none');
+        // A clipped value still shows in full on hover.
+        steps.value='123456789012345';steps.scrollWidth=200;steps.clientWidth=50;container.dispatch('mouseover',{target:steps});
+        assert.equal(steps.title,'123456789012345');
+        // A row list: its header carries the list's help; a field shows "<field>: <help>" and drops its title.
+        const stack=byTarget('binding:stack:value');const header=walk(stack).find(n=>n.tagName==='BUTTON'&&n.attributes['aria-expanded']);
+        assert.ok(ids(header).some(id=>text('binding:stack:value',id)==='The stack.'));
+        header.dispatch('click');await settle();
+        const strength=walk(stack).find(n=>n.attributes['aria-label']==='LoRA 1 strength');
+        assert.equal(strength.title,undefined);strength.dispatch('mouseenter');assert.equal(tip('binding:stack:value').textContent,'strength: How strong.');
+        const name=walk(stack).find(n=>n.attributes['aria-label']==='LoRA 1 lora_name');assert.equal(name.title,'lora_name','no help: its title stays');
+        strength.dispatch('mouseleave');
+        assert.ok(ids(strength).some(id=>text('binding:stack:value',id)==='How strong.'),'a screen reader hears the field help');
+        // A long option list opens on focus: its help never covers it.
+        const many=Array.from({length:25},(_,i)=>'opt'+i);
+        publish({...view,bindings:[b('pick','Pick',{kind:'COMBO',value:'opt0',options:many,tooltip:'Pick one.'})]});await settle();
+        const pickInput=input('binding:pick:value');pickInput.focus();
+        assert.notEqual(tip('binding:pick:value').style.display,'block','suppressed over the open list');pickInput.blur();
+        // A detached anchor's tip goes with its last attachment.
+        const {createHoverTip}=await import(new URL('controls_hover_tip.js',PANEL_URL).href);
+        const box=new El('div'),anchor=new El('div'),button=new El('button');box.append(anchor);anchor.append(button);
+        const tips=createHoverTip(box),detachTip=tips.attach(button,()=>'Help',{anchor});
+        assert.equal(anchor.children.filter(n=>n.dataset.controlsTip).length,1);detachTip();
+        assert.equal(anchor.children.filter(n=>n.dataset.controlsTip).length,0,'no tip keeps a dropped row alive');tips.destroy();
+        // The tip is the help's text, never markup.
+        publish({...view,bindings:[b('steps','Steps',{tooltip:'<b>bold</b>'})]});await settle();
+        label('binding:steps:value').dispatch('mouseenter');assert.equal(tip('binding:steps:value').textContent,'Steps — <b>bold</b>');
+        assert.equal(tip('binding:steps:value').children.length,0);
+        panel.destroy();assert.equal(walk(container).some(n=>n.dataset.controlsTip==='true'),false);
+    }
     if(SCENARIO==='switches'){
         // Node switches and inactive settings (plans/output-views-phase-1a.md).
         publish({...view, bindings:[...view.bindings, {source:'binding',binding_id:'off',label:'Pass 2 steps',kind:'INT',value:'8',status:'ok',
@@ -1002,7 +1084,7 @@ if(SCENARIO==='markdown'){
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','notes-hidden','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app','pickers','note-titles','switches'])
+@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','notes-hidden','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app','pickers','note-titles','switches','tooltips'])
 def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

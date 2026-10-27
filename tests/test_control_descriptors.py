@@ -421,6 +421,85 @@ def test_promoted_input_with_two_consumers_merges_bounds_and_options():
     assert len(view["n"]["targets"]) == 2
 
 
+class HelpSampler:
+    """A V1 node with help on its inputs."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "seed": ("INT", {"default": 0, "min": 0, "max": 99, "tooltip": "The random seed used for creating the noise."}),
+            "steps": ("INT", {"min": 1, "max": 50}),
+            "cfg": ("FLOAT", {"tooltip": 7}),
+        }}
+
+
+class HelpV3:
+    """What a V3 node's ``INPUT_TYPES()`` holds: ``Input.as_dict()`` drops None
+    and keeps ``tooltip`` beside the widget's own extras (comfy_api/latest/_io.py)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "steps": ("INT", {"optional": False, "tooltip": "  Fewer steps\trun   faster.\n\n\n\nMore look better.  ",
+                              "default": 20, "min": 1, "max": 50}),
+            "mode": ("COMBO", {"optional": False, "tooltip": "\u202eevil\u202c \x07Which\x00 mode", "options": ["a", "b"]}),
+            "cfg": ("FLOAT", {"optional": False, "tooltip": "Its own guidance."}),
+        }}
+
+
+class OtherHelp:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"cfg": ("FLOAT", {"tooltip": "Guidance."})}}
+
+
+def test_a_v1_tooltip_reaches_its_descriptor_as_declared():
+    classes = dict(CLASSES, HelpSampler=HelpSampler)
+    prompt = {"1": _relay({"s": _binding("9", "seed"), "n": _binding("9", "steps"), "c": _binding("9", "cfg")}),
+              "9": _node("HelpSampler", {"seed": 1, "steps": 3, "cfg": 2.0})}
+    view = {b["binding_id"]: b for b in cd.describe_bindings(prompt, class_lookup=classes.get)["bindings"]}
+    assert view["s"]["tooltip"] == "The random seed used for creating the noise."
+    assert "tooltip" not in view["n"], "no help, no key"
+    assert "tooltip" not in view["c"], "a tooltip that isn't text is dropped"
+    assert cd.json_safe(view["s"])["tooltip"] == view["s"]["tooltip"]
+
+
+def test_a_v3_tooltip_is_cleaned_but_keeps_its_lines():
+    classes = dict(CLASSES, HelpV3=HelpV3)
+    prompt = {"1": _relay({"n": _binding("9", "steps"), "m": _binding("9", "mode")}),
+              "9": _node("HelpV3", {"steps": 3, "mode": "a"})}
+    view = {b["binding_id"]: b for b in cd.describe_bindings(prompt, class_lookup=classes.get)["bindings"]}
+    assert view["n"]["tooltip"] == "Fewer steps run faster.\n\nMore look better."
+    assert view["m"]["tooltip"] == "evil Which mode", "controls and bidi overrides are stripped"
+
+
+def test_tooltip_cap_counts_code_points():
+    text = cd.clean_tooltip("日" * 600)
+    assert len(text) == cd.CONTROL_TOOLTIP_MAX_CHARS and text.endswith("…")
+    assert cd.clean_tooltip("ok") == "ok" and cd.clean_tooltip(None) == "" and cd.clean_tooltip(" \n\t ") == ""
+    assert cd.clean_tooltip("a \x0b b\u2028c") == "a b\nc", "a dropped control leaves one space"
+
+
+def test_a_fan_out_takes_the_first_target_that_declares_help():
+    classes = dict(CLASSES, HelpSampler=HelpSampler, HelpV3=HelpV3, OtherHelp=OtherHelp)
+    prompt = {"1": _relay({"n": {"label": "Steps", "status": "ok",
+                                  "targets": [{"path": "7", "input": "steps"}, {"path": "8", "input": "steps"}]},
+                           "r": {"label": "Steps", "status": "ok",
+                                  "targets": [{"path": "9", "input": "cfg"}, {"path": "8", "input": "cfg"}]}}),
+              "7": _node("KSampler", {"steps": 20}), "8": _node("HelpV3", {"steps": 20, "cfg": 1.0}),
+              "9": _node("OtherHelp", {"cfg": 1.0})}
+    view = {b["binding_id"]: b for b in cd.describe_bindings(prompt, class_lookup=classes.get)["bindings"]}
+    assert view["n"]["tooltip"] == "Fewer steps run faster.\n\nMore look better.", "past an empty first target"
+    assert view["r"]["tooltip"] == "Guidance.", "the first that has one, in target order"
+
+
+def test_a_descriptor_that_is_not_ok_carries_no_tooltip():
+    classes = dict(CLASSES, HelpSampler=HelpSampler)
+    prompt = {"1": _relay({"s": _binding("9", "seed")}), "9": _node("HelpSampler", {"seed": ["4", 0]})}
+    b = next(b for b in cd.describe_bindings(prompt, class_lookup=classes.get)["bindings"])
+    assert b["status"] == cd.STATUS_LINKED and "tooltip" not in b
+
+
 def test_mixed_target_kinds_are_unsupported():
     prompt = {"1": _relay({"m": {"label": "M", "status": "ok", "targets": [{"path": "9", "input": "steps"},
                                                                           {"path": "9", "input": "cfg"}]}}),

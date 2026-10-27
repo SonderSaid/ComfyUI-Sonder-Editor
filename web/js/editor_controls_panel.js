@@ -7,6 +7,7 @@ import { mountRowsEditor, NO_ROWS_NOTICE } from "./controls_rows_editor.js";
 import { mountExecutionRow, switchScope } from "./controls_execution_row.js";
 import { mountDriverLanePicker, mountReferenceLanePicker, normalizeAssetFolder } from "./controls_lane_pickers.js";
 import { mountManageSection, smallButton } from "./controls_manage.js";
+import { createHoverTip } from "./controls_hover_tip.js";
 import { mountPanelArrangement } from "./controls_panel_arrangement.js";
 import { EDITOR_PARTITION, comparePanelRows, canArrange, planPanelMove } from "./controls_panel_layout.js";
 import { moveToGroupItems, openGroupMenu, startGroupRename } from "./controls_panel_groups.js";
@@ -136,6 +137,9 @@ export function mountControlsPanel(container, host) {
     let validTargets = null,
         layoutSaving = false;
     container.dataset.sonderControlsPanel = "true";
+    // A node's own help on its setting: the label on hover, the value control on
+    // keyboard focus (plans/live-workflow-phase-4-controls-modes.md D6).
+    const tips = createHoverTip(container);
     // A stable gutter: Manage's longer list adding a scrollbar never shifts the header.
     container.style.cssText = `display:flex;flex-direction:column;flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;padding:${SPACE.s3}px;gap:${SPACE.s2}px;font:${TYPE.t12}px ${FONT.sans};color:${COLORS.text};`;
     applyNativeControlTheme(container);
@@ -969,6 +973,7 @@ export function mountControlsPanel(container, host) {
                 row.editor = mountRowsEditor({
                     commit: (next, before) => commit(row, row.target, { rows: next, base: before }, before),
                     onEditing,
+                    attachTip: (el, getText, options = {}) => tips.attach(el, getText, { ...options, anchor: row.el }),
                 });
             } else if (row.editorKind === "reference_lanes") {
                 row.editor = mountReferenceLanePicker({ commit: (next, before) => commit(row, row.target, next, before), onEditing });
@@ -1059,7 +1064,19 @@ export function mountControlsPanel(container, host) {
                 row.control.append(row.mode);
             }
             row.line.append(row.label, row.control);
-            row.el.append(row.line, row.offReason);
+            // The node's help, for screen readers, beside why it is off.
+            row.help = make("span");
+            row.help.id = `controls-${panelId}-help-${++nextDescription}`;
+            row.help.style.cssText = VISUALLY_HIDDEN_CSS;
+            row.el.append(row.line, row.offReason, row.help);
+            // Hovering the label shows its help; focusing the value from the
+            // keyboard shows it too, with why the setting is off. Never over
+            // an open option list.
+            row.tipDetach = [tips.attach(row.label, () => labelTip(row), { anchor: row.el })];
+            for (const target of valueTargets(row)) {
+                row.tipDetach.push(tips.attach(target, () => focusTip(row), { anchor: row.el, focusOnly: true,
+                    suppressed: () => !!row.picker?.open || !!row.editor?.open }));
+            }
             row.note = noteBox(row, `${baseOf(spec)}:note`, false);
             row.el.append(row.note);
         }
@@ -1117,8 +1134,31 @@ export function mountControlsPanel(container, host) {
         setShown(row.tagOff, off);
         setShown(row.tagDot, advanced && !!spec.overridden);
         setText(row.offReason, reason);
-        const targets = row.input ? [row.input, row.mode] : row.editor?.describeTargets || [];
-        for (const target of targets) describedBy(target, row.offReason.id, off);
+        const tooltip = spec.source === "binding" ? spec.tooltip || "" : "";
+        setText(row.help, tooltip);
+        for (const target of valueTargets(row)) {
+            describedBy(target, row.offReason.id, off);
+            describedBy(target, row.help.id, !!tooltip);
+        }
+    }
+    // Where a row's value is edited: its input (and a seed's mode), or a
+    // dedicated editor's focusable parts.
+    function valueTargets(row) {
+        return (row.input ? [row.input, row.mode] : row.editor?.describeTargets || []).filter(Boolean);
+    }
+    function labelTip(row) {
+        const tooltip = row.spec.source === "binding" ? row.spec.tooltip : "";
+        return tooltip ? `${row.labelText.textContent} — ${tooltip}` : "";
+    }
+    function focusTip(row) {
+        const tooltip = row.spec.source === "binding" ? row.spec.tooltip : "";
+        return [tooltip, row.offReason?.textContent].filter(Boolean).join("\n");
+    }
+    function dropRow(row) {
+        for (const detach of row.tipDetach || []) detach();
+        row.picker?.destroy();
+        row.editor?.destroy();
+        row.el.remove();
     }
     function update(row, spec, fresh) {
         row.spec = spec;
@@ -1143,7 +1183,9 @@ export function mountControlsPanel(container, host) {
         if (row.label) {
             const label = row.labelOptimistic || spec.label || "";
             setText(row.labelText, label);
-            row.label.title = label;
+            // The help tip names the label itself: one tooltip, not two.
+            if (spec.tooltip) row.label.removeAttribute("title");
+            else row.label.title = label;
             row.input?.setAttribute("aria-label", label || "Control value");
             paintTags(row, spec);
         }
@@ -1382,9 +1424,7 @@ export function mountControlsPanel(container, host) {
                 (row.kind !== spec.kind || row.editorKind !== editorKind(spec)) &&
                 !row.editing
             ) {
-                row.picker?.destroy();
-                row.editor?.destroy();
-                row.el.remove();
+                dropRow(row);
                 rows.delete(target);
                 row = null;
             }
@@ -1415,9 +1455,7 @@ export function mountControlsPanel(container, host) {
         }
         for (const [target, row] of rows)
             if (!alive.has(target) && !row.editing) {
-                row.picker?.destroy();
-                row.editor?.destroy();
-                row.el.remove();
+                dropRow(row);
                 rows.delete(target);
             }
         declarePickerInterest(pickerKinds);
@@ -1448,6 +1486,7 @@ export function mountControlsPanel(container, host) {
             (!empty
                 ? query && !shownTotal && !editorVisible ? `No settings match “${query.trim()}”. Search looks at names, groups and choices.` : ""
                 : view.state === "ready" ? host.emptyMessage || CANVAS_EMPTY : "Loading controls…"));
+        tips.refresh();
     }
     let closing = null;
     function setManage(on) {
@@ -1474,7 +1513,7 @@ export function mountControlsPanel(container, host) {
         manageButton.setAttribute("aria-pressed", String(on));
         setButtonVariant(manageButton, on ? "accentSoft" : "secondary", { padding: `2px ${SPACE.s2}px`, fontSize: `${TYPE.t11}px` });
         if (on) {
-            manage = mountManageSection(host, { notify: warning, flushPending, changed: () => render(),
+            manage = mountManageSection(host, { notify: warning, success: message => host.success?.(message), flushPending, changed: () => render(),
                 track: (work, changes) => track(work, Object.keys(changes).some(changesRun)) });
             restore.el.after(manage.el);
         } else {
@@ -1599,6 +1638,7 @@ export function mountControlsPanel(container, host) {
             workflowHeader.destroy();
             modes.destroy();
             restore.destroy();
+            tips.destroy();
             for (const row of rows.values()) {
                 row.picker?.destroy();
                 row.editor?.destroy();

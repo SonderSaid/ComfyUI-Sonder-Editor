@@ -590,6 +590,24 @@ def test_a_published_view_keeps_picker_hints_for_the_mounted_panel():
     assert next(d for d in view['bindings'] if d['binding_id'] == 'lane')['value'] == '1'
 
 
+def test_a_published_tooltip_is_cut_or_dropped_never_refused():
+    # plans/live-workflow-phase-4-controls-modes.md D6: help is display text.
+    long = 'é' * 700
+    body = {'view_seq': 1, 'prompt_hash': 'h', 'view': {'bindings': [
+        {'binding_id': 'a', 'status': 'ok', 'kind': 'INT', 'value': 1, 'targets': [], 'tooltip': long},
+        {'binding_id': 'b', 'status': 'ok', 'kind': 'INT', 'value': 1, 'targets': [], 'tooltip': {'x': 1}},
+        {'binding_id': 'c', 'status': 'ok', 'kind': 'INT', 'value': 1, 'targets': [], 'tooltip': 'Short.'},
+        {'binding_id': 'r', 'status': 'ok', 'kind': 'ROWS', 'value': [], 'min': 0, 'max': 3, 'targets': [],
+         'fields': [{'id': 'n', 'kind': 'INT', 'tooltip': long}, {'id': 'm', 'kind': 'INT', 'tooltip': 3}]},
+    ], 'notes': []}}
+    view = sr._prepare_control_publication(body)['view']
+    by = {d['binding_id']: d for d in view['bindings']}
+    assert len(by['a']['tooltip']) == 500 and by['a']['tooltip'].endswith('…')
+    assert 'tooltip' not in by['b'] and by['c']['tooltip'] == 'Short.'
+    assert len(by['r']['fields'][0]['tooltip']) == 500 and 'tooltip' not in by['r']['fields'][1]
+    assert 'note_truncated' not in by['a'], 'never the note path'
+
+
 def test_views_demand_flag_and_view_publication_shape():
     """Output Views 3A: the tab's panes keep the canvas describing; Views pass the shape check."""
     async def run():

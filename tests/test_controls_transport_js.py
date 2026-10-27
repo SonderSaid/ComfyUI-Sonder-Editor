@@ -165,6 +165,8 @@ if(SCENARIO.startsWith('mounted')){
         else{controlsView.cleared=true;intervalFns.at(-1)();}
         // The server dropped the relay; the request settles instead of polling forever.
         const result=await work;assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/canvas (restarted|closed)/);
+        // No answer came: it may have landed, so it is marked not confirmed (D8).
+        assert.equal(result.unconfirmed,true);
         delete controlsView.cleared;const before=gets;intervalFns.at(-1)();await settle();assert.equal(gets,before);
     }
     if(SCENARIO==='mounted-abandon-recreated'){
@@ -172,7 +174,7 @@ if(SCENARIO.startsWith('mounted')){
         const work=host.applyChanges({'binding:n:value':'31'});await settle();
         // Same canvas session, but its relay was cleared and published afresh.
         seq=1;host.changed({host_id:'h'});
-        const result=await work;assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/reconnected/);
+        const result=await work;assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/reconnected/);assert.equal(result.unconfirmed,true);
     }
     if(SCENARIO==='mounted-restore'){
         controlsView.restore={restorable:[{binding_id:'n',label:'Steps',path:'1',input:'steps'}],unmatched:[]};
@@ -193,7 +195,8 @@ if(SCENARIO.startsWith('mounted')){
     }
     if(SCENARIO==='mounted-refusal'){
         const work=host.applyChanges({'binding:n:value':'31'});await settle();rejected=[{request_id:'r',target:'binding:n:value',reason:'canvas refused'}];seq=2;
-        host.changed({host_id:'h'});assert.equal((await work).rejected[0].reason,'canvas refused');
+        host.changed({host_id:'h'});const refused=await work;assert.equal(refused.rejected[0].reason,'canvas refused');
+        assert.equal(refused.unconfirmed,undefined,'a refusal is an answer');
     }
     if(SCENARIO==='mounted-manage'){
         // Manage and its filter travel with the visibility report; the canvas lists.
@@ -300,6 +303,20 @@ if(SCENARIO==='relay-fit'){
     assert.ok(capped.bindings.every(d=>d.options.length===200&&d.options_truncated===true));
     const noted=fitPublicationView({bindings:[],notes:Array.from({length:140},(_,i)=>({note_id:'n'+i,status:'ok',text:'z'.repeat(4000)}))},envelope);
     assert.ok(noted.notes.every(d=>d.text.length===500&&d.note_truncated===true));
+    // A node's help shortens to 80 code points, then goes, before Manage's lists
+    // and without the note path; a surrogate pair is never split.
+    const helped=n=>({bindings:Array.from({length:n},(_,i)=>({binding_id:'t'+i,status:'ok',kind:'INT',value:'1',tooltip:'\u{1F600}'.repeat(400),
+        ...(i%2?{kind:'ROWS',value:[],fields:[{id:'f',kind:'INT',tooltip:'\u{1F600}'.repeat(400)}]}:{})})),notes:[],
+        candidates:Array.from({length:40},(_,i)=>({path:String(i),input:'w',targets:[],label:'x'}))});
+    const short=fitPublicationView(helped(250),envelope);
+    assert.ok(short.bindings.every(d=>Array.from(d.tooltip).length===80&&d.tooltip.endsWith('\u2026')&&!/[\uD800-\uDBFF]\u2026$/.test(d.tooltip)));
+    assert.ok(short.bindings.filter(d=>d.fields).every(d=>Array.from(d.fields[0].tooltip).length===80));
+    assert.equal(short.tooltips_truncated,undefined);assert.equal(short.candidates.length,40,'Manage keeps its list');
+    assert.ok(short.bindings.every(d=>!d.note_truncated));
+    const dropped=fitPublicationView(helped(1400),envelope);
+    assert.ok(!dropped.error);assert.equal(dropped.tooltips_truncated,true);
+    assert.ok(dropped.bindings.every(d=>!('tooltip' in d)&&(d.fields||[]).every(f=>!('tooltip' in f))));
+    assert.equal(fitPublicationView(listing,envelope).tooltips_truncated,undefined,'no help, no flag');
     const huge=fitPublicationView({bindings:[{binding_id:'s',status:'ok',kind:'STRING',value:'v'.repeat(600000)}],notes:[]},envelope);
     assert.match(huge.error,/too large/);
     // Bytes, not characters: 400 notes of 600 three-byte characters keep their

@@ -26,6 +26,30 @@ const shorten = (descriptor, field, limit) =>
     typeof descriptor[field] === "string" && descriptor[field].length > limit
         ? { ...descriptor, [field]: descriptor[field].slice(0, limit), note_truncated: true }
         : descriptor;
+// A node's help shortens, then goes: display text only, and never the note
+// path (no "edit on the canvas" line). Code points, so no surrogate splits.
+const TOOLTIP_PREVIEW = 80;
+const withTooltip = (spec, cut) => {
+    if (typeof spec.tooltip !== "string") return spec;
+    const next = { ...spec };
+    if (cut === null) delete next.tooltip;
+    else {
+        const points = Array.from(spec.tooltip);
+        if (points.length <= cut) return spec;
+        next.tooltip = points.slice(0, cut - 1).join("") + "…";
+    }
+    return next;
+};
+function trimTooltips(view, cut) {
+    let changed = false;
+    const trim = spec => { const next = withTooltip(spec, cut); changed ||= next !== spec; return next; };
+    const bindings = (view.bindings || []).map(d => {
+        const trimmed = trim(d);
+        return Array.isArray(d.fields) ? { ...trimmed, fields: d.fields.map(trim) } : trimmed;
+    });
+    // Marks that help was left out; nothing shows it yet (the canvas has the text).
+    return changed ? { ...view, bindings, ...(cut === null ? { tooltips_truncated: true } : {}) } : view;
+}
 
 // Shrink display-only parts until the publication fits. A capped option preview
 // and a truncated note keep their existing rules: the canvas writer validates
@@ -60,6 +84,9 @@ export function fitPublicationView(view, envelope) {
     // member paths against its own fresh describe, never this publication.
     if (!fits(view) && view.execution?.length) view = { ...view, execution: view.execution.map(d => ({...d,
         members: (d.members || []).map(m => ({...m, title: ""}))})) };
+    // Help on hover is for reading, not for setting: it goes before Manage's lists.
+    if (!fits(view)) view = trimTooltips(view, TOOLTIP_PREVIEW);
+    if (!fits(view)) view = trimTooltips(view, null);
     // Manage's candidates go first: a narrower filter shows the rest.
     while ((view.candidates?.length || view.execution_candidates?.length) && !fits(view)) {
         view = { ...view, candidates: (view.candidates || []).slice(0, Math.floor((view.candidates || []).length / 2)), candidates_truncated: true,

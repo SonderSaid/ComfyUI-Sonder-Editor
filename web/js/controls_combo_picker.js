@@ -115,6 +115,8 @@ export function mountComboPicker({ choose, cancel, onLeave, inputCss, freeText =
         list,
         freeText,
         commitTyped,
+        // Its option list shows: a help tip would cover it.
+        get open() { return open && !list.hidden; },
         contains: el => box.contains(el),
         update(spec) {
             options = spec.options || [];

@@ -29,6 +29,13 @@ For a workflow that already has Controls, [Modes](#modes) and notes, open
 Click a value and change it. Long option lists have a filter at the top. A
 seed shows its mode beside it (fixed, increment, decrement, randomize).
 
+To read what a setting does, hold the pointer over its name: a box under it
+shows the node's own help for that setting, when the node has some. Pressing
+**Tab** to move to the value shows the same help. In a LoRA list, hold the
+pointer over a field (such as *strength*) for its help. Press **Escape** to
+close the box. Help comes from the node, in English; settings without any show
+nothing.
+
 In the Sonder App, values are saved for that imported workflow.
 
 A setting whose node is muted or bypassed (or sits inside a muted or bypassed
@@ -124,11 +131,22 @@ The table is hidden while you search, and while **Manage** is open.
    its **In this choice**, then click **Create**. Add at least two choices.
 4. Click **Done**.
 
-To change a choice later, click it in **Manage**:
+To change a choice later, click it in **Manage**. Clicking it first sets the
+Controls to that choice, exactly as clicking its button in the **Modes** table
+does, so what you see is what the choice holds. The editor reads *Loading…*,
+then *Loaded*. If it reads *Not loaded*, the reason follows and the Controls
+keep your current values; fix the cause, or edit the choice anyway. Under
+**Category**, **Choices in “<category>”** lists the category's other choices:
+click one to move to it. If you changed a Control since the choice loaded,
+Sonder asks before loading another choice over it.
 
-- **Update from current values** saves what the ticked Controls hold now.
+- **Update from current values** saves what the ticked Controls hold now. It
+  asks first when the choice didn't load.
 - **Category** moves it to another category, or to **Not in a category**.
 - **Delete** removes it from the workflow.
+
+Creating a category or choice, **Update from current values**, and saving a
+new name or description each show a short notice once saved.
 
 Click **Edit** on a category to rename it, change its description or
 **Delete** it; its choices stay, under **Not in a category**. **↑** / **↓**

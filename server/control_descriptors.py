@@ -369,6 +369,30 @@ def derive_kind(target_kinds: Iterable[str]) -> str | None:
 # The frontend gives these INT inputs a seed control even without the flag.
 _SEED_INPUT_NAMES = frozenset({"seed", "noise_seed"})
 
+# A node's own help for an input (``INPUT_TYPES()`` ``tooltip``), shown as text
+# only. The panel's hover tip reads it; translated and runtime tooltips exist
+# only on the canvas.
+CONTROL_TOOLTIP_MAX_CHARS = 500
+# C0 and C1 controls except newline and tab (tabs collapse with spaces), and
+# the bidi embeddings, overrides and isolates that reorder what follows them.
+_TOOLTIP_DROP = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]")
+_TOOLTIP_SPACES = re.compile("[ \t]+")
+
+
+def clean_tooltip(value: Any) -> str:
+    """A declared tooltip as plain text, or ``""``: controls and bidi
+    overrides stripped, spaces and tabs collapsed, newlines kept, capped at
+    ``CONTROL_TOOLTIP_MAX_CHARS`` code points."""
+    if not isinstance(value, str):
+        return ""
+    text = value.replace("\r\n", "\n").replace("\r", "\n").replace("\u2028", "\n").replace("\u2029", "\n\n")
+    # Controls first, so the spaces around one collapse with each other.
+    text = _TOOLTIP_SPACES.sub(" ", _TOOLTIP_DROP.sub("", text))
+    text = re.sub(r"\n{3,}", "\n\n", re.sub(r" *\n *", "\n", text)).strip()
+    if len(text) > CONTROL_TOOLTIP_MAX_CHARS:
+        text = text[:CONTROL_TOOLTIP_MAX_CHARS - 1].rstrip() + "…"
+    return text
+
 
 def spec_from_input_info(input_type: Any, extra: Any, input_name: str = "") -> dict:
     """Reduce one ``INPUT_TYPES`` entry to the facts a Control needs.
@@ -403,6 +427,10 @@ def spec_from_input_info(input_type: Any, extra: Any, input_name: str = "") -> d
     for key in ("min", "max", "step", "default", "multiline", "label_on", "label_off"):
         if key in extra and extra[key] is not None:
             spec[key] = extra[key]
+    # V1 extras and V3 ``Input.as_dict()`` both carry it here.
+    tooltip = clean_tooltip(extra.get("tooltip"))
+    if tooltip:
+        spec["tooltip"] = tooltip
     return spec
 
 
@@ -547,6 +575,10 @@ def _read_rows_target(prompt: dict, path: str, input_name: str, class_type: Any,
     if spec is None:
         target.update(status=STATUS_UNSUPPORTED, kind=None, reason=reason)
         return target
+    # The group's own help; each row field keeps its own in ``fields``.
+    tooltip = clean_tooltip(extra.get("tooltip"))
+    if tooltip:
+        target["tooltip"] = tooltip
     rows, linked = control_rows.rows_from_inputs(prompt_graph.node_inputs(prompt, path), input_name,
                                                  [field["id"] for field in spec["fields"]])
     target.update(spec)
@@ -732,6 +764,11 @@ def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Call
     for name in ("default", "label_on", "label_off"):
         if name in read[0]:
             descriptor[name] = read[0][name]
+    # The first target that declares help, in target order: a fan-out across
+    # classes shows one node's text, never a blend.
+    tooltip = next((t["tooltip"] for t in read if t.get("tooltip")), None)
+    if tooltip:
+        descriptor["tooltip"] = tooltip
     if provider:
         descriptor["provider"] = True
         if static_options is not None:
@@ -767,6 +804,8 @@ def _describe_rows(prompt: dict, descriptor: dict, entry: dict, target: dict) ->
     """
     for name in ROWS_SPEC_KEYS:
         descriptor[name] = copy.deepcopy(target[name])
+    if target.get("tooltip"):
+        descriptor["tooltip"] = target["tooltip"]
     if entry.get("rows_unavailable"):
         descriptor["rows_unavailable"] = True
     if not entry["label"]:
