@@ -16,18 +16,78 @@ whose size or modification time changed as unavailable, never the new bytes.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import json
 import logging
 import os
 from typing import Any, Iterable
 
 from aiohttp import web
 
-from . import run_control, run_outputs, sampling_previews, sdk_runs, session_registry
+from . import run_control, run_feedback, run_outputs, sampling_previews, sdk_runs, session_registry
 
 logger = logging.getLogger("sonder_editor")
 
 MAX_ID_CHARS = 200
 MAX_EDITORS = 16
+# A registration may carry the Controls authoring snapshot for its Modes capture;
+# the same cap as the Controls describe route (routes.CONTROLS_DESCRIBE_MAX_BYTES).
+MAX_REGISTER_BYTES = 32 * 1024 * 1024
+# Modes captures run one at a time on their own worker, never on the shared default
+# executor every other off-loop read uses; past a small backlog they are dropped
+# (that run's receipt omits Modes), so a ComfyUI batch can't queue N describes.
+MAX_MODES_BACKLOG = 4
+_MODES_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="sonder-run-modes")
+_MODES_TASKS: set = set()
+
+
+def _capture_modes(controls: Any, prompt_id: str, key: str) -> None:
+    """Capture a canvas run's Modes off the loop, after the registration replied:
+    describing must never delay ownership (or a reply the canvas waits 5 s for)."""
+    if not isinstance(controls, dict):
+        return
+    if len(_MODES_TASKS) >= MAX_MODES_BACKLOG:
+        logger.info("Run Modes capture skipped: %d captures already waiting", len(_MODES_TASKS))
+        return
+
+    async def capture() -> None:
+        loop = asyncio.get_running_loop()
+        rows = await loop.run_in_executor(_MODES_EXECUTOR, run_feedback.capture_canvas_modes, controls)
+        if rows is not None:
+            run_feedback.note_modes(rows, prompt_id=prompt_id, key=key)
+
+    task = asyncio.ensure_future(capture())
+    _MODES_TASKS.add(task)
+    task.add_done_callback(_MODES_TASKS.discard)
+
+
+async def register_body_of(request: web.Request) -> tuple[dict, bool]:
+    """``(body, too_large)``: a registration body read up to the cap and parsed off
+    the loop (one may carry a whole authoring snapshot)."""
+    if request.content_length is not None and request.content_length > MAX_REGISTER_BYTES:
+        return {}, True
+    chunks, total = [], 0
+    async for chunk in request.content.iter_chunked(1024 * 1024):
+        total += len(chunk)
+        if total > MAX_REGISTER_BYTES:
+            return {}, True
+        chunks.append(chunk)
+
+    def parse() -> dict:
+        try:
+            body = json.loads(b"".join(chunks).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    return await asyncio.to_thread(parse), False
+
+
+def feedback_response(owners: list) -> web.Response:
+    """Run feedback records for these owners (live, and terminals still kept).
+    Reaps ComfyUI's queue first, as the other run reads do."""
+    _reap_removed_runs()
+    return web.json_response({"ok": True, "epoch": run_feedback.EPOCH, "records": run_feedback.records_for(owners)})
 
 
 def _clean_id(value: Any) -> str:
@@ -254,7 +314,10 @@ def register_run_output_routes(routes) -> None:
     @routes.post("/sonder-editor/runs/register")
     async def api_register_run(request: web.Request) -> web.Response:
         """The canvas page registers the receipt it stamped on its Editor nodes."""
-        body = await body_of(request)
+        body, too_large = await register_body_of(request)
+        if too_large:
+            # The canvas sends Controls only under the cap; past it, it retries without them.
+            return web.json_response({"ok": False, "code": "body_too_large"}, status=413)
         code, owner = await gate(body.get("project_id"), body.get("host_id"), body.get("session_id"), canvas_only=True)
         if code:
             return refused(code)
@@ -265,7 +328,28 @@ def register_run_output_routes(routes) -> None:
             return web.json_response({"ok": False, "code": result}, status=429 if result == "too_many" else 400)
         if prompt_id:
             run_outputs.announce(prompt_id)  # it was observed unowned until now
+            # Its host may have missed everything so far, the terminal included.
+            run_feedback.on_registered(prompt_id)
+        _capture_modes(body.get("controls"), prompt_id, str(body.get("receipt") or ""))
         return web.json_response({"ok": True, "prompt_id": prompt_id})
+
+    @routes.post("/sonder-editor/runs/register/modes")
+    async def api_register_run_modes(request: web.Request) -> web.Response:
+        """Modes for a receipt registered elsewhere (a mounted tab's run request,
+        registered at its claim): only the receipt's own host may add them."""
+        body, too_large = await register_body_of(request)
+        if too_large:
+            # The canvas sends Controls only under the cap; past it, it retries without them.
+            return web.json_response({"ok": False, "code": "body_too_large"}, status=413)
+        code, owner = await gate(body.get("project_id"), body.get("host_id"), body.get("session_id"), canvas_only=True)
+        if code:
+            return refused(code)
+        receipt = str(body.get("receipt") or "")
+        state = sdk_runs.receipt_state(receipt)
+        if state is None or tuple(state.get("owner") or ()) != owner:
+            return web.json_response({"ok": False, "code": "unknown_receipt"}, status=404)
+        _capture_modes(body.get("controls"), str(state.get("prompt_id") or ""), receipt)
+        return web.json_response({"ok": True})
 
     @routes.get("/sonder-editor/project/{project_id}/runs/outputs")
     async def api_run_outputs(request: web.Request) -> web.Response:
@@ -348,6 +432,17 @@ def register_run_output_routes(routes) -> None:
         if code:
             return refused(code)
         return await cancel_response([owner], request.match_info.get("prompt_id", ""))
+
+    @routes.get("/sonder-editor/project/{project_id}/runs/feedback")
+    async def api_run_feedback(request: web.Request) -> web.Response:
+        """This host's run feedback records: a host's notifications after a reload
+        or a reconnect. A run-state read, not a project read: outside the
+        change-certificate contract, like the other run reads here."""
+        query = request.rel_url.query
+        code, owner = await gate(request.match_info.get("project_id"), query.get("host_id"), query.get("session_id"))
+        if code:
+            return refused(code)
+        return await asyncio.to_thread(feedback_response, [owner])
 
     # Wildcard id after the named subresources above.
     @routes.get("/sonder-editor/project/{project_id}/runs/{prompt_id}")

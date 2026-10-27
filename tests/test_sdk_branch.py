@@ -69,6 +69,23 @@ def test_a_branch_posts_its_own_ids_and_targets_and_advances_seeds(world):
     assert world.client.submitted == []  # never through the proxy
 
 
+def test_a_branch_notes_its_modes_under_its_token(world, monkeypatch):
+    """Phase 3: a branch run's receipt carries the Modes of the view it was built from."""
+    from server import sdk_runner
+    notes = []
+    monkeypatch.setattr(sdk_runner.run_feedback, "view_modes", lambda view: [{"id": "look"}] if isinstance(view, dict) else None)
+    monkeypatch.setattr(sdk_runner.run_feedback, "note_modes",
+                        lambda rows, prompt_id="", key="": notes.append((rows, key)))
+
+    async def go():
+        session = await world.open()
+        await branch(world, session)
+
+    asyncio.run(go())
+    token = world.branch.bodies[0]["prompt"]["1"]["_meta"]["sonder_run"]
+    assert notes == [([{"id": "look"}], token)]
+
+
 @pytest.mark.parametrize("target", ["5", "9", "", None])
 def test_only_an_output_node_in_the_compiled_prompt_can_run(world, target):
     async def go():

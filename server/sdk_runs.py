@@ -448,6 +448,23 @@ def note_token_job(token: str, job_id: str) -> None:
                 record["claimed_job_id"] = str(job_id or "")
 
 
+def note_claimed_job(key: Any, job_id: str) -> None:
+    """Record a job any run's Editor consumed, on its open release.
+
+    A list: two consuming Editors in one prompt each claim one. Kept on the release
+    because a save that completes the job settles (drops) its lease.
+    """
+    job_id = str(job_id or "")
+    if not job_id:
+        return
+    with _LOCK:
+        record = _RELEASES.get(_key(key))
+        if record is not None:
+            claimed = record.setdefault("claimed_job_ids", [])
+            if job_id not in claimed:
+                claimed.append(job_id)
+
+
 def token_state(token: str) -> dict[str, Any] | None:
     with _LOCK:
         entry = _TOKENS.get(str(token or "").strip())
@@ -795,6 +812,23 @@ def reap_removed_bound(present: set[str], grace: float | None = None) -> list[di
             if bound["state"] != BOUND_QUEUED or bound["opened_at"] >= cutoff or prompt_id in present:
                 continue
             if prompt_id in _RELEASE_STATE_BY_PROMPT:
+                continue
+            _end_bound_locked(bound, OUTCOME_REMOVED)
+            ended.append(_bound_public(bound))
+        if ended:
+            _evict_bound_locked(time.time())
+    return ended
+
+
+def end_removed_bound(prompt_ids) -> list[dict[str, Any]]:
+    """End the named queued runs: ComfyUI's queue just deleted them (no grace needed,
+    unlike a reap, because the caller saw them leave). Returns the ended runs."""
+    wanted = {_key(item) for item in prompt_ids or ()}
+    ended = []
+    with _LOCK:
+        for prompt_id in wanted:
+            bound = _BOUND.get(prompt_id)
+            if bound is None or bound["state"] != BOUND_QUEUED or prompt_id in _RELEASE_STATE_BY_PROMPT:
                 continue
             _end_bound_locked(bound, OUTCOME_REMOVED)
             ended.append(_bound_public(bound))

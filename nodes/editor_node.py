@@ -158,6 +158,28 @@ class _RenderProgressBar:
         self._send(total, total, restart=False)
 
 
+def _snapshot_guides_carry_fit(queue_job) -> bool:
+    """Whether a queued job's guide snapshots recorded their fit and crop. Jobs
+    queued before that keep rendering with the defaults (never rewritten at rest)."""
+    snapshots = [item for item in (getattr(queue_job, "guide_frame_snapshots", []) or []) if isinstance(item, dict)]
+    return bool(snapshots) and all("fit_mode" in item for item in snapshots)
+
+
+_RUN_FEEDBACK_WARNED: set = set()
+
+
+def _note_run_feedback(method: str, prompt, unique_id, *args) -> None:
+    """Tell run feedback what this run is doing; never fails a render. A failure
+    warns once per method, so a drifted signature can't silently drop receipts."""
+    try:
+        from ..server import run_feedback
+        getattr(run_feedback, method)(prompt, unique_id, *args)
+    except Exception:
+        if method not in _RUN_FEEDBACK_WARNED:
+            _RUN_FEEDBACK_WARNED.add(method)
+            logger.warning("Run feedback note %s failed; run notifications may lack it", method, exc_info=True)
+
+
 def _coerce_int(value, default: int = 0) -> int:
     try:
         return int(value)
@@ -892,6 +914,9 @@ class SonderEditor:
                 queue_job_mode = "consume" if queue_job else ""
                 if run_token and queue_job is not None:
                     sdk_runs.note_token_job(run_token, queue_job.job_id)
+                if queue_job is not None:
+                    # Every run, not only SDK tokens: the release names the job it took.
+                    sdk_runs.note_claimed_job(run_key, queue_job.job_id)
             elif render_queue_active:
                 # Peek the queued snapshot for any non-consume queue-active case,
                 # including when no save node is wired (e.g. preview/show-any-only
@@ -899,6 +924,9 @@ class SonderEditor:
                 # completing, or otherwise mutating the job or the project.
                 queue_job = self._peek_queue_job(proj)
                 queue_job_mode = "peek" if queue_job else ""
+            if queue_job is not None:
+                # Before the render, so the run's notification names the job from its first frame.
+                _note_run_feedback("note_job", prompt, unique_id, queue_job, queue_job_mode)
             # After a claim, the run's release returns the leased job to pending.
             interrupt.raise_if_set()
             snapshot_version = self._queue_snapshot_version(queue_job)
@@ -1110,10 +1138,21 @@ class SonderEditor:
                 implicit_render_reason="color_drift_reference" if implicit_drift_render else "",
             )
 
+            # What this run renders, for its notification's receipt: before any frame.
+            _note_run_feedback("note_window", prompt, unique_id, {
+                "scene_id": scene.scene_id, "scene_name": getattr(scene, "name", "") or "",
+                "generation_start": generation_start, "generation_end": generation_end,
+                "render_start": render_start, "render_end": render_end,
+                "frame_count": frame_count, "frame_count_padding": frame_count_padding,
+                "source_frame_count": source_frame_count, "fps": float(proj_fps or 0.0),
+                "queue": queue_job_mode or "live",
+            }, project_event_aliases(proj))
+
             # --- Render composited frames ---
             if render_needed:
                 interrupt.raise_if_set()
                 render_started_at = time.perf_counter()
+                _note_run_feedback("note_stage", prompt, unique_id, "rendering")
                 logger.info("render start: scene_id=%s range=%d-%d", scene.scene_id, render_start, render_end)
                 logger.info("render stage=rendering scene_id=%s frames=%d elapsed=%.2fs",
                             scene.scene_id, render_end - render_start,
@@ -1148,6 +1187,7 @@ class SonderEditor:
             interrupt.raise_if_set()
             logger.info("render stage=preparing_inputs scene_id=%s elapsed=%.2fs",
                         scene.scene_id, time.perf_counter() - execute_started_at)
+            _note_run_feedback("note_stage", prompt, unique_id, "preparing_inputs")
 
             # --- Gather guide frames within render range ---
             guide_images = []
@@ -1528,6 +1568,9 @@ class SonderEditor:
                     # The Driver Bridge reads a queued run's lane visibility from the job.
                     driver_configs=(list(getattr(queue_job, "driver_lane_configs", []) or [])
                                     if queue_job and snapshot_version > 0 else None),
+                    # Read from the raw entries: GuideFrame.from_dict fills the defaults.
+                    snapshot_guide_fit=bool(queue_job and snapshot_version > 0
+                                            and _snapshot_guides_carry_fit(queue_job)),
                 ))
             except Exception:
                 logger.exception("Recording the executed editor context failed")

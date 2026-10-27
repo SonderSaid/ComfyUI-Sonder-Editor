@@ -204,3 +204,54 @@ def _shared_conflicts(here: list, there: list, conditions: dict) -> list:
                 if len(keys) > WARNING_NAMES:
                     return keys
     return keys
+
+
+# --- Modes in effect (mirror of controls_modes_model.js::deriveModes) ----------------
+
+_UNUSABLE_STATES = frozenset({"unavailable", "refused"})
+
+
+def derive_modes(view: Any) -> dict:
+    """Which choice each category shows, derived from a projected view.
+
+    The Python mirror of ``web/js/controls_modes_model.js::deriveModes``; the two
+    are parity-tested (``tests/test_controls_modes_parity.py``). One ``match`` is
+    selected, several are ambiguous (no tie-break), all unusable is unavailable,
+    otherwise custom. A choice listed by two categories belongs to the first; a
+    category with no choice left is not shown. Used by run feedback's receipt.
+    """
+    view = view if isinstance(view, dict) else {}
+    presets = [row for row in view.get("presets") or [] if isinstance(row, dict)] if isinstance(view.get("presets"), list) else []
+    categories = view.get("preset_categories") if isinstance(view.get("preset_categories"), list) else []
+    by_id = {row.get("id"): row for row in presets}
+    claimed: set = set()
+    rows = []
+    for category in categories:
+        if not isinstance(category, dict):
+            continue
+        listed = category.get("choices") if isinstance(category.get("choices"), list) else []
+        # As in JS: filtered against the claims made before this category.
+        choices = [by_id[cid] for cid in listed if cid in by_id and cid not in claimed]
+        for row in choices:
+            claimed.add(row.get("id"))
+        if not choices:
+            continue
+        matches = [row for row in choices if row.get("state") == "match"]
+        status = ("selected" if len(matches) == 1 else "ambiguous" if len(matches) > 1
+                  else "unavailable" if all(row.get("state") in _UNUSABLE_STATES for row in choices) else "custom")
+        rows.append({
+            "id": category.get("id"), "name": category.get("name") or "", "description": category.get("description") or "",
+            "origin": category.get("origin") or "workflow",
+            "warnings": category.get("warnings") if isinstance(category.get("warnings"), list) else [],
+            "choices": choices, "status": status, "selected": matches[0] if status == "selected" else None,
+            "matches": matches,
+        })
+    return {"rows": rows, "uncategorized": [row for row in presets if row.get("id") not in claimed]}
+
+
+def modes_receipt(view: Any) -> list:
+    """A run receipt's Modes: one small row per shown category, names only."""
+    return [{"id": str(row["id"] or ""), "name": str(row["name"])[:120], "status": row["status"],
+             "choice": str((row["selected"] or {}).get("name") or "")[:120],
+             "matches": [str(match.get("name") or "")[:120] for match in row["matches"]][:8]}
+            for row in derive_modes(view)["rows"]]

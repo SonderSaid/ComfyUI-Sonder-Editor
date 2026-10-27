@@ -255,13 +255,10 @@ def _describe_controls_body(raw: bytes) -> dict:
     # never queued. Absent means a caller that cannot see them (none today).
     from . import control_execution
     try:
-        authoring = (control_descriptors.clean_authoring(body["inactive"], prompt)
-                     if body.get("inactive") is not None else None)
         execution_inventory = (control_execution.clean_candidates(body["execution_candidates"])
                                if body.get("execution_candidates") is not None else None)
     except control_descriptors.ControlValueError as exc:
         raise _ControlsRequestError(str(exc)) from None
-    readable = control_descriptors.authoring_prompt(prompt, authoring)
     # The Editor node hosting the canvas panel, so picker hints can tell its own
     # project from another Editor's. Only a key naming an Editor in this prompt.
     # An explicit null: the hosting Editor is not in this prompt (muted, bypassed,
@@ -272,10 +269,11 @@ def _describe_controls_body(raw: bytes) -> dict:
             or prompt[editor_key].get("class_type") != "SonderEditor"):
         raise _ControlsRequestError("The editor key must name a Sonder Editor in the prompt.")
     try:
-        view = control_descriptors.describe_bindings(prompt, relay_census=census,
-                                                    orphan_manifest=body.get("orphan_manifest"),
-                                                    host_editor=editor_key, authoring=authoring)
-    except control_descriptors.control_manifest.ManifestError as exc:
+        # The describe core run feedback's Modes capture shares.
+        view, readable, authoring = control_descriptors.describe_for_projection(
+            prompt, relay_census=census, inactive=body.get("inactive"), editor_key=editor_key,
+            orphan_manifest=body.get("orphan_manifest"))
+    except (control_descriptors.ControlValueError, control_descriptors.control_manifest.ManifestError) as exc:
         raise _ControlsRequestError(str(exc)) from None
     from . import control_cleanup
     definition_anchors = body.get("definition_anchors", [])

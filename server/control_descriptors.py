@@ -860,6 +860,19 @@ def authoring_prompt(prompt: dict, authoring: dict | None) -> dict:
     return {**authoring, **prompt} if authoring else prompt
 
 
+def describe_for_projection(prompt: dict, *, relay_census: Any = None, inactive: Any = None,
+                            editor_key: Any = SOLE_EDITOR, orphan_manifest: Any = None) -> tuple[dict, dict, dict | None]:
+    """``(view, readable, authoring)``: the canvas describe core, shared by the
+    Controls describe route and run feedback's Modes capture, so a receipt reads
+    Controls exactly as the panel does (muted and bypassed targets included).
+    Raises ``ControlValueError`` (and ``ManifestError``) on a bad request."""
+    authoring = clean_authoring(inactive, prompt) if inactive is not None else None
+    readable = authoring_prompt(prompt, authoring)
+    view = describe_bindings(prompt, relay_census=relay_census, orphan_manifest=orphan_manifest,
+                             host_editor=editor_key, authoring=authoring)
+    return view, readable, authoring
+
+
 def _mark_participation(descriptor: dict, prompt: dict, authoring: dict) -> None:
     """``active``, ``inactive`` or ``partial`` from where each target was read.
     Only a canvas describe (one with ``authoring``) can tell."""

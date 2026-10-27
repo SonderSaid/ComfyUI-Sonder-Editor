@@ -45,7 +45,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import control_descriptors, controls_snapshot, launcher_state, prompt_graph, run_control, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry
+from . import control_descriptors, controls_snapshot, launcher_state, prompt_graph, run_control, run_feedback, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry
 from .control_manifest import RELAY_CLASS_TYPE
 from .editor_inputs import clean_editor_value, clean_editor_values, editor_optional_inputs
 from .sdk_install import install_state, uninstall_running
@@ -1086,6 +1086,8 @@ class SdkRunner:
         labels = {str(key): control_descriptors._node_title(node, str(node.get("class_type") or ""))
                   for key, node in build["prompt"].items()}
         token, prompt_id = secrets.token_urlsafe(24), str(uuid.uuid4())
+        # The receipt's Modes, from the view this run was built from; attached when it binds.
+        run_feedback.note_modes(run_feedback.view_modes(build.get("view")), key=token)
         run = SdkRun(
             run_id=f"run-{uuid.uuid4().hex[:12]}", token=token, session_id=session.session_id, index=1, count=1,
             seeds=seeds, submitted_at=self._clock(), node_labels=labels, template_id=build["template_id"],
@@ -1158,6 +1160,8 @@ class SdkRunner:
                   for key, node in build["prompt"].items()}
         seed_bindings = build["seed_bindings"]
         run_ids, seeds_used, failure = [], [], None
+        # The receipt's Modes: one projected view serves every take of this Generate.
+        modes = run_feedback.view_modes(build.get("view"))
         try:
             for index in range(1, count + 1):
                 if session.cancel_epoch != epoch:
@@ -1171,6 +1175,7 @@ class SdkRunner:
                         self._check_submit_epoch(session, epoch, build)
                     break
                 token = secrets.token_urlsafe(24)
+                run_feedback.note_modes(modes, key=token)
                 run = SdkRun(
                     run_id=f"run-{uuid.uuid4().hex[:12]}", token=token, session_id=session.session_id,
                     index=index, count=count, seeds=seeds, submitted_at=self._clock(), client=client, node_labels=labels,
@@ -1499,6 +1504,9 @@ class SdkRunner:
     # ── In-process node progress ────────────────────────────────────────────
 
     def _on_progress_threadsafe(self, snapshot: dict) -> None:
+        # Run feedback watches every bound run: wake the loop only for this runner's.
+        if not any(token in self._runs_by_token for token in snapshot.get("run_tokens") or (snapshot.get("run_token"),)):
+            return
         if self._loop is not None and not self._loop.is_closed():
             self._loop.call_soon_threadsafe(self.apply_progress, snapshot)
 
@@ -1510,7 +1518,9 @@ class SdkRunner:
         return ""
 
     def apply_progress(self, snapshot: dict) -> None:
-        run = self._runs_by_token.get(snapshot["run_token"])
+        # A prompt can have several watchers (run feedback watches every bound run).
+        run = next((self._runs_by_token[token] for token in snapshot.get("run_tokens") or (snapshot["run_token"],)
+                    if token in self._runs_by_token), None)
         if run is None or run.final:
             return
         prompt_id = snapshot["prompt_id"]

@@ -77,16 +77,34 @@ def add_listener(listener):
 
 
 def watch(prompt_id, run_token):
+    """Watch a prompt for ``run_token``. Several watchers can share one prompt:
+    the SDK runner (its run token) and run feedback (``run:<prompt id>``)."""
     if prompt_id and run_token:
         with _LOCK:
-            _WATCHED.setdefault(str(prompt_id), {"token": str(run_token), "node": "", "display": "", "nodes": {}, "count": None})
+            state = _WATCHED.setdefault(str(prompt_id), {"tokens": [], "node": "", "display": "", "nodes": {}, "count": None})
+            if str(run_token) not in state["tokens"]:
+                state["tokens"].append(str(run_token))
 
 
 def unwatch(prompt_id, run_token=None):
+    """Drop one watcher, or every watcher when ``run_token`` is None."""
     with _LOCK:
         state = _WATCHED.get(str(prompt_id))
-        if state and (run_token is None or state["token"] == run_token):
-            _WATCHED.pop(str(prompt_id), None)
+        if not state:
+            return
+        if run_token is not None:
+            if run_token in state["tokens"]:
+                state["tokens"].remove(run_token)
+            if state["tokens"]:
+                return
+        _WATCHED.pop(str(prompt_id), None)
+
+
+def watching(prompt_id) -> tuple:
+    """The tokens watching a prompt (tests and diagnostics)."""
+    with _LOCK:
+        state = _WATCHED.get(str(prompt_id))
+        return tuple(state["tokens"]) if state else ()
 
 
 def _count(data):
@@ -158,7 +176,10 @@ def observe(event, data):
             if not _belongs(node, state["node"], state["nodes"]):
                 return
             state["count"] = _count(data)
-        snapshot = {"prompt_id": prompt_id, "run_token": state["token"],
+        # ``run_token`` is the first watcher's, kept for single-watcher readers;
+        # ``run_tokens`` names every watcher, so each finds its own.
+        snapshot = {"prompt_id": prompt_id, "run_token": state["tokens"][0] if state["tokens"] else "",
+                    "run_tokens": tuple(state["tokens"]),
                     "node_id": state["node"], "display_node_id": state["display"],
                     "count": dict(state["count"]) if state["count"] else None}
         listeners = list(_LISTENERS)

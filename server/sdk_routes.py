@@ -460,6 +460,13 @@ def register_sdk_routes(
         return await run_output_routes.outputs_response(owners, query.get("workflow_id", ""), query.get("sources", ""),
                                                         query.get("keep_holds"))
 
+    @routes.get("/sonder-editor/sdk/session/{session_id}/runs/feedback")
+    @handle
+    async def api_sdk_run_feedback(request: web.Request) -> web.Response:
+        """The session's run feedback records (stage, count, receipt), by its secret."""
+        owners, _holder = await output_owners(request)
+        return await asyncio.to_thread(run_output_routes.feedback_response, owners)
+
     @routes.get("/sonder-editor/sdk/session/{session_id}/runs/live")
     @handle
     async def api_sdk_run_live(request: web.Request) -> web.Response:

@@ -1129,6 +1129,17 @@ def _run_outcome(status) -> tuple[str, str, str]:
     return "success", "The run finished without completing this job.", ""
 
 
+def _failed_node_type(status) -> str:
+    """The class of the node a run failed in, as ``_run_outcome`` reads it (the last
+    error message); never its exception text."""
+    node_type = ""
+    for message in getattr(status, "messages", None) or []:
+        if (isinstance(message, (list, tuple)) and len(message) >= 2
+                and message[0] == "execution_error" and isinstance(message[1], dict)):
+            node_type = str(message[1].get("node_type") or "")
+    return node_type
+
+
 def _return_leased_job_to_pending(project_dir: str, job_id: str, note: str) -> bool:
     """Return a job its run left ``running`` to ``pending``, retrying save conflicts."""
     for _attempt in range(3):
@@ -1169,6 +1180,21 @@ def _release_prompt_run(prompt_key: str, status) -> None:
     announced = set()
     run_token = sdk_runs.run_token_of(record)
     take_saved = bool(record.get("saved_to_project"))
+    # Run feedback's terminal record, from this one outcome, before run_finished.
+    # It also reaches the bound run's projects, so a canvas run that failed before
+    # its Editor executed still ends its notification.
+    try:
+        from ..server import run_feedback
+        claimed = list(record.get("claimed_job_ids") or [])
+        if record.get("claimed_job_id") and record["claimed_job_id"] not in claimed:
+            claimed.append(record["claimed_job_id"])
+        aliases = [alias for ids in record["projects"].values() for alias in ids] + list(record.get("token_project_ids") or [])
+        # The note words a returned job ("… before this job completed"); a run that
+        # returned none has nothing to say. The failing node is its own field.
+        run_feedback.on_released(record.get("prompt_id", ""), outcome, note if returned else "", claimed, returned,
+                                 take_saved, aliases, node_type=_failed_node_type(status))
+    except Exception:
+        logger.exception("Run feedback failed to end %s", prompt_key)
 
     def announce(alias, job_ids):
         announced.add(alias)
@@ -1231,8 +1257,17 @@ def _bind_queued_item(item) -> None:
     pnginfo = extra_data.get("extra_pnginfo")
     workflow = pnginfo.get("workflow") if isinstance(pnginfo, dict) else None
     workflow_id = workflow.get("id") if isinstance(workflow, dict) else ""
-    sdk_runs.bind_queued(prompt_id, prompt, roots,
-                         workflow_id=str(workflow_id or ""), client_id=str(extra_data.get("client_id") or ""))
+    bound = sdk_runs.bind_queued(prompt_id, prompt, roots,
+                                 workflow_id=str(workflow_id or ""), client_id=str(extra_data.get("client_id") or ""))
+    if bound is not None:
+        # After sdk_runs returned, in its own guard: run feedback watches every
+        # bound run (provisional too), and ends any queued run binding evicted.
+        try:
+            from ..server import run_feedback
+            run_feedback.on_bound(prompt_id, prompt)
+            run_feedback.reconcile()
+        except Exception:
+            logger.exception("Run feedback failed to watch a queued prompt")
 
 
 _RUN_REAP_INTERVAL_SEC = 15.0
@@ -1250,8 +1285,52 @@ def _reap_removed_runs(prompt_queue) -> None:
     if now - _last_run_reap < _RUN_REAP_INTERVAL_SEC:
         return
     _last_run_reap = now
-    from ..server import run_outputs
+    from ..server import run_feedback, run_outputs
     run_outputs.reap_removed(run_outputs.queued_prompt_ids(prompt_queue))
+    run_feedback.reconcile()
+
+
+_RUN_STAGE_WARNED: set = set()
+
+
+def _note_run_stage(prompt, unique_id, stage: str) -> None:
+    """Declare this save node's stage for run feedback; never fails a save. Warns
+    once per stage, so a broken note can't silently drop the stage."""
+    try:
+        from ..server import run_feedback
+        run_feedback.note_stage(prompt, unique_id, stage)
+    except Exception:
+        if stage not in _RUN_STAGE_WARNED:
+            _RUN_STAGE_WARNED.add(stage)
+            logger.warning("Run feedback stage note %s failed", stage, exc_info=True)
+
+
+def _wrap_queue_removal(prompt_queue, name: str) -> None:
+    """End the bound runs a queue deletion or clear removed, the moment it happens.
+
+    The removed ids are the difference of the queue before and after the call, so
+    a prompt a concurrent ``put`` bound but has not inserted yet is never taken
+    for a removed one. A cancel (``run_control.cancel_prompt``) deletes through
+    this same method.
+    """
+    original = getattr(prompt_queue, name, None)
+    if not callable(original) or getattr(original, "_sonder_bridge_wrapped", False):
+        return
+
+    def wrapped(*args, **kwargs):
+        from ..server import run_outputs
+        before = run_outputs.queued_prompt_ids(prompt_queue)
+        result = original(*args, **kwargs)
+        try:
+            after = run_outputs.queued_prompt_ids(prompt_queue)
+            if before is not None and after is not None and before - after:
+                run_outputs.end_removed(before - after)
+        except Exception:
+            logger.exception("Ending runs removed from the queue failed")
+        return result
+
+    wrapped._sonder_bridge_wrapped = True
+    setattr(prompt_queue, name, wrapped)
 
 
 def _finish_observed_run(prompt_key: str, args, kwargs) -> None:
@@ -1375,6 +1454,7 @@ def _install_bridge_prompt_queue_hooks() -> bool:
         if callable(original_get) and not getattr(original_get, "_sonder_bridge_wrapped", False):
             def wrapped_get(*args, **kwargs):
                 result = original_get(*args, **kwargs)
+                prompt_key = None
                 if result is not None:
                     # A prompt starting resets the proxy builds' idle grace period.
                     comfy_idle.note_busy()
@@ -1394,6 +1474,14 @@ def _install_bridge_prompt_queue_hooks() -> bool:
                                 break
                 except Exception:
                     logger.exception("Failed to capture bridge prompt identity from prompt queue get()")
+                # Its own guard: run feedback must never cost the App its watch.
+                try:
+                    if prompt_key:
+                        from ..server import run_feedback
+                        # Running from the queue itself, so it holds without the send_sync wrap.
+                        run_feedback.on_started(_prompt_id_from_queue_get_result(result))
+                except Exception:
+                    logger.exception("Run feedback failed to start a run")
                 return result
 
             wrapped_get._sonder_bridge_wrapped = True
@@ -1409,6 +1497,12 @@ def _install_bridge_prompt_queue_hooks() -> bool:
                     # The grace period counts from a prompt's end, not its start.
                     comfy_idle.note_busy()
                     if prompt_key:
+                        # Finishing before bridge finalization, also without the send_sync wrap.
+                        try:
+                            from ..server import run_feedback
+                            run_feedback.on_task_done((sdk_runs.record_snapshot(prompt_key) or {}).get("prompt_id", ""))
+                        except Exception:
+                            logger.exception("Run feedback failed to mark %s finishing", prompt_key)
                         status = _status_from_task_done_call(args, kwargs)
                         try:
                             outcome = _run_outcome(status)[0]
@@ -1461,10 +1555,14 @@ def _install_bridge_prompt_queue_hooks() -> bool:
             wrapped_put._sonder_bridge_wrapped = True
             setattr(prompt_queue, "put", wrapped_put)
 
+        for name in ("delete_queue_item", "wipe_queue"):
+            _wrap_queue_removal(prompt_queue, name)
+
         try:
-            from ..server import run_control, run_outputs
+            from ..server import run_control, run_feedback, run_outputs
             sdk_progress.add_observer(run_outputs.observe)
             sdk_progress.add_observer(_run_control_observer)
+            run_feedback.install()
             _install_run_output_hints(run_outputs)
         except Exception:
             logger.exception("Run output observation unavailable")
@@ -2280,6 +2378,7 @@ class SonderSaveVideo:
             asset_metadata = dict(encode_metadata)
             asset_metadata["editor_export"] = asset_editor_export
             asset_metadata[COLOR_DRIFT_METADATA_KEY] = drift_record
+            _note_run_stage(prompt, unique_id, "saving")
             output_path, png_assets = _save_custom_png_sequence(
                 project,
                 rgb_frames,
@@ -2353,6 +2452,7 @@ class SonderSaveVideo:
         if encode_pbar is not None:
             _encode_total = len(rgb_frames)
             encode_progress_cb = lambda done: encode_pbar.update_absolute(min(int(done), _encode_total))
+        _note_run_stage(prompt, unique_id, "encoding")
         try:
             encode_metadata = encode_video(
                 rgb_frames,
@@ -2383,6 +2483,9 @@ class SonderSaveVideo:
             preset_id,
             time.perf_counter() - ffmpeg_started_at,
         )
+        # Registration, placement, the job, the save and the inline proxy: no count
+        # (the proxy's packet count must not read as frames encoded).
+        _note_run_stage(prompt, unique_id, "saving")
         has_audio = bool(encode_metadata.get("has_audio", has_audio))
         audio_alerts.extend(encode_metadata.get("alerts") or [])
         asset_generation_params = dict(encode_metadata)

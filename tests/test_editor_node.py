@@ -4865,3 +4865,143 @@ def test_post_frames_the_mask_now_preserves_make_color_drift_render(tmp_path, mo
     ctx = project._execution_context
     assert (ctx["source_frame_count"], ctx["frame_count"], ctx["mask_end_frame"]) == (129, 141, 107)
     assert calls == {"render": 1, "stash": 1}
+
+
+def _queued_guide_run(tmp_path, monkeypatch, snapshot_extra, real_feedback=False):
+    """One consumed queued job with one guide; returns the guide loader's kwargs,
+    the order of run feedback notes against the render, and the content records
+    the Editor noted for its run. With ``real_feedback`` the prompt is bound and
+    trusted, and run feedback's own broadcasts are recorded in the order instead."""
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    (tmp_path / "media").mkdir(exist_ok=True)
+    (tmp_path / "media" / "guide.png").write_bytes(b"guide")
+
+    class DummyScene:
+        scene_id = "scene-1"
+        name = "Scene 1"
+        duration_frames = 40
+        width = 6
+        height = 4
+        fps = 24.0
+        guide_frames = []
+
+        @staticmethod
+        def get_prompt_for_range(start_frame, end_frame, labels_on=True, delimiter=".", boundary_threshold_pct=0.0, **kwargs):
+            return "live"
+
+    queue_job = types.SimpleNamespace(
+        job_id="job-1", scene_id="scene-1", scene_name="Scene 1", batch_id="b", batch_index=0, batch_total=2,
+        selection_start=10, selection_end=30, pre_context_frames=0, post_context_frames=0, context_frames=0,
+        prompt="queued prompt", status="pending", error="", progress=0.0, params={"snapshot_version": 1},
+        guide_frame_snapshots=[{"frame_index": 20, "asset_id": "guide-1", "source": "asset", "strength": 1.0,
+                                **snapshot_extra}],
+        scene_width=8, scene_height=6, scene_fps=24.0, take_placement_mode="trimmed",
+    )
+
+    class DummyProject:
+        def __init__(self):
+            self.fps = 24.0
+            self.resolution = (7, 5)
+            self.project_dir = str(tmp_path)
+            self._execution_context = None
+            self._scene = DummyScene()
+            self.generation_queue = [queue_job]
+
+        def get_scene(self, scene_id):
+            return self._scene if scene_id == self._scene.scene_id else None
+
+        @staticmethod
+        def get_asset(asset_id):
+            return types.SimpleNamespace(asset_id=asset_id, asset_type="image", path=os.path.join("media", "guide.png"))
+
+    project = DummyProject()
+    order, loads = [], []
+    monkeypatch.setattr(editor_node, "load_project", lambda project_dir: project)
+    monkeypatch.setattr(editor_node, "save_project", lambda proj: None)
+
+    def render(self, proj, scene, start, end, **_kwargs):
+        order.append("render")
+        return torch.zeros(max(1, end - start), 4, 6, 3, dtype=torch.float32)
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_render_scene_frames", render)
+    monkeypatch.setattr(editor_node.SonderEditor, "_load_scene_audio",
+                        lambda self, proj, scene, start, end, **_kwargs: editor_node._make_silent_audio(1.0))
+
+    def load_guide(self, path, asset_type, target_w, target_h, **kwargs):
+        loads.append(kwargs)
+        return torch.ones(target_h, target_w, 3, dtype=torch.float32)
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_load_guide_image", load_guide)
+    contexts = []
+    monkeypatch.setattr(editor_node.run_outputs, "note_editor_context",
+                        lambda prompt, unique_id, context, content=None: contexts.append(content() if content else None))
+    prompt = _prompt_graph({
+        "editor-1": _prompt_node("SonderEditor"),
+        "save-1": _prompt_node("SonderSaveVideo", {"project": ["editor-1", 0], "mark_queue_complete": True,
+                                                   "frames": ["editor-1", 1]}),
+        "guide-use": _prompt_node("TestGuideConsumer", {"images": ["editor-1", 2], "indices": ["editor-1", 3],
+                                                        "strengths": ["editor-1", 4]}),
+    })
+    if real_feedback:
+        run_feedback = importlib.import_module(f"{TEST_PACKAGE}.server.run_feedback")
+        sdk_runs = editor_node.sdk_runs
+        sdk_runs.reset_for_tests()
+        run_feedback.reset_for_tests()
+        monkeypatch.setattr(run_feedback, "REAP_INTERVAL_SEC", 3600.0)
+        receipt = "11111111-2222-4333-8444-555555555555"
+        prompt["editor-1"]["_meta"] = {"sonder_receipt": receipt}
+        assert sdk_runs.register_receipt(receipt, ("host", "proj", "host-1"))[0] == "ok"
+        assert sdk_runs.bind_queued("p1", prompt) is not None
+        assert sdk_runs.open_release("k1", "p1", prompt)
+        run_feedback._HOOKS["emit"] = lambda alias, event: order.append(("emit", event["record"]))
+        run_feedback.on_bound("p1", prompt)
+        run_feedback.on_started("p1")
+    else:
+        monkeypatch.setattr(editor_node, "_note_run_feedback", lambda method, prompt, unique_id, *args: order.append(
+            (method, args[0] if method == "note_stage" else None)))
+    try:
+        editor_node.SonderEditor().execute(
+            project="Existing Project", project_name="Ignored", fps=24.0, width=768, height=512,
+            prompt=prompt, unique_id="editor-1", scene_id="widget-scene", selection_start=1, selection_end=2,
+            pre_context_frames=0, post_context_frames=0,
+        )
+    finally:
+        if real_feedback:
+            run_feedback.reset_for_tests()
+            sdk_runs.reset_for_tests()
+    return loads, order, contexts
+
+
+def test_a_queued_guide_renders_with_the_fit_and_crop_its_snapshot_recorded(tmp_path, monkeypatch):
+    loads, _order, contexts = _queued_guide_run(tmp_path, monkeypatch, {"fit_mode": "cover", "crop_position": "left"})
+    assert [(k["fit_mode"], k["crop_position"]) for k in loads] == [("cover", "left")]
+    # The run's content record compares the guides' fit too (the Editor's wiring).
+    assert [record["guide_fit"] for record in contexts] == [True]
+
+
+def test_a_queued_guide_from_an_older_job_keeps_the_defaults(tmp_path, monkeypatch):
+    loads, _order, contexts = _queued_guide_run(tmp_path, monkeypatch, {})
+    assert [(k["fit_mode"], k["crop_position"]) for k in loads] == [("pad_edge", "center")]
+    assert [record["guide_fit"] for record in contexts] == [False]
+
+
+def test_run_feedback_names_the_job_and_window_before_the_first_frame(tmp_path, monkeypatch):
+    _loads, order, _contexts = _queued_guide_run(tmp_path, monkeypatch, {})
+    render_at = order.index("render")
+    assert order.index(("note_job", None)) < render_at and order.index(("note_window", None)) < render_at
+    assert order.index(("note_stage", "rendering")) < render_at < order.index(("note_stage", "preparing_inputs"))
+
+
+def test_the_editor_drives_real_run_feedback_through_its_trusted_prompt(tmp_path, monkeypatch):
+    """No stand-in for the notes: the Editor's calls reach run feedback with the
+    signatures it has, resolved through the trusted prompt (audit 3A #13)."""
+    _loads, order, _contexts = _queued_guide_run(tmp_path, monkeypatch, {}, real_feedback=True)
+    render_at = order.index("render")
+    before = [item[1] for item in order[:render_at] if isinstance(item, tuple)]
+    receipt = next(record["receipt"] for record in reversed(before) if "receipt" in record)
+    assert [(job["job_id"], job["mode"]) for job in receipt["jobs"]] == [("job-1", "consume")]
+    assert [window["queue"] for window in receipt["windows"]] == ["consume"]
+    assert before[-1]["stage"] == "rendering"
+    after = [item[1] for item in order[render_at:] if isinstance(item, tuple)]
+    assert after and after[-1]["stage"] == "preparing_inputs"

@@ -218,6 +218,24 @@ def test_generate_n_submits_n_runs_with_tokens_values_and_advancing_seeds(world)
     assert {alias for alias, _ in world.events} == set(ALIASES)
 
 
+def test_generate_notes_each_takes_modes_from_its_one_projected_view(world, monkeypatch):
+    """Phase 3: the receipt's Modes come from the view Generate built, once per
+    Generate, and are noted under each take's token before its prompt binds."""
+    views, notes = [], []
+    monkeypatch.setattr(sdk_runner.run_feedback, "view_modes", lambda view: views.append(view) or [{"id": "task"}])
+    monkeypatch.setattr(sdk_runner.run_feedback, "note_modes",
+                        lambda rows, prompt_id="", key="": notes.append((rows, prompt_id, key)))
+
+    async def go():
+        session = await world.open()
+        await world.runner.generate(session, tab_session_id="tab-1", count=2)
+
+    asyncio.run(go())
+    tokens = [graph["1"]["_meta"]["sonder_run"] for graph in world.client.submitted]
+    assert len(views) == 1 and isinstance(views[0], dict)
+    assert notes == [([{"id": "task"}], "", token) for token in tokens]
+
+
 def test_seeds_default_to_randomize_and_fixed_never_changes(world, monkeypatch):
     modes = []
     real = sdk_runner.control_descriptors.next_seed_value
@@ -966,7 +984,7 @@ def test_an_open_takes_over_a_departed_sessions_unfinished_takes(world):
     assert landed not in new.runs  # already announced where it landed
     # Still tracked: by token, by progress watch, and in the new session's status.
     assert all(world.runner._runs_by_token[run.token] is run for run in moving)
-    assert all(sdk_runner.sdk_progress._WATCHED[run.prompt_id]["token"] == run.token for run in moving)
+    assert all(run.token in sdk_runner.sdk_progress.watching(run.prompt_id) for run in moving)
     snapshot = world.events[-1][1]
     assert snapshot["session_id"] == new.session_id
     assert [run["run_id"] for run in snapshot["runs"]] == [run.run_id for run in moving]

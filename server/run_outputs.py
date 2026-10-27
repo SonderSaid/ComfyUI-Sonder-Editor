@@ -258,7 +258,15 @@ def reap_removed(present: set[str] | None) -> None:
     """End bound runs removed from ComfyUI's queue unrun (``present`` = ids it holds)."""
     if present is None:
         return
-    ended = sdk_runs.reap_removed_bound(present)
+    _ended_unrun(sdk_runs.reap_removed_bound(present))
+
+
+def end_removed(prompt_ids) -> None:
+    """End the bound runs ComfyUI's queue just deleted (delete or clear hook)."""
+    _ended_unrun(sdk_runs.end_removed_bound(prompt_ids))
+
+
+def _ended_unrun(ended: list) -> None:
     if not ended:
         return
     live = sdk_runs.bound_ids()
@@ -266,6 +274,9 @@ def reap_removed(present: set[str] | None) -> None:
         _prune_locked(live)
     for bound in ended:
         _notify(_hint(bound))
+    # After sdk_runs returned, never inside it: run feedback ends their notifications.
+    from . import run_feedback
+    run_feedback.reconcile()
 
 
 def queued_prompt_ids(prompt_queue: Any = None) -> set[str] | None:

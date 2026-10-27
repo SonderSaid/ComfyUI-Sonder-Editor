@@ -192,6 +192,21 @@ def test_filtered_guides_peek_uses_queue_job_ref_snapshot_and_manifest(tmp_path,
     assert [(guide["asset_id"], guide["local_idx"]) for guide in guides] == [("frozen", 7)]
 
 
+def test_a_queued_snapshot_reports_its_recorded_guide_fit_and_old_ones_the_defaults(tmp_path, monkeypatch):
+    """Phase 3: a job's guide snapshot records fit and crop; one queued before keeps the defaults."""
+    bridge, ts, project, scene = _make_project_with_guides(tmp_path, monkeypatch, [{"frame_index": 2, "asset_id": "g"}])
+    raw = {"guide_id": "g1", "frame_index": 2, "asset_id": "g", "source": "asset", "strength": 1.0, "muted": False}
+    results = []
+    for snapshot in ({**raw, "fit_mode": "cover", "crop_position": "left"}, raw):
+        job = ts.GenerationJob(job_id="job-q", scene_id=scene.scene_id, selection_start=0, selection_end=scene.duration_frames,
+                               guide_frame_snapshots=[snapshot], params={"snapshot_version": 1})
+        project.generation_queue = [job]
+        project._execution_context = {"scene_id": scene.scene_id, "context_start": 0, "context_end": scene.duration_frames,
+                                      "queue_job_id": "", "queue_job_ref_id": job.job_id}
+        results.append([(guide["fit_mode"], guide["crop_position"]) for guide in bridge._filtered_guides(project)])
+    assert results == [[("cover", "left")], [("pad_edge", "center")]]
+
+
 # ── Start: -1 frame_index resolves to last frame ──────────────────────
 def test_negative_one_resolves_last_frame(tmp_path, monkeypatch):
     bridge, _ts, project, scene = _make_project_with_guides(

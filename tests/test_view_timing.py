@@ -144,7 +144,8 @@ def live_record(scene_dict: dict, window=WINDOW) -> dict:
                                    snapshot_window=None)
 
 
-def snapshot_record(scene_dict: dict, *, selection=(14, 34), pre=2, post=2, window=WINDOW, executed: dict | None = None) -> dict:
+def snapshot_record(scene_dict: dict, *, selection=(14, 34), pre=2, post=2, window=WINDOW, executed: dict | None = None,
+                    with_fit: bool = False) -> dict:
     """A queued run: guides, Drivers and Driver lane visibility frozen as
     editor_widget._buildQueueSnapshot does; `executed` is the live scene at
     execution when it changed after enqueue."""
@@ -160,14 +161,18 @@ def snapshot_record(scene_dict: dict, *, selection=(14, 34), pre=2, post=2, wind
         if start <= index < end:
             guides.append({"guide_id": guide.get("guide_id", ""), "frame_index": index, "asset_id": guide.get("asset_id"),
                            "source": guide.get("source") or "asset", "strength": guide.get("strength", 1.0),
-                           "muted": hidden or bool(guide.get("muted"))})
+                           "muted": hidden or bool(guide.get("muted")),
+                           # Phase 3: newer jobs record fit and crop (with_fit); older ones did not.
+                           **({"fit_mode": guide.get("fit_mode", "pad_edge"),
+                               "crop_position": guide.get("crop_position", "center")} if with_fit else {})})
     from server.timeline_state import ClipReference, GuideFrame
     drivers = [ClipReference.from_dict(dict(c)) for c in scene_dict["clips"]
                if c.get("role") == "motion_driver" and c.get("timeline_start_frame", 0) < end and c.get("timeline_end_frame", 0) > start]
     return vt.scene_content_record(scene, fps=FPS, width=W, height=H, render_start=window[0], render_end=window[1],
                                    driver_source=drivers, guide_frames=[GuideFrame.from_dict(g) for g in guides],
                                    guide_track_hidden=False, snapshot_window=(start, end),
-                                   driver_configs=[dict(c) for c in scene_dict["motion_driver_lane_configs"]])
+                                   driver_configs=[dict(c) for c in scene_dict["motion_driver_lane_configs"]],
+                                   snapshot_guide_fit=with_fit and bool(guides))
 
 
 def _with(scene, fn):
@@ -231,6 +236,12 @@ def parity_cases():
     shown = _with(base, lambda s: s["guide_frames"].append({"guide_id": "g4", "frame_index": 11, "asset_id": "img4", "fit_mode": "stretch"}))
     cases.append(("queued run, guide fit and snap extension", shown, snapshot_record(shown), "same"))
     cases.append(("queued run, a guide edited after", _with(shown, lambda s: s["guide_frames"][0].update(strength=1.0)), snapshot_record(shown), "changed"))
+    # A job that recorded its guides' fit and crop compares them too.
+    cases.append(("queued run with recorded fit, unchanged", shown, snapshot_record(shown, with_fit=True), "same"))
+    cases.append(("queued run with recorded fit, a guide's fit changed after",
+                  _with(shown, lambda s: s["guide_frames"][0].update(fit_mode="stretch")), snapshot_record(shown, with_fit=True), "changed"))
+    cases.append(("queued run without recorded fit, a guide's fit changed after",
+                  _with(shown, lambda s: s["guide_frames"][0].update(fit_mode="stretch")), snapshot_record(shown), "same"))
     # Unicode in paths hashes identically.
     odd = _with(base, lambda s: _clip(s, "c1").update(source_path="Médias/ΑΣ 🎬  \x7f\"q\".mp4"))
     cases.append(("unicode, astral and control characters", odd, live_record(odd), "same"))
@@ -263,6 +274,7 @@ def test_records_have_their_window_present_set_and_snapshot_flags():
     assert record["present"] == sorted(["c1", "take0", "d1", "a1"])
     queued = snapshot_record(base_scene())
     assert queued["input_window"] == [12, 36] and queued["guide_fit"] is False
+    assert snapshot_record(base_scene(), with_fit=True)["guide_fit"] is True
 
 
 def test_digest_moves_with_inputs_in_the_window_only():

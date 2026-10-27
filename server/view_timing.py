@@ -237,15 +237,18 @@ def content_record(*, fps: float, width: int, height: int, window, input_window,
 def scene_content_record(scene: Any, *, fps: float, width: int, height: int, render_start: int, render_end: int,
                          driver_source: Iterable[Any] | None, guide_frames: Iterable[Any] | None,
                          guide_track_hidden: bool, snapshot_window: tuple[int, int] | None,
-                         driver_configs: Iterable[Any] | None = None) -> dict | None:
+                         driver_configs: Iterable[Any] | None = None,
+                         snapshot_guide_fit: bool = False) -> dict | None:
     """The Editor's content record for one run. A queued snapshot run took its
     guides, Drivers and Driver lane visibility from the job (``snapshot_window``,
-    ``driver_configs``; its guides carry no fit today); its render clips and
-    audio are the live scene's at execution."""
+    ``driver_configs``); its render clips and audio are the live scene's at
+    execution. Its guides carry fit and crop only when the job's raw snapshot
+    entries recorded them (``snapshot_guide_fit``); older jobs' never did, and
+    their guides rendered with the defaults."""
     window = (render_start, render_end)
     return content_record(
         fps=fps, width=width, height=height, window=window, input_window=snapshot_window or window,
-        guide_fit=snapshot_window is None,
+        guide_fit=snapshot_window is None or bool(snapshot_guide_fit),
         render_clips=[c for c in (_get(scene, "clips", []) or []) if _get(c, "role", "render") != "motion_driver"],
         render_configs=_get(scene, "video_lane_configs", []),
         driver_clips=[c for c in (driver_source or []) if _get(c, "role", "render") == "motion_driver"],
