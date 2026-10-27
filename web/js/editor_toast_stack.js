@@ -16,6 +16,7 @@ import {
     pause,
     resume,
     dismiss,
+    formatElapsed,
     formatProgress,
     progressFraction,
 } from "./editor_notifications.js";
@@ -54,14 +55,6 @@ function ensureStyle() {
         }
     `;
     (document.head || document.documentElement).appendChild(style);
-}
-
-function formatElapsed(ms) {
-    const total = Math.max(0, Math.floor(ms / 1000));
-    if (total < 60) return `${total}s`;
-    const m = Math.floor(total / 60);
-    const s = total % 60;
-    return `${m}:${String(s).padStart(2, "0")}`;
 }
 
 function copyText(text) {
@@ -163,8 +156,8 @@ export function mountToastStack(target = document.body) {
             const span = el.querySelector("[data-elapsed]");
             if (!span) continue;
             any = true;
-            const created = Number(el.dataset.created || now);
-            span.textContent = formatElapsed(now - created);
+            const since = Number(span.dataset.since || el.dataset.created || now);
+            span.textContent = formatElapsed(now - since);
         }
         if (!any) ensureElapsedTimer(false);
     }
@@ -266,14 +259,15 @@ export function mountToastStack(target = document.body) {
         const bodyText = n.verb ? n.message : n.detail;
         if (bodyText) {
             const msg = document.createElement("div");
-            msg.style.cssText = `margin-top:3px; font-size:${TYPE.t11}px; color:${THEME.fg1}; word-break:break-word;`;
+            // pre-line: a detail's lines (a run receipt, a list of problems) stay lines.
+            msg.style.cssText = `margin-top:3px; font-size:${TYPE.t11}px; color:${THEME.fg1}; word-break:break-word; white-space:pre-line;`;
             msg.textContent = bodyText;
             body.appendChild(msg);
             el._msgEl = msg;
         }
         if (n.verb && n.detail) {
             const det = document.createElement("div");
-            det.style.cssText = `margin-top:2px; font-size:${TYPE.t10}px; color:${THEME.fg2}; word-break:break-word;`;
+            det.style.cssText = `margin-top:2px; font-size:${TYPE.t10}px; color:${THEME.fg2}; word-break:break-word; white-space:pre-line;`;
             det.textContent = n.detail;
             body.appendChild(det);
         }
@@ -298,16 +292,24 @@ export function mountToastStack(target = document.body) {
             track.appendChild(fill);
             wrap.appendChild(track);
 
-            const labelEl = document.createElement("span");
-            labelEl.style.cssText = `flex:0 0 auto; font-size:${TYPE.t10}px; font-variant-numeric:tabular-nums; color:${THEME.fg2};`;
+            const labelCss = `flex:0 0 auto; font-size:${TYPE.t10}px; font-variant-numeric:tabular-nums; color:${THEME.fg2};`;
             if (label != null) {
-                labelEl.textContent = label;
-            } else {
-                // Indeterminate → live elapsed counter.
-                labelEl.dataset.elapsed = "1";
-                labelEl.textContent = formatElapsed(Date.now() - n.createdAt);
+                const countEl = document.createElement("span");
+                countEl.style.cssText = labelCss;
+                countEl.textContent = label;
+                wrap.appendChild(countEl);
             }
-            wrap.appendChild(labelEl);
+            // A live elapsed clock: always for indeterminate progress, and beside
+            // the count for an operation that says when it started (a run), so a
+            // long step with no new count still visibly moves.
+            if (label == null || n.startedAt) {
+                const labelEl = document.createElement("span");
+                labelEl.style.cssText = labelCss;
+                labelEl.dataset.elapsed = "1";
+                labelEl.dataset.since = String(n.startedAt || n.createdAt);
+                labelEl.textContent = formatElapsed(Date.now() - (n.startedAt || n.createdAt));
+                wrap.appendChild(labelEl);
+            }
             body.appendChild(wrap);
         }
 
@@ -358,7 +360,7 @@ export function mountToastStack(target = document.body) {
 
     function render(list) {
         const seen = new Set();
-        let hasIndeterminate = false;
+        let needsClock = false;
         for (const n of list) {
             seen.add(n.id);
             let el = els.get(n.id);
@@ -370,7 +372,7 @@ export function mountToastStack(target = document.body) {
             } else {
                 renderInner(el, body(), n);
             }
-            if (n.tier === "progress" && progressFraction(n.progress) == null) hasIndeterminate = true;
+            if (n.tier === "progress" && (progressFraction(n.progress) == null || n.startedAt)) needsClock = true;
         }
         for (const [id, el] of els) {
             if (!seen.has(id)) {
@@ -383,7 +385,7 @@ export function mountToastStack(target = document.body) {
             const el = els.get(n.id);
             if (el) container.appendChild(el);
         }
-        ensureElapsedTimer(hasIndeterminate);
+        ensureElapsedTimer(needsClock);
     }
 
     const unsubscribe = subscribe(render);

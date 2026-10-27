@@ -25474,6 +25474,10 @@ export class EditorWidget {
                     source: guide.source || "asset",
                     strength: guide.strength ?? 1.0,
                     muted: guideTrackHidden || !!guide.muted,
+                    // As a live run reads them: the guide's own values, else
+                    // GuideFrame's defaults (never the browser's creation default).
+                    fit_mode: guide.fit_mode || "pad_edge",
+                    crop_position: guide.crop_position || "center",
                 });
             }
         }

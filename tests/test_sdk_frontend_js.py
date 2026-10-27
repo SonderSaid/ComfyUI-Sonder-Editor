@@ -415,22 +415,6 @@ out.faces = {
     canceling: gc.generateButtonState([{ state: "running", canceling: true }, { state: "queued", canceling: true }]),
     partly_canceling: gc.generateButtonState([{ state: "running", canceling: true }, { state: "queued" }]),
 };
-out.progress = {
-    queued: gc.describeBatchProgress([{ state: "queued" }, { state: "submitting" }]),
-    running: gc.describeBatchProgress([{ state: "landed" }, { state: "running", progress_node: "Sampler", progress_count: {value: 2, max: 8} }, { state: "queued" }]),
-    finishing: gc.describeBatchProgress([{ state: "finishing" }]),
-    null_progress: gc.describeBatchProgress([{ state: "running", progress: null }]),
-    empty: gc.describeBatchProgress([]),
-    named: gc.describeBatchProgress([{ state: "landed", template_name: "Upscale" }, { state: "running", template_name: "LTX Edit" }]),
-};
-out.branch_progress = {
-    finishing: gc.describeBatchProgress([{ state: "finishing", purpose: "branch" }]),
-    done: gc.describeBatchProgress([{ state: "completed", purpose: "branch" }, { state: "queued", purpose: "branch" }]),
-};
-out.branch_toasts = ["completed", "landed", "failed", "canceled", "ended"].map((state) =>
-    gc.outcomeToast({ state, purpose: "branch", note: "Why." }));
-out.toasts_pure = ["landed", "failed", "canceled", "ended", "running"].map((state) =>
-    gc.outcomeToast({ state, index: 2, count: 3, note: state === "landed" ? "" : "Because." }));
 out.notices = {
     ok: gc.generateResultNotice({ ok: true, status: 202, payload: { run_ids: ["a", "b"], error: null } }, 2),
     partial: gc.generateResultNotice({ ok: true, status: 202, payload: { run_ids: ["a"], error: { error: "ComfyUI did not confirm this run." } } }, 3),
@@ -547,8 +531,9 @@ function mount(fake, order, before = null) {
 
     fake.emit({ seq: 0, runs: [{ run_id: "a", state: "queued", index: 1, count: 2 }, { run_id: "b", state: "submitting", index: 2, count: 2 }] });
     faces.push([button.textContent, cancelButton.textContent, countGroup.style.display]);
-    const progress = live.find((n) => n.source === "sdk-generate");
-    out.dom_progress = progress && { tier: progress.tier, foreground: progress.foreground, message: progress.message };
+    // The shared run notice (run_feedback_notice.js): one live toast per page.
+    const progress = live.find((n) => n.source === "run-live:app");
+    out.dom_progress = progress && { tier: progress.tier, foreground: progress.foreground, verb: progress.verb, detail: progress.detail };
     cancelButton.click();
     await settle();
     out.dom_cancels = fake.cancels;
@@ -557,8 +542,8 @@ function mount(fake, order, before = null) {
     fake.emit({ seq: 2, runs: [{ run_id: "a", state: "landed", index: 1, count: 2 }, { run_id: "b", state: "canceled", index: 2, count: 2, note: "Canceled before it started." }] });
     faces.push([button.textContent, countGroup.style.display]);
     out.dom_faces = faces;
-    out.dom_progress_after = live.filter((n) => n.source === "sdk-generate").length;
-    out.dom_toasts = captured.filter((n) => n.source.startsWith("sdk-generate-")).map((n) => [n.tier, n.message]);
+    out.dom_progress_after = live.filter((n) => n.tier === "progress").length;
+    out.dom_toasts = live.filter((n) => n.tier !== "progress").map((n) => [n.tier, n.message]).sort();
     controls.destroy();
     out.dom_listeners_after_destroy = fake.listeners.size;
 }
@@ -568,7 +553,7 @@ function mount(fake, order, before = null) {
     const [button, countGroup, cancelButton] = controls.element.children;
     let release;
     fake.generate = () => new Promise(resolve => release = resolve);
-    fake.emit({seq:1,runs:[{run_id:"a",state:"running",progress_node:"Sampler"}]});
+    fake.emit({seq:1,runs:[{run_id:"a",state:"running"}]});
     button.click(); await settle();
     const sending = {disabled:button.disabled,label:button.textContent,cancel:cancelButton.textContent,count:countGroup.children[0].textContent};
     cancelButton.click(); await settle();
@@ -581,11 +566,15 @@ function mount(fake, order, before = null) {
 {
     const fake = fakeGenerationHost({seq:0,runs:[]});
     const controls = mount(fake, []);
+    for (const n of [...live]) notes.dismiss(n.id);
     for(let i=0;i<50;i++) {
         const runs = Array.from({length:i+1},(_,n)=>({run_id:`long${n}`,state:n===i?"running":"landed"})).slice(-25);
         fake.emit({seq:i+1,runs});
     }
-    out.trimmed_line = live.find(n=>n.source === "sdk-generate")?.message;
+    // Takes landing one after another: one live toast follows the running take,
+    // the landed ones coalesce into one receipt toast (the server trims at 25).
+    out.trimmed = {live: live.filter(n => n.tier === "progress").length, verb: live.find(n => n.tier === "progress")?.verb,
+        landed: live.filter(n => n.tier === "success").map(n => n.count)};
     controls.destroy();
 }
 {
@@ -600,7 +589,7 @@ function mount(fake, order, before = null) {
     const controls=mount(fake,[]);
     fake.emit({seq:1,runs:[{run_id:"detail-run",state:"failed",note:"The run failed."}]});
     await settle();
-    out.failure_detail={reads,detail:live.find(n=>n.source === "sdk-generate-failed")?.detail};
+    out.failure_detail={reads,detail:live.find(n=>n.tier === "error" && n.message === "Take failed")?.detail};
     controls.destroy();
 }
 {
@@ -629,9 +618,9 @@ function mount(fake, order, before = null) {
     out.primed_toasts = captured.slice(before).map((n) => [n.tier, n.message]);
     // An ended session ends the progress line too.
     h.applyStatus({ session_id: "sdk-1", seq: 9, runs: [{ run_id: "w", state: "running", progress: 0.1 }] });
-    const progressBefore = live.filter((n) => n.source === "sdk-generate").length;
+    const progressBefore = live.filter((n) => n.source === "run-live:app").length;
     h.setOwnerState("ended");
-    out.ended_progress = { before: progressBefore, after: live.filter((n) => n.source === "sdk-generate").length,
+    out.ended_progress = { before: progressBefore, after: live.filter((n) => n.source === "run-live:app").length,
         face: controls.element.children[0].textContent };
     controls.destroy();
 }
@@ -834,31 +823,9 @@ def test_generate_button_faces(results):
     assert results["clamp"] == [1, 3, 8, 1]
 
 
-def test_progress_line(results):
-    progress = results["progress"]
-    assert progress["queued"] == {"message": "Generating 1 of 2 · waiting in ComfyUI's queue", "progress": None, "detail": None}
-    assert progress["running"] == {"message": "Generating 2 of 3 · Sampler 2/8", "progress": 0.25, "detail": None}
-    assert progress["finishing"] == {"message": "Generating 1 of 1 · saving the take", "progress": None, "detail": None}
-    # The line names the workflow of the take it describes (#21).
-    assert progress["named"]["detail"] == "LTX Edit"
-    assert progress["null_progress"]["progress"] is None
-    assert progress["empty"] is None
-
-
 def test_a_missing_node_refusal_says_so(results):
     assert results["notices"]["missing_nodes"] == {"tier": "error", "message": "This workflow needs nodes that aren't installed.",
                                                   "detail": "This workflow needs nodes that aren't installed: X."}
-
-
-def test_outcome_toasts_carry_no_take_index(results):
-    landed, failed, canceled, ended, running = results["toasts_pure"]
-    assert landed == {"tier": "success", "message": "Take landed on the timeline", "source": "sdk-generate-landed"}
-    assert failed == {"tier": "error", "message": "Take failed", "detail": "Because.", "source": "sdk-generate-failed"}
-    assert canceled["tier"] == "warning" and canceled["message"] == "Take canceled"
-    assert ended["tier"] == "warning" and ended["message"] == "Take ended without landing"
-    assert running is None
-    for toast in (landed, failed, canceled, ended):
-        assert not any(ch.isdigit() for ch in toast["message"])
 
 
 def test_refusal_notices_put_the_sentence_in_message_and_the_reason_in_detail(results):
@@ -893,10 +860,10 @@ def test_generate_controls_drive_the_host(results):
     assert faces[4] == "Canceling…"
     assert faces[5] == ["Generate", ""]
     assert results["dom_cancels"] == 1
-    assert results["dom_progress"] == {"tier": "progress", "foreground": True,
-                                       "message": "Generating 1 of 2 · waiting in ComfyUI's queue"}
+    # The shared run notice: one live toast, its outcome and receipts.
+    assert results["dom_progress"] == {"tier": "progress", "foreground": True, "verb": "Queued", "detail": "+1 waiting"}
     assert results["dom_progress_after"] == 0
-    assert results["dom_toasts"] == [["success", "Take landed on the timeline"], ["warning", "Take canceled"]]
+    assert results["dom_toasts"] == [["success", "Take landed on the timeline"], ["warning", "Canceled before it started"]]
     assert results["dom_listeners_after_destroy"] == 0
 
 
@@ -1054,7 +1021,7 @@ def test_every_save_is_drained_and_sequence_protects_keepalive(results):
 def test_failure_details_survive_newer_snapshots_and_fetch_once(results):
     assert results["old_details"] == {"older": False, "seq": 9, "detail": "ValueError: detail"}
     assert results["details_after_ws"] == "ValueError: detail"
-    assert results["failure_detail"] == {"reads": 1, "detail": "The run failed.\n\nValueError: private detail"}
+    assert results["failure_detail"] == {"reads": 1, "detail": "The run failed.\nValueError: private detail"}
 
 
 def test_generate_and_cancel_are_independent_with_capacity_feedback(results):
@@ -1062,7 +1029,7 @@ def test_generate_and_cancel_are_independent_with_capacity_feedback(results):
     assert results["side_by_side"]["cancels"] == 1
     assert results["side_by_side"]["capacityDisabled"] is True
     assert "16" in results["side_by_side"]["reason"]
-    assert results["trimmed_line"] == "Generating 50 of 50"
+    assert results["trimmed"] == {"live": 1, "verb": "Running", "landed": [49]}
     assert results["canceled_saved"] is True
     assert results["canceled_notice"] == {"tier": "info", "message": "Canceled before it was sent."}
 
@@ -1072,13 +1039,3 @@ def test_cancel_invalidates_generate_during_each_client_barrier(results):
     assert results["cancel_before_host"] == {"methods": ["POST", "PUT"], "generated": False, "saved": 43}
 
 
-def test_a_branch_run_reads_as_an_output_never_a_take(results):
-    progress = results["branch_progress"]
-    assert progress["finishing"]["message"] == "Running output 1 of 1 · finishing"
-    # A completed branch counts as done.
-    assert progress["done"]["message"] == "Running output 2 of 2 · waiting in ComfyUI's queue"
-    completed, landed, failed, canceled, ended = results["branch_toasts"]
-    assert completed == {"tier": "success", "message": "Output ready", "source": "sdk-branch-completed"}
-    assert landed["message"] == "Take landed on the timeline"  # a branch that saved a take
-    assert failed == {"tier": "error", "message": "Output failed", "detail": "Why.", "source": "sdk-branch-failed"}
-    assert canceled["message"] == "Output canceled" and ended["message"] == "Output run ended"

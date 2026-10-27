@@ -129,9 +129,6 @@ class SdkRun:
     prompt_id: str = ""
     job: Any = None
     position: int | None = None
-    progress_node: str = ""
-    progress_count: dict | None = None
-    node_labels: dict = field(default_factory=dict)
     detail: str = ""
     cancel_requested: bool = False
     job_id: str = ""
@@ -168,8 +165,6 @@ class SdkRun:
             "state": self.state,
             "canceling": self.cancel_requested and not self.final,
             "position": self.position,
-            "progress_node": self.progress_node,
-            **({"progress_count": dict(self.progress_count)} if self.progress_count else {}),
             "prompt_id": self.prompt_id,
             "job_id": self.job_id,
             "outcome": self.outcome,
@@ -1083,14 +1078,12 @@ class SdkRunner:
         seeds = {b["binding_id"]: b["seed"] for b in seed_bindings}
         graph = await asyncio.to_thread(self._graph_for_run, build, seeds)
         self._check_submit_epoch(session, epoch, build)
-        labels = {str(key): control_descriptors._node_title(node, str(node.get("class_type") or ""))
-                  for key, node in build["prompt"].items()}
         token, prompt_id = secrets.token_urlsafe(24), str(uuid.uuid4())
         # The receipt's Modes, from the view this run was built from; attached when it binds.
         run_feedback.note_modes(run_feedback.view_modes(build.get("view")), key=token)
         run = SdkRun(
             run_id=f"run-{uuid.uuid4().hex[:12]}", token=token, session_id=session.session_id, index=1, count=1,
-            seeds=seeds, submitted_at=self._clock(), node_labels=labels, template_id=build["template_id"],
+            seeds=seeds, submitted_at=self._clock(), template_id=build["template_id"],
             template_name=build["template_name"], purpose=PURPOSE_BRANCH, pending_prompt_id=prompt_id,
         )
         graph[build["editor_key"]].setdefault("_meta", {})["sonder_run"] = token
@@ -1156,8 +1149,6 @@ class SdkRunner:
             self._emit(session, force=True)
 
     async def _submit_runs(self, session: SdkSession, client, build: dict, count: int, epoch: int) -> dict:
-        labels = {str(key): control_descriptors._node_title(node, str(node.get("class_type") or ""))
-                  for key, node in build["prompt"].items()}
         seed_bindings = build["seed_bindings"]
         run_ids, seeds_used, failure = [], [], None
         # The receipt's Modes: one projected view serves every take of this Generate.
@@ -1178,7 +1169,7 @@ class SdkRunner:
                 run_feedback.note_modes(modes, key=token)
                 run = SdkRun(
                     run_id=f"run-{uuid.uuid4().hex[:12]}", token=token, session_id=session.session_id,
-                    index=index, count=count, seeds=seeds, submitted_at=self._clock(), client=client, node_labels=labels,
+                    index=index, count=count, seeds=seeds, submitted_at=self._clock(), client=client,
                     template_id=build["template_id"], template_name=build["template_name"],
                 )
                 graph[build["editor_key"]].setdefault("_meta", {})["sonder_run"] = token
@@ -1406,7 +1397,6 @@ class SdkRunner:
         run.finished_at = self._clock()
         sdk_runs.forget_token(run.token)
         sdk_progress.unwatch(run.prompt_id, run.token)
-        run.progress_node, run.progress_count = "", None
         session = self._sessions.get(run.session_id)
         if session is not None:
             self._emit(session, force=True)
@@ -1510,14 +1500,10 @@ class SdkRunner:
         if self._loop is not None and not self._loop.is_closed():
             self._loop.call_soon_threadsafe(self.apply_progress, snapshot)
 
-    @staticmethod
-    def _progress_label(labels: dict, node: str, display: str) -> str:
-        for key in (node, node.split(".", 1)[0], display):
-            if key in labels:
-                return labels[key]
-        return ""
-
     def apply_progress(self, snapshot: dict) -> None:
+        """The run started: RUNNING at once, and the prompt id when a branch's reply
+        has not named it yet. What the run is doing (stage, count, receipt) is run
+        feedback's (run_feedback.py), joined by prompt id in the page."""
         # A prompt can have several watchers (run feedback watches every bound run).
         run = next((self._runs_by_token[token] for token in snapshot.get("run_tokens") or (snapshot["run_token"],)
                     if token in self._runs_by_token), None)
@@ -1526,10 +1512,10 @@ class SdkRunner:
         prompt_id = snapshot["prompt_id"]
         if run.prompt_id and run.prompt_id != prompt_id:
             return
+        if run.state == RUNNING and run.prompt_id == prompt_id:
+            return  # nothing new for generation status
         run.prompt_id = prompt_id
         run.state, run.position = RUNNING, None
-        run.progress_node = self._progress_label(run.node_labels, snapshot["node_id"], snapshot["display_node_id"])
-        run.progress_count = snapshot["count"] if run.progress_node else None
         session = self._sessions.get(run.session_id)
         if session is not None:
             self._emit(session)

@@ -89,6 +89,66 @@ out.push({ again, answer, calls: calls.map(c => ({ self: c.self, stamped: !!c.da
     assert result["warnings"] == 1
 
 
+MODES_ROOT = """
+const manifest = JSON.stringify({ v: 1, bindings: {}, notes: {},
+    presets: { a: { name: "Alpha", order: 0, members: {} } },
+    preset_categories: { task: { name: "Task", order: 0, choices: ["a"] } } });
+root._nodes.push({ id: 20, type: "SonderControlRelay", mode: 0, widgets: [{ name: "manifest", value: manifest }] });
+"""
+
+
+def test_a_run_with_modes_registers_them_read_from_a_copy_and_falls_back_past_the_cap():
+    """Phase 3: the receipt's Modes are captured at submission, read as the panel
+    reads them, without touching the queued output; past the server's cap (or on
+    its 413) the run still registers, without them."""
+    (result,) = _run(MODES_ROOT + """
+const posts = [];
+let refuse = false;
+const api = { apiURL: (p) => p, queuePrompt: () => Promise.resolve({ prompt_id: "pm" }) };
+const fetchImpl = (url, init) => { const body = JSON.parse(init.body); posts.push({ url, controls: !!body.controls, body });
+    return Promise.resolve(refuse && body.controls ? { ok: false, status: 413 } : { ok: true, status: 200 }); };
+const registered = [];
+mod.installRunRegistration({ api, app: { graph: root }, fetchImpl, onRegistered: (pid) => registered.push(pid) });
+const data = { output: { "1": { class_type: "SonderEditor", inputs: {} }, "4": { class_type: "KSampler", inputs: { text: "{a|b}" } } } };
+const frozen = JSON.stringify(data);
+await api.queuePrompt(0, data, {});
+await new Promise((r) => setTimeout(r, 10));
+const first = posts[0];
+refuse = true;
+await api.queuePrompt(0, data, {});
+await new Promise((r) => setTimeout(r, 10));
+out.push({ untouched: JSON.stringify(data) === frozen, controls: first.controls, editorKey: first.body.controls?.editor_key,
+           census: first.body.controls?.relay_census, promptKeys: Object.keys(first.body.controls?.prompt || {}).sort(),
+           retried: posts.slice(1).map(p => p.controls), registered,
+           small: JSON.parse(mod.registrationBody({ receipt: "r" }, { prompt: { x: "y".repeat(100) } }, 50)) });
+""")
+    assert result["untouched"] is True and result["controls"] is True
+    assert result["editorKey"] == "1"
+    assert result["census"]["active"] == 1
+    assert result["promptKeys"] == ["1", "4"]
+    assert result["retried"] == [True, False]  # the 413 retry drops only the Modes
+    assert result["registered"] == ["pm", "pm"]
+    assert result["small"] == {"receipt": "r"}
+
+
+def test_a_workflow_without_modes_sends_none_and_a_preregistered_run_sends_only_them():
+    (result,) = _run("""
+const posts = [];
+const api = { apiURL: (p) => p, queuePrompt: () => Promise.resolve({ prompt_id: "pn" }) };
+mod.installRunRegistration({ api, app: { graph: root }, fetchImpl: (url, init) => { posts.push({ url, controls: !!JSON.parse(init.body).controls }); return Promise.resolve({ ok: true }); } });
+await api.queuePrompt(0, { output: { "1": { class_type: "SonderEditor", inputs: {} } } }, {});
+await new Promise((r) => setTimeout(r, 10));
+const plain = posts.slice();
+""" + MODES_ROOT + """
+posts.length = 0;
+const stamped = mod.stampReceipts({ output: { "1": { class_type: "SonderEditor", inputs: {} } } }, root,
+    { receiptFor: () => "pre-1" });
+out.push({ plain, pre: stamped.registrations.map(r => [r.receipt, r.preregistered === true]) });
+""")
+    assert result["plain"] == [{"url": "/sonder-editor/runs/register", "controls": False}]
+    assert result["pre"] == [["pre-1", True]]
+
+
 def test_outputs_client_routes_hints_to_its_own_host_and_session():
     node = shutil.which("node")
     if not node:

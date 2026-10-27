@@ -90,15 +90,12 @@ def test_the_sdk_runner_still_finds_its_run_when_run_feedback_watched_first():
     run_feedback.on_bound("p9", prompt)
     sdk_progress.watch("p9", "tok")  # the runner, after its submit returned
     assert sdk_progress.watching("p9") == ("run:p9", "tok")
-    run = types.SimpleNamespace(final=False, prompt_id="p9", state="queued", position=1, node_labels={"1": "Editor"},
-                                progress_node="", progress_count=None, session_id="s")
-    runner = types.SimpleNamespace(_runs_by_token={"tok": run}, _sessions={},
-                                   _progress_label=sdk_runner.SdkRunner._progress_label)
+    run = types.SimpleNamespace(final=False, prompt_id="", state="queued", position=1, session_id="s")
+    runner = types.SimpleNamespace(_runs_by_token={"tok": run}, _sessions={})
     sdk_progress.add_listener(lambda snap: sdk_runner.SdkRunner.apply_progress(runner, snap))
     sdk_progress.observe("executing", {"prompt_id": "p9", "node": "1"})
     progress("p9", "1", 3, 10)
-    assert run.state == sdk_runner.RUNNING and run.progress_node == "Editor"
-    assert run.progress_count == {"value": 3, "max": 10}
+    assert run.state == sdk_runner.RUNNING and run.prompt_id == "p9"
 
 
 # ── Lifecycle ──────────────────────────────────────────────────────────────────────
@@ -397,15 +394,13 @@ def test_the_apps_progress_survives_a_bind_through_the_put_hook(tmp_path, monkey
     io_nodes._bind_queued_item((0, "p9", editor_prompt(receipt=None, token="tok"), {}, []))
     progress_mod.watch("p9", "tok")  # the runner, after its submit returned
     assert progress_mod.watching("p9") == ("run:p9", "tok")
-    run = types.SimpleNamespace(final=False, prompt_id="p9", state="queued", position=1, node_labels={"1": "Editor"},
-                                progress_node="", progress_count=None, session_id="s")
-    runner = types.SimpleNamespace(_runs_by_token={"tok": run}, _sessions={},
-                                   _progress_label=runner_mod.SdkRunner._progress_label)
+    run = types.SimpleNamespace(final=False, prompt_id="", state="queued", position=1, session_id="s")
+    runner = types.SimpleNamespace(_runs_by_token={"tok": run}, _sessions={})
     remove = progress_mod.add_listener(lambda snap: runner_mod.SdkRunner.apply_progress(runner, snap))
     progress_mod.observe("executing", {"prompt_id": "p9", "node": "1"})
     progress_mod.observe("progress", {"prompt_id": "p9", "node": "1", "value": 3, "max": 10})
     remove()
-    assert run.state == runner_mod.RUNNING and run.progress_count == {"value": 3, "max": 10}
+    assert run.state == runner_mod.RUNNING and run.prompt_id == "p9"
     rf.reset_for_tests()
     progress_mod.reset_for_tests()
 

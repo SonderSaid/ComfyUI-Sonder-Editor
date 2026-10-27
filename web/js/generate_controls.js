@@ -1,26 +1,28 @@
 // Generate ×N and Cancel all for an editor whose host runs the workflow itself
-// (Sonder App / SDK mode). The canvas modes keep ComfyUI's own Run and progress;
-// this is SDK mode's substitute, drawn with the existing chrome: a toolbar
-// button, the foreground progress notification and toasts.
+// (Sonder App / SDK mode). The canvas modes keep ComfyUI's own Run; this is SDK
+// mode's substitute, drawn with the existing chrome: a toolbar button and toasts.
+// A run's notification and receipt are the shared ones every host shows
+// (run_feedback_notice.js): the App's runs give their state and outcome, and the
+// server's run records add the stage, count and receipt.
 //
 // Module contract: the host (`generationHost`) owns state and networking —
-// `subscribe(fn)`, `activeRuns()`, `generate(count, opts)`, `cancelAll()`.
+// `subscribe(fn)`, `activeRuns()`, `generate(count, opts)`, `cancelAll()`, and
+// optionally `subscribeRunFeedback(fn)`, `refreshStatus()`, `details`.
 // This module owns the DOM and listeners and returns `destroy()`.
 
 import {
+    notify,
     notifyError,
     notifyInfo,
-    notifyProgress,
     notifySuccess,
     notifyWarning,
 } from "./editor_notifications.js";
 import { EDITOR_COLORS as COLORS, FONT, TYPE, setButtonDisabled } from "./editor_theme.js";
+import { createRunFeedbackDriver } from "./run_feedback_notice.js";
 
 export const GENERATE_MAX_COUNT = 8;
 export const GENERATE_MAX_UNFINISHED = 16;
 
-// "completed": a branch run whose output is ready but which landed no take.
-const FINAL_STATES = new Set(["landed", "failed", "canceled", "ended", "completed"]);
 const UNFINISHED_STATES = new Set(["submitting", "unconfirmed", "queued", "running", "finishing"]);
 
 export function clampGenerateCount(value) {
@@ -34,72 +36,6 @@ export function generateButtonState(runs, { submitting = false, count = 1 } = {}
         generate: submitting ? "sending" : active.length + count > GENERATE_MAX_UNFINISHED ? "full" : "idle",
         cancel: !active.length ? "hidden" : active.every(run => run.canceling) ? "canceling" : "active",
     };
-}
-
-// Pure: the progress line for the runs of the current batch. ``detail`` names the
-// workflow of the take it describes: takes keep their own after a switch.
-export function describeBatchProgress(batchRuns, completedTrimmed = 0) {
-    const runs = batchRuns || [];
-    const total = runs.length + completedTrimmed;
-    if (!total) return null;
-    const done = completedTrimmed + runs.filter((run) => FINAL_STATES.has(String(run?.state || ""))).length;
-    const current = runs.find((run) => run?.state === "running")
-        || runs.find((run) => UNFINISHED_STATES.has(String(run?.state || "")));
-    const index = Math.min(total, done + 1);
-    // A branch run (one output node) promises no take.
-    const branch = current?.purpose === "branch";
-    let suffix = "";
-    if (current?.state === "queued") suffix = " · waiting in ComfyUI's queue";
-    else if (current?.state === "finishing") suffix = branch ? " · finishing" : " · saving the take";
-    else if (current?.state === "submitting" || current?.state === "unconfirmed") suffix = " · sending";
-    let progress = null;
-    if (current?.state === "running" && current.progress_node) {
-        suffix = ` · ${current.progress_node}`;
-        const count = current.progress_count;
-        if (count && Number.isFinite(count.value) && Number.isFinite(count.max) && count.max > 1) {
-            suffix += ` ${count.value}/${count.max}`;
-            progress = count.value / count.max;
-        }
-    }
-    const verb = branch ? "Running output" : "Generating";
-    return { message: `${verb} ${index} of ${total}${suffix}`, progress, detail: current?.template_name || null };
-}
-
-// Pure: the toast for a run that just became final, or null. Messages carry no
-// take index: same-source toasts coalesce into one with a count ("×3"), which
-// would otherwise show only the last index.
-export function outcomeToast(run, detail = "") {
-    const note = String(run?.note || "").trim();
-    if (run?.purpose === "branch" && run?.state !== "landed") return branchOutcomeToast(run, note, detail);
-    switch (run?.state) {
-        case "landed":
-            return { tier: "success", message: "Take landed on the timeline", source: "sdk-generate-landed" };
-        case "failed":
-            return { tier: "error", message: "Take failed", detail: [note, detail].filter(Boolean).join("\n\n") || null, source: "sdk-generate-failed" };
-        case "canceled":
-            return { tier: "warning", message: "Take canceled", detail: note || null, source: "sdk-generate-canceled" };
-        case "ended":
-            return { tier: "warning", message: "Take ended without landing", detail: note || null, source: "sdk-generate-ended" };
-        default:
-            return null;
-    }
-}
-
-// A branch run's outcome: its output, never a take (one that saved a take lands
-// as "Take landed", above).
-function branchOutcomeToast(run, note, detail) {
-    switch (run.state) {
-        case "completed":
-            return { tier: "success", message: "Output ready", source: "sdk-branch-completed" };
-        case "failed":
-            return { tier: "error", message: "Output failed", detail: [note, detail].filter(Boolean).join("\n\n") || null, source: "sdk-branch-failed" };
-        case "canceled":
-            return { tier: "warning", message: "Output canceled", detail: note || null, source: "sdk-branch-canceled" };
-        case "ended":
-            return { tier: "warning", message: "Output run ended", detail: note || null, source: "sdk-branch-ended" };
-        default:
-            return null;
-    }
 }
 
 // Pure: the notification for a Generate request the server refused or only
@@ -172,6 +108,7 @@ function notifyTier(notice, opts = {}) {
  * @param {object} args.buttonOptions      top-chrome BUTTON_OPTIONS
  * @param {Function} [args.beforeGenerate] awaited before each Generate (drains pending edits)
  * @param {Function} [args.renderCacheMaxBytes] current render-cache budget
+ * @param {Function} [args.timecodeMode] "frames" | "timecode", for run receipts
  */
 export function createGenerateControls({
     host,
@@ -181,18 +118,34 @@ export function createGenerateControls({
     buttonOptions,
     beforeGenerate = null,
     renderCacheMaxBytes = () => 0,
+    timecodeMode = () => "frames",
 }) {
     let count = 1;
     let submitting = false;
     let pendingGenerate = null;
     let destroyed = false;
-    let progressHandle = null;
-    const batchIds = new Set();
-    let completedTrimmed = 0;
-    let previouslySeen = new Set();
     let latestRuns = [];
     let primed = false;
-    const announced = new Set();
+    // The App's runs drive the shared notice; a record joins its run by prompt
+    // id, so any record with App run ids is kept (the driver shows only this
+    // session's runs).
+    const feedback = createRunFeedbackDriver({
+        page: "app",
+        app: true,
+        notify,
+        timecodeMode,
+        ownerMatch: (record) => Array.isArray(record?.run_ids) && record.run_ids.length > 0,
+        // A failed take's detail arrives only on an owner-gated read.
+        failureDetail: async (run) => {
+            await Promise.resolve(host.refreshStatus?.()).catch(() => {});
+            return host.details?.get(run.run_id) || "";
+        },
+    });
+    const unsubscribeFeedback = host.subscribeRunFeedback?.((message) => {
+        if (destroyed) return;
+        if (message?.record) feedback.applyRecord(message.record);
+        else if (message?.read) feedback.applyRead(message.read);
+    }) || (() => {});
 
     const element = document.createElement("span");
     element.dataset.sonderGenerate = "true";
@@ -247,67 +200,13 @@ export function createGenerateControls({
             : "Stop every take that is still queued or running";
     }
 
-    function updateProgress(runs) {
-        const byId = new Map(runs.map((run) => [run.run_id, run]));
-        const hadBatch = batchIds.size > 0;
-        for (const run of runs) {
-            if (UNFINISHED_STATES.has(String(run?.state || "")) || (hadBatch && !previouslySeen.has(run.run_id))) {
-                batchIds.add(run.run_id);
-            }
-        }
-        // The server trims finished runs past 24. Fold missing ids into a
-        // counter so the line grows across batches without an unbounded id set.
-        for (const id of batchIds) {
-            if (!byId.has(id)) { batchIds.delete(id); completedTrimmed++; }
-        }
-        previouslySeen = new Set(byId.keys());
-        const batchRuns = [...batchIds].map(id => byId.get(id));
-        const stillActive = batchRuns.some((run) => UNFINISHED_STATES.has(String(run.state || "")));
-        if (!stillActive) {
-            progressHandle?.dismiss();
-            progressHandle = null;
-            batchIds.clear();
-            completedTrimmed = 0;
-            return;
-        }
-        const line = describeBatchProgress(batchRuns, completedTrimmed);
-        if (!progressHandle) {
-            progressHandle = notifyProgress({
-                source: "sdk-generate",
-                foreground: true,
-                message: line.message,
-                detail: line.detail,
-                progress: line.progress,
-            });
-        } else {
-            progressHandle.update({ message: line.message, detail: line.detail, progress: line.progress });
-        }
-    }
-
-    function announceOutcomes(runs) {
-        for (const run of runs) {
-            if (!FINAL_STATES.has(String(run?.state || "")) || announced.has(run.run_id)) continue;
-            announced.add(run.run_id);
-            // The first snapshot (a reload, a reopen) reports finished runs that
-            // were already announced, or that ended while nobody was looking.
-            if (primed) {
-                if (run.state === "failed") {
-                    // Mark announced before fetching: refreshStatus publishes
-                    // another snapshot and must never start a second fetch/toast.
-                    Promise.resolve(host.refreshStatus?.()).catch(() => {}).then(() => {
-                        if (!destroyed) notifyTier(outcomeToast(run, host.details?.get(run.run_id)));
-                    });
-                } else notifyTier(outcomeToast(run));
-            }
-        }
-    }
-
     const unsubscribe = host.subscribe((status) => {
         if (destroyed) return;
         latestRuns = Array.isArray(status?.runs) ? status.runs : [];
-        announceOutcomes(latestRuns);
+        // The first snapshot (a reload, a reopen) reports finished runs that
+        // were already announced, or that ended while nobody was looking.
+        feedback.applyAppRuns(latestRuns, { primed });
         if (status && Number(status.seq) >= 0) primed = true;
-        updateProgress(latestRuns);
         render();
     });
 
@@ -363,8 +262,8 @@ export function createGenerateControls({
         destroy() {
             destroyed = true;
             unsubscribe();
-            progressHandle?.dismiss();
-            progressHandle = null;
+            unsubscribeFeedback();
+            feedback.destroy();
         },
     };
 }

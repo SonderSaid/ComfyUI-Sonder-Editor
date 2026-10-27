@@ -140,6 +140,8 @@ export class SdkWidgetHost {
         this._seq = 0;
         this._cancelEpoch = 0;
         this._listeners = new Set();
+        this._feedbackListeners = new Set();
+        this._lastFeedbackRead = null;
         this._workflowListeners = new Set();
         this._generating = 0;
         this._switching = false;
@@ -385,6 +387,51 @@ export class SdkWidgetHost {
 
     activeRuns() {
         return this.status.runs.filter(isUnfinishedRun);
+    }
+
+    // ── Run feedback (stage, count, receipt; server/run_feedback.py) ────────
+    // The App's runs keep their state and outcome in generation status; these
+    // records add what the run is doing and its receipt, joined by prompt id.
+
+    subscribeRunFeedback(listener) {
+        if (typeof listener !== "function") return () => {};
+        this._feedbackListeners.add(listener);
+        // A read that landed before Generate mounted still reaches it.
+        if (this._lastFeedbackRead) {
+            try { listener({ read: this._lastFeedbackRead }); } catch (err) { console.warn("[Sonder] run feedback listener failed:", err); }
+        }
+        return () => this._feedbackListeners.delete(listener);
+    }
+
+    _publishFeedback(message) {
+        for (const listener of [...this._feedbackListeners]) {
+            try {
+                listener(message);
+            } catch (err) {
+                console.warn("[Sonder] run feedback listener failed:", err);
+            }
+        }
+    }
+
+    applyRunProgress(event) {
+        if (this._destroyed || !event?.record) return;
+        this._publishFeedback({ record: event.record });
+    }
+
+    /** This session's run records, on load and after a reconnect. */
+    async refreshRunFeedback() {
+        if (!this.canWrite()) return;
+        try {
+            const result = await readResponse(await this._fetch(this._sessionPath("runs/feedback"), {
+                headers: this.headers(false),
+            }));
+            if (result.ok) {
+                this._lastFeedbackRead = result.payload;
+                this._publishFeedback({ read: result.payload });
+            }
+        } catch (_err) {
+            // The next reconnect reads again; the App's own status still ends its runs.
+        }
     }
 
     async refreshStatus() {
@@ -650,6 +697,7 @@ export class SdkWidgetHost {
         if (this._flushTimer != null) this._clearTimeout(this._flushTimer);
         this._flushTimer = null;
         this._listeners.clear();
+        this._feedbackListeners.clear();
         this._workflowListeners.clear();
         this.details.clear();
     }

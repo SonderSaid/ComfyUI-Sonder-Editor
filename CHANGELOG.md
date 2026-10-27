@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- One notification per run, the same on the canvas, in fullscreen, in a mounted tab and in the Sonder App: it shows what the run is doing (Queued, Rendering frames 40/144, Preparing graph inputs, Encoding frames, Saving the take) with a ticking elapsed time, then turns into how it ended, with a short receipt: the range it rendered, whether the Render Queue was off or which queued job ran, and the Modes in effect. A batch keeps one live notification with how many runs are waiting, and each finished run leaves a receipt.
 - **Restore Take Placement** (Settings ▸ Timeline Behavior, on by default): drag a take from Assets onto the timeline and it comes back with its original trim, at its original time in its own scene or where you drop it in another (converted to that scene's frame rate). Drop on the ruler to bring its sound back too. Older takes that don't record their placement, and takes whose media was replaced, drop whole at the cursor. This replaces the old same-scene drop, which put the whole file at the Selection's start; with the setting off a take now drops whole at the cursor. Works in fullscreen, mounted tabs and the Sonder App.
 - **Keep take padding** (Settings ▸ Render, and the Controls tab's Editor group): place a new take with the extra frames a model renders to meet its frame rule, when the render generated them, from the take's start to the end of the file. A take whose kept frames run past the scene's end says so. Off by default; a queued job keeps the choice it was queued with.
 - Output Views can show a sampler's live preview: pick a sampler or KJNodes Model Preview Override from a pane's **Sampling previews** list and watch its newest preview, labelled with the step, while the workflow runs. Works in fullscreen, mounted tabs and the Sonder App.
@@ -65,6 +66,8 @@ a fresh `[Unreleased]` block.
 - Reference Lane Setup counts a chip as attached to an item under MiniMax H3 when it cites one of the item's members, directly or through a Subject.
 
 ### Fixed
+- A queued job's guides now render with their own fit and crop, as a live run's do (jobs queued before this update keep the defaults they were queued with).
+- Notifications that change between a warning and an error on one subject no longer stack up: each kind keeps one notification that counts its repeats.
 - Cancel stops an Editor render within about a frame instead of waiting for the whole render to finish; a queued job it had claimed still goes back to Pending to run again.
 - A Save Bridge run that errors or is cancelled after the Editor returns its queued job to Pending, with the failing node named after an error, instead of marking it Failed with "Bridge terminal produced no files". Later jobs of its batch stay Pending.
 - Editor renders and timeline exports read each clip's frames in order instead of jumping to every frame, so clips play through at decoding speed: a scene with a large Lossless FFV1 upscale went from about 1.5 s to about 0.13 s per frame in our tests. The render cache starts fresh once after updating.

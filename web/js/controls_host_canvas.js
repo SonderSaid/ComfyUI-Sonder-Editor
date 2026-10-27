@@ -4,7 +4,7 @@ import {
     dropExecutionAnchors, executionAnchorSnapshot, graphsOf, applyCategoryEdit, applyGroupPlan, applyPresetEdit, dropAnchors, editManifest, exportManifest,
     executionCandidatesFor, inactiveBodies, isStructuralTarget, listCandidates, listExecutionCandidates, nodesOf, parseManifest, parseTarget, readAnchors,
     readExecution, readExecutionAnchor, relayCensus, resolveBindings, resolveCandidate, resolveExecution, resolveExecutionCandidate,
-    planRestore, restoreAnchors, restoreDynamicPrompts, restoreExecutionAnchor, setAnchor, setExecutionAnchor,
+    planRestore, readPresetCategories, restoreAnchors, restoreDynamicPrompts, restoreExecutionAnchor, setAnchor, setExecutionAnchor,
     INFRASTRUCTURE_CLASSES, VIEWS_VERSION, VIEW_FEED_SAMPLING, dropViewAnchors, inactiveOutputs, isOutputNodeOf, nodeType, readViewAnchors, readViews, resolveExecPath, resolveViews,
     restoreViewAnchors, setViewAnchor, viewAnchorSnapshot,
 } from "./control_bindings.js";
@@ -33,6 +33,45 @@ async function promptHash(text) {
     // HTTP LAN origins lack Web Crypto. This bounded fingerprint only detects
     // stale views; registry ownership and fresh graph comparison gate writes.
     return `local:${twoLaneHash(text)}`;
+}
+
+// The active Relay's saved manifest, or null (none, or unreadable: the server
+// reports why from the export).
+export function savedRelayManifest(root) {
+    const relay = relayCensus(root).active[0];
+    try { return parseManifest(relay?.widgets?.find(w => w.name === "manifest")?.value || ""); }
+    catch { return null; }
+}
+
+// Muted and bypassed bodies the export omits: a View's own muted source first,
+// then every other muted output (the server lists those as Views and candidates
+// that are off).
+function canvasInactiveBodies(root, manifest, views) {
+    const viewSources = Object.values(views).filter(v => v.inactiveReason && v.node)
+        .map(v => ({ node: v.node, path: v.path, inactive: v.inactiveReason }));
+    return inactiveBodies(manifest ? resolveBindings(root, manifest).bindings : {},
+        { first: viewSources, last: inactiveOutputs(root) });
+}
+
+// Whether this workflow's Controls declare Modes (categories with a choice).
+export function declaresModes(root) {
+    const manifest = savedRelayManifest(root);
+    return !!manifest && Object.values(readPresetCategories(manifest.preset_categories)).some(c => c.choices.length);
+}
+
+// The describe inputs for one exported prompt, read as the panel reads them, so
+// a run's receipt shows the Modes the panel showed when it was queued. Works on
+// a copy: the queued `output` itself is never touched.
+export function controlsDescribeInputs(root, output, editorKey = null) {
+    const prompt = JSON.parse(JSON.stringify(output || {}));
+    restoreDynamicPrompts(root, prompt);
+    const manifest = savedRelayManifest(root);
+    const views = manifest ? resolveViews(root, manifest).views : {};
+    const census = relayCensus(root).census;
+    const key = editorKey != null && prompt[String(editorKey)]?.class_type === "SonderEditor" ? String(editorKey) : null;
+    const inputs = { prompt, inactive: canvasInactiveBodies(root, manifest, views), relay_census: census, editor_key: key };
+    if (!census.active) inputs.orphan_manifest = exportManifest("", root);
+    return inputs;
 }
 
 // The first expose in a workflow without a Relay adds one at the root, beside
@@ -75,11 +114,7 @@ export function createCanvasControlsHost({app, api, getEditorNode,
     const isCurrent = (id, stamp) => epoch === stamp && sameGraph(id);
     const editorKey = (id, prompt) => nodesOf(id.root).includes(id.editor)
         && prompt[String(id.editor?.id)]?.class_type === "SonderEditor" ? String(id.editor.id) : null;
-    const savedManifest = root => {
-        const relay = relayCensus(root).active[0];
-        try { return parseManifest(relay?.widgets?.find(w => w.name === "manifest")?.value || ""); }
-        catch { return null; } // the server reports why from the export
-    };
+    const savedManifest = savedRelayManifest;
     const snapshot = async id => {
         const {output} = await app.graphToPrompt();
         if (!output || typeof output !== "object") throw new Error("The workflow could not be exported.");
@@ -93,13 +128,8 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         // bodies, and each switch's members and modes, join the fingerprint:
         // an edit to either between validation and write refuses the write.
         const manifest = savedManifest(id.root);
-        // A View's own muted source first, then every other muted output: the
-        // server lists those as Views and candidates that are off.
         const views = manifest ? resolveViews(id.root, manifest).views : {};
-        const viewSources = Object.values(views).filter(v => v.inactiveReason && v.node)
-            .map(v => ({ node: v.node, path: v.path, inactive: v.inactiveReason }));
-        const inactive = inactiveBodies(manifest ? resolveBindings(id.root, manifest).bindings : {},
-            { first: viewSources, last: inactiveOutputs(id.root) });
+        const inactive = canvasInactiveBodies(id.root, manifest, views);
         const switches = manifest ? Object.entries(resolveExecution(id.root, manifest).controls)
             .map(([sid, r]) => [sid, r.status, r.members.map(m => [m.path, m.mode])]) : [];
         const viewStates = Object.entries(views).map(([vid, v]) => [vid, v.status, v.path || null, v.participation || null]);

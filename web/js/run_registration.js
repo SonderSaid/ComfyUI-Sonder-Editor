@@ -14,9 +14,36 @@
 // Never take a prompt id from `app.queuePrompt`: it returns a boolean, and while
 // another queue is processing it defers the request and returns false.
 
+import { controlsDescribeInputs, declaresModes } from "./controls_host_canvas.js";
+
 const EDITOR_CLASS = "SonderEditor";
 const REGISTER_PATH = "/sonder-editor/runs/register";
+const MODES_PATH = "/sonder-editor/runs/register/modes";
 const REGISTER_TIMEOUT_MS = 5000;
+// The server's cap on a registration body (run_output_routes.MAX_REGISTER_BYTES,
+// the Controls describe cap). Past it the run registers without its Modes.
+export const MAX_REGISTER_BYTES = 32 * 1024 * 1024;
+
+const utf8Bytes = text => (typeof TextEncoder === "function" ? new TextEncoder().encode(text).length : text.length * 3);
+
+// The Controls inputs a run's receipt reads its Modes from, taken now, before the
+// prompt is queued, from a copy of `output`. Null when the workflow declares no
+// Modes (most runs: no Relay, or no categories) or the read fails.
+export function modesCapture(rootGraph, output, editorKey) {
+    try {
+        if (!rootGraph || !output || !declaresModes(rootGraph)) return null;
+        return controlsDescribeInputs(rootGraph, output, editorKey);
+    } catch (_error) {
+        return null;
+    }
+}
+
+// A registration body with its Modes when they fit, else without them.
+export function registrationBody(body, controls, maxBytes = MAX_REGISTER_BYTES) {
+    if (!controls) return JSON.stringify(body);
+    const full = JSON.stringify({ ...body, controls });
+    return full.length * 3 <= maxBytes || utf8Bytes(full) <= maxBytes ? full : JSON.stringify(body);
+}
 
 const nodesOf = graph => graph?._nodes || graph?.nodes || [];
 
@@ -79,7 +106,6 @@ export function stampReceipts(data, rootGraph, { partial = false, mint = mintRec
         for (const key of group.editors) {
             stamped[key] = { ...stamped[key], _meta: { ...(stamped[key]._meta || {}), sonder_receipt: group.receipt } };
         }
-        if (group.preregistered) continue;
         registrations.push({
             receipt: group.receipt,
             project_id: group.projectId,
@@ -87,6 +113,9 @@ export function stampReceipts(data, rootGraph, { partial = false, mint = mintRec
             session_id: group.sessionId,
             editors: group.editors,
             purpose: partial ? "branch" : "run",
+            // A mounted run request's receipt is registered at its claim: this
+            // page sends only its Modes.
+            ...(group.preregistered ? { preregistered: true } : {}),
         });
     }
     return { data: { ...data, output: stamped }, registrations };
@@ -184,28 +213,41 @@ export async function runBranch(target, { receipt = "", hostId = "" } = {}) {
     });
 }
 
+// `onRegistered(promptId)`: ComfyUI accepted the prompt and Sonder registered it
+// (its run notification is on the way; the canvas encode pill stands down).
 export function installRunRegistration({
     api, app, fetchImpl = globalThis.fetch?.bind(globalThis), warn = console.warn, isOutputNode = defaultIsOutputNode,
+    onRegistered = null,
 } = {}) {
     if (!api || typeof api.queuePrompt !== "function" || api.__sonderRunRegistration) return false;
     installed = { api, app, fetchImpl, isOutputNode };
     const original = api.queuePrompt;
-    const register = (body) => {
+    const post = (path, text) => {
         const controller = typeof AbortController === "function" ? new AbortController() : null;
         const timer = controller ? setTimeout(() => controller.abort(), REGISTER_TIMEOUT_MS) : null;
         return Promise.resolve()
-            .then(() => fetchImpl(api.apiURL(REGISTER_PATH), {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-                signal: controller?.signal,
+            .then(() => fetchImpl(api.apiURL(path), {
+                method: "POST", headers: { "Content-Type": "application/json" }, body: text, signal: controller?.signal,
             }))
-            .then((resp) => { if (!resp?.ok) warn("Sonder: run registration was refused; its outputs are not observed.", resp?.status); })
-            .catch(() => warn("Sonder: run registration failed; its outputs are not observed."))
             .finally(() => { if (timer) clearTimeout(timer); });
     };
+    const register = ({ preregistered, ...body }, controls, promptId) => {
+        if (preregistered) {
+            // Modes only: the run itself is already registered. Best effort.
+            if (!controls) return Promise.resolve();
+            return post(MODES_PATH, registrationBody(body, controls)).catch(() => {});
+        }
+        return post(REGISTER_PATH, registrationBody(body, controls))
+            // Past the server's cap the run still registers, without its Modes.
+            .then(resp => (resp?.status === 413 && controls ? post(REGISTER_PATH, JSON.stringify(body)) : resp))
+            .then((resp) => {
+                if (!resp?.ok) warn("Sonder: run registration was refused; its outputs are not observed.", resp?.status);
+                else if (promptId) onRegistered?.(promptId);
+            })
+            .catch(() => warn("Sonder: run registration failed; its outputs are not observed."));
+    };
     api.queuePrompt = function sonderQueuePrompt(number, data, options, ...rest) {
-        let request = data, registrations = [];
+        let request = data, registrations = [], controls = null;
         const targets = options?.partialExecutionTargets;
         const intent = pendingIntent && !pendingIntent.seen && !pendingIntent.settled && sameTargets(targets, pendingIntent)
             ? pendingIntent : null;
@@ -213,7 +255,11 @@ export function installRunRegistration({
         try {
             const partial = Array.isArray(targets) && targets.length > 0;
             const receiptFor = (identity) => (intent?.receipt && identity.hostId === intent.hostId ? intent.receipt : "");
-            ({ data: request, registrations } = stampReceipts(data, app?.graph || app?.rootGraph, { partial, receiptFor }));
+            const root = app?.graph || app?.rootGraph;
+            ({ data: request, registrations } = stampReceipts(data, root, { partial, receiptFor }));
+            // The Modes this run is queued with, read now: the graph can change
+            // before the registration is sent.
+            if (registrations.length) controls = modesCapture(root, data?.output, registrations[0].editors[0]);
         } catch (_error) {
             request = data;
             registrations = [];
@@ -224,7 +270,7 @@ export function installRunRegistration({
         // queue, and its receipt would only hold an unbound slot. The server
         // pairs a registration that arrives after the run started (or finished).
         Promise.resolve(result).then((response) => {
-            if (response?.prompt_id) for (const body of registrations) void register(body);
+            if (response?.prompt_id) for (const body of registrations) void register(body, controls, String(response.prompt_id));
             intent?.settle(response?.prompt_id ? { state: "queued", prompt_id: String(response.prompt_id) }
                 : { state: "refused", code: "no_prompt_id" });
         }, (error) => intent?.settle(refusalOf(error)));

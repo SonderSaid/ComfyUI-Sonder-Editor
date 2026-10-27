@@ -1,5 +1,5 @@
 import { ASPECT_RATIO_PRESETS, MAX_SCENE_DURATION_FRAMES, getEditorSettings, renderCacheMaxBytes } from "./editor_settings.js";
-import { subscribeForeground, formatProgress } from "./editor_notifications.js";
+import { subscribeForeground, formatElapsed, formatProgress } from "./editor_notifications.js";
 import { createGenerateControls } from "./generate_controls.js";
 import {
     EDITOR_COLORS as COLORS,
@@ -203,6 +203,8 @@ function updateForegroundPill(widget, item) {
     const pill = widget._foregroundPill;
     if (!pill) return;
     if (!item) {
+        if (pill._clock) window.clearInterval(pill._clock);
+        pill._clock = null;
         pill.style.display = "none";
         return;
     }
@@ -210,9 +212,16 @@ function updateForegroundPill(widget, item) {
     let text;
     if (item.verb) text = prog ? `${item.verb}: ${prog}` : `${item.verb}…`;
     else text = item.message || "Working…";
-    pill._label.textContent = text;
-    // The detail names what the progress belongs to (a Sonder App take's workflow).
-    pill.title = item.detail ? `${text} — ${item.detail}` : text;
+    const paint = () => {
+        // A run's elapsed clock keeps moving through a long step with no new count.
+        const shown = item.startedAt ? `${text} · ${formatElapsed(Date.now() - item.startedAt)}` : text;
+        pill._label.textContent = shown;
+        // The detail names what the progress belongs to (a Sonder App take's workflow).
+        pill.title = item.detail ? `${shown} — ${item.detail}` : shown;
+    };
+    paint();
+    if (pill._clock) window.clearInterval(pill._clock);
+    pill._clock = item.startedAt ? window.setInterval(paint, 1000) : null;
     pill.style.display = "inline-flex";
 }
 
@@ -221,7 +230,13 @@ function wireForegroundPill(widget) {
         widget._foregroundPillUnsub();
         widget._foregroundPillUnsub = null;
     }
-    widget._foregroundPillUnsub = subscribeForeground((item) => updateForegroundPill(widget, item));
+    const unsubscribe = subscribeForeground((item) => updateForegroundPill(widget, item));
+    widget._foregroundPillUnsub = () => {
+        unsubscribe();
+        const pill = widget._foregroundPill;
+        if (pill?._clock) window.clearInterval(pill._clock);
+        if (pill) pill._clock = null;
+    };
 }
 
 export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
@@ -632,6 +647,8 @@ export function buildEditorToolbar(widget) {
                 await widget._drainProjectMutations?.("sdk_generate");
             },
             renderCacheMaxBytes: () => renderCacheMaxBytes(widget._settings || getEditorSettings()),
+            // Run receipts word frames as the queue panel does.
+            timecodeMode: () => (widget._settings || getEditorSettings())?.timelineBehavior?.timecodeMode || "frames",
         })
         : null;
 

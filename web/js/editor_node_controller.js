@@ -1888,6 +1888,7 @@ export class EditorNodeController {
         this._pendingProjectUpdatedEvent = null;
         this._syncSubscribed = false;
         this._stopOwnerPolling();
+        const closed = !!this._syncConnection;
         if (this._syncConnection) {
             this._syncConnection.close();
             this._syncConnection = null;
@@ -1897,6 +1898,16 @@ export class EditorNodeController {
         this._syncSourceNodeId = "";
         this.state.syncConnectionState = "closed";
         this.state.canvasHostConnected = false;
+        // Run notifications this socket relayed may have no source left on the page.
+        // Also from destroy (a workflow tab switch), so not gated on _destroyed.
+        if (closed) {
+            try { this.onProjectSyncClosed?.(); } catch (error) { console.warn("[Sonder] onProjectSyncClosed handler failed:", error); }
+        }
+    }
+
+    /** The project this controller's socket relays, or "" (run notifications). */
+    relaysProject() {
+        return !this._destroyed && this._syncConnection ? this._syncProjectId : "";
     }
 
     _projectSyncMatches() {
@@ -1998,8 +2009,10 @@ export class EditorNodeController {
                 this._handleSyncSubscribed(event);
                 void this._controlsRelay?.cycle();
                 void this._drainRunRequests();  // requests made while this page was away
+                this._readRunFeedback();        // run notifications missed while away
             },
             onRunFinished: (event) => this._handleRunFinished(event),
+            onRunProgress: (event) => this._forwardRunFeedback("onRunProgress", event),
             onRunRequestsPending: (event) => { if (event.host_id === this._hostId()) void this._drainRunRequests(); },
             onControlChangesPending: (event) => { if (event.host_id === this._hostId()) void this._controlsRelay?.cycle(); },
             onControlsVisibilityChanged: (event) => { if (event.host_id === this._hostId()) void this._controlsRelay?.cycle(); },
@@ -3297,6 +3310,35 @@ export class EditorNodeController {
     /** Whether `run_finished` can reach this controller over its project sync socket. */
     receivesRunFinished() {
         return this._syncSubscribed === true && this.state.syncConnectionState === "open";
+    }
+
+    // Run notifications belong to the page (extension.js), not to one Editor:
+    // controllers only forward what their project socket and read deliver.
+    _forwardRunFeedback(hook, payload) {
+        if (this._destroyed) return;
+        try {
+            this[hook]?.(payload);
+        } catch (error) {
+            console.warn(`[Sonder] ${hook} handler failed:`, error);
+        }
+    }
+
+    /**
+     * This host's run records (live, and outcomes still kept): a reload or a
+     * reconnect. The page's driver reads through `fetchRead`, retrying a failed
+     * read, and lets it speak only for this host's runs.
+     */
+    _readRunFeedback() {
+        const projectId = this._projectId(), hostId = this._hostId(), sessionId = this._editorSessionId;
+        if (this._destroyed || !projectId || !hostId || !sessionId || !this.onRunFeedbackRead) return;
+        const query = `host_id=${encodeURIComponent(hostId)}&session_id=${encodeURIComponent(sessionId)}`;
+        const fetchRead = async () => {
+            // The Editor moved on: this read speaks for nothing now.
+            if (this._destroyed || projectId !== this._projectId()) return { ok: true, skip: true };
+            const resp = await fetch(api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectId)}/runs/feedback?${query}`));
+            return resp.ok ? await resp.json() : null;
+        };
+        this._forwardRunFeedback("onRunFeedbackRead", { fetchRead, hostId, projectId: this._syncProjectId || projectId });
     }
 
     _handleRunFinished(event) {

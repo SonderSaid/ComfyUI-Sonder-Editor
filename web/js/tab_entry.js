@@ -1,8 +1,9 @@
 import { installComfyApiShim } from "./comfy_api_shim.js";
 import { FONT, THEME, applyNativeControlTheme, chromeButtonCss, injectSonderFontFaces, setButtonDisabled, statusPillCss } from "./editor_theme.js";
 import { mountToastStack } from "./editor_toast_stack.js";
-import { configureNotifications, notifySuccess, notifyWarning } from "./editor_notifications.js";
-import { notificationCoreConfig, subscribeEditorSettings } from "./editor_settings.js";
+import { configureNotifications, notify, notifySuccess, notifyWarning } from "./editor_notifications.js";
+import { getEditorSettings, notificationCoreConfig, subscribeEditorSettings } from "./editor_settings.js";
+import { createRunFeedbackDriver } from "./run_feedback_notice.js";
 import { LAUNCHER_WINDOW_NAME } from "./sdk_setup_client.js";
 import { modelMessage } from "./launcher_view.js";
 import { createMountedControlsHost } from "./controls_host_remote.js";
@@ -581,7 +582,12 @@ async function runSdkTab() {
             else if (["ended", "displaced", "orphaned"].includes(state)) viewsHost.lost();
             render();
         },
-        onReclaimed: () => void host.refreshStatus(),
+        // A taken-over session reads its running takes' receipts too: they are
+        // broadcast only when they change.
+        onReclaimed: () => {
+            void host.refreshStatus();
+            void host.refreshRunFeedback();
+        },
     });
 
     async function takeOver(button) {
@@ -601,6 +607,7 @@ async function runSdkTab() {
         onGenerationStatus: (event) => {
             host.applyStatus(event);
         },
+        onRunProgress: (event) => host.applyRunProgress(event),
         onSessionChanged: (event) => {
             if (String(event.host_id || "") !== sdkSessionId) return;
             ownership.handleSessionChanged(event);
@@ -612,7 +619,10 @@ async function runSdkTab() {
             tabDiagRecord("transport_state", { state });
             render();
             // Snapshots sent while the socket was down are gone; fetch the latest.
-            if (reconnected) void host.refreshStatus();
+            if (reconnected) {
+                void host.refreshStatus();
+                void host.refreshRunFeedback();
+            }
         },
     }, {
         clientId: sessionId,
@@ -623,6 +633,7 @@ async function runSdkTab() {
 
     // Runs still generating from an earlier visit (reattach, reload).
     void host.refreshStatus();
+    void host.refreshRunFeedback();
 
     // Save the position while the page can still finish a request.
     document.addEventListener("visibilitychange", () => {
@@ -991,8 +1002,26 @@ async function main() {
         tabDiagRecord("visibilitychange", { state: document.visibilityState });
     });
 
+    // The canvas host's run notifications, shown here too: the records it owns
+    // reach this tab over the project socket, and the read restores them after a
+    // reload or a reconnect.
+    const runFeedback = createRunFeedbackDriver({
+        page: "mounted",
+        notify,
+        timecodeMode: () => getEditorSettings()?.timelineBehavior?.timecodeMode || "frames",
+        ownerMatch: (record) => Array.isArray(record?.host_ids) && record.host_ids.includes(hostId),
+    });
+    // Retried while it fails (after a restart the gate refuses until the canvas
+    // host is back); a read that never answers ends what the tab was showing.
+    const readRunFeedback = () => runFeedback.read(async () => {
+        const query = `host_id=${encodeURIComponent(hostId)}&session_id=${encodeURIComponent(sessionId)}`;
+        const result = await fetchJson(`/sonder-editor/project/${encodeURIComponent(projectId)}/runs/feedback?${query}`).catch(() => null);
+        return result?.ok ? result.payload : null;
+    }, { project: projectId });
+
     const sync = connectProjectSync(projectId, {
         onProjectUpdated: createProjectUpdatedHandler(editor, getProjectVersion),
+        onRunProgress: (event) => runFeedback.applyRecord(event?.record, { project: event?.project_id }),
         onWidgetStateChanged: (event) => {
             if (String(event.host_id || "") !== hostId) return;
             if (String(event.source_node_id || "") !== sourceNodeId) return;
@@ -1010,6 +1039,7 @@ async function main() {
         },
         onSubscribed: (event) => {
             void controlsHost.refresh(true);
+            void readRunFeedback();
             if (event.host_id && String(event.host_id) !== hostId) return;
             if (event.source_node_id && String(event.source_node_id) !== sourceNodeId) return;
             if (Object.prototype.hasOwnProperty.call(event, "canvas_host_connected")) {

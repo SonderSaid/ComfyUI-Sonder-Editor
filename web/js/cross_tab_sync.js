@@ -46,6 +46,9 @@ export function connectProjectSync(projectId, handlers = {}, options = {}) {
             // Sent once per ComfyUI prompt that touched this project, after Sonder
             // finished its bridges and returned any job the run left running.
             else if (event.type === "run_finished") handlers.onRunFinished?.(event);
+            // A bound run's stage, count and receipt (server/run_feedback.py), at
+            // most 4 Hz per run, ordered by its `seq`; one per run notification.
+            else if (event.type === "run_progress") handlers.onRunProgress?.(event);
             // Sonder App run status, about 5 Hz while takes generate. Ordered by
             // the session's `seq`; the host drops stale snapshots (sdk_host.js).
             else if (event.type === "generation_status") handlers.onGenerationStatus?.(event);

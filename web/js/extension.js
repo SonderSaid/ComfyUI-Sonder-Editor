@@ -22,7 +22,8 @@ import {
 import { createSonderProject, snapFpsToTemplate } from "./project_create.js";
 import { FONT, THEME, chromeInputCss, injectSonderFontFaces } from "./editor_theme.js";
 import { mountToastStack } from "./editor_toast_stack.js";
-import { notifyProgress, notifyInfo, notifyWarning, configureNotifications } from "./editor_notifications.js";
+import { notify, notifyProgress, notifyInfo, notifyWarning, configureNotifications } from "./editor_notifications.js";
+import { createRunFeedbackDriver } from "./run_feedback_notice.js";
 import { mountNodeVideoPreview, unmountNodeVideoPreview } from "./node_video_preview.js";
 import { installRunRegistration } from "./run_registration.js";
 import { applyRenderCacheSettingToNode, applyRenderCacheSettingToNodes } from "./render_cache_activation.js";
@@ -69,9 +70,20 @@ function _sonderSaveNodeInfo(nodeId) {
 function _sonderHandleProgressEvent(detail) {
     const nodeId = detail?.node;
     if (nodeId == null) return;
+    // A run this page registered, or has a record for, gets its encode stage in
+    // its run notification. Expiry: retire this pill once every Save Video prompt
+    // is a bound run (canvas runs without a Sonder Editor are not today).
+    const promptId = String(detail?.prompt_id || "");
     const info = _sonderSaveNodeInfo(nodeId);
     if (!info) return; // not a Sonder save node
     const key = String(nodeId);
+    if (promptId && (registeredRunPrompts.has(promptId) || canvasRunFeedbackDriver?.knows(promptId))) {
+        // Its run notification took over (registration can land mid-encode):
+        // one foreground item, so a pill already showing gives way.
+        _sonderEncodeNotifs.get(key)?.dismiss();
+        _sonderEncodeNotifs.delete(key);
+        return;
+    }
     const max = Number(detail?.max) || 0;
     const value = Number(detail?.value) || 0;
     const progress = max > 0 ? { current: value, total: max, unit: "f" } : null;
@@ -1045,10 +1057,57 @@ function schedulePostPromptRefresh() {
     });
 }
 
+// ── Run notifications (canvas page) ──────────────────────────────────────
+// One driver per page (run_feedback_notice.js): each Editor controller forwards
+// its project socket's `run_progress` and its feedback read; the driver shows the
+// runs any of this page's Editor hosts own, de-duplicated by prompt id.
+const pageEditorControllers = new Set();
+let canvasRunFeedbackDriver = null;
+// Prompts this page registered: their notification is on the way, so the
+// legacy encode pill stands down for them. Bounded; oldest first out.
+const registeredRunPrompts = new Set();
+const MAX_REGISTERED_RUN_PROMPTS = 256;
+
+function canvasRunFeedback() {
+    if (!canvasRunFeedbackDriver) {
+        canvasRunFeedbackDriver = createRunFeedbackDriver({
+            page: "canvas",
+            notify,
+            timecodeMode: () => getEditorSettings()?.timelineBehavior?.timecodeMode || "frames",
+            ownerMatch: (record) => {
+                const hosts = Array.isArray(record?.host_ids) ? record.host_ids : [];
+                for (const controller of pageEditorControllers) {
+                    if (controller._destroyed) { pageEditorControllers.delete(controller); continue; }
+                    if (hosts.includes(controller._hostId?.())) return true;
+                }
+                return false;
+            },
+        });
+    }
+    return canvasRunFeedbackDriver;
+}
+
+// A project socket closed (a workflow tab switch destroys this page's Editor
+// controllers; a project switch moves one). After the current task, so a socket
+// reopened at once for the same project still counts as relaying it.
+function detachUnrelayedRuns() {
+    if (!canvasRunFeedbackDriver) return;
+    queueMicrotask(() => canvasRunFeedbackDriver?.detach({
+        watched: (project) => [...pageEditorControllers].some((controller) => controller.relaysProject?.() === project),
+    }));
+}
+
+function noteRegisteredRunPrompt(promptId) {
+    registeredRunPrompts.add(String(promptId));
+    while (registeredRunPrompts.size > MAX_REGISTERED_RUN_PROMPTS) {
+        registeredRunPrompts.delete(registeredRunPrompts.values().next().value);
+    }
+}
+
 // ── Main Extension ─────────────────────────────────────────────────────
 // Runs this page submits are registered so their outputs can be observed
 // (run_registration.js); it wraps the shared api once, before any Run.
-installRunRegistration({ api, app });
+installRunRegistration({ api, app, onRegistered: noteRegisteredRunPrompt });
 
 app.registerExtension({
     name: "sonder.editor",
@@ -1091,6 +1150,13 @@ app.registerExtension({
                 const controller = new EditorNodeController(node, projectWidget, { app });
                 node._sonderController = controller;
                 controller.onRunFinished = () => handleRunFinished(node);
+                pageEditorControllers.add(controller);
+                controller.onRunProgress = (event) => canvasRunFeedback().applyRecord(event?.record, { project: event?.project_id });
+                // A read speaks only for its own host's runs.
+                controller.onRunFeedbackRead = ({ fetchRead, hostId, projectId }) => void canvasRunFeedback().read(fetchRead, {
+                    scope: (record) => Array.isArray(record?.host_ids) && record.host_ids.includes(hostId), project: projectId,
+                });
+                controller.onProjectSyncClosed = detachUnrelayedRuns;
                 node.resizable = true;
                 node.flags = { ...(node.flags || {}), resizable: true };
                 controller.render();

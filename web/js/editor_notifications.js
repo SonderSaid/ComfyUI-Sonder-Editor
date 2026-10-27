@@ -84,6 +84,15 @@ export function formatProgress(progress) {
     return null; // indeterminate
 }
 
+// An elapsed clock ("12s", "3:04"), shared by toast and pill.
+export function formatElapsed(ms) {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    if (total < 60) return `${total}s`;
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return `${m}:${String(s).padStart(2, "0")}`;
+}
+
 // Returns a 0..1 fraction for a determinate bar, or null for indeterminate.
 export function progressFraction(progress) {
     if (typeof progress === "number") return clamp01(progress);
@@ -102,6 +111,9 @@ function _publicView(notif) {
         message: notif.message,
         detail: notif.detail,
         progress: notif.progress,
+        // Epoch ms a running operation began: presenters tick an elapsed clock
+        // from it, so a long step with no new event still reads as working.
+        startedAt: notif.startedAt,
         foreground: notif.foreground,
         source: notif.source,
         onRetry: notif.onRetry,
@@ -164,16 +176,25 @@ function _coalesceKey(opts, tier) {
     return `${tier}:${opts.message ?? opts.verb ?? ""}`;
 }
 
-function _findByKey(s, key) {
+// A coalescing slot is one source and one tier: a different tier opens its own
+// slot, so alternating tiers on one source keep at most one toast per tier
+// instead of stacking (the first toast with the key used to win every match).
+function _findByKey(s, key, tier) {
     for (const n of s.notifications.values()) {
-        if (n._key === key) return n;
+        if (n._key === key && n.tier === tier) return n;
     }
     return null;
 }
 
 function _applyOpts(notif, opts) {
-    if ("tier" in opts && opts.tier) notif.tier = opts.tier;
+    if ("tier" in opts && opts.tier) {
+        // A tier change keeps no stale title ("Rendering" over a failure) unless
+        // the patch names one.
+        if (opts.tier !== notif.tier && !("verb" in opts)) notif.verb = null;
+        notif.tier = opts.tier;
+    }
     if ("verb" in opts) notif.verb = opts.verb ?? null;
+    if ("startedAt" in opts) notif.startedAt = Number(opts.startedAt) > 0 ? Number(opts.startedAt) : null;
     if ("message" in opts) notif.message = opts.message ?? "";
     if ("detail" in opts) notif.detail = opts.detail ?? null;
     if ("progress" in opts) notif.progress = opts.progress ?? null;
@@ -189,7 +210,7 @@ function _applyOpts(notif, opts) {
 
 // ── Core API ───────────────────────────────────────────────────────────────────
 
-// notify({ tier, verb, message, detail, progress, foreground, source, onRetry, actions, durationMs })
+// notify({ tier, verb, message, detail, progress, startedAt, foreground, source, onRetry, actions, durationMs })
 // Action descriptors are { label, variant, fn, dismiss? }; dismiss defaults to
 // true in presenters, while false keeps a progress notification mounted.
 // Returns a handle: { id, update, progress, resolve, dismiss }.
@@ -201,8 +222,8 @@ export function notify(opts = {}) {
     // Coalesce: an identical key still on screen bumps count + refreshes instead
     // of stacking a duplicate. Same-tier only — a failure must not silently fold
     // into a warning of the same text.
-    const existing = _findByKey(s, key);
-    if (existing && existing.tier === tier) {
+    const existing = _findByKey(s, key, tier);
+    if (existing) {
         existing.count += 1;
         existing.updatedAt = _now();
         _applyOpts(existing, { ...opts, tier });
@@ -220,6 +241,7 @@ export function notify(opts = {}) {
         message: opts.message ?? "",
         detail: opts.detail ?? null,
         progress: opts.progress ?? null,
+        startedAt: Number(opts.startedAt) > 0 ? Number(opts.startedAt) : null,
         foreground: !!opts.foreground,
         source: opts.source ?? null,
         onRetry: opts.onRetry ?? null,
@@ -299,6 +321,9 @@ function _handle(id) {
         progress: (value) => _update(id, { progress: value }),
         resolve: (patch) => _resolve(id, patch),
         dismiss: () => dismiss(id),
+        // Still on screen: not dismissed and not expired. A long-lived owner (a
+        // run's live toast) checks this rather than reopening what the author closed.
+        alive: () => _ensure().notifications.has(id),
     };
 }
 

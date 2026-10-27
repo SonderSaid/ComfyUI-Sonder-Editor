@@ -426,8 +426,8 @@ def test_missing_progress_observer_keeps_state_only_status(world):
         await world.runner.presence_tick()
         await asyncio.sleep(0)
         await asyncio.sleep(0)
-        assert run.state == RUNNING and run.progress_count is None
-        assert run.progress_node == ""
+        assert run.state == RUNNING
+        assert "progress_node" not in run.public()  # what it does is run feedback's
 
     asyncio.run(go())
 
@@ -844,28 +844,24 @@ def test_generate_rechecks_owner_after_template_lock(world):
     asyncio.run(go())
 
 
-@pytest.mark.parametrize("node,display,expected", [
-    ("12:5", "12", "Sampler"), ("12.0.1.inner", "9", "Bridge"),
-    ("unknown", "12:5", "Sampler"), ("unknown", "other", "")])
-def test_progress_resolves_labels(node, display, expected):
-    assert SdkRunner._progress_label({"12:5": "Sampler", "12": "Bridge"}, node, display) == expected
-
-
 def test_run_detail_is_memory_only_and_progress_ignores_late_events(world):
     async def go():
         session = await world.open()
         await world.runner.generate(session, tab_session_id="tab-1")
         run = session.runs[0]
         snapshot = {"run_token": run.token, "prompt_id": run.prompt_id, "node_id": "5", "display_node_id": "5", "count": {"value": 1, "max": 4}}
+        before = len(world.events)
         world.runner.apply_progress(snapshot)
-        assert run.public()["progress_node"] == "KSampler"
-        assert run.public()["progress_count"] == {"value": 1, "max": 4}
+        assert run.state == RUNNING and "progress_count" not in run.public()
+        world.runner.apply_progress({**snapshot, "count": {"value": 2, "max": 4}})
+        # A count alone changes nothing the App's status carries: no new snapshot.
+        assert len(world.events) - before <= 1
         world.runner.apply_run_finished({"run_token": run.token, "prompt_id": run.prompt_id, "outcome": "error", "detail": "ValueError: private/path"})
         assert run.detail == "ValueError: private/path"
         assert "private/path" not in json.dumps(world.runner.status(session))
         assert "private/path" not in json.dumps(world.events)
         world.runner.apply_progress(snapshot)
-        assert run.state == FAILED and run.progress_node == ""
+        assert run.state == FAILED
     asyncio.run(go())
 
 
@@ -918,7 +914,6 @@ def test_progress_metadata_cannot_prevent_generate(world, meta):
         session = await world.open()
         result = await world.runner.generate(session, tab_session_id="tab-1")
         assert result["run_ids"]
-        assert session.runs[0].node_labels["5"] == "KSampler"
     asyncio.run(go())
 
 

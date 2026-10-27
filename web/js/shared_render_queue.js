@@ -5,6 +5,7 @@ import {
     chromeButtonCss,
     statusPillCss,
 } from "./editor_theme.js";
+import { formatQueueSelectionSummary, formatQueueTime, queueChunkLabel } from "./queue_format.js";
 
 function style(el, cssText) {
     el.style.cssText = cssText;
@@ -40,31 +41,8 @@ export function formatQueueStatusLabel(status) {
     return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
-export function formatQueueTime(frame, fps, mode = "frames") {
-    const safeFrame = Math.max(0, parseInt(frame, 10) || 0);
-    if (mode !== "timecode") return String(safeFrame);
-    const safeFps = Math.max(1, Number(fps) || 24);
-    const totalSeconds = safeFrame / safeFps;
-    const h = Math.floor(totalSeconds / 3600);
-    const m = Math.floor((totalSeconds % 3600) / 60);
-    const s = Math.floor(totalSeconds % 60);
-    const f = Math.floor(safeFrame % safeFps);
-    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}:${String(f).padStart(2, "0")}`;
-    return `${m}:${String(s).padStart(2, "0")}:${String(f).padStart(2, "0")}`;
-}
-
-export function formatQueueSelectionSummary(job, options = {}) {
-    const start = Math.max(0, parseInt(job?.selection_start, 10) || 0);
-    const end = Math.max(start, parseInt(job?.selection_end, 10) || 0);
-    const duration = end - start;
-    const preContext = Math.max(0, parseInt(job?.pre_context_frames, 10) || 0);
-    const postContext = Math.max(0, parseInt(job?.post_context_frames, 10) || 0);
-    const maskPre = Math.max(0, parseInt(job?.mask_pre_offset, 10) || 0);
-    const maskPost = Math.max(0, parseInt(job?.mask_post_offset, 10) || 0);
-    const fps = Math.max(1, Number(job?.scene_fps) || Number(options.fps) || 24);
-    const mode = options.mode === "timecode" ? "timecode" : "frames";
-    return `In: ${formatQueueTime(start, fps, mode)} Out: ${formatQueueTime(end, fps, mode)} (${formatQueueTime(duration, fps, mode)}) | Ctx: -${preContext}/+${postContext} | Mask Offset: -${maskPre}/+${maskPost}`;
-}
+// The pure wording lives in queue_format.js, shared with run notifications.
+export { formatQueueTime, formatQueueSelectionSummary };
 
 export function groupQueueJobs(queue) {
     const groups = [];
@@ -598,9 +576,8 @@ function createBatchGroup(current, entry, rerender) {
             flex-direction: column;
         `);
         entry.jobs.forEach((job, index) => {
-            const chunkIndex = Math.max(1, (parseInt(job?.batch_index, 10) || index) + 1);
             rows.appendChild(createQueueRow(current, job, {
-                title: `Chunk ${chunkIndex} of ${batchTotal}`,
+                title: queueChunkLabel(job?.batch_index, batchTotal, index),
                 nested: true,
             }));
         });
