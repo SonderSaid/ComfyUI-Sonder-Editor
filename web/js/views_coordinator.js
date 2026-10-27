@@ -12,8 +12,8 @@
 // Holds pin a result for comparison. A read names this page's holds
 // (`keep_holds`), so a closed page's holds age out on the server; pagehide
 // releases them at once. A hold ends on Release, a source, workflow or project
-// change, its pane closing or the layout shrinking past it, fullscreen exit and
-// teardown.
+// change, its pane closing or the pane count shrinking past it, fullscreen exit
+// and teardown. Rearranging the panes (Grid, Row, Column) ends nothing.
 //
 // Linked playback (Phase 3B): a video or audio result whose frames sit on the
 // current scene (a take's placement, or the View's authored timing against its
@@ -92,7 +92,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
     const client = () => current()?.runOutputs?.() || null;
     const viewList = () => controls.getView()?.views || [];
     const viewFor = id => viewList().find(view => view.view_id === id) || null;
-    const visibleCount = () => paneCount(layout.layout);
+    const visibleCount = () => paneCount(layout);
     const viewPanes = () => layout.panes.slice(0, visibleCount())
         .map((pane, index) => ({ pane, index })).filter(({ pane }) => pane.source.kind === "view");
     const isSampling = view => viewFeed(view) === VIEW_FEED_SAMPLING;
@@ -598,10 +598,20 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
 
     // ── Public ───────────────────────────────────────────────────────────────
 
-    function setLayout(next) {
+    // `patch`: {count?, arrangement?}. An unchanged layout writes nothing, so a
+    // click on the pressed segment cannot overwrite another tab's layout.
+    function setLayout(patch) {
         const before = visibleCount();
-        layout = normalizeLayout({ ...layout, layout: next });
-        // Panes past the new layout close: their holds and sound end.
+        const next = normalizeLayout({ ...layout, ...patch });
+        if (next.count === layout.count && next.arrangement === layout.arrangement) return;
+        layout = next;
+        if (next.count === before) {
+            // Rearranged: the same panes show, so nothing is released or read.
+            persist();
+            changed();
+            return;
+        }
+        // Panes past the new count close: their holds and sound end.
         for (let i = visibleCount(); i < Math.max(before, MAX_PANES); i++) {
             if (panes[i].held) releasePane(i, { quiet: true });
             audio?.release(paneId(i));

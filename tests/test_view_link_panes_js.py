@@ -217,13 +217,13 @@ def test_one_audible_source_under_random_pane_operations():
 let seed = 11;
 const rand = n => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
 answer.sources = { '9': { state: 'ok', result: result() } };
-const layouts = ['1', '2c', '3c', '2x2'];
+const layouts = [{count: 1}, {count: 2}, {count: 3}, {count: 4}, {arrangement: 'grid'}, {arrangement: 'row'}, {arrangement: 'column'}];
 const sources = [{ kind: 'view', viewId: 'a' }, { kind: 'guides' }, { kind: 'composite' }];
 let bad = null;
 for (let sequence = 0; sequence < 50 && !bad; sequence++) {
     for (let step = 0; step < 20; step++) {
         const op = rand(6), pane = rand(4);
-        if (op === 0) c.setLayout(layouts[rand(4)]);
+        if (op === 0) c.setLayout(layouts[rand(layouts.length)]);
         else if (op === 1) c.assign(pane, sources[rand(3)]);
         else if (op === 2 && pane < c.visibleCount()) audio.claim(c.paneId(pane));
         else if (op === 3) audio.release(audio.owner());

@@ -280,9 +280,22 @@ renders.
 
 ### Panes and Output Views
 
-The viewport can show up to four things side by side. Click the buttons at
-the right of the bar above the viewport: **1** (one pane), **2** or **3**
-(side by side) or **2×2** (four).
+The viewport can show up to four things at once. At the right of the bar
+above the viewport, click **1**, **2**, **3** or **4** to choose how many
+panes show.
+
+With two or more panes, small picture buttons appear to the right of the
+numbers: **Row** and **Column**, plus **Grid** with three or four panes.
+Hover over one to see its name:
+
+- **Row**: the panes sit side by side.
+- **Column**: the panes are stacked from top to bottom.
+- **Grid** (three or four panes only): four panes form two rows of two;
+  three panes show one large pane on the left and two stacked on the right.
+
+Each pane keeps what it shows when you change the arrangement. When you
+lower the number, the panes you hide keep their choice for when you raise it
+again, but a result held in a hidden pane is released.
 
 Each pane has a source button at its top left (**Composite ▾** at first).
 Click it and choose:

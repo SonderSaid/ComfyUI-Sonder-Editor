@@ -8,19 +8,49 @@
 
 import { KJ_PREVIEW_CLASS, VIEW_FEED_SAMPLING, viewFeed } from "./control_targets.js";
 
-export const LAYOUTS = Object.freeze({ "1": 1, "2c": 2, "3c": 3, "2x2": 4 });
-export const LAYOUT_ORDER = Object.freeze(["1", "2c", "3c", "2x2"]);
-export const LAYOUT_LABELS = Object.freeze({ "1": "1", "2c": "2", "3c": "3", "2x2": "2×2" });
-export const LAYOUT_TITLES = Object.freeze({
-    "1": "One pane", "2c": "Two panes side by side", "3c": "Three panes side by side", "2x2": "Four panes, two by two",
-});
 export const MAX_PANES = 4;
 export const MAX_LAYOUT_RECORDS = 64;
 export const FITS = Object.freeze(["contain", "cover"]);
+// How many panes show, and how they sit. Grid is two by two, or with three
+// panes one large pane on the left and two stacked; with two panes it is the
+// same as Row, so the bar offers Row and Column only.
+export const PANE_COUNT_TITLES = Object.freeze(["One pane", "Two panes", "Three panes", "Four panes"]);
+export const ARRANGEMENTS = Object.freeze(["grid", "row", "column"]);
+export const ARRANGEMENT_TITLES = Object.freeze({
+    grid: "Grid: two by two, or one large pane and two stacked",
+    row: "Row: panes side by side",
+    column: "Column: panes stacked top to bottom",
+});
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_ZOOM = 16;
 
-export const paneCount = layout => LAYOUTS[layout] || 1;
+const normalizeCount = raw => (Number.isInteger(raw) && raw >= 1 && raw <= MAX_PANES ? raw : 1);
+export const paneCount = record => normalizeCount(record?.count);
+// What the panes show as: "single" with one pane; Grid with two panes is Row.
+export function effectiveArrangement(record) {
+    const count = paneCount(record);
+    if (count === 1) return "single";
+    const arrangement = ARRANGEMENTS.includes(record?.arrangement) ? record.arrangement : "grid";
+    return count === 2 && arrangement === "grid" ? "row" : arrangement;
+}
+
+// The panes' CSS grid: columns, rows, and each cell's `gridRow` ("" for none).
+// Cells keep their order whatever the arrangement, so a pane is the same
+// pane (and keeps its content) when the arrangement changes.
+export function paneGrid(count, arrangement) {
+    const n = normalizeCount(count);
+    const effective = effectiveArrangement({ count: n, arrangement });
+    const spans = Array(n).fill("");
+    const repeat = `repeat(${n}, 1fr)`;
+    if (effective === "single") return { gridTemplateColumns: "1fr", gridTemplateRows: "1fr", spans };
+    if (effective === "row") return { gridTemplateColumns: repeat, gridTemplateRows: "1fr", spans };
+    if (effective === "column") return { gridTemplateColumns: "1fr", gridTemplateRows: repeat, spans };
+    if (n === 3) {
+        spans[0] = "1 / 3";
+        return { gridTemplateColumns: "2fr 1fr", gridTemplateRows: "1fr 1fr", spans };
+    }
+    return { gridTemplateColumns: "1fr 1fr", gridTemplateRows: "1fr 1fr", spans };
+}
 // The first pane starts on the Composite, the others on the Guides.
 // `link`: an output follows the editor's scene clock when it can (Phase 3B).
 export const defaultPane = (index = 0) => ({ source: { kind: index === 0 ? "composite" : "guides" }, item: 0, fit: "contain", zoom: null, link: true });
@@ -53,13 +83,15 @@ export function normalizePane(raw, index = 0) {
     return pane;
 }
 
-// A layout record: always four pane slots (the hidden ones keep their choice
-// for when the layout grows again), Composite in at most one of them.
+// A layout record: a pane count, an arrangement, and always four pane slots
+// (the hidden ones keep their choice for when the count grows again),
+// Composite in at most one of them.
 export function normalizeLayout(raw) {
-    const record = { ts: 0, layout: "1", panes: Array.from({ length: MAX_PANES }, (_, i) => defaultPane(i)) };
+    const record = { ts: 0, count: 1, arrangement: "grid", panes: Array.from({ length: MAX_PANES }, (_, i) => defaultPane(i)) };
     if (!raw || typeof raw !== "object") return record;
     record.ts = Number.isFinite(Number(raw.ts)) && Number(raw.ts) > 0 ? Number(raw.ts) : 0;
-    record.layout = Object.hasOwn(LAYOUTS, raw.layout) ? raw.layout : "1";
+    record.count = normalizeCount(raw.count);
+    record.arrangement = ARRANGEMENTS.includes(raw.arrangement) ? raw.arrangement : "grid";
     const panes = Array.isArray(raw.panes) ? raw.panes : [];
     record.panes = Array.from({ length: MAX_PANES }, (_, i) => normalizePane(panes[i], i));
     let composite = false;
@@ -93,7 +125,7 @@ export function normalizeLayoutMap(raw) {
     return Object.fromEntries(entries.slice(-MAX_LAYOUT_RECORDS));
 }
 
-export const visiblePanes = record => normalizeLayout(record).panes.slice(0, paneCount(record?.layout));
+export const visiblePanes = record => normalizeLayout(record).panes.slice(0, paneCount(record));
 
 // Show `source` in pane `index`. Composite sits in one pane at most: picking
 // it where another pane has it swaps the two panes' sources.

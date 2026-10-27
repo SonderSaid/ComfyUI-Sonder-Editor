@@ -567,3 +567,40 @@ def test_the_publication_refuses_a_malformed_sampling_list():
     with pytest.raises(ValueError):
         sr._prepare_control_publication({"view_seq": 1, "prompt_hash": "h",
                                          "view": {"bindings": [], "notes": [], "view_sampling_candidates": "6"}})
+
+
+# ── View order (live-workflow Phase 5) ───────────────────────────────────────
+
+def test_a_new_view_follows_the_last_view_not_the_panel_order():
+    prompt = prompt_with({"a": view_entry("9", order=3)})
+    view = describe(prompt, authoring={})
+    cleaned, rejected = cd.validate_binding_changes(view, {
+        "view:n1:create": {"candidate": {"path": "12:7"}},
+        "view:n2:create": {"candidate": {"path": "12:15:3"}},
+        "binding:b1:expose": {"candidate": {"path": "6", "input": "seed"}},
+    }, structural="canvas")
+    assert not rejected, rejected
+    assert [cleaned["view:n1:create"]["order"], cleaned["view:n2:create"]["order"]] == [4, 5]
+    # Bindings keep their own counter: a View create never moves them.
+    assert cleaned["binding:b1:expose"]["order"] == 1
+    # A later batch (the reported case: Views added one after another).
+    later = prompt_with({"a": view_entry("9", order=3), "n1": view_entry("12:7", "SaveVideo", order=4)})
+    again, rejected = cd.validate_binding_changes(describe(later, authoring={}),
+                                                  {"view:n2:create": {"candidate": {"path": "12:15:3"}}}, structural="canvas")
+    assert not rejected and again["view:n2:create"]["order"] == 5
+
+
+def test_sdk_view_creates_follow_the_apps_visible_views(app):
+    st, identity, prompt, validation, snapshot, write = app
+    authored = {**prompt, "90": relay({"a": view_entry("9", order=4), "b": view_entry("12:7", "SaveVideo", order=9)})}
+    st.replace_template(identity, json.dumps(authored).encode(), validate=validation)
+    write({"view:b:remove": True})
+    # The app's copy of a workflow View carries its own order: it counts.
+    write({"view:a:order": 7})
+    data = write({"view:n1:create": {"candidate": {"path": "12:7"}}})
+    assert data["views"]["n1"]["order"] == 8  # the removed View's 9 no longer counts
+    # A later batch takes the next one (a sampler's preview View here).
+    data = write({"view:n2:create": {"candidate": {"path": "6"}, "feed": "sampling"}})
+    assert data["views"]["n2"]["order"] == 9
+    views = {d["view_id"]: (d["order"], d["origin"]) for d in snapshot()[2]["views"]}
+    assert views == {"a": (7, "app_copy"), "n1": (8, "app"), "n2": (9, "app")}

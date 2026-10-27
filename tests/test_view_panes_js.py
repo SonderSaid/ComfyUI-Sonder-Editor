@@ -315,10 +315,10 @@ def test_coordinator_reads_holds_keepalive_pagehide_and_layout():
     out = run_coordinator("""
 c.setVisible(true); await settle();
 out.firstReads = reads.length;  // no View pane yet: nothing to read
-c.setLayout('2c'); c.assign(1, {kind: 'view', viewId: 'a'}); await settle();
+c.setLayout({count: 2}); c.assign(1, {kind: 'view', viewId: 'a'}); await settle();
 out.demand = demand.slice();
 out.read = reads.at(-1);
-out.stored = stored.get('c:wf')?.layout;
+out.stored = stored.get('c:wf')?.count;
 answer.sources = { '9': { state: 'ok', result: { prompt_id: 'p1', fresh: true, run: {}, entries: [{ index: 0, kind: 'image', file: { filename: 'a.png' } }] } } };
 client.hint(); await settle();
 let model = c.paneModel(1);
@@ -340,14 +340,14 @@ for (const fn of winListeners.pagehide || []) fn();
 out.pagehide = released.at(-1);
 // Shrinking the layout closes pane 2: its hold ends.
 await c.hold(1); await settle();
-c.setLayout('1'); await settle();
+c.setLayout({count: 1}); await settle();
 out.shrunk = released.at(-1);
-out.defaultDeleted = stored.has('c:wf') ? stored.get('c:wf').layout : null;
+out.defaultDeleted = stored.has('c:wf') ? stored.get('c:wf').count : null;
 """)
     assert out["firstReads"] == 0
     assert out["demand"][-1] is True
     assert out["read"] == [["9"], []]
-    assert out["stored"] == "2c"
+    assert out["stored"] == 2
     assert out["model"] == [None, True, "a.png", True]
     assert out["held"] == [True, "Held", ["h1"]]
     assert out["keepalive"]
@@ -358,7 +358,7 @@ out.defaultDeleted = stored.has('c:wf') ? stored.get('c:wf').layout : null;
 
 def test_coordinator_runs_settle_cancel_session_loss_workflow_switch_and_create():
     out = run_coordinator("""
-c.setVisible(true); c.setLayout('2c'); c.assign(1, {kind: 'view', viewId: 'a'}); await settle();
+c.setVisible(true); c.setLayout({count: 2}); c.assign(1, {kind: 'view', viewId: 'a'}); await settle();
 await c.run(1); await settle();
 out.started = [runs.at(-1), c.paneModel(1).chip, c.paneModel(1).cancellable.enabled];
 out.polling = timers.some(([ms]) => ms === POLL_MS);
@@ -377,9 +377,9 @@ answer.sources = { '9': { state: 'ok', result: { prompt_id: 'p1', fresh: true, r
 answer.holds = [{ hold_id: 'h1', state: 'ok', entry: { kind: 'image', file: { filename: 'a.png' } }, run: {} }];
 client.hint(); await settle();
 await c.hold(1); await settle();
-stored.set('a:t2', { ts: 9, layout: '3c', panes: [] });
+stored.set('a:t2', { ts: 9, count: 3, panes: [] });
 key = 'a:t2'; c.hostChanged(); await settle();
-out.switched = [c.layout().layout, released.at(-1)];
+out.switched = [c.layout().count, released.at(-1)];
 // Add output: one Controls change, then the pane shows the new View.
 await c.createView(0, { path: '12:7' });
 const target = Object.keys(applied.at(-1))[0];
@@ -392,7 +392,7 @@ out.destroyed = demand.at(-1);
     assert out["removed"] == "Canceled"
     assert out["lost"] == ["Disconnected", True, False]
     assert out["restored"]
-    assert out["switched"][0] == "3c" and out["switched"][1] == [["h1"], False]
+    assert out["switched"][0] == 3 and out["switched"][1] == [["h1"], False]
     assert out["created"] == [True, {"candidate": {"path": "12:7"}}, "view"]
     assert out["destroyed"] is False
 
@@ -413,10 +413,10 @@ const panes = mountViewPanes({{ root, header, coordinator: c, audio, sourceHost,
     placeComposite: (body, opts) => placed.push(body ? body.parentElement?.dataset.sonderPane : (opts?.restore ? 'restore' : 'park')) }});
 globalThis.onCoordinatorChange = () => panes.update();
 flushRaf();
-out.layoutButtons = header.all(el => el.dataset.sonderPaneLayout).map(el => el.dataset.sonderPaneLayout);
+out.layoutButtons = header.all(el => el.dataset.sonderPaneCount).map(el => el.dataset.sonderPaneCount);
 out.singleBarInHeader = !!header.find(el => el.dataset.sonderPaneSource === '0');
 out.firstPlaced = placed.at(-1);
-header.find(el => el.dataset.sonderPaneLayout === '2c').click(); flushRaf();
+header.find(el => el.dataset.sonderPaneCount === '2').click(); flushRaf();
 out.cells = root.children.length;
 // The picker: sections, Escape closes it; picking Composite in pane 2 swaps.
 const button = root.find(el => el.dataset.sonderPaneSource === '1');
@@ -433,7 +433,7 @@ panes.destroy();
 out.teardown = [root.style.cssText, header.children.length, placed.at(-1)];
 """
     out = node_run(script + "\nconsole.log('RESULT=' + JSON.stringify(out));")
-    assert out["layoutButtons"] == ["1", "2c", "3c", "2x2"]
+    assert out["layoutButtons"] == ["1", "2", "3", "4"]
     assert out["singleBarInHeader"] and out["firstPlaced"] == "0"
     assert out["cells"] == 2
     assert out["menu"][:4] == ["Composite", "Guides", "Driver 1", "Preview"] and "SaveVideo" in out["menu"]
@@ -528,7 +528,7 @@ VIEW_RESULT = "{ '9': { state: 'ok', result: { prompt_id: 'p1', fresh: true, run
 def test_coordinator_audit_fixes_keepalive_unlisted_runs_late_holds_refused_create_and_capability():
     out = run_tracked_coordinator(f"""
 const live = ms => timers.map((t, i) => [t, i + 1]).filter(([t, id]) => t[0] === ms && !cleared.has(id));
-c.setVisible(true); c.setLayout('2c'); c.assign(1, {{kind: 'view', viewId: 'a'}}); await settle();
+c.setVisible(true); c.setLayout({{count: 2}}); c.assign(1, {{kind: 'view', viewId: 'a'}}); await settle();
 // F14: a failed capability ask is asked again on session restore.
 out.capability = [c.paneModel(1).runnable.show, capCalls];
 globalThis.capabilityAnswer = {{ ok: true }};
@@ -575,7 +575,7 @@ out.keepaliveRead = [reads.length - readsHidden, reads.at(-1)[1], c.paneModel(1)
 document.hidden = false;
 // F9: a refused Add output puts back what the pane showed.
 controls.applyChanges = async () => ({{ ok: false, rejected: [{{ reason: 'This output moved. Refresh the Controls panel.' }}] }});
-c.release(1); c.setLayout('1'); await settle();
+c.release(1); c.setLayout({{count: 1}}); await settle();
 out.before = c.layout().panes[0].source.kind;
 await c.createView(0, {{ path: '12:7' }}); await settle();
 out.refused = [c.layout().panes[0].source.kind, notes.at(-1)];
@@ -615,7 +615,7 @@ flushRaf();
 def test_panes_audit_fixes_paused_painters_owner_mute_and_hold_keeps_media():
     script = (COORDINATOR.replace("COORD_URL", url("views_coordinator.js")).replace("AUDIO_URL", url("audio_ownership.js"))
               + PANES.replace("PANES_URL", url("view_panes.js")) + f"""
-c.setLayout('2c'); c.assign(1, {{ kind: 'view', viewId: 'a' }}); flushRaf();
+c.setLayout({{count: 2}}); c.assign(1, {{ kind: 'view', viewId: 'a' }}); flushRaf();
 c.assign(0, {{ kind: 'guides' }}); flushRaf();
 // F1: the Guide track hidden under a paused clock: the pane says so on the next render.
 const readsBefore = sceneReads;
@@ -815,7 +815,7 @@ controlsView = { state: 'ready', views: [
     { view_id: 's', feed: 'sampling', status: 'ok', participation: 'active', path: '6', label: 'Pass 1' }],
     view_candidates: [], view_sampling_candidates: [{ path: '6', class_type: 'KSampler' }] };
 for (const fn of controlsListeners) fn(controlsView);
-c.setVisible(true); c.setLayout('2c'); c.assign(0, {kind: 'view', viewId: 'a'}); c.assign(1, {kind: 'view', viewId: 's'});
+c.setVisible(true); c.setLayout({count: 2}); c.assign(0, {kind: 'view', viewId: 'a'}); c.assign(1, {kind: 'view', viewId: 's'});
 await settle();
 out.sources = reads.at(-1)?.[0];
 await c.createView(0, { path: '31' }, { feed: 'sampling' });
@@ -867,7 +867,7 @@ def test_coordinator_live_reads_fetch_the_newest_bytes_and_poll_only_while_activ
     out = run_live_coordinator("""
 c.setVisible(true); await settle();
 out.noPane = liveReads.length;  // no sampling pane, no picker: nothing to read
-c.setLayout('2c'); c.assign(0, {kind: 'view', viewId: 'a'}); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
+c.setLayout({count: 2}); c.assign(0, {kind: 'view', viewId: 'a'}); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
 out.outputSources = reads.at(-1)[0];
 out.liveSources = liveReads.at(-1);
 liveAnswer.sources = { '6': { state: 'live', live: rec(4), run: { prompt_id: 'p1', finished: false }, latest_run: { prompt_id: 'p1', in_scope: true } } };
@@ -919,7 +919,7 @@ liveAnswer.seen = [{ source: '31', class_type: 'MySampler', title: 'Custom', pub
 c.setPickerOpen(true); await settle();
 out.seenRead = [liveReads.at(-1), c.liveSeen().map(s => s.source)];
 c.setPickerOpen(false);
-c.setLayout('2c'); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
+c.setLayout({count: 2}); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
 // 409: a newer run took the node. One more read, then no retry loop.
 liveAnswer.sources = { '6': { state: 'live', live: rec(3), run: { prompt_id: 'p1', finished: false } } };
 bytesImpl = async () => ({ ok: false, status: 409, code: 'superseded' });
@@ -1019,7 +1019,7 @@ c.setVisible(true);
 const panes = mountViewPanes({{ root, header, coordinator: c, audio, sourceHost, cache: {{}}, placeComposite: () => {{}} }});
 globalThis.onCoordinatorChange = () => panes.update();
 flushRaf();
-c.setLayout('2c'); c.assign(1, {{ kind: 'view', viewId: 's' }}); await settle(); flushRaf();
+c.setLayout({{count: 2}}); c.assign(1, {{ kind: 'view', viewId: 's' }}); await settle(); flushRaf();
 const cell = () => root.find(el => el.dataset?.sonderPane === '1');
 const buttons = () => cell().all(el => el.tagName === 'BUTTON').map(el => el.textContent);
 out.waiting = [buttons(), cell().textContent.includes('No result yet')];
@@ -1125,7 +1125,7 @@ console.log('RESULT=' + JSON.stringify(heard));
 
 def test_coordinator_an_unreachable_server_is_retried_once_per_read_not_in_a_loop():
     out = run_live_coordinator("""
-c.setVisible(true); c.setLayout('2c'); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
+c.setVisible(true); c.setLayout({count: 2}); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
 liveAnswer.sources = { '6': { state: 'live', live: rec(4), run: { prompt_id: 'p1', finished: false } } };
 bytesImpl = async () => { throw new TypeError('Failed to fetch'); };
 client.liveHint(); await settle(); await settle();
@@ -1142,7 +1142,7 @@ out.recovered = [byteCalls.length, c.paneModel(1).frame?.n];
 
 def test_coordinator_drops_a_live_answer_from_before_a_project_switch():
     out = run_live_coordinator("""
-c.setVisible(true); c.setLayout('2c'); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
+c.setVisible(true); c.setLayout({count: 2}); c.assign(1, {kind: 'view', viewId: 's'}); await settle();
 let release;
 const realRead = client.readLive;
 client.readLive = sources => new Promise(r => { release = () => r({ ok: true, sources: { '6': { state: 'live', live: rec(9),
@@ -1158,7 +1158,7 @@ out.after = [c.paneModel(1).read?.live?.n ?? null, byteCalls.length];
 
 def test_sampling_pane_wording_while_adding_and_when_refused():
     out = run_live_coordinator("""
-c.setVisible(true); c.setLayout('2c');
+c.setVisible(true); c.setLayout({count: 2});
 let resolve;
 controls.applyChanges = () => new Promise(r => { resolve = r; });
 const creating = c.createView(1, { path: '31' }, { feed: 'sampling' });
@@ -1200,3 +1200,120 @@ const out = {{ canvas: [canvas.nodeState('32'), canvas.nodeState('6')], mounted:
 console.log('RESULT=' + JSON.stringify(out));
 """)
     assert out == {"canvas": [{"inactive": {"mode": "muted", "by": "self"}}, None], "mounted": None, "sdk": None, "states": ["32", "6"]}
+
+
+# ── Phase 5: pane count and arrangement ──────────────────────────────────────
+
+def test_coordinator_rearranging_keeps_holds_and_reads_and_an_unchanged_layout_writes_nothing():
+    out = run_coordinator("""
+c.setVisible(true); c.setLayout({count: 2}); c.assign(1, {kind: 'view', viewId: 'a'}); await settle();
+answer.sources = { '9': { state: 'ok', result: { prompt_id: 'p1', fresh: true, run: {}, entries: [{ index: 0, kind: 'image', file: { filename: 'a.png' } }] } } };
+answer.holds = [{ hold_id: 'h1', state: 'ok', entry: { kind: 'image', file: { filename: 'a.png' } }, run: {} }];
+client.hint(); await settle();
+await c.hold(1); await settle();
+audio.claim(c.paneId(1));
+const before = [reads.length, demand.length, released.length];
+clock += 5;
+c.setLayout({arrangement: 'column'}); await settle();
+out.rearranged = [c.paneModel(1).held, audio.owner() === c.paneId(1), reads.length - before[0], demand.length - before[1],
+    released.length - before[2], stored.get('c:wf').arrangement, stored.get('c:wf').count];
+// The same layout again (a click on the pressed segment) stores nothing.
+const ts = stored.get('c:wf').ts;
+clock += 5;
+c.setLayout({arrangement: 'column'}); c.setLayout({count: 2}); c.setLayout({count: 2, arrangement: 'column'});
+out.unchangedTs = stored.get('c:wf').ts === ts;
+// Another tab rearranged: last write wins, nothing released.
+stored.set('c:wf', { ...stored.get('c:wf'), arrangement: 'row', ts: ts + 100 });
+c.storedLayoutChanged(); await settle();
+out.synced = [c.layout().arrangement, c.paneModel(1).held];
+// Shrinking the count still ends the hidden pane's hold.
+c.setLayout({count: 1}); await settle();
+out.shrunk = [released.length - before[2] > 0, audio.owner()];
+""")
+    assert out["rearranged"] == [True, True, 0, 0, 0, "column", 2]
+    assert out["unchangedTs"] is True
+    assert out["synced"] == ["row", True]
+    assert out["shrunk"] == [True, "timeline"]
+
+
+def test_panes_count_and_arrangement_bar_grid_focus_picker_and_no_remount():
+    script = (COORDINATOR.replace("COORD_URL", url("views_coordinator.js")).replace("AUDIO_URL", url("audio_ownership.js"))
+              + PANES.replace("PANES_URL", url("view_panes.js")).replace(
+                  "placeComposite: () => {}", "placeComposite: body => placedBodies.push(body)").replace(
+                  "let hidden = false", "const placedBodies = [];\nlet hidden = false") + r"""
+const seg = (attr, value) => header.find(el => el.dataset?.[attr] === value);
+const countSeg = n => seg('sonderPaneCount', String(n));
+const arrSeg = a => seg('sonderPaneArrangement', a);
+const group = label => header.find(el => el.getAttribute?.('aria-label') === label);
+const css = el => el.style.cssText;
+// One pane: the count group only; the selected segment stacks above its neighbour.
+out.one = [header.all(el => el.dataset?.sonderPaneCount).map(el => el.dataset.sonderPaneCount),
+    group('Pane arrangement').style.display, countSeg(1).getAttribute('aria-pressed'),
+    css(countSeg(1)).includes('position: relative') && css(countSeg(1)).includes('z-index: 1'),
+    css(countSeg(2)).includes('z-index: 0'), css(countSeg(1)).includes('margin-left:-1px'), css(countSeg(2)).includes('margin-left:-1px'),
+    arrSeg('row').getAttribute('aria-label')];
+// Two panes: Grid hidden, Row pressed for the stored Grid; a click on it keeps Grid.
+countSeg(2).click(); flushRaf();
+out.two = [group('Pane arrangement').style.display, css(arrSeg('grid')), arrSeg('row').getAttribute('aria-pressed'),
+    css(arrSeg('row')).includes('margin-left:-1px'), css(arrSeg('column')).includes('margin-left:-1px'), c.layout().arrangement];
+arrSeg('row').click(); flushRaf();
+out.rowKept = c.layout().arrangement;
+// Bars sit in the cells and wrap there.
+out.wrap = root.children.map(cell => [cell.children[0].style.flexWrap, cell.children[0].children.at(-1).style.flexWrap, cell.children[0].children.at(-1).style.flex]);
+// Pane 2 shows the Guides: its content survives every arrangement.
+c.assign(1, { kind: 'guides' }); flushRaf();
+const body1 = root.children[1].children[1];
+const content = [root.children[0], root.children[1], body1.children[0]];
+const acquired = acquires;
+const placedBefore = placedBodies.length;
+arrSeg('column').click(); flushRaf();
+out.column = [css(root).includes('grid-template-columns:1fr;'), css(root).includes('grid-template-rows:repeat(2, 1fr);'), c.layout().arrangement];
+countSeg(3).click(); flushRaf();
+arrSeg('grid').click(); flushRaf();
+out.grid3 = [css(root).includes('grid-template-columns:2fr 1fr;'), css(root).includes('grid-template-rows:1fr 1fr;'),
+    root.children.map(cell => cell.style.gridRow), arrSeg('grid').getAttribute('aria-pressed'), css(arrSeg('grid')).includes('margin-left:-1px')];
+arrSeg('row').click(); flushRaf();
+out.row3 = [css(root).includes('grid-template-columns:repeat(3, 1fr);'), root.children[0].style.gridRow];
+out.kept = [root.children[0] === content[0], root.children[1] === content[1], root.children[1].children[1].children[0] === content[2],
+    acquires === acquired, placedBodies.slice(placedBefore).every(b => b === root.children[0].children[1])];
+countSeg(4).click(); arrSeg('grid').click(); flushRaf();
+out.grid4 = [css(root).includes('grid-template-columns:1fr 1fr;'), root.children.map(cell => cell.style.gridRow)];
+// Keyboard focus draws an inset ring at once (no render needed); a mouse
+// focus (not :focus-visible) and blur draw none.
+countSeg(3).matches = sel => sel === ':focus-visible';
+countSeg(3).dispatch('focus');
+out.focus = css(countSeg(3)).includes('outline:2px solid') && css(countSeg(3)).includes('outline-offset:-3px');
+countSeg(3).dispatch('blur');
+out.blur = css(countSeg(3)).includes('outline:none');
+countSeg(3).matches = () => false;
+countSeg(3).dispatch('focus');
+out.mouseFocus = css(countSeg(3)).includes('outline:none');
+countSeg(3).dispatch('blur');
+// The numbers are named by their text; the icons by their title.
+out.names = [countSeg(2).getAttribute('aria-label'), countSeg(2).title, arrSeg('grid').getAttribute('aria-label')];
+// An open picker closes when the arrangement changes.
+root.find(el => el.dataset?.sonderPaneSource === '0').click(); flushRaf();
+out.pickerOpen = !!document.body.find(el => el.dataset?.sonderPanePicker === 'true');
+arrSeg('column').click(); flushRaf();
+out.pickerClosed = !document.body.find(el => el.dataset?.sonderPanePicker === 'true');
+// One pane: the bar moves to the header and does not wrap.
+countSeg(1).click(); flushRaf();
+out.headerBar = [header.children[0].children[0]?.style.flexWrap, header.children[0].children[0]?.children.at(-1).style.flexWrap];
+panes.destroy();
+out.teardown = header.children.length;
+""")
+    out = node_run(script + "\nconsole.log('RESULT=' + JSON.stringify(out));")
+    assert out["one"] == [["1", "2", "3", "4"], "none", "true", True, True, False, True, "Row: panes side by side"]
+    assert out["two"] == ["flex", "display:none;", "true", False, True, "grid"]
+    assert out["rowKept"] == "grid"
+    assert out["wrap"] == [["wrap", "wrap", "0 1 auto"], ["wrap", "wrap", "0 1 auto"]]
+    assert out["column"] == [True, True, "column"]
+    assert out["grid3"] == [True, True, ["1 / 3", "", ""], "true", False]
+    assert out["row3"] == [True, ""]
+    assert out["kept"] == [True, True, True, True, True]
+    assert out["grid4"] == [True, ["", "", "", ""]]
+    assert out["focus"] is True and out["blur"] is True and out["mouseFocus"] is True
+    assert out["names"] == [None, "Two panes", "Grid: two by two, or one large pane and two stacked"]
+    assert out["pickerOpen"] is True and out["pickerClosed"] is True
+    assert out["headerBar"] == ["nowrap", "nowrap"]
+    assert out["teardown"] == 0

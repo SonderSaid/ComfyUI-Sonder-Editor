@@ -488,8 +488,8 @@ export const DEFAULT_EDITOR_SETTINGS = {
     // Show notes off hides the workflow's notes outside Manage and search.
     controls: { view: "rows", showAdvanced: false, showNotes: true },
     // Output Views pane layout per workflow (`c:<graph id>` on the canvas,
-    // `a:<template id>` in the Sonder App): layout, each pane's source, item,
-    // fit and zoom. The default (one Composite pane) is never stored; the
+    // `a:<template id>` in the Sonder App): pane count, arrangement, each pane's
+    // source, item, fit and zoom. The default (one Composite pane) is never stored; the
     // newest 64 workflows are kept. Not stored: holds, mute, who has the sound.
     views: { layoutByWorkflow: {} },
     // Browser preferences for Reference work (Settings → References). The

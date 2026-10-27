@@ -475,8 +475,12 @@ export function tabCss({ active = false } = {}) {
     `;
 }
 
+// Segments share a 1 px border with their neighbour: the active one stacks
+// above it, so its accent outline shows on every side.
 export function segmentCss({ active = false } = {}) {
     return `
+        position: relative;
+        z-index: ${active ? 1 : 0};
         background: ${active ? THEME.accentBg : THEME.bg2};
         border: 1px solid ${active ? THEME.accent : THEME.line2};
         color: ${active ? THEME.fg0 : THEME.fg1};

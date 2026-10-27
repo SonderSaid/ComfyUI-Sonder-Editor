@@ -24,24 +24,25 @@ def run(body: str):
 def test_layout_normalizer_default_composite_rule_and_lru():
     out = run("""
 out.fresh = M.normalizeLayout(null);
-out.isDefault = [M.isDefaultLayout(null), M.isDefaultLayout({layout:'1', panes:[{source:{kind:'composite'}}]}),
-    M.isDefaultLayout({layout:'2c'}), M.isDefaultLayout({layout:'1', panes:[{}, {source:{kind:'view', viewId:'v1'}}]})];
+out.isDefault = [M.isDefaultLayout(null), M.isDefaultLayout({count:1, panes:[{source:{kind:'composite'}}]}),
+    M.isDefaultLayout({count:2}), M.isDefaultLayout({count:1, panes:[{}, {source:{kind:'view', viewId:'v1'}}]}),
+    M.isDefaultLayout({count:1, arrangement:'column'}), M.isDefaultLayout({layout:'2c'})];
 // Junk is read tolerantly; Composite sits in one pane at most.
-out.junk = M.normalizeLayout({ts:5, layout:'9', panes:[{source:{kind:'composite'}},{source:{kind:'composite'}},
+out.junk = M.normalizeLayout({ts:5, count:9, arrangement:'diagonal', panes:[{source:{kind:'composite'}},{source:{kind:'composite'}},
     {source:{kind:'driver', index:2}, item:3, fit:'cover', zoom:{scale:2,x:5,y:-5}},{source:{kind:'view', viewId:'bad id'}, zoom:{scale:99,x:0,y:0}}]});
 // The map keeps the newest 64 real records, never the default one.
 const map = {};
-for (let i = 0; i < 70; i++) map[`c:${i}`] = {ts: i + 1, layout: '2c'};
-map['c:default'] = {ts: 999, layout: '1'};
-map['c:nots'] = {layout: '2c'};
+for (let i = 0; i < 70; i++) map[`c:${i}`] = {ts: i + 1, count: 2};
+map['c:default'] = {ts: 999, count: 1};
+map['c:nots'] = {count: 2};
 const kept = M.normalizeLayoutMap(map);
 out.kept = [Object.keys(kept).length, 'c:0' in kept, 'c:69' in kept, 'c:default' in kept, 'c:nots' in kept];
-out.visible = M.visiblePanes({layout:'3c'}).map(p => p.source.kind);
+out.visible = M.visiblePanes({count:3}).map(p => p.source.kind);
 """)
-    assert out["fresh"]["layout"] == "1" and [p["source"]["kind"] for p in out["fresh"]["panes"]] == ["composite", "guides", "guides", "guides"]
-    assert out["isDefault"] == [True, True, False, False]
+    assert out["fresh"]["count"] == 1 and out["fresh"]["arrangement"] == "grid" and "layout" not in out["fresh"] and [p["source"]["kind"] for p in out["fresh"]["panes"]] == ["composite", "guides", "guides", "guides"]
+    assert out["isDefault"] == [True, True, False, False, False, True]
     junk = out["junk"]
-    assert junk["layout"] == "1" and [p["source"] for p in junk["panes"]] == [
+    assert junk["count"] == 1 and junk["arrangement"] == "grid" and [p["source"] for p in junk["panes"]] == [
         {"kind": "composite"}, {"kind": "guides"}, {"kind": "driver", "index": 2}, {"kind": "guides"}]
     assert junk["panes"][2] == {"source": {"kind": "driver", "index": 2}, "item": 3, "fit": "cover", "zoom": {"scale": 2, "x": 5, "y": -5},
                                 "link": True}
@@ -52,7 +53,7 @@ out.visible = M.visiblePanes({layout:'3c'}).map(p => p.source.kind);
 
 def test_assign_swaps_composite_and_resets_item_and_zoom():
     out = run("""
-let r = M.normalizeLayout({ts:1, layout:'2c', panes:[{source:{kind:'composite'}},{source:{kind:'view',viewId:'a'}, item:2, zoom:{scale:3,x:1,y:1}}]});
+let r = M.normalizeLayout({ts:1, count:2, panes:[{source:{kind:'composite'}},{source:{kind:'view',viewId:'a'}, item:2, zoom:{scale:3,x:1,y:1}}]});
 r = M.assignSource(r, 1, {kind:'composite'});
 out.swap = r.panes.slice(0, 2).map(p => [p.source, p.item, p.zoom]);
 out.composite = M.compositePane(r);
@@ -169,19 +170,20 @@ globalThis.localStorage = {{getItem: k => store.get(k) ?? null, setItem: (k, v) 
 globalThis.window = {{localStorage: globalThis.localStorage}};
 const S = await import({json.dumps(settings)});
 const out = {{}};
-S.updateEditorSettings({{views: {{layoutByWorkflow: {{'c:a': {{ts: 5, layout: '2x2', panes: [{{source: {{kind: 'view', viewId: 'v1'}}}}]}}}}}}}});
-S.updateEditorSettings({{views: {{layoutByWorkflow: {{'c:b': {{ts: 6, layout: '2c'}}}}}}}});
+S.updateEditorSettings({{views: {{layoutByWorkflow: {{'c:a': {{ts: 5, count: 4, panes: [{{source: {{kind: 'view', viewId: 'v1'}}}}]}}}}}}}});
+S.updateEditorSettings({{views: {{layoutByWorkflow: {{'c:b': {{ts: 6, count: 2, arrangement: 'column'}}}}}}}});
 out.both = Object.keys(S.getEditorSettings().views.layoutByWorkflow).sort();
 // Patching one key never reverts another; null deletes.
 S.updateEditorSettings({{views: {{layoutByWorkflow: {{'c:a': null}}}}}});
 out.after = Object.keys(S.getEditorSettings().views.layoutByWorkflow);
-out.stored = JSON.parse(store.get('sonder-editor-settings')).views.layoutByWorkflow['c:b'].layout;
+out.stored = JSON.parse(store.get('sonder-editor-settings')).views.layoutByWorkflow['c:b'];
+out.stored = [out.stored.count, out.stored.arrangement, 'layout' in out.stored];
 console.log('RESULT=' + JSON.stringify(out));
 """
     result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert result.returncode == 0, result.stderr
     out = json.loads(next(l for l in result.stdout.splitlines() if l.startswith("RESULT="))[7:])
-    assert out == {"both": ["c:a", "c:b"], "after": ["c:b"], "stored": "2c"}
+    assert out == {"both": ["c:a", "c:b"], "after": ["c:b"], "stored": [2, "column", False]}
 
 
 def test_a_sampling_view_never_offers_run():
@@ -300,3 +302,36 @@ out.media = [M.samplingMediaStatus('decode'), M.samplingMediaStatus('too_large')
     assert rows["kj_ok"] == rows["kj_absent"] == ["Sampling · step 3/6", True]
     assert rows["nativeUnderKj"] == "Sampling · step 3/6"
     assert out["media"][0]["chip"] == "Unsupported" and out["media"][1]["chip"] == "Unavailable" and out["media"][2] is None
+
+
+def test_pane_count_arrangement_and_grid_for_every_pair():
+    out = run("""
+out.count = [M.paneCount(null), M.paneCount({count: 3}), M.paneCount({count: '3'}), M.paneCount({count: 7}), M.paneCount({count: 0}),
+    M.paneCount({count: 2.5}), M.paneCount({layout: '2x2'})];
+out.effective = [[1, 'row'], [2, 'grid'], [2, 'row'], [2, 'column'], [3, 'grid'], [4, 'column'], [3, 'bad']]
+    .map(([count, arrangement]) => M.effectiveArrangement({count, arrangement}));
+out.grid = {};
+for (const count of [1, 2, 3, 4]) for (const arrangement of M.ARRANGEMENTS) {
+    const g = M.paneGrid(count, arrangement);
+    out.grid[`${count}:${arrangement}`] = [g.gridTemplateColumns, g.gridTemplateRows, g.spans];
+}
+// An old record (the `layout` id) keeps its chosen panes and opens at one pane.
+const old = M.normalizeLayout({ts: 4, layout: '2c', panes: [{}, {source: {kind: 'view', viewId: 'v1'}}]});
+out.old = [old.count, old.arrangement, 'layout' in old, old.panes[1].source.viewId, M.visiblePanes(old).length];
+out.oldMap = Object.keys(M.normalizeLayoutMap({'c:x': {ts: 4, layout: '2c'}, 'c:y': {ts: 5, layout: '3c', panes: [{}, {source: {kind: 'view', viewId: 'v1'}}]}}));
+""")
+    assert out["count"] == [1, 3, 1, 1, 1, 1, 1]
+    assert out["effective"] == ["single", "row", "row", "column", "grid", "column", "grid"]
+    g = out["grid"]
+    for arrangement in ("grid", "row", "column"):
+        assert g[f"1:{arrangement}"] == ["1fr", "1fr", [""]]
+    assert g["2:grid"] == g["2:row"] == ["repeat(2, 1fr)", "1fr", ["", ""]]
+    assert g["2:column"] == ["1fr", "repeat(2, 1fr)", ["", ""]]
+    assert g["3:grid"] == ["2fr 1fr", "1fr 1fr", ["1 / 3", "", ""]]
+    assert g["3:row"] == ["repeat(3, 1fr)", "1fr", ["", "", ""]]
+    assert g["3:column"] == ["1fr", "repeat(3, 1fr)", ["", "", ""]]
+    assert g["4:grid"] == ["1fr 1fr", "1fr 1fr", ["", "", "", ""]]
+    assert g["4:row"] == ["repeat(4, 1fr)", "1fr", ["", "", "", ""]]
+    assert g["4:column"] == ["1fr", "repeat(4, 1fr)", ["", "", "", ""]]
+    assert out["old"] == [1, "grid", False, "v1", 1]
+    assert out["oldMap"] == ["c:y"]

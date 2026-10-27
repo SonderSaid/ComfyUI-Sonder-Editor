@@ -1511,6 +1511,10 @@ class _StructuralBatch:
         orders = [d.get("order") for d in [*view.get("bindings", []), *view.get("notes", []), *(view.get("execution") or [])]
                   if not d.get("group") and isinstance(d.get("order"), int) and not isinstance(d.get("order"), bool)]
         self.next_order = max(orders, default=0)
+        # Views sort only among themselves: a new View follows the last View.
+        view_orders = [d.get("order") for d in view.get("views", []) or []
+                       if isinstance(d.get("order"), int) and not isinstance(d.get("order"), bool)]
+        self.next_view_order = max(view_orders, default=0)
         listed = view.get("group_order")
         self.group_list = [g for g in listed if isinstance(g, str)] if isinstance(listed, list) else group_order(view)
         self.known_groups = set(self.group_list)
@@ -1608,6 +1612,10 @@ class _StructuralBatch:
         self.next_order = min(self.next_order + 1, PANEL_ORDER_LIMIT)
         return self.next_order
 
+    def _view_order(self) -> int:
+        self.next_view_order = min(self.next_view_order + 1, PANEL_ORDER_LIMIT)
+        return self.next_view_order
+
     def _candidate(self, raw: Any, binding_id: str) -> dict:
         locator = _clean_locator(raw, with_class=False)
         if locator is None or ":" in locator["path"]:
@@ -1646,7 +1654,7 @@ class _StructuralBatch:
             return self._note(identity, op, raw)
         if source == "view":
             from . import control_views
-            return control_views.validate_structural(self.view, identity, op, raw, self.mode, self.view_state, self._order)
+            return control_views.validate_structural(self.view, identity, op, raw, self.mode, self.view_state, self._view_order)
         if source == "execution":
             from . import control_execution
             if op in ("hide", "unhide"):  # app-only, like a setting's

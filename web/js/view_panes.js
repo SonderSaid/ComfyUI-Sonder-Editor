@@ -1,13 +1,16 @@
 // The viewport's panes: a grid of up to four, each showing the Composite, the
-// Guides, a Driver lane or an output View. Owns the grid, the layout control
-// (1 / 2 / 3 / 2×2) in the viewport header and each pane's chrome: its source
+// Guides, a Driver lane or an output View. Owns the grid, the pane count
+// (1–4) and arrangement (Grid / Row / Column) segments in the viewport header,
+// and each pane's chrome: its source
 // button and picker, status chip, Hold/Release, Run/Cancel, item picker, fit
 // and sound, and for a video or audio output its Link to the editor clock. A
 // sampling-preview View (Phase 4) shows its node's newest preview with its
 // step, and offers only Fit and zoom/pan. The coordinator (views_coordinator.js)
 // owns state; the widget owns the Composite canvas and is told where it goes
 // (`placeComposite`).
-import { LAYOUTS, LAYOUT_LABELS, LAYOUT_ORDER, LAYOUT_TITLES, entryPlayer, pickerSections } from "./views_model.js";
+import {
+    ARRANGEMENTS, ARRANGEMENT_TITLES, PANE_COUNT_TITLES, effectiveArrangement, entryPlayer, paneCount, paneGrid, pickerSections,
+} from "./views_model.js";
 import { openPanePicker } from "./view_pane_picker.js";
 import { mountOutputMedia, messageEl } from "./output_pane_media.js";
 import { mountSamplingMedia } from "./sampling_pane_media.js";
@@ -32,12 +35,19 @@ function button(text, title, variant = "secondary") {
     return el;
 }
 
-const GRIDS = {
-    "1": "grid-template-columns:1fr;grid-template-rows:1fr;",
-    "2c": "grid-template-columns:1fr 1fr;grid-template-rows:1fr;",
-    "3c": "grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr;",
-    "2x2": "grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;",
+// The arrangement icons, 12 px, drawn like the arrangement: Grid as its
+// three-pane shape (a plain 2×2 is the Sonder App Launcher's icon).
+const ARRANGEMENT_ICONS = {
+    grid: '<rect x="1" y="1" width="10" height="10" rx="1"/><path d="M7.5 1v10M7.5 6H11"/>',
+    row: '<rect x="1" y="1" width="10" height="10" rx="1"/><path d="M4.33 1v10M7.67 1v10"/>',
+    column: '<rect x="1" y="1" width="10" height="10" rx="1"/><path d="M1 4.33h10M1 7.67h10"/>',
 };
+const iconSvg = paths => '<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" '
+    + `aria-hidden="true" focusable="false" style="display:block;">${paths}</svg>`;
+
+function focusVisible(el) {
+    try { return typeof el.matches !== "function" || el.matches(":focus-visible"); } catch { return true; }
+}
 
 export function sourceLabel(model, { driverLabel = index => `Driver ${index + 1}` } = {}) {
     const source = model.source;
@@ -62,32 +72,88 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
     let destroyed = false;
     let frame = null;
     let picker = null; // {index, close}
+    let lastShape = null; // "count:arrangement" at the last render
     const cells = [];
     const zoomTimers = new Map();
     const rootStyle = root.style.cssText;
     root.style.cssText = "flex:1;display:grid;gap:2px;min-height:0;position:relative;overflow:hidden;";
 
-    // Header: the layout control, and in one-pane layouts the pane's own bar.
+    // Header: the pane count and arrangement, and with one pane its own bar.
     const headerSlot = make("div", undefined, `display:flex;align-items:center;gap:${SPACE.s2}px;min-width:0;flex:1 1 auto;justify-content:flex-end;`);
-    const layoutControl = make("div", undefined, "display:flex;gap:0;flex:0 0 auto;");
-    layoutControl.setAttribute("role", "group");
-    layoutControl.setAttribute("aria-label", "Viewport panes");
-    const layoutButtons = new Map();
-    LAYOUT_ORDER.forEach((layout, i) => {
-        const el = make("button", LAYOUT_LABELS[layout]);
-        el.type = "button";
-        el.title = LAYOUT_TITLES[layout];
-        el.dataset.sonderPaneLayout = layout;
-        el.addEventListener("click", () => coordinator.setLayout(layout));
-        layoutButtons.set(layout, el);
+    const layoutControl = make("div", undefined, `display:flex;align-items:stretch;gap:${SPACE.s2}px;flex:0 0 auto;`);
+    const group = label => {
+        const el = make("div", undefined, "display:flex;gap:0;");
+        el.setAttribute("role", "group");
+        el.setAttribute("aria-label", label);
         layoutControl.append(el);
-        el._radius = i === 0 ? `${RADIUS.r2}px 0 0 ${RADIUS.r2}px` : i === LAYOUT_ORDER.length - 1 ? `0 ${RADIUS.r2}px ${RADIUS.r2}px 0` : "0";
+        return el;
+    };
+    // A segment keeps a keyboard-focus flag: the focus ring is drawn inside
+    // it, so the neighbour it overlaps by a pixel cannot cover it.
+    const segment = (parent, value, title, onClick) => {
+        const el = make("button");
+        el.type = "button";
+        el.title = title;
+        el._focusRing = false;
+        el.addEventListener("click", onClick);
+        el.addEventListener("focus", () => { el._focusRing = focusVisible(el); paintLayoutControl(); });
+        el.addEventListener("blur", () => { el._focusRing = false; paintLayoutControl(); });
+        parent.append(el);
+        return { value, el };
+    };
+    const countGroup = group("Number of panes");
+    const countSegments = PANE_COUNT_TITLES.map((title, i) => {
+        const s = segment(countGroup, i + 1, title, () => coordinator.setLayout({ count: i + 1 }));
+        s.el.textContent = String(i + 1);
+        s.el.dataset.sonderPaneCount = String(i + 1);
+        return s;
+    });
+    const arrangementGroup = group("Pane arrangement");
+    const arrangementSegments = ARRANGEMENTS.map(value => {
+        // Row pressed for a stored Grid at two panes: a click there keeps Grid.
+        const s = segment(arrangementGroup, value, ARRANGEMENT_TITLES[value], () => {
+            if (value !== effectiveArrangement(coordinator.layout())) coordinator.setLayout({ arrangement: value });
+        });
+        // An icon has no text: its name is its title (the numbers keep theirs).
+        s.el.setAttribute("aria-label", ARRANGEMENT_TITLES[value]);
+        s.el.innerHTML = iconSvg(ARRANGEMENT_ICONS[value]);
+        s.el.dataset.sonderPaneArrangement = value;
+        return s;
     });
     header.append(headerSlot, layoutControl);
 
+    // Shown segments join with a shared 1 px border; the selected one sits
+    // above its neighbours so its whole outline shows.
+    function paintSegments(segments, active, shown = () => true) {
+        const visible = segments.filter(s => shown(s.value));
+        for (const s of segments) {
+            const i = visible.indexOf(s);
+            const on = i >= 0 && s.value === active;
+            s.el.setAttribute("aria-pressed", String(on));
+            const first = i === 0 ? RADIUS.r2 : 0, last = i === visible.length - 1 ? RADIUS.r2 : 0;
+            // The focus ring sits inside the border in another colour, so a
+            // focused segment never reads as the selected one.
+            const css = i < 0 ? "display:none;" : segmentCss({ active: on })
+                + `border-radius:${first}px ${last}px ${last}px ${first}px;cursor:pointer;`
+                + "display:flex;align-items:center;justify-content:center;"
+                + (i > 0 ? "margin-left:-1px;" : "")
+                + (s.el._focusRing ? `outline:2px solid ${THEME.fg0};outline-offset:-3px;` : "outline:none;");
+            if (s.el._css !== css) s.el.style.cssText = s.el._css = css;
+        }
+    }
+    function paintLayoutControl() {
+        if (destroyed) return;
+        const record = coordinator.layout();
+        const count = paneCount(record);
+        paintSegments(countSegments, count);
+        arrangementGroup.style.display = count === 1 ? "none" : "flex";
+        paintSegments(arrangementSegments, effectiveArrangement(record), value => !(count === 2 && value === "grid"));
+    }
+
     function cell(index) {
         if (cells[index]) return cells[index];
-        const el = make("div", undefined, `display:flex;flex-direction:column;min-width:0;min-height:0;background:${COLORS.panelMuted};`);
+        // Clipped: a narrow pane's bar wraps rather than spilling under the next.
+        const el = make("div", undefined, `display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;background:${COLORS.panelMuted};`);
         el.dataset.sonderPane = String(index);
         const bar = make("div", undefined, `display:flex;align-items:center;gap:${SPACE.s1}px;min-width:0;flex:0 0 auto;`
             + `padding:2px ${SPACE.s1}px;font:${TYPE.t11}px ${FONT.sans};color:${COLORS.textSecondary};`);
@@ -103,11 +169,13 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         sourceButton.style.overflow = "hidden";
         sourceButton.style.textOverflow = "ellipsis";
         sourceButton.addEventListener("click", () => togglePicker(index, sourceButton));
-        const chip = make("span", "", `min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${THEME.statusPending};`);
+        // The chip takes the free width from nothing (basis 0), so its text
+        // ellipsizes rather than wrapping the bar; the actions stay at the right,
+        // also on a line of their own.
+        const chip = make("span", "", `flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${THEME.statusPending};`);
         chip.dataset.sonderPaneChip = String(index);
-        const spacer = make("span", undefined, "flex:1 1 auto;");
-        const actions = make("span", undefined, `display:flex;gap:${SPACE.s1}px;flex:0 0 auto;`);
-        bar.append(sourceButton, chip, spacer, actions);
+        const actions = make("span", undefined, `display:flex;gap:${SPACE.s1}px;flex:0 0 auto;min-width:0;margin-left:auto;`);
+        bar.append(sourceButton, chip, actions);
         el.append(bar, body);
         cells[index] = { index, el, bar, body, sourceButton, chip, actions, key: null, content: null, message: null, painterStatus: null };
         return cells[index];
@@ -290,8 +358,12 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
             else entry.el.insertBefore(entry.bar, entry.body);
         }
         entry.bar.style.padding = single ? "0" : `2px ${SPACE.s1}px`;
-        // In the header the bar takes the free width; in a cell it keeps its height.
+        // In the header the bar takes the free width; in a cell it keeps its
+        // height, and its buttons wrap to a second line when the pane is narrow.
         entry.bar.style.flex = single ? "1 1 auto" : "0 0 auto";
+        entry.bar.style.flexWrap = single ? "nowrap" : "wrap";
+        entry.actions.style.flex = single ? "0 0 auto" : "0 1 auto";
+        entry.actions.style.flexWrap = single ? "nowrap" : "wrap";
         return { entry, model };
     }
 
@@ -299,12 +371,15 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         frame = null;
         if (destroyed) return;
         const record = coordinator.layout();
-        const count = LAYOUTS[record.layout] || 1;
-        root.style.cssText = `flex:1;display:grid;gap:2px;min-height:0;position:relative;overflow:hidden;${GRIDS[record.layout] || GRIDS["1"]}`;
-        for (const [layout, el] of layoutButtons) {
-            el.style.cssText = segmentCss({ active: layout === record.layout }) + `border-radius:${el._radius};cursor:pointer;margin-left:-1px;`;
-            el.setAttribute("aria-pressed", String(layout === record.layout));
-        }
+        const count = paneCount(record), arrangement = effectiveArrangement(record);
+        // The picker opened at its button's old spot: a new layout closes it.
+        const shape = `${count}:${arrangement}`;
+        if (picker && lastShape !== null && shape !== lastShape) closePicker();
+        lastShape = shape;
+        const grid = paneGrid(count, record.arrangement);
+        root.style.cssText = "flex:1;display:grid;gap:2px;min-height:0;position:relative;overflow:hidden;"
+            + `grid-template-columns:${grid.gridTemplateColumns};grid-template-rows:${grid.gridTemplateRows};`;
+        paintLayoutControl();
         for (let i = count; i < cells.length; i++) {
             if (!cells[i]) continue;
             destroyContent(cells[i]);
@@ -317,6 +392,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         let compositeBody = null;
         for (let i = 0; i < count; i++) {
             const { entry, model } = renderPane(i, count === 1);
+            entry.el.style.gridRow = grid.spans[i];
             if (entry.el.parentElement !== root || root.children[i] !== entry.el) root.insertBefore(entry.el, root.children[i] || null);
             if (model.source.kind === "composite") compositeBody = entry.body;
         }
