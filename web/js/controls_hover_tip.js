@@ -15,6 +15,8 @@ import { EDITOR_COLORS as COLORS, RADIUS, SPACE, TYPE } from "./editor_theme.js"
 
 let serial = 0;
 const TIP_MAX_HEIGHT = 240;
+// Shared presentation policy: every hovered target earns its own dwell time.
+const HOVER_DELAY_MS = 500;
 const editable = el => !!el && (["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) || el.isContentEditable === true);
 // Where Escape edits text: a draft there owns it, never the tip.
 const typesText = el => !!el && (el.tagName === "TEXTAREA" || el.isContentEditable === true
@@ -49,7 +51,7 @@ export function createHoverTip(container, { register = registerKeys, mark = "con
     const tips = new WeakMap(); // anchor -> its tip element
     const uses = new WeakMap(); // fixed anchor -> attachments still using its tip
     const made = new Set();
-    let shown = null, destroyed = false;
+    let shown = null, pending = null, destroyed = false;
 
     function tipFor(anchor) {
         let tip = tips.get(anchor);
@@ -91,7 +93,13 @@ export function createHoverTip(container, { register = registerKeys, mark = "con
         tip.style.left = `${Math.max(min, Math.min(local(r.left - left0), max))}px`;
     }
 
+    function cancelHover() {
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        pending = null;
+    }
     function hide() {
+        cancelHover();
         if (!shown) return;
         shown.tip.style.display = "none";
         shown = null;
@@ -112,7 +120,7 @@ export function createHoverTip(container, { register = registerKeys, mark = "con
     // `via`: what opened it. A hover tip closes when the pointer leaves, even
     // if a click focused its element; a keyboard-focus tip stays until blur.
     function show(entry, via = shown?.entry === entry ? shown.via : "hover") {
-        if (destroyed || entry.suppressed?.()) { if (shown?.entry === entry) hide(); return; }
+        if (destroyed || entry.el.offsetParent === null || entry.suppressed?.()) { if (shown?.entry === entry) hide(); return; }
         const text = String(entry.getText() || "");
         if (!text) { if (shown?.entry === entry) hide(); return; }
         const anchor = entry.anchor(), tip = tipFor(anchor);
@@ -123,8 +131,31 @@ export function createHoverTip(container, { register = registerKeys, mark = "con
         shown = { entry, tip, via };
     }
 
+    function hover(entry) {
+        // Crossing the focused control must not downgrade keyboard help.
+        if (shown?.entry === entry && shown.via === "focus") return;
+        hide();
+        pending = { entry, timer: setTimeout(() => {
+            pending = null;
+            show(entry, "hover");
+        }, HOVER_DELAY_MS) };
+    }
+    function onScroll() {
+        cancelHover();
+        // Keyboard focus scrolls its field into view; keep that help open.
+        if (shown?.via === "hover") hide();
+    }
+    // Using the panel ends help, including a click on an already focused field.
+    container.addEventListener("pointerdown", hide, true);
+    globalThis.window?.addEventListener?.("scroll", onScroll, true);
+    globalThis.window?.addEventListener?.("blur", hide);
+
     const unregister = register({ id: `controls-hover-tip:${++serial}`, priority: PRIORITY.OVERLAY, keydown: e => {
-        if (!shown || e.key !== "Escape" || e.isComposing) return false;
+        // Tab is fresh keyboard intent, even back to a just-clicked field.
+        if (e.key === "Tab") pressed = null;
+        if (e.key !== "Escape" || e.isComposing) return false;
+        cancelHover();
+        if (!shown) return false;
         // A tip left open under a hidden panel (no mouseleave came): drop it.
         if (container.offsetParent === null) { hide(); return false; }
         const active = document.activeElement;
@@ -147,17 +178,24 @@ export function createHoverTip(container, { register = registerKeys, mark = "con
             const fixed = anchor && typeof anchor !== "function" ? anchor : null;
             if (fixed) { tipFor(fixed); uses.set(fixed, (uses.get(fixed) || 0) + 1); }
             const mine = () => shown?.entry === entry;
+            const dismiss = () => {
+                if (pending?.entry === entry) cancelHover();
+                if (mine()) hide();
+            };
             const listeners = [
-                ["focus", () => { if (focusVisible(el)) show(entry, "focus"); }],
-                ["blur", () => { if (mine()) hide(); }],
+                ["focus", () => { cancelHover(); if (focusVisible(el)) show(entry, "focus"); }],
+                ["blur", dismiss],
                 // Typing, or a key that opens a list, is using the field, not
                 // reading its help.
-                ["input", () => { if (mine()) hide(); }],
-                ["keydown", e => { if (mine() && !QUIET_KEYS.has(e?.key)) hide(); }],
+                ["input", dismiss],
+                ["keydown", e => { if (!QUIET_KEYS.has(e?.key)) dismiss(); }],
             ];
             if (!focusOnly) {
-                listeners.push(["mouseenter", () => show(entry, "hover")],
-                    ["mouseleave", () => { if (mine() && (shown.via === "hover" || document.activeElement !== el)) hide(); }]);
+                listeners.push(["mouseenter", () => hover(entry)],
+                    ["mouseleave", () => {
+                        if (pending?.entry === entry) cancelHover();
+                        if (mine() && (shown.via === "hover" || document.activeElement !== el)) hide();
+                    }]);
             }
             for (const [type, fn] of listeners) el.addEventListener(type, fn);
             let attached = true;
@@ -165,7 +203,7 @@ export function createHoverTip(container, { register = registerKeys, mark = "con
                 if (!attached) return;
                 attached = false;
                 for (const [type, fn] of listeners) el.removeEventListener?.(type, fn);
-                if (mine()) hide();
+                dismiss();
                 if (fixed && !destroyed) release(fixed);
             };
         },
@@ -176,6 +214,9 @@ export function createHoverTip(container, { register = registerKeys, mark = "con
             destroyed = true;
             hide();
             unregister();
+            container.removeEventListener("pointerdown", hide, true);
+            globalThis.window?.removeEventListener?.("scroll", onScroll, true);
+            globalThis.window?.removeEventListener?.("blur", hide);
             for (const tip of made) tip.remove();
             made.clear();
         },

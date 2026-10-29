@@ -51,6 +51,7 @@ a fresh `[Unreleased]` block.
 - Sonder Control Relay node: a workflow's Controls menu. It exposes existing node settings, a Sonder Selector's feature list included, in the Controls sidebar with labels, groups and Markdown notes, and the Sonder App reads the same menu from an Export (API) workflow. The settings stay on their own nodes, and a copied node is never exposed twice.
 
 ### Changed
+- Controls help waits half a second on each hovered setting or Mode choice, so moving across a dense panel stays quiet. Keyboard help stays immediate; clicking a focused field dismisses it.
 - Controls: a setting on a muted or bypassed node shows only its **Muted** / **Bypassed** tag, with the reason on hover, instead of repeating it under every setting. A node switch's **Enabled / Muted / Bypassed** buttons sit under its name, all the same size, in one row or one per line, never two and one. Modes show each category's name above its choices, and every choice in a category has the same width and height.
 - Controls no longer repeats **Keep take padding** in the Editor group; it stays in Settings ▸ Render.
 - The Sonder Editor node shows ComfyUI's progress bar while it renders frames, filling only when the render is done; the Sonder App's progress shows the Editor's frame count too.

@@ -949,18 +949,29 @@ if(SCENARIO==='markdown'){
         assert.equal(label('binding:plain:value').title,'Plain','no help: the label keeps its title');
         // Hover: "<label> — <help>", kept line breaks, never read by a screen reader.
         label('binding:steps:value').dispatch('mouseenter');
+        assert.notEqual(tip('binding:steps:value').style.display,'block','crossing a setting never opens help immediately');
+        label('binding:steps:value').dispatch('mouseleave');
+        await new Promise(r=>setTimeout(r,550));
+        assert.notEqual(tip('binding:steps:value').style.display,'block','leaving cancels the pending help');
+        label('binding:steps:value').dispatch('mouseenter');await new Promise(r=>setTimeout(r,550));
         assert.equal(tip('binding:steps:value').style.display,'block');assert.equal(tip('binding:steps:value').textContent,'Steps — '+help);
         assert.equal(tip('binding:steps:value').attributes['aria-hidden'],'true');assert.equal(tip('binding:steps:value').style.whiteSpace,undefined);
         assert.match(tip('binding:steps:value').style.cssText,/white-space:pre-line/);
         label('binding:steps:value').dispatch('mouseleave');assert.equal(tip('binding:steps:value').style.display,'none');
-        label('binding:plain:value').dispatch('mouseenter');assert.equal(tip('binding:plain:value')?.style.display??'none','none','no help, no tip');
+        label('binding:plain:value').dispatch('mouseenter');await new Promise(r=>setTimeout(r,550));assert.equal(tip('binding:plain:value')?.style.display??'none','none','no help, no tip');
         // Keyboard focus: the help, without the label; typing hides it.
         const steps=input('binding:steps:value');steps.focus();
         assert.equal(tip('binding:steps:value').style.display,'block');assert.equal(tip('binding:steps:value').textContent,help);
+        container.dispatch('pointerdown',{target:steps});
+        assert.equal(tip('binding:steps:value').style.display,'none','clicking an already focused field ends keyboard help');
+        steps.blur();steps.focus();
         steps.dispatch('input');assert.equal(tip('binding:steps:value').style.display,'none');
         // A press into a field shows nothing, though Chromium's :focus-visible
         // matches a clicked text field; a clicked button fails :focus-visible.
         steps.blur();for(const f of events.pointerdown||[])f({});steps.focus();assert.equal(tip('binding:steps:value').style.display,'none');
+        steps.blur();key('Tab');steps.focus();assert.equal(tip('binding:steps:value').style.display,'block','Tab immediately restores keyboard help after a click');
+        for(const f of events.scroll||[])f({target:container});
+        assert.equal(tip('binding:steps:value').style.display,'block','automatic focus scrolling keeps keyboard help');
         steps.blur();const now=Date.now;Date.now=()=>now()+2000;
         steps.matches=sel=>sel!==':focus-visible';steps.focus();assert.equal(tip('binding:steps:value').style.display,'none');
         delete steps.matches;steps.blur();steps.focus();assert.equal(tip('binding:steps:value').style.display,'block','the keyboard, later');
@@ -983,7 +994,7 @@ if(SCENARIO==='markdown'){
         off.value='99';const e=key('Escape');assert.equal(off.value,'20','the draft reverted');assert.ok(e.stopped);
         assert.equal(tip('binding:off:value').style.display,'none','its blur hid the tip');
         // An open tip with focus on nothing that edits takes Escape.
-        label('binding:steps:value').dispatch('mouseenter');const esc=key('Escape');assert.ok(esc.stopped&&esc.prevented);
+        label('binding:steps:value').dispatch('mouseenter');await new Promise(r=>setTimeout(r,550));const esc=key('Escape');assert.ok(esc.stopped&&esc.prevented);
         assert.equal(tip('binding:steps:value').style.display,'none');
         // A clipped value still shows in full on hover.
         steps.value='123456789012345';steps.scrollWidth=200;steps.clientWidth=50;container.dispatch('mouseover',{target:steps});
@@ -993,7 +1004,7 @@ if(SCENARIO==='markdown'){
         assert.ok(ids(header).some(id=>text('binding:stack:value',id)==='The stack.'));
         header.dispatch('click');await settle();
         const strength=walk(stack).find(n=>n.attributes['aria-label']==='LoRA 1 strength');
-        assert.equal(strength.title,undefined);strength.dispatch('mouseenter');assert.equal(tip('binding:stack:value').textContent,'strength: How strong.');
+        assert.equal(strength.title,undefined);strength.dispatch('mouseenter');await new Promise(r=>setTimeout(r,550));assert.equal(tip('binding:stack:value').textContent,'strength: How strong.');
         const name=walk(stack).find(n=>n.attributes['aria-label']==='LoRA 1 lora_name');assert.equal(name.title,'lora_name','no help: its title stays');
         strength.dispatch('mouseleave');
         assert.ok(ids(strength).some(id=>text('binding:stack:value',id)==='How strong.'),'a screen reader hears the field help');
@@ -1006,11 +1017,12 @@ if(SCENARIO==='markdown'){
         const {createHoverTip}=await import(new URL('controls_hover_tip.js',PANEL_URL).href);
         const box=new El('div'),anchor=new El('div'),button=new El('button');box.append(anchor);anchor.append(button);
         const tips=createHoverTip(box),detachTip=tips.attach(button,()=>'Help',{anchor});
-        assert.equal(anchor.children.filter(n=>n.dataset.controlsTip).length,1);detachTip();
+        assert.equal(anchor.children.filter(n=>n.dataset.controlsTip).length,1);
+        button.dispatch('mouseenter');detachTip();await new Promise(r=>setTimeout(r,550));
         assert.equal(anchor.children.filter(n=>n.dataset.controlsTip).length,0,'no tip keeps a dropped row alive');tips.destroy();
         // The tip is the help's text, never markup.
         publish({...view,bindings:[b('steps','Steps',{tooltip:'<b>bold</b>'})]});await settle();
-        label('binding:steps:value').dispatch('mouseenter');assert.equal(tip('binding:steps:value').textContent,'Steps — <b>bold</b>');
+        label('binding:steps:value').dispatch('mouseenter');await new Promise(r=>setTimeout(r,550));assert.equal(tip('binding:steps:value').textContent,'Steps — <b>bold</b>');
         assert.equal(tip('binding:steps:value').children.length,0);
         panel.destroy();assert.equal(walk(container).some(n=>n.dataset.controlsTip==='true'),false);
     }

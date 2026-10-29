@@ -148,7 +148,7 @@ assert.equal(desc('a').textContent,'Makes video from text.');assert.equal(desc('
 assert.equal(choice('b').attributes['aria-describedby'],undefined,'no text, no description');
 const tip=()=>walk(rowOf('a-b')).find(n=>n.dataset.controlsModeTip==='true');
 assert.equal(tip().attributes['aria-hidden'],'true');
-choice('a').dispatch('mouseenter');assert.equal(tip().style.display,'block');assert.equal(tip().textContent,'Makes video from text.');
+choice('a').dispatch('mouseenter');await new Promise(r=>setTimeout(r,550));assert.equal(tip().style.display,'block');assert.equal(tip().textContent,'Makes video from text.');
 choice('a').dispatch('mouseleave');assert.equal(tip().style.display,'none');
 choice('a').focus();assert.equal(tip().style.display,'block');
 let e=key('Escape');assert.ok(e.prevented&&e.stopped,'Escape closes an open tooltip');assert.equal(tip().style.display,'none');
@@ -157,14 +157,14 @@ e=key('Enter');assert.ok(e.stopped&&!e.prevented,'keys on a choice never reach e
 for(const mod of ['ctrlKey','metaKey','altKey']){e=key('z',{[mod]:true});assert.ok(!e.stopped,`${mod}+Z reaches the editor's Undo`);}
 e=key('s',{ctrlKey:true});assert.ok(!e.stopped,'Ctrl+S reaches the editor');
 const field=new El('input');document.body.append(field);field.focus();
-choice('a').dispatch('mouseenter');e=key('Escape');assert.ok(!e.stopped,'an unrelated field keeps its Escape');
+choice('a').dispatch('mouseenter');await new Promise(r=>setTimeout(r,550));e=key('Escape');assert.ok(!e.stopped,'an unrelated field keeps its Escape');
 choice('a').dispatch('mouseleave');
 // A tooltip left open under a hidden panel neither takes Escape nor stays.
 document.body.focus?.();document.activeElement=document.body;
-choice('a').dispatch('mouseenter');modes.el.offsetParent=null;e=key('Escape');
+choice('a').dispatch('mouseenter');await new Promise(r=>setTimeout(r,550));modes.el.offsetParent=null;e=key('Escape');
 assert.ok(!e.stopped,'hidden: Escape goes on');assert.equal(tip().style.display,'none');delete modes.el.offsetParent;
 // A click focuses the button; leaving it still closes the hover tip.
-choice('a').dispatch('mouseenter');for(const f of events.pointerdown||[])f({target:choice('a')});choice('a').focus();
+choice('a').dispatch('mouseenter');await new Promise(r=>setTimeout(r,550));for(const f of events.pointerdown||[])f({target:choice('a')});choice('a').focus();
 assert.equal(tip().style.display,'block');choice('a').dispatch('mouseleave');assert.equal(tip().style.display,'none','closed on leave');
 choice('a').blur();
 // Both headings are headings to assistive technology.
