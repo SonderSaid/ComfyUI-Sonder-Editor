@@ -21,12 +21,12 @@ generates.
 It works with the model you choose: LTX, Wan, HunyuanVideo, MiniMax H3 and
 more.
 
-![The Sonder Editor fullscreen surface: asset gallery and Reference Library in
-the left sidebar, viewport with transport controls in the centre, and a
-multi-lane timeline below carrying video, audio, prompt, guide and Reference
-lanes](docs/images/editor.webp)
-<p align="center"><em>The fullscreen editor: gallery and References at the left,
-viewport centre, timeline below.</em></p>
+![The Sonder Editor with the Controls tab at the left showing the LTX 2.5 Edit &
+VFX workflow's Modes, the viewport split into three panes (the shot, its depth
+map and a sampler's live preview), and the timeline below with a run
+notification](docs/images/editor-controls-views.webp)
+<p align="center"><em>Controls and Modes at the left; the viewport split into
+the shot, its depth map and a live sampler preview.</em></p>
 
 **[▶ Watch the launch overview](https://youtu.be/lixgY2G80xE)** (recorded at the first release)
 
