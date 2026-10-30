@@ -1,6 +1,6 @@
 # ComfyUI-Sonder-Editor
 
-**Version 0.7.8** — see the [CHANGELOG](CHANGELOG.md) for release notes.
+**Version 0.8.0** — see the [CHANGELOG](CHANGELOG.md) for release notes.
 
 Sonder Editor is a timeline-based video editing studio for ComfyUI, built for
 iterative long-form video.
@@ -170,8 +170,10 @@ mask preparation, and saving results with sound.
 
 The last three also ship with the [Sonder App](docs/sonder-app.md)
 (experimental, optional) as its starter workflows, exported for the API.
-[Sonder App Workflows](docs/sonder-app-workflows.md) has the steps for each of
-their tasks in the app.
+Edit & VFX comes in two versions there: **LTX 2.5 Edit & VFX**, which needs no
+Prompt Relay, and **LTX 2.5 Edit & VFX — Prompt Relay**, which adds timed
+prompts. [Sonder App Workflows](docs/sonder-app-workflows.md) has the steps for
+each of their tasks in the app.
 
 Every sample project, with its matching workflow, showcase video, tested editor
 version and opening instructions, is on
@@ -244,10 +246,11 @@ adapters, grouped under the `Sonder`, `Sonder/IO`, `Sonder/Logic`, and
 
 ## Requirements
 
-- **ComfyUI** — 0.7.8 was validated on ComfyUI **0.40.0** with frontend
-  **1.55.17**. That is what this release was tested against, not a minimum;
+- **ComfyUI** — 0.8.0 was validated on ComfyUI **0.42.0** with frontend
+  **1.57.1**. That is what this release was tested against, not a minimum;
   other versions are expected to work. The V3 nodes listed under Nodes load
-  only on builds that provide `comfy_api`.
+  only on builds that provide `comfy_api`. A View pane's **Run** needs ComfyUI
+  0.42.0 or newer; on older builds it doesn't show.
 - **Python 3.10+** (matching your ComfyUI environment; validated on 3.12).
 - **FFmpeg 7.0+** — required for video/audio decode, encode, and export. The
   `imageio-ffmpeg` dependency (0.6.0 or newer) bundles one. A system `ffmpeg`

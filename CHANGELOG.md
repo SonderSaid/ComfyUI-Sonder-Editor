@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-30
+
 The Sonder App release: run a workflow from a page of its own, change its
 settings from the editor with Controls and Modes, and watch its outputs beside
 the scene in up to four viewport panes.
@@ -24,7 +26,7 @@ fullscreen, a mounted tab and the Sonder App.
 - Run your workflows from a page of their own, without the ComfyUI canvas. Install it from the editor's **Settings ▸ Sonder App (experimental)**. It runs through the Comfy SDK (`comfy-sdk`) and a local API proxy (`comfy-api-proxy`) against your running ComfyUI, and every take lands in your project as it would from the canvas.
 - **Launcher:** lists your projects and imported workflows (any ComfyUI **Export (API)** file with a Sonder Editor) and opens the editor on the pair you choose. A workflow that needs node packs this ComfyUI lacks is marked **Missing nodes** with the packs that provide them, and missing model rows show the full path where each file goes.
 - **Generate** (1–8 takes per click) beside **+ Queue**.
-- Three starter workflows, the new example workflows below exported for the API: **LTX 2.5 Edit & VFX**, **LTX 2.5 Refine & Upscale** and **MiniMax H3 — References & Swaps**.
+- Starter workflows, the new example workflows below exported for the API: **LTX 2.5 Edit & VFX**, **LTX 2.5 Refine & Upscale** and **MiniMax H3 — References & Swaps**. Edit & VFX needs no Prompt Relay; **LTX 2.5 Edit & VFX — Prompt Relay** is the same workflow with timed prompts.
 - A **Workflow** menu at the top of the Controls panel switches to another imported workflow without leaving the project, scene or timeline.
 - **Export as API** shares Sonder App values and curated Controls with another Sonder App.
 
