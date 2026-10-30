@@ -4,6 +4,7 @@ import hashlib
 import json
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -93,3 +94,100 @@ def test_secret_cancel_refuses_live_owner_and_wrong_secret_then_cancels_after_de
         assert session.runs[0].cancel_requested
     try: asyncio.run(scenario())
     finally: world.runner.close()
+
+
+def _set_initial_modes(source, modes):
+    path = source.with_suffix('.meta.json')
+    meta = json.loads(path.read_text(encoding='utf-8'))
+    meta['initial_node_modes'] = modes
+    path.write_text(json.dumps(meta), encoding='utf-8')
+
+
+def test_starter_initial_modes_apply_once_and_never_reenable_after_user_change(starter):
+    identity, source = starter
+    original = source.read_bytes()
+    defaults = {'5': {'mode': 'muted', 'class_type': 'Sampler'}}
+    _set_initial_modes(source, defaults)
+    assert st.read_control_values(identity)['node_modes'] == defaults
+    st.update_control_values(identity, lambda data: data['node_modes'].pop('5'))
+    assert st.read_control_values(identity)['node_modes'] == {}
+    source.write_bytes(original + b'\n')
+    assert st.read_control_values(identity)['node_modes'] == {}
+    assert sorted(p.name for p in source.parent.iterdir()) == ['sample.json', 'sample.meta.json']
+
+
+def test_starter_initial_modes_preserve_existing_user_sidecar(starter):
+    identity, source = starter
+    st.update_control_values(identity, lambda data: data['bindings'].update({'seed': {'value': 99}}))
+    _set_initial_modes(source, {'5': {'mode': 'muted', 'class_type': 'Sampler'}})
+    values = st.read_control_values(identity)
+    assert values['node_modes'] == {}
+    assert values['bindings']['seed']['value'] == 99
+
+
+def test_starter_initial_modes_apply_before_first_setting_write(starter):
+    identity, source = starter
+    defaults = {'5': {'mode': 'bypassed', 'class_type': 'Sampler'}}
+    _set_initial_modes(source, defaults)
+    st.update_control_values(identity, lambda data: data['notes'].update({'note:test': 'User note'}))
+    values = st.read_control_values(identity)
+    assert values['node_modes'] == defaults
+    assert values['notes']['note:test'] == 'User note'
+
+
+def test_starter_initial_modes_ignore_invalid_modes_and_unrelated_metadata(starter):
+    identity, source = starter
+    _set_initial_modes(source, {
+        '5': {'mode': 'muted', 'class_type': 'Sampler'},
+        '6': {'mode': 'invalid', 'class_type': 'Sampler'},
+        '7:8': {'mode': 'muted', 'class_type': 'Sampler'},
+        '9': {'mode': 'muted', 'class_type': 123},
+        'bindings': {'seed': {'value': 99}},
+    })
+    values = st.read_control_values(identity)
+    assert values['node_modes'] == {'5': {'mode': 'muted', 'class_type': 'Sampler'}}
+    assert values['bindings'] == {}
+
+
+def test_starter_without_initial_modes_does_not_create_controls_sidecar(starter):
+    identity, _ = starter
+    st.read_control_values(identity)
+    assert not Path(st._template_paths(identity)[2]).exists()
+
+
+@pytest.mark.parametrize('slug, choices', [
+    ('sonder_ltx_2_5_edit_vfx', ['Make a New Video', 'Generate New Audio', 'Standard']),
+    ('sonder_ltx_2_5_refine_upscale', ['Refine and Upscale Pass', 'Mask Off']),
+    ('sonder_minimax_h3_references_swaps', ['Standard Generation']),
+])
+def test_shipped_starter_sources_and_initial_choices(slug, choices):
+    from server import control_manifest as cm, prompt_graph
+
+    folder = Path(st.__file__).resolve().parents[1] / 'sdk_starters'
+    graph = st.parse_template_bytes((folder / (slug + '.json')).read_bytes())
+    meta = json.loads((folder / (slug + '.meta.json')).read_text(encoding='utf-8'))
+    assert meta['name'] and meta['model_family'] and meta['order'] > 0
+    editors = prompt_graph.editor_keys(graph)
+    assert len(editors) == 1
+    saves = prompt_graph.nodes_reaching(graph, editors[0], prompt_graph.SONDER_SAVE_CLASS_TYPES)
+    assert saves and all(graph[key]['inputs']['mark_queue_complete'] is False for key in saves)
+    relay = cm.find_relay(graph)
+    assert relay['status'] == 'ok'
+    menu = json.loads(graph[relay['key']]['inputs']['manifest'])
+    assert menu['views']['items']
+    assert all(entry.get('status', 'ok') == 'ok' for entry in menu['bindings'].values())
+    effects = {}
+    for name in choices:
+        preset = next(p for p in menu['presets'].values() if p['name'] == name)
+        effects.update(cm.execution_effects(preset.get('execution', {})))
+        for identity, member in preset['members'].items():
+            for target in menu['bindings'][identity]['targets']:
+                assert graph[target['path']]['inputs'][target['input']] == member['value']
+    expected = {path: mode for path, mode in effects.items() if mode != 'enabled'}
+    assert {path: entry['mode'] for path, entry in meta['initial_node_modes'].items()} == expected
+    members = {member['path']: member['class_type']
+               for switch in menu['execution']['controls'].values() for member in switch['members']}
+    assert all(entry['class_type'] == members[path] for path, entry in meta['initial_node_modes'].items())
+    seeds = [node['inputs']['seed'] for node in graph.values() if node['class_type'] in ('SeedNode', 'SeedGenerator')]
+    assert seeds and set(seeds) == {0}
+    assert {entry['seed_mode'] for entry in menu['bindings'].values() if entry.get('seed_mode')} == {'fixed'}

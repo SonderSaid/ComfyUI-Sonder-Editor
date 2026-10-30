@@ -840,10 +840,29 @@ def _presentation_hash(template_id: str) -> str:
         return hashlib.sha256(handle.read()).hexdigest()
 
 
+def _read_controls_locked(template_id: str, controls_path: str) -> dict:
+    """Seed bundled switch defaults once; the install sidecar owns later edits.
+
+    The caller holds the template lock. An existing sidecar, including an
+    empty one, is user state and never receives the starter defaults again.
+    """
+    existed = os.path.isfile(controls_path)
+    data = _normalized_controls(read_json_sidecar(controls_path), _presentation_hash(template_id))
+    source = starter_sources().get(template_id) if not existed else None
+    if source:
+        shipped = read_json_sidecar(source[:-5] + ".meta.json")
+        modes = control_execution.stored_node_modes({"node_modes": shipped.get("initial_node_modes")})
+        if modes:
+            data["node_modes"] = {path: {"mode": mode, "class_type": class_type}
+                                  for path, (mode, class_type) in modes.items()}
+            write_json_atomic(controls_path, data)
+    return data
+
+
 def read_control_values(template_id: str) -> dict:
     _, _, controls_path = _template_paths(template_id)
     with template_lock(template_id):
-        return _normalized_controls(read_json_sidecar(controls_path), _presentation_hash(template_id))
+        return _read_controls_locked(template_id, controls_path)
 
 
 def update_control_values(template_id: str, mutate: Callable[[dict], None]) -> dict:
@@ -856,7 +875,7 @@ def update_control_values(template_id: str, mutate: Callable[[dict], None]) -> d
     with template_lock(template_id):
         if not os.path.isfile(json_path):
             raise TemplateError("Unknown workflow.", "unknown_template", 404)
-        data = _normalized_controls(read_json_sidecar(controls_path), _presentation_hash(template_id))
+        data = _read_controls_locked(template_id, controls_path)
         mutate(data)
         data["seq"] += 1
         write_json_atomic(controls_path, data)

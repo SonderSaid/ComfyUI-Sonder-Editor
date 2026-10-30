@@ -1,0 +1,31 @@
+{
+  "name": "LTX 2.5 Refine & Upscale",
+  "model_family": "LTX 2.5",
+  "order": 2,
+  "initial_node_modes": {
+    "9462": {
+      "mode": "muted",
+      "class_type": "LTXVPreprocessMasks"
+    },
+    "9508": {
+      "mode": "muted",
+      "class_type": "MaskToImage"
+    },
+    "9509": {
+      "mode": "muted",
+      "class_type": "SonderPreviewVideo"
+    },
+    "9510": {
+      "mode": "muted",
+      "class_type": "SonderDriverBridge"
+    },
+    "9511": {
+      "mode": "muted",
+      "class_type": "SonderDriverSelector"
+    },
+    "9512": {
+      "mode": "muted",
+      "class_type": "ImageToMask"
+    }
+  }
+}

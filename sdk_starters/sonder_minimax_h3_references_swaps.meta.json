@@ -1,0 +1,107 @@
+{
+  "name": "MiniMax H3 — References & Swaps",
+  "model_family": "MiniMax H3",
+  "order": 3,
+  "initial_node_modes": {
+    "741": {
+      "mode": "muted",
+      "class_type": "MiniMaxH3AddGuide"
+    },
+    "745": {
+      "mode": "muted",
+      "class_type": "LoraLoaderModelOnly"
+    },
+    "746": {
+      "mode": "muted",
+      "class_type": "LoraLoaderModelOnly"
+    },
+    "753": {
+      "mode": "muted",
+      "class_type": "MiniMaxH3ReferenceToVideo"
+    },
+    "762": {
+      "mode": "muted",
+      "class_type": "SonderReferenceSelector"
+    },
+    "763": {
+      "mode": "muted",
+      "class_type": "SonderReferenceImageBridge"
+    },
+    "765": {
+      "mode": "muted",
+      "class_type": "StringConcatenate"
+    },
+    "766": {
+      "mode": "muted",
+      "class_type": "StringConcatenate"
+    },
+    "768": {
+      "mode": "muted",
+      "class_type": "StringConcatenate"
+    },
+    "769": {
+      "mode": "muted",
+      "class_type": "StringConcatenate"
+    },
+    "772": {
+      "mode": "muted",
+      "class_type": "SonderReferencePromptBridge"
+    },
+    "785": {
+      "mode": "muted",
+      "class_type": "SonderDriverSelector"
+    },
+    "786": {
+      "mode": "muted",
+      "class_type": "SonderDriverBridge"
+    },
+    "788": {
+      "mode": "muted",
+      "class_type": "SonderLazyCluster"
+    },
+    "790": {
+      "mode": "bypassed",
+      "class_type": "SAM3_Detect"
+    },
+    "791": {
+      "mode": "bypassed",
+      "class_type": "CheckpointLoaderSimple"
+    },
+    "792": {
+      "mode": "bypassed",
+      "class_type": "CLIPTextEncode"
+    },
+    "794": {
+      "mode": "bypassed",
+      "class_type": "MaskToImage"
+    },
+    "795": {
+      "mode": "bypassed",
+      "class_type": "SonderPreviewVideo"
+    },
+    "802": {
+      "mode": "bypassed",
+      "class_type": "SetLatentNoiseMask"
+    },
+    "803": {
+      "mode": "bypassed",
+      "class_type": "LTXVSeparateAVLatent"
+    },
+    "804": {
+      "mode": "bypassed",
+      "class_type": "LTXVConcatAVLatent"
+    },
+    "820": {
+      "mode": "bypassed",
+      "class_type": "ImageCompositeMasked"
+    },
+    "821": {
+      "mode": "bypassed",
+      "class_type": "InvertMask"
+    },
+    "824": {
+      "mode": "bypassed",
+      "class_type": "GrowMaskWithBlur"
+    }
+  }
+}

@@ -1,0 +1,1134 @@
+{
+  "121": {
+    "inputs": {
+      "vae_name": "H3\\minimax_h3_video_vae_fp16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load Video VAE"
+    }
+  },
+  "122": {
+    "inputs": {
+      "vae_name": "H3\\minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load Audio VAE"
+    }
+  },
+  "123": {
+    "inputs": {
+      "samples": [
+        "127",
+        0
+      ],
+      "vae": [
+        "122",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeAudio",
+    "_meta": {
+      "title": "VAE Decode Audio"
+    }
+  },
+  "127": {
+    "inputs": {
+      "noise": [
+        "557",
+        0
+      ],
+      "guider": [
+        "128",
+        0
+      ],
+      "sampler": [
+        "556",
+        0
+      ],
+      "sigmas": [
+        "551",
+        0
+      ],
+      "latent_image": [
+        "804",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "128": {
+    "inputs": {
+      "model": [
+        "560",
+        0
+      ],
+      "conditioning": [
+        "789",
+        1
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "Basic Guider"
+    }
+  },
+  "130": {
+    "inputs": {
+      "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+      "type": "minimax",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "136": {
+    "inputs": {
+      "project": "+ Create New",
+      "project_name": "My Project",
+      "fps": 24,
+      "width": 1280,
+      "height": 720,
+      "scene_id": "76c2d54c",
+      "selection_start": 0,
+      "selection_end": 0,
+      "pre_context_frames": 41,
+      "post_context_frames": 0,
+      "mask_pre_offset": 0,
+      "mask_post_offset": 0,
+      "take_placement_mode": "trimmed",
+      "take_placement_linked": true,
+      "take_placement_muted": false,
+      "render_cache_max_bytes": 0,
+      "render_queue_active": true,
+      "take_fit_mode": "cover",
+      "take_crop_position": "center",
+      "take_keep_padding": false
+    },
+    "class_type": "SonderEditor",
+    "_meta": {
+      "title": "Sonder Editor"
+    }
+  },
+  "144": {
+    "inputs": {
+      "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "214": {
+    "inputs": {
+      "shift_video": 12,
+      "shift_audio": 6,
+      "model": [
+        "732",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3SigmaShift",
+    "_meta": {
+      "title": "ModelSamplingMiniMaxH3"
+    }
+  },
+  "271": {
+    "inputs": {
+      "lora_name": "H3\\minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors",
+      "strength_model": 0.75,
+      "model": [
+        "144",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load Turbo LoRA"
+    }
+  },
+  "303": {
+    "inputs": {
+      "reference_lanes": "0",
+      "project": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "SonderReferenceSelector",
+    "_meta": {
+      "title": "Sonder Reference Image Selector"
+    }
+  },
+  "304": {
+    "inputs": {
+      "reference_lanes": "1",
+      "project": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "SonderReferenceSelector",
+    "_meta": {
+      "title": "Sonder Reference Video Selector"
+    }
+  },
+  "305": {
+    "inputs": {
+      "reference_lanes": "2",
+      "project": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "SonderReferenceSelector",
+    "_meta": {
+      "title": "Sonder Reference Audio Selector"
+    }
+  },
+  "306": {
+    "inputs": {
+      "unused_slots": "nothing",
+      "reference_set": [
+        "303",
+        0
+      ]
+    },
+    "class_type": "SonderReferenceImageBridge",
+    "_meta": {
+      "title": "Sonder Reference Image Bridge"
+    }
+  },
+  "309": {
+    "inputs": {
+      "unused_slots": "nothing",
+      "reference_set": [
+        "304",
+        0
+      ]
+    },
+    "class_type": "SonderReferenceImageBridge",
+    "_meta": {
+      "title": "Sonder Reference Image Bridge"
+    }
+  },
+  "311": {
+    "inputs": {
+      "unused_slots": "nothing",
+      "reference_set": [
+        "305",
+        0
+      ]
+    },
+    "class_type": "SonderReferenceAudioBridge",
+    "_meta": {
+      "title": "Sonder Reference Audio Bridge"
+    }
+  },
+  "373": {
+    "inputs": {
+      "prompt": [
+        "136",
+        5
+      ],
+      "width": [
+        "136",
+        8
+      ],
+      "height": [
+        "136",
+        9
+      ],
+      "length": [
+        "136",
+        6
+      ],
+      "ref_image_size": "max",
+      "clip": [
+        "130",
+        0
+      ],
+      "vae": [
+        "121",
+        0
+      ],
+      "audio_vae": [
+        "122",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "306",
+        0
+      ],
+      "ref_images.ref_image_1": [
+        "306",
+        1
+      ],
+      "ref_images.ref_image_2": [
+        "306",
+        2
+      ],
+      "ref_images.ref_image_3": [
+        "306",
+        3
+      ],
+      "ref_images.ref_image_4": [
+        "306",
+        4
+      ],
+      "ref_images.ref_image_5": [
+        "306",
+        5
+      ],
+      "ref_images.ref_image_6": [
+        "306",
+        6
+      ],
+      "ref_videos.ref_video_0": [
+        "309",
+        0
+      ],
+      "ref_videos.ref_video_1": [
+        "309",
+        1
+      ],
+      "ref_videos.ref_video_2": [
+        "309",
+        2
+      ],
+      "ref_audios.ref_audio_0": [
+        "311",
+        0
+      ],
+      "ref_audios.ref_audio_1": [
+        "311",
+        1
+      ],
+      "ref_audios.ref_audio_2": [
+        "311",
+        2
+      ],
+      "ref_images.ref_image_7": [
+        "306",
+        7
+      ],
+      "ref_images.ref_image_8": [
+        "306",
+        8
+      ]
+    },
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "_meta": {
+      "title": "MiniMax H3 Reference to Video"
+    }
+  },
+  "406": {
+    "inputs": {
+      "frame_idx": [
+        "407",
+        2
+      ],
+      "positive": [
+        "407",
+        4
+      ],
+      "latent": [
+        "451",
+        0
+      ],
+      "vae": [
+        "121",
+        0
+      ],
+      "audio_vae": [
+        "122",
+        0
+      ],
+      "image": [
+        "407",
+        1
+      ]
+    },
+    "class_type": "MiniMaxH3AddGuide",
+    "_meta": {
+      "title": "Add Guide for MiniMax H3"
+    }
+  },
+  "407": {
+    "inputs": {
+      "iteration_index": 0,
+      "bridge_overrides_json": "{}",
+      "project": [
+        "136",
+        0
+      ],
+      "value_0": [
+        "373",
+        0
+      ]
+    },
+    "class_type": "SonderGuidesBridgeStart",
+    "_meta": {
+      "title": "Sonder Guides Bridge Start"
+    }
+  },
+  "408": {
+    "inputs": {
+      "project": [
+        "136",
+        0
+      ],
+      "flow_control": [
+        "407",
+        0
+      ],
+      "value_0": [
+        "406",
+        0
+      ]
+    },
+    "class_type": "SonderGuidesBridgeEnd",
+    "_meta": {
+      "title": "Sonder Guides Bridge End"
+    }
+  },
+  "448": {
+    "inputs": {
+      "samples": [
+        "458",
+        0
+      ],
+      "mask": [
+        "457",
+        4
+      ]
+    },
+    "class_type": "SetLatentNoiseMask",
+    "_meta": {
+      "title": "Set Latent Noise Mask"
+    }
+  },
+  "449": {
+    "inputs": {
+      "samples": [
+        "459",
+        0
+      ],
+      "mask": [
+        "457",
+        5
+      ]
+    },
+    "class_type": "SetLatentNoiseMask",
+    "_meta": {
+      "title": "Set Latent Noise Mask"
+    }
+  },
+  "451": {
+    "inputs": {
+      "video_latent": [
+        "448",
+        0
+      ],
+      "audio_latent": [
+        "449",
+        0
+      ]
+    },
+    "class_type": "LTXVConcatAVLatent",
+    "_meta": {
+      "title": "Concat AV Latent"
+    }
+  },
+  "457": {
+    "inputs": {
+      "edit_video": true,
+      "edit_audio": true,
+      "project": [
+        "136",
+        0
+      ],
+      "video_latent": [
+        "458",
+        0
+      ],
+      "audio_latent": [
+        "459",
+        0
+      ],
+      "video_vae": [
+        "121",
+        0
+      ],
+      "audio_vae": [
+        "122",
+        0
+      ]
+    },
+    "class_type": "SonderMasksBridge",
+    "_meta": {
+      "title": "Sonder Masks Bridge"
+    }
+  },
+  "458": {
+    "inputs": {
+      "tile_size": 1024,
+      "overlap": 256,
+      "temporal_size": 248,
+      "temporal_overlap": 32,
+      "pixels": [
+        "136",
+        1
+      ],
+      "vae": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "VAEEncodeTiled",
+    "_meta": {
+      "title": "VAE Encode (Tiled)"
+    }
+  },
+  "459": {
+    "inputs": {
+      "audio": [
+        "136",
+        10
+      ],
+      "vae": [
+        "122",
+        0
+      ]
+    },
+    "class_type": "VAEEncodeAudio",
+    "_meta": {
+      "title": "VAE Encode Audio"
+    }
+  },
+  "464": {
+    "inputs": {
+      "tile_size": 1024,
+      "overlap": 256,
+      "temporal_size": 128,
+      "temporal_overlap": 32,
+      "samples": [
+        "127",
+        0
+      ],
+      "vae": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": {
+      "title": "VAE Decode (Tiled)"
+    }
+  },
+  "485": {
+    "inputs": {
+      "filename_prefix": "MinimaxH3",
+      "fps": [
+        "136",
+        7
+      ],
+      "mode": "Take",
+      "place_audio_on_timeline": true,
+      "mark_queue_complete": false,
+      "embed_metadata": false,
+      "save_preset": "High Quality MP4",
+      "custom_output_kind": "Video File",
+      "custom_container": "mp4",
+      "custom_video_codec": "libx264",
+      "custom_pix_fmt": "yuv420p",
+      "custom_crf": 18,
+      "custom_encoder_preset": "slow",
+      "custom_audio_codec": "aac",
+      "custom_audio_bitrate_kbps": 192,
+      "custom_png_compression": 0,
+      "autoplay_preview": false,
+      "color_drift_correction": true,
+      "project": [
+        "136",
+        0
+      ],
+      "frames": [
+        "464",
+        0
+      ],
+      "audio": [
+        "123",
+        0
+      ]
+    },
+    "class_type": "SonderSaveVideo",
+    "_meta": {
+      "title": "Sonder Save Video"
+    }
+  },
+  "489": {
+    "inputs": {
+      "seed": 0
+    },
+    "class_type": "SeedGenerator",
+    "_meta": {
+      "title": "SeedGenerator"
+    }
+  },
+  "551": {
+    "inputs": {
+      "scheduler": "sgm_uniform",
+      "steps": 10,
+      "denoise": 1,
+      "model": [
+        "214",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "Scheduler"
+    }
+  },
+  "556": {
+    "inputs": {
+      "sampler_name": "er_sde"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "Sampler"
+    }
+  },
+  "557": {
+    "inputs": {
+      "noise_seed": [
+        "489",
+        0
+      ]
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise"
+    }
+  },
+  "560": {
+    "inputs": {
+      "max_resolution": 512,
+      "jpeg_quality": 80,
+      "suppress_default_preview": true,
+      "preview_frames": 24,
+      "preview_fps": 8,
+      "tiny_vae": "taeh3.safetensors",
+      "model": [
+        "789",
+        0
+      ]
+    },
+    "class_type": "ModelPreviewOverrideKJ",
+    "_meta": {
+      "title": "Generation Preview"
+    }
+  },
+  "732": {
+    "inputs": {
+      "loras.0.lora_name": "H3\\H3_VBVR_Pro_attn_only.safetensors",
+      "loras.0.strength": 1,
+      "loras.0.enabled": false,
+      "model": [
+        "271",
+        0
+      ]
+    },
+    "class_type": "LoadLoraModel",
+    "_meta": {
+      "title": "Load Additional LoRAs"
+    }
+  },
+  "738": {
+    "inputs": {
+      "manifest": "{\"v\": 1, \"bindings\": {\"b6sw5lo9Y8Fp\": {\"label\": \"Advance queue after take\", \"group\": \"\", \"order\": -8750, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"485\", \"input\": \"mark_queue_complete\"}], \"seed_mode\": null}, \"tGy7OPyCaN-L\": {\"label\": \"Edit video\", \"group\": \"\", \"order\": -7500, \"advanced\": false, \"note\": \"Set automatically by **Modes → Task**. Generate Audio with Existing Video keeps the timeline picture.\", \"targets\": [{\"path\": \"457\", \"input\": \"edit_video\"}], \"seed_mode\": null}, \"8NYCdjEy0qmv\": {\"label\": \"Variation Number\", \"group\": \"Generation Settings\", \"order\": -5000, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"489\", \"input\": \"seed\"}], \"seed_mode\": \"fixed\"}, \"Zip_dSVvnMsq\": {\"label\": \"Video Model\", \"group\": \"Models and LoRAs\", \"order\": -5000, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"144\", \"input\": \"unet_name\"}], \"seed_mode\": null}, \"lkwA0UoOPgAC\": {\"label\": \"Edit audio\", \"group\": \"\", \"order\": -4999, \"advanced\": false, \"note\": \"Set automatically by **Modes → Task**. All four swap choices keep the sound on your Audio lanes.\", \"targets\": [{\"path\": \"457\", \"input\": \"edit_audio\"}], \"seed_mode\": null}, \"Hk0Iqr6IpwE9\": {\"label\": \"Text Encoder\", \"group\": \"Models and LoRAs\", \"order\": -2500, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"130\", \"input\": \"clip_name\"}], \"seed_mode\": null}, \"XQW1eT4vuNde\": {\"label\": \"Place take audio on timeline\", \"group\": \"\", \"order\": -2498, \"advanced\": false, \"note\": \"Set automatically by **Modes → Task**. Generated sound adds an Audio clip; preserved sound is not placed again.\", \"targets\": [{\"path\": \"485\", \"input\": \"place_audio_on_timeline\"}], \"seed_mode\": null}, \"kzkj0iWd0i3g\": {\"label\": \"Picture Reference Lanes\", \"group\": \"Generation References\", \"order\": 0, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"303\", \"input\": \"reference_lanes\"}], \"seed_mode\": null}, \"Pcooc_uAm80u\": {\"label\": \"Replacement Picture Lane\", \"group\": \"Swap Sources\", \"order\": 0, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"762\", \"input\": \"reference_lanes\"}], \"seed_mode\": null}, \"8HvRDrhuU9Lv\": {\"label\": \"Sampling Method\", \"group\": \"Generation Settings\", \"order\": 0, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"556\", \"input\": \"sampler_name\"}], \"seed_mode\": null}, \"CVKKDne1Vb9M\": {\"label\": \"Video VAE\", \"group\": \"Models and LoRAs\", \"order\": 0, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"121\", \"input\": \"vae_name\"}], \"seed_mode\": null}, \"zM9aWX0t72AD\": {\"label\": \"File name\", \"group\": \"\", \"order\": 3, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"485\", \"input\": \"filename_prefix\"}], \"seed_mode\": null}, \"Y7FDgKEzTkDO\": {\"label\": \"Save as\", \"group\": \"\", \"order\": 4, \"advanced\": false, \"note\": \"**Take** adds the result to the timeline. **Video** saves it in Assets without placing it.\", \"targets\": [{\"path\": \"485\", \"input\": \"mode\"}], \"seed_mode\": null}, \"NEummeWkysV-\": {\"label\": \"Output Format\", \"group\": \"\", \"order\": 7, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"485\", \"input\": \"save_preset\"}], \"seed_mode\": null}, \"YfjyQ0_Q5Hw6\": {\"label\": \"Who do you want to mask and swap in your target video?\", \"group\": \"\", \"order\": 8, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"792\", \"input\": \"text\"}], \"seed_mode\": null}, \"9nSLh_hB2H4R\": {\"label\": \"Noise Schedule\", \"group\": \"Generation Settings\", \"order\": 5000, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"551\", \"input\": \"scheduler\"}], \"seed_mode\": null}, \"vhQEDdWQkX1G\": {\"label\": \"Source Driver Lane\", \"group\": \"Swap Sources\", \"order\": 5000, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"785\", \"input\": \"driver_lane_index\"}], \"seed_mode\": null}, \"DUKNTJmhGNE0\": {\"label\": \"Video Reference Lanes\", \"group\": \"Generation References\", \"order\": 5000, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"304\", \"input\": \"reference_lanes\"}], \"seed_mode\": null}, \"_UccCLiSgLka\": {\"label\": \"Audio Reference Lanes\", \"group\": \"Generation References\", \"order\": 7500, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"305\", \"input\": \"reference_lanes\"}], \"seed_mode\": null}, \"-gXoFWYR6zEP\": {\"label\": \"Audio VAE\", \"group\": \"Models and LoRAs\", \"order\": 7500, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"122\", \"input\": \"vae_name\"}], \"seed_mode\": null}, \"mCbg-Qm0-tif\": {\"label\": \"Generation Steps\", \"group\": \"Generation Settings\", \"order\": 7500, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"551\", \"input\": \"steps\"}], \"seed_mode\": null}, \"6scRHZFyGp9o\": {\"label\": \"Minimum Detection Confidence\", \"group\": \"Mask Settings\", \"order\": 7500, \"advanced\": true, \"note\": \"Higher values require a more confident detection.\", \"targets\": [{\"path\": \"790\", \"input\": \"threshold\"}], \"seed_mode\": null}, \"rJJ8vq_grrnj\": {\"label\": \"Change Strength (Denoise)\", \"group\": \"Generation Settings\", \"order\": 8750, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"551\", \"input\": \"denoise\"}], \"seed_mode\": null}, \"0qXN6Eto6WVO\": {\"label\": \"Grow / Shrink Mask\", \"group\": \"Mask Settings\", \"order\": 8750, \"advanced\": false, \"note\": \"Positive values grow the mask; negative values shrink it.\", \"targets\": [{\"path\": \"824\", \"input\": \"expand\"}], \"seed_mode\": null}, \"crZibGuiQd5Q\": {\"label\": \"Mask Growth per Frame\", \"group\": \"Mask Settings\", \"order\": 9375, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"824\", \"input\": \"incremental_expandrate\"}], \"seed_mode\": null}, \"gCN015cUKd7a\": {\"label\": \"Taper Mask Corners\", \"group\": \"Mask Settings\", \"order\": 9687, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"824\", \"input\": \"tapered_corners\"}], \"seed_mode\": null}, \"RxEZBJ8MQ8Ms\": {\"label\": \"Turbo LoRA\", \"group\": \"Models and LoRAs\", \"order\": 9687, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"271\", \"input\": \"lora_name\"}], \"seed_mode\": null}, \"qS8FcKtFMWkC\": {\"label\": \"Video Noise Shift\", \"group\": \"Generation Settings\", \"order\": 9687, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"214\", \"input\": \"shift_video\"}], \"seed_mode\": null}, \"HslWsWrPT-Xf\": {\"label\": \"Audio Noise Shift\", \"group\": \"Generation Settings\", \"order\": 9843, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"214\", \"input\": \"shift_audio\"}], \"seed_mode\": null}, \"lNMTRVQL7uRW\": {\"label\": \"Invert Input Mask\", \"group\": \"Mask Settings\", \"order\": 9843, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"824\", \"input\": \"flip_input\"}], \"seed_mode\": null}, \"PNkGKf797B6A\": {\"label\": \"Sampling Preview VAE\", \"group\": \"Models and LoRAs\", \"order\": 9843, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"560\", \"input\": \"tiny_vae\"}], \"seed_mode\": null}, \"MTcUEknZUxDX\": {\"label\": \"Mask Detection Model\", \"group\": \"Models and LoRAs\", \"order\": 9921, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"791\", \"input\": \"ckpt_name\"}], \"seed_mode\": null}, \"RNM7bjZC-tE6\": {\"label\": \"Mask Edge Softness\", \"group\": \"Mask Settings\", \"order\": 9921, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"824\", \"input\": \"blur_radius\"}], \"seed_mode\": null}, \"l2OXR4zd2MqI\": {\"label\": \"Turbo LoRA Strength\", \"group\": \"Generation Settings\", \"order\": 9921, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"271\", \"input\": \"strength_model\"}], \"seed_mode\": null}, \"YhXSe7VqwHYS\": {\"label\": \"Current Frame Weight\", \"group\": \"Mask Settings\", \"order\": 9960, \"advanced\": true, \"note\": \"**1** skips frame blending. Lower values mix more of the previous mask into the current frame.\", \"targets\": [{\"path\": \"824\", \"input\": \"lerp_alpha\"}], \"seed_mode\": null}, \"8tOUWcNKjR-8\": {\"label\": \"Task\", \"group\": \"Generation Settings\", \"order\": 9960, \"advanced\": true, \"note\": \"Use **Modes → Task** above to set the task, sound behavior and processing switches together.\", \"targets\": [{\"path\": \"814\", \"input\": \"choice\"}], \"seed_mode\": null}, \"Ai3YmRn0T-X6\": {\"label\": \"Head Swap LoRA\", \"group\": \"Models and LoRAs\", \"order\": 9980, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"745\", \"input\": \"lora_name\"}], \"seed_mode\": null}, \"061Bs49GDZ7y\": {\"label\": \"Mask Decay Factor\", \"group\": \"Mask Settings\", \"order\": 9980, \"advanced\": true, \"note\": \"Adds a contribution from the previous mask after frame blending. Values between **0** and **1** set that contribution; **0** and **1** disable this extra carryover.\", \"targets\": [{\"path\": \"824\", \"input\": \"decay_factor\"}], \"seed_mode\": null}, \"1amQ1YmcpL22\": {\"label\": \"Character Swap LoRA\", \"group\": \"Models and LoRAs\", \"order\": 9982, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"746\", \"input\": \"lora_name\"}], \"seed_mode\": null}, \"5xl-4NNF0kMN\": {\"label\": \"Additional LoRAs\", \"group\": \"Models and LoRAs\", \"order\": 9985, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"732\", \"input\": \"loras\"}], \"seed_mode\": null}}, \"notes\": {\"h3_start_here\": {\"text\": \"**Start here**\\n\\n**New to Sonder Editor?** Start with the **Start here** and **Prepare your media** notes in **[LTX 2.5 Edit & VFX](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/example_workflows/sonder_ltx_2_5_edit_vfx.json)**. They introduce importing media, timeline prompts, selecting a range, Guides and Drivers. You can read them without running a generation.\\n\\nThis workflow adds **References**, **character swaps** and **head swaps**. Choose a **Task** above, then follow the matching note below. Open **H3 setup** before your first run.\\n\\nTo refine or enlarge a finished result afterward, use **[LTX 2.5 Refine & Upscale](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/example_workflows/sonder_ltx_2_5_refine_upscale.json)**.\", \"group\": \"\", \"order\": 9}, \"h3_setup\": {\"text\": \"**H3 setup**\\n\\n**Install the required nodes.** Use **Extensions → ComfyUI Manager** at the top right of ComfyUI to install [Sonder Editor](https://github.com/SonderSaid/ComfyUI-Sonder-Editor), [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) and [RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF). Restart ComfyUI and refresh the page afterward. Keep ComfyUI updated for its built-in H3, SAM3 and LoRA-list nodes.\\n\\n**Set the H3 format.** In the toolbar above the timeline, choose **Model → MiniMax H3** and **Channels → MiniMax H3 (full reference)**. Use the choice with **(full reference)** for References.\\n\\n**Load the models.** Open **Models and downloads** below. If **advanced hidden** appears below Modes, click it. Expand **Models and LoRAs** to select your installed files.\\n\\n**Choose how much to change.** Under **Generation Settings**, set **Change Strength (Denoise)** to **1** for new content. Lower values rework the footage already on the timeline; compare a short test before processing a longer section.\\n\\n**Keep the first test simple.** Above the timeline, use **Ctx: Pre/Post 0** and **Mask −/+ 0**. For editing, select a short range inside your footage. When adding context later, keep that range over real footage and sound: empty context supplies black pictures and silence.\\n\\n**Run the selected section.** Set **[In / Out](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/generating.md#ways-to-set-in-and-out)** inside your footage. Open **Render Queue** at the bottom of Assets and turn **Queue Active** off. In ComfyUI, click **✕ Exit** at the upper right, then **Run**. In **[Sonder App](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/sonder-app.md#generate)**, click **Generate** with **×1** selected.\", \"group\": \"\", \"order\": 10}, \"h3_models\": {\"text\": \"**Models and downloads**\\n\\nClick a filename to open its download page. Put it in the folder shown inside **ComfyUI/models/**.\\n\\n- **Main model:** [minimax_h3_fl2va_pruned_int8_convrot.safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors) → **diffusion_models/**\\n- **Text encoder:** [qwen3vl_32b_minimax_h3_int8_convrot.safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors) → **text_encoders/**\\n- **Video VAE:** [minimax_h3_video_vae_fp16.safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_video_vae_fp16.safetensors) → **vae/H3/**\\n- **Audio VAE:** [minimax_h3_audio_vae_fp32.safetensors](https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_audio_vae_fp32.safetensors) → **vae/H3/**\\n- **Turbo LoRA:** [minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors](https://huggingface.co/Kijai/MiniMax-H3-experimental/blob/main/loras/minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors) → **loras/H3/**\\n- **Head swaps:** [minimax_h3_head_swap_v1.0_r32.safetensors](https://huggingface.co/Alissonerdx/BFS-Best-Face-Swap-Video/blob/main/h3/minimax_h3_head_swap_v1.0_r32.safetensors) → **loras/H3/**\\n- **Character swaps:** [minimax_h3_character_swap_v1.1_ref2va_fro.safetensors](https://huggingface.co/Alissonerdx/Minimax-H3-ComfyUI/blob/main/loras/minimax_h3_character_swap_v1.1_ref2va_fro.safetensors) → **loras/H3/**\\n- **Masked swaps:** [sam3.1_multiplex_int8_convrot_selective_fp16clip_fp32source.safetensors](https://huggingface.co/Sparknight/sam3.1-int8-int4-convrot/blob/main/sam3.1_multiplex_int8_convrot_selective_fp16clip_fp32source.safetensors) → **checkpoints/**\\n- **Sampling preview:** [taeh3.safetensors](https://huggingface.co/Kijai/MiniMax-H3-TAE/blob/main/vae_approx/taeh3.safetensors) → **vae_approx/**\\n\\nThe swap LoRA is needed for its matching Task; SAM3 is used by the two masked swaps. **Additional LoRAs** is optional.\\n\\n- **Use models from other folders.** If **advanced hidden** appears below Modes, click it. Expand **Models and LoRAs** and select your installed files in the matching model and LoRA controls.\", \"group\": \"\", \"order\": 11}, \"h3_references\": {\"text\": \"**Use References**\\n\\n**[References](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/references.md)** supply a character's appearance, a place, a visual example or a sound. They guide generation without becoming visible Video clips. Use this note for the three generation Tasks; swap Tasks use the picture setup here and the next note.\\n\\n1. **Register your media.** In **References** at the upper left, click **+**, fill **Name**, then **Save**. Expand the new Reference, click **+ Member**, choose **Image**, **Video** or **Audio**, and select its asset. Fill **Member name** and **Prompt**, then **Save**. Use **Prompt** to describe what that member shows or contains.\\n2. **Place it in time.** Drag the member from **References** onto the timeline ruler, or click **Add to timeline** on its Reference card to stage the card's members at the playhead. Move or trim its Reference item to cover the section where it should apply. Adding media to the Library alone does not send it to the model.\\n3. **Choose how H3 receives it.** Click **☰** on the Reference lane header to open **Reference Lane Setup**. Under **Recipe → Template**, choose **MiniMax H3 Pictures**, **MiniMax H3 Videos (IMAGE sequences)** or **MiniMax H3 Standalone Audio** for the media you added. Keep different media types on separate Reference lanes.\\n4. **Choose the lanes this workflow reads.** Defaults: **R1: pictures · R2: videos · R3: audio**. Only change these selectors if you use different lanes. To change them, in **Controls**, click **advanced hidden** if it appears, expand **Generation References**, then set **Picture Reference Lanes**, **Video Reference Lanes** and **Audio Reference Lanes** to your lanes. The graph accepts up to **9 pictures, 3 videos and 3 standalone audio** inputs.\\n5. **Use it in the prompt.** For generation Tasks, describe the action in a timeline **Prompt** section. Open **Prompt Management** from **☰** on the Prompt lane, then click **+ Attach → Reference** to attach the source you use. Follow **[H3 Subject or Picture setup](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/references.md#minimax-h3-full-reference)** for a character's identity, its appearance and what should carry over.\\n\\nAfter choosing **In / Out**, check that the intended Reference item reads **In window**. See **[Reference timing](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/references.md#what-a-generation-window-resolves-to)** if it is excluded. This graph reads video References as pictures over time; use the standalone Audio Reference input for reference sound.\", \"group\": \"\", \"order\": 12}, \"h3_swaps\": {\"text\": \"**Swap a character or head**\\n\\n1. **Keep the source picture and sound.** Place the original footage on a **Video** lane and its soundtrack on an **Audio** lane. Keep one copy of the sound. **[Dropping media on the timeline](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#dropping-assets-onto-the-timeline)** explains how to place picture and sound together.\\n2. **Add the source Driver.** Place a second copy of the video on another **Video** lane, right-click that clip and choose **Convert to Driver**. Keep its start, trim, length and framing matched to the original. The **[Driver](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#driver-clips)** supplies the performance used by the swap; it disappears from the normal preview.\\n3. **Add the replacement picture.** Follow **Use References** above with one picture on a **MiniMax H3 Pictures** lane. Keep it as the first member and cover the range you want to process. In the Library member's **Prompt**, describe the replacement's appearance. For a character swap, include clothing and body details; for a head swap, describe the head, face and hair.\\n4. **Choose the swap inputs.** Defaults: **D1: source video · R1: replacement picture**. Only change these selectors if you use different lanes. To change them, in **Controls**, click **advanced hidden** if it appears, expand **Swap Sources**, then set **Replacement Picture Lane** and **Source Driver Lane** to the matching lanes.\\n5. **Choose the change.** Under **Modes → Task**, select **Character Swap** or **Head Swap**. For a masked version, follow **Focus a swap with a mask** below. Swapping keeps your original audio.\\n\\n**The swap prompt is prepared for you.** These Tasks use the first picture member's **Prompt** to describe the replacement. The timeline Prompt is ignored.\\n\\n**Keep the source visible.** This is essential for masked swaps: the Video clip supplies the picture outside the mask, while the Driver supplies the swap guidance. Check a short section inside both clips first.\", \"group\": \"\", \"order\": 13}, \"h3_masked_swaps\": {\"text\": \"**Focus a swap with a mask**\\n\\n**Prepare the swap first.** Follow **Swap a character or head** above. Keep matching copies on **Video and Driver** lanes; an empty Video area would leave the picture outside the mask black. This workflow makes the mask automatically—you do not need to import a mask video.\\n\\n1. **Choose the masked Task.** Under **Modes → Task**, select **Masked Character Swap** or **Masked Head Swap**.\\n2. **Describe who changes.** In **Controls**, use **Who do you want to mask and swap in your target video?** below Modes. Describe the target, such as `the woman`. For a head-only area, describe that person's head.\\n3. **Check the processed guide.** Open the source menu at the top of a viewport pane, choose **Masked Driver Preview**, then click that pane's **Run**. It shows the Driver prepared for the swap, with the surrounding area blacked out. Check that the intended person or head is included before running the full generation.\\n4. **Adjust the edges if needed.** Expand **Mask Settings** in Controls. **Grow / Shrink Mask** grows the affected area; **Mask Edge Softness** softens its edge. Preview again after changing them.\\n\", \"group\": \"\", \"order\": 14}, \"h3_review\": {\"text\": \"**Review and continue**\\n\\n**Find your result.** Open **Assets → Takes** at the upper left. With **Controls → Editor → Save as → Take**, the result is also placed on the timeline. **Video** saves it in Assets without placing it.\\n\\n**Keep sound with the result.** Saved swap videos include the existing timeline audio. \\n\\n**Save for the next pass.** In **Controls → Editor → Output Format**, choose **Lossless FFV1 (RGB)** or **Editing Master MP4** when you plan more editing or another workflow. Use **High Quality MP4** for a finished video. Lossless files can be much larger.\\n\\n**Refine or enlarge it.** Open **[LTX 2.5 Refine & Upscale](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/example_workflows/sonder_ltx_2_5_refine_upscale.json)** and use the scene or saved result you want to process. It can refine at the timeline resolution, enlarge to twice the timeline's width and height, or do both.\\n\\nFor choosing between versions, see **[Compare](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/assets-and-gallery.md#compare-mode)**. The **Review and export** note in **[LTX 2.5 Edit & VFX](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/example_workflows/sonder_ltx_2_5_edit_vfx.json)** covers the shared review and export steps.\", \"group\": \"\", \"order\": 15}}, \"groups\": {\"Generation Settings\": {\"order\": 0}, \"Mask Settings\": {\"order\": 1}, \"Models and LoRAs\": {\"order\": 2}, \"Generation References\": {\"order\": 3}, \"Swap Sources\": {\"order\": 4}, \"Processing Switches\": {\"order\": 5}}, \"description\": \"## MiniMax H3\\n\\nGenerate video and sound using prompts, Guides and References. Replace a character or just their head, with optional automatic masking.\", \"views\": {\"v\": 1, \"items\": {\"AE6Ia67nxA_D\": {\"label\": \"\", \"order\": 8, \"status\": \"ok\", \"path\": \"560\", \"class_type\": \"ModelPreviewOverrideKJ\", \"title\": \"Generation Preview\", \"feed\": \"sampling\"}, \"f3AOXclwSPjY\": {\"label\": \"\", \"order\": 9, \"status\": \"ok\", \"path\": \"795\", \"class_type\": \"SonderPreviewVideo\", \"title\": \"Masked Driver Preview\", \"timing\": {\"mode\": \"editor_window\", \"anchor\": \"generation_start\", \"source_offset\": 0, \"fps\": \"editor\"}}}}, \"execution\": {\"v\": 1, \"controls\": {\"mc-2wEaeHEpH\": {\"label\": \"\", \"group\": \"Processing Switches\", \"order\": 0, \"advanced\": true, \"note\": \"\", \"target\": {\"kind\": \"group\", \"group_id\": 5}, \"status\": \"ok\", \"title\": \"Generation References\", \"member_count\": 7, \"members\": [{\"path\": \"306\", \"class_type\": \"SonderReferenceImageBridge\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Reference Image Bridge\"}, {\"path\": \"373\", \"class_type\": \"MiniMaxH3ReferenceToVideo\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"MiniMax H3 Reference to Video\"}, {\"path\": \"303\", \"class_type\": \"SonderReferenceSelector\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Reference Image Selector\"}, {\"path\": \"304\", \"class_type\": \"SonderReferenceSelector\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Reference Video Selector\"}, {\"path\": \"305\", \"class_type\": \"SonderReferenceSelector\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Reference Audio Selector\"}, {\"path\": \"311\", \"class_type\": \"SonderReferenceAudioBridge\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Reference Audio Bridge\"}, {\"path\": \"309\", \"class_type\": \"SonderReferenceImageBridge\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Reference Image Bridge\"}]}, \"SvXPhXfUopkH\": {\"label\": \"\", \"group\": \"Processing Switches\", \"order\": 5000, \"advanced\": true, \"note\": \"\", \"target\": {\"kind\": \"group\", \"group_id\": 11}, \"status\": \"ok\", \"title\": \"Swap Conditioning\", \"member_count\": 14, \"members\": [{\"path\": \"741\", \"class_type\": \"MiniMaxH3AddGuide\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Add Guide for MiniMax H3\"}, {\"path\": \"745\", \"class_type\": \"LoraLoaderModelOnly\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Load LoRA\"}, {\"path\": \"746\", \"class_type\": \"LoraLoaderModelOnly\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Load LoRA\"}, {\"path\": \"753\", \"class_type\": \"MiniMaxH3ReferenceToVideo\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"MiniMax H3 Reference to Video\"}, {\"path\": \"762\", \"class_type\": \"SonderReferenceSelector\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Swap Reference Selector\"}, {\"path\": \"763\", \"class_type\": \"SonderReferenceImageBridge\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Reference Image Bridge\"}, {\"path\": \"765\", \"class_type\": \"StringConcatenate\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Concatenate Text\"}, {\"path\": \"766\", \"class_type\": \"StringConcatenate\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Concatenate Text\"}, {\"path\": \"768\", \"class_type\": \"StringConcatenate\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Concatenate Text\"}, {\"path\": \"769\", \"class_type\": \"StringConcatenate\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Concatenate Text\"}, {\"path\": \"772\", \"class_type\": \"SonderReferencePromptBridge\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Reference Prompt Bridge\"}, {\"path\": \"785\", \"class_type\": \"SonderDriverSelector\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Swap Driver Selector\"}, {\"path\": \"786\", \"class_type\": \"SonderDriverBridge\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Driver Bridge\"}, {\"path\": \"788\", \"class_type\": \"SonderLazyCluster\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Cluster\"}]}, \"YNb-54zglNU0\": {\"label\": \"\", \"group\": \"Processing Switches\", \"order\": 7500, \"advanced\": true, \"note\": \"\", \"target\": {\"kind\": \"group\", \"group_id\": 12}, \"status\": \"ok\", \"title\": \"Automatic Mask\", \"member_count\": 11, \"members\": [{\"path\": \"790\", \"class_type\": \"SAM3_Detect\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"SAM3 Detect\"}, {\"path\": \"791\", \"class_type\": \"CheckpointLoaderSimple\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Load Checkpoint\"}, {\"path\": \"792\", \"class_type\": \"CLIPTextEncode\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Who do you want to mask and swap in your target \"}, {\"path\": \"794\", \"class_type\": \"MaskToImage\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Convert Mask to Image\"}, {\"path\": \"795\", \"class_type\": \"SonderPreviewVideo\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Masked Driver Preview\"}, {\"path\": \"802\", \"class_type\": \"SetLatentNoiseMask\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Set Latent Noise Mask\"}, {\"path\": \"803\", \"class_type\": \"LTXVSeparateAVLatent\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Separate AV Latent\"}, {\"path\": \"804\", \"class_type\": \"LTXVConcatAVLatent\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Concat AV Latent\"}, {\"path\": \"820\", \"class_type\": \"ImageCompositeMasked\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Image Composite Masked\"}, {\"path\": \"821\", \"class_type\": \"InvertMask\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Invert Mask\"}, {\"path\": \"824\", \"class_type\": \"GrowMaskWithBlur\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Grow Mask With Blur\"}]}}, \"routing\": \"{\\\"v\\\":1,\\\"nodes\\\":{\\\"303\\\":{\\\"i\\\":[[\\\"project\\\",\\\"SONDER_PROJECT\\\",{\\\"a\\\":[\\\"136\\\",0]}],[\\\"reference_lanes\\\",\\\"STRING\\\",null]],\\\"o\\\":[[\\\"SONDER_REFERENCE_SET\\\"],[\\\"INT\\\"],[\\\"FLOAT\\\"]]},\\\"304\\\":{\\\"i\\\":[[\\\"project\\\",\\\"SONDER_PROJECT\\\",{\\\"a\\\":[\\\"136\\\",0]}],[\\\"reference_lanes\\\",\\\"STRING\\\",null]],\\\"o\\\":[[\\\"SONDER_REFERENCE_SET\\\"],[\\\"INT\\\"],[\\\"FLOAT\\\"]]},\\\"305\\\":{\\\"i\\\":[[\\\"project\\\",\\\"SONDER_PROJECT\\\",{\\\"a\\\":[\\\"136\\\",0]}],[\\\"reference_lanes\\\",\\\"STRING\\\",null]],\\\"o\\\":[[\\\"SONDER_REFERENCE_SET\\\"],[\\\"INT\\\"],[\\\"FLOAT\\\"]]},\\\"306\\\":{\\\"i\\\":[[\\\"reference_set\\\",\\\"SONDER_REFERENCE_SET\\\",{\\\"m\\\":[\\\"303\\\",0,\\\"SONDER_REFERENCE_SET\\\"]}],[\\\"unused_slots\\\",\\\"COMBO\\\",null]],\\\"o\\\":[[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"]]},\\\"309\\\":{\\\"i\\\":[[\\\"reference_set\\\",\\\"SONDER_REFERENCE_SET\\\",{\\\"m\\\":[\\\"304\\\",0,\\\"SONDER_REFERENCE_SET\\\"]}],[\\\"unused_slots\\\",\\\"COMBO\\\",null]],\\\"o\\\":[[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"]]},\\\"311\\\":{\\\"i\\\":[[\\\"reference_set\\\",\\\"SONDER_REFERENCE_SET\\\",{\\\"m\\\":[\\\"305\\\",0,\\\"SONDER_REFERENCE_SET\\\"]}],[\\\"unused_slots\\\",\\\"COMBO\\\",null]],\\\"o\\\":[[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"],[\\\"AUDIO\\\"]]},\\\"373\\\":{\\\"i\\\":[[\\\"clip\\\",\\\"CLIP\\\",{\\\"a\\\":[\\\"130\\\",0]}],[\\\"vae\\\",\\\"VAE\\\",{\\\"a\\\":[\\\"121\\\",0]}],[\\\"audio_vae\\\",\\\"VAE\\\",{\\\"a\\\":[\\\"122\\\",0]}],[\\\"ref_images.ref_image_0\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"306\\\",0,\\\"IMAGE\\\"]}],[\\\"ref_images.ref_image_1\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"306\\\",1,\\\"IMAGE\\\"]}],[\\\"ref_images.ref_image_2\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"306\\\",2,\\\"IMAGE\\\"]}],[\\\"ref_images.ref_image_3\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"306\\\",3,\\\"IMAGE\\\"]}],[\\\"ref_images.ref_image_4\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"306\\\",4,\\\"IMAGE\\\"]}],[\\\"ref_images.ref_image_5\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"306\\\",5,\\\"IMAGE\\\"]}],[\\\"ref_images.ref_image_6\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"306\\\",6,\\\"IMAGE\\\"]}],[\\\"ref_videos.ref_video_0\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"309\\\",0,\\\"IMAGE\\\"]}],[\\\"ref_videos.ref_video_1\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"309\\\",1,\\\"IMAGE\\\"]}],[\\\"ref_videos.ref_video_2\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"309\\\",2,\\\"IMAGE\\\"]}],[\\\"ref_video_audios.ref_video_audio_0\\\",\\\"AUDIO\\\",null],[\\\"ref_video_audios.ref_video_audio_1\\\",\\\"AUDIO\\\",null],[\\\"ref_video_audios.ref_video_audio_2\\\",\\\"AUDIO\\\",null],[\\\"ref_audios.ref_audio_0\\\",\\\"AUDIO\\\",{\\\"m\\\":[\\\"311\\\",0,\\\"AUDIO\\\"]}],[\\\"ref_audios.ref_audio_1\\\",\\\"AUDIO\\\",{\\\"m\\\":[\\\"311\\\",1,\\\"AUDIO\\\"]}],[\\\"ref_audios.ref_audio_2\\\",\\\"AUDIO\\\",{\\\"m\\\":[\\\"311\\\",2,\\\"AUDIO\\\"]}],[\\\"prompt\\\",\\\"STRING\\\",{\\\"a\\\":[\\\"136\\\",5]}],[\\\"width\\\",\\\"INT\\\",{\\\"a\\\":[\\\"136\\\",8]}],[\\\"height\\\",\\\"INT\\\",{\\\"a\\\":[\\\"136\\\",9]}],[\\\"length\\\",\\\"INT\\\",{\\\"a\\\":[\\\"136\\\",6]}],[\\\"ref_image_size\\\",\\\"COMBO\\\",null],[\\\"ref_images.ref_image_7\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"306\\\",7,\\\"IMAGE\\\"]}],[\\\"ref_images.ref_image_8\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"306\\\",8,\\\"IMAGE\\\"]}]],\\\"o\\\":[[\\\"CONDITIONING\\\"],[\\\"LATENT\\\"]]},\\\"741\\\":{\\\"i\\\":[[\\\"positive\\\",\\\"CONDITIONING\\\",{\\\"m\\\":[\\\"753\\\",0,\\\"CONDITIONING\\\"]}],[\\\"latent\\\",\\\"LATENT\\\",{\\\"m\\\":[\\\"804\\\",0,\\\"LATENT\\\"]}],[\\\"vae\\\",\\\"VAE\\\",{\\\"a\\\":[\\\"121\\\",0]}],[\\\"audio_vae\\\",\\\"VAE\\\",{\\\"a\\\":[\\\"122\\\",0]}],[\\\"image\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"820\\\",0,\\\"IMAGE\\\"]}],[\\\"audio\\\",\\\"AUDIO\\\",null],[\\\"frame_idx\\\",\\\"INT\\\",null]],\\\"o\\\":[[\\\"CONDITIONING\\\"]]},\\\"745\\\":{\\\"i\\\":[[\\\"model\\\",\\\"MODEL\\\",{\\\"a\\\":[\\\"214\\\",0]}],[\\\"lora_name\\\",\\\"COMBO\\\",null],[\\\"strength_model\\\",\\\"FLOAT\\\",null]],\\\"o\\\":[[\\\"MODEL\\\"]]},\\\"746\\\":{\\\"i\\\":[[\\\"model\\\",\\\"MODEL\\\",{\\\"a\\\":[\\\"214\\\",0]}],[\\\"lora_name\\\",\\\"COMBO\\\",null],[\\\"strength_model\\\",\\\"FLOAT\\\",null]],\\\"o\\\":[[\\\"MODEL\\\"]]},\\\"753\\\":{\\\"i\\\":[[\\\"clip\\\",\\\"CLIP\\\",{\\\"a\\\":[\\\"130\\\",0]}],[\\\"vae\\\",\\\"VAE\\\",{\\\"a\\\":[\\\"121\\\",0]}],[\\\"audio_vae\\\",\\\"VAE\\\",{\\\"a\\\":[\\\"122\\\",0]}],[\\\"ref_images.ref_image_0\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"763\\\",0,\\\"IMAGE\\\"]}],[\\\"ref_images.ref_image_1\\\",\\\"IMAGE\\\",null],[\\\"ref_videos.ref_video_0\\\",\\\"IMAGE\\\",null],[\\\"ref_video_audios.ref_video_audio_0\\\",\\\"AUDIO\\\",null],[\\\"ref_audios.ref_audio_0\\\",\\\"AUDIO\\\",null],[\\\"ref_audios.ref_audio_1\\\",\\\"AUDIO\\\",null],[\\\"ref_audios.ref_audio_2\\\",\\\"AUDIO\\\",null],[\\\"prompt\\\",\\\"STRING\\\",{\\\"m\\\":[\\\"788\\\",1,\\\"STRING\\\"]}],[\\\"width\\\",\\\"INT\\\",{\\\"a\\\":[\\\"136\\\",8]}],[\\\"height\\\",\\\"INT\\\",{\\\"a\\\":[\\\"136\\\",9]}],[\\\"length\\\",\\\"INT\\\",{\\\"a\\\":[\\\"136\\\",6]}],[\\\"ref_image_size\\\",\\\"COMBO\\\",null],[\\\"ref_video_audios.ref_video_audio_1\\\",\\\"AUDIO\\\",null],[\\\"ref_video_audios.ref_video_audio_2\\\",\\\"AUDIO\\\",null]],\\\"o\\\":[[\\\"CONDITIONING\\\"],[\\\"LATENT\\\"]]},\\\"762\\\":{\\\"i\\\":[[\\\"project\\\",\\\"SONDER_PROJECT\\\",{\\\"a\\\":[\\\"136\\\",0]}],[\\\"reference_lanes\\\",\\\"STRING\\\",null]],\\\"o\\\":[[\\\"SONDER_REFERENCE_SET\\\"],[\\\"INT\\\"],[\\\"FLOAT\\\"]]},\\\"763\\\":{\\\"i\\\":[[\\\"reference_set\\\",\\\"SONDER_REFERENCE_SET\\\",{\\\"m\\\":[\\\"762\\\",0,\\\"SONDER_REFERENCE_SET\\\"]}],[\\\"unused_slots\\\",\\\"COMBO\\\",null]],\\\"o\\\":[[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"],[\\\"IMAGE\\\"]]},\\\"765\\\":{\\\"i\\\":[[\\\"string_a\\\",\\\"STRING\\\",null],[\\\"string_b\\\",\\\"STRING\\\",{\\\"m\\\":[\\\"772\\\",2,\\\"STRING\\\"]}],[\\\"delimiter\\\",\\\"STRING\\\",null]],\\\"o\\\":[[\\\"STRING\\\"]]},\\\"766\\\":{\\\"i\\\":[[\\\"string_a\\\",\\\"STRING\\\",{\\\"m\\\":[\\\"765\\\",0,\\\"STRING\\\"]}],[\\\"string_b\\\",\\\"STRING\\\",null],[\\\"delimiter\\\",\\\"STRING\\\",null]],\\\"o\\\":[[\\\"STRING\\\"]]},\\\"768\\\":{\\\"i\\\":[[\\\"string_a\\\",\\\"STRING\\\",{\\\"m\\\":[\\\"769\\\",0,\\\"STRING\\\"]}],[\\\"string_b\\\",\\\"STRING\\\",null],[\\\"delimiter\\\",\\\"STRING\\\",null]],\\\"o\\\":[[\\\"STRING\\\"]]},\\\"769\\\":{\\\"i\\\":[[\\\"string_a\\\",\\\"STRING\\\",null],[\\\"string_b\\\",\\\"STRING\\\",{\\\"m\\\":[\\\"772\\\",2,\\\"STRING\\\"]}],[\\\"delimiter\\\",\\\"STRING\\\",null]],\\\"o\\\":[[\\\"STRING\\\"]]},\\\"772\\\":{\\\"i\\\":[[\\\"reference_set\\\",\\\"SONDER_REFERENCE_SET\\\",{\\\"m\\\":[\\\"762\\\",0,\\\"SONDER_REFERENCE_SET\\\"]}]],\\\"o\\\":[[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"]]},\\\"785\\\":{\\\"i\\\":[[\\\"project\\\",\\\"SONDER_PROJECT\\\",{\\\"a\\\":[\\\"136\\\",0]}],[\\\"driver_lane_index\\\",\\\"INT\\\",null],[\\\"driver_selector_overrides_json\\\",\\\"STRING\\\",null]],\\\"o\\\":[[\\\"SONDER_DRIVER_REF\\\"],[\\\"INT\\\"]]},\\\"786\\\":{\\\"i\\\":[[\\\"driver_ref\\\",\\\"SONDER_DRIVER_REF\\\",{\\\"m\\\":[\\\"785\\\",0,\\\"SONDER_DRIVER_REF\\\"]}]],\\\"o\\\":[[\\\"IMAGE\\\"],[\\\"INT\\\"],[\\\"FLOAT\\\"]]},\\\"788\\\":{\\\"i\\\":[[\\\"select\\\",\\\"INT\\\",{\\\"a\\\":[\\\"814\\\",1]}],[\\\"branches\\\",\\\"INT\\\",null],[\\\"lanes\\\",\\\"INT\\\",null],[\\\"b0_l0\\\",\\\"MODEL\\\",{\\\"m\\\":[\\\"746\\\",0,\\\"MODEL\\\"]}],[\\\"b0_l1\\\",\\\"STRING\\\",{\\\"m\\\":[\\\"768\\\",0,\\\"STRING\\\"]}],[\\\"b1_l0\\\",\\\"MODEL\\\",{\\\"m\\\":[\\\"745\\\",0,\\\"MODEL\\\"]}],[\\\"b1_l1\\\",\\\"STRING\\\",{\\\"m\\\":[\\\"766\\\",0,\\\"STRING\\\"]}]],\\\"o\\\":[[\\\"MODEL\\\"],[\\\"STRING\\\"]]},\\\"790\\\":{\\\"i\\\":[[\\\"model\\\",\\\"MODEL\\\",{\\\"m\\\":[\\\"791\\\",0,\\\"MODEL\\\"]}],[\\\"image\\\",\\\"IMAGE\\\",{\\\"a\\\":[\\\"136\\\",1]}],[\\\"conditioning\\\",\\\"CONDITIONING\\\",{\\\"m\\\":[\\\"792\\\",0,\\\"CONDITIONING\\\"]}],[\\\"bboxes\\\",\\\"BOUNDING_BOX\\\",null],[\\\"positive_coords\\\",\\\"STRING\\\",null],[\\\"negative_coords\\\",\\\"STRING\\\",null],[\\\"threshold\\\",\\\"FLOAT\\\",null],[\\\"refine_iterations\\\",\\\"INT\\\",null],[\\\"individual_masks\\\",\\\"BOOLEAN\\\",null]],\\\"o\\\":[[\\\"MASK\\\"],[\\\"BOUNDING_BOX\\\"]]},\\\"791\\\":{\\\"i\\\":[[\\\"ckpt_name\\\",\\\"COMBO\\\",null]],\\\"o\\\":[[\\\"MODEL\\\"],[\\\"CLIP\\\"],[\\\"VAE\\\"]]},\\\"792\\\":{\\\"i\\\":[[\\\"clip\\\",\\\"CLIP\\\",{\\\"m\\\":[\\\"791\\\",1,\\\"CLIP\\\"]}],[\\\"text\\\",\\\"STRING\\\",null]],\\\"o\\\":[[\\\"CONDITIONING\\\"]]},\\\"794\\\":{\\\"i\\\":[[\\\"mask\\\",\\\"MASK\\\",{\\\"m\\\":[\\\"790\\\",0,\\\"MASK\\\"]}]],\\\"o\\\":[[\\\"IMAGE\\\"]]},\\\"795\\\":{\\\"i\\\":[[\\\"frames\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"820\\\",0,\\\"IMAGE\\\"]}],[\\\"audio\\\",\\\"AUDIO\\\",null],[\\\"fps\\\",\\\"FLOAT\\\",null],[\\\"autoplay_preview\\\",\\\"BOOLEAN\\\",null]],\\\"o\\\":[]},\\\"802\\\":{\\\"i\\\":[[\\\"samples\\\",\\\"LATENT\\\",{\\\"m\\\":[\\\"803\\\",0,\\\"LATENT\\\"]}],[\\\"mask\\\",\\\"MASK\\\",{\\\"m\\\":[\\\"824\\\",0,\\\"MASK\\\"]}]],\\\"o\\\":[[\\\"LATENT\\\"]]},\\\"803\\\":{\\\"i\\\":[[\\\"av_latent\\\",\\\"LATENT\\\",{\\\"a\\\":[\\\"451\\\",0]}]],\\\"o\\\":[[\\\"LATENT\\\"],[\\\"LATENT\\\"]]},\\\"804\\\":{\\\"i\\\":[[\\\"video_latent\\\",\\\"LATENT\\\",{\\\"m\\\":[\\\"802\\\",0,\\\"LATENT\\\"]}],[\\\"audio_latent\\\",\\\"LATENT\\\",{\\\"m\\\":[\\\"803\\\",1,\\\"LATENT\\\"]}]],\\\"o\\\":[[\\\"LATENT\\\"]]},\\\"820\\\":{\\\"i\\\":[[\\\"destination\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"786\\\",0,\\\"IMAGE\\\"]}],[\\\"source\\\",\\\"IMAGE\\\",{\\\"m\\\":[\\\"794\\\",0,\\\"IMAGE\\\"]}],[\\\"mask\\\",\\\"MASK\\\",{\\\"m\\\":[\\\"821\\\",0,\\\"MASK\\\"]}],[\\\"x\\\",\\\"INT\\\",null],[\\\"y\\\",\\\"INT\\\",null],[\\\"resize_source\\\",\\\"BOOLEAN\\\",null]],\\\"o\\\":[[\\\"IMAGE\\\"]]},\\\"821\\\":{\\\"i\\\":[[\\\"mask\\\",\\\"MASK\\\",{\\\"m\\\":[\\\"824\\\",0,\\\"MASK\\\"]}]],\\\"o\\\":[[\\\"MASK\\\"]]},\\\"824\\\":{\\\"i\\\":[[\\\"mask\\\",\\\"MASK\\\",{\\\"m\\\":[\\\"790\\\",0,\\\"MASK\\\"]}],[\\\"expand\\\",\\\"INT\\\",null],[\\\"incremental_expandrate\\\",\\\"FLOAT\\\",null],[\\\"tapered_corners\\\",\\\"BOOLEAN\\\",null],[\\\"flip_input\\\",\\\"BOOLEAN\\\",null],[\\\"blur_radius\\\",\\\"FLOAT\\\",null],[\\\"lerp_alpha\\\",\\\"FLOAT\\\",null],[\\\"decay_factor\\\",\\\"FLOAT\\\",null],[\\\"fill_holes\\\",\\\"BOOLEAN\\\",null]],\\\"o\\\":[[\\\"MASK\\\"],[\\\"MASK\\\"]]}},\\\"edges\\\":[[\\\"127\\\",\\\"latent_image\\\",\\\"804\\\",0,\\\"LATENT\\\"],[\\\"306\\\",\\\"reference_set\\\",\\\"303\\\",0,\\\"SONDER_REFERENCE_SET\\\"],[\\\"373\\\",\\\"ref_images.ref_image_0\\\",\\\"306\\\",0,\\\"IMAGE\\\"],[\\\"373\\\",\\\"ref_images.ref_image_1\\\",\\\"306\\\",1,\\\"IMAGE\\\"],[\\\"373\\\",\\\"ref_images.ref_image_2\\\",\\\"306\\\",2,\\\"IMAGE\\\"],[\\\"373\\\",\\\"ref_images.ref_image_3\\\",\\\"306\\\",3,\\\"IMAGE\\\"],[\\\"373\\\",\\\"ref_images.ref_image_4\\\",\\\"306\\\",4,\\\"IMAGE\\\"],[\\\"373\\\",\\\"ref_images.ref_image_5\\\",\\\"306\\\",5,\\\"IMAGE\\\"],[\\\"373\\\",\\\"ref_images.ref_image_6\\\",\\\"306\\\",6,\\\"IMAGE\\\"],[\\\"373\\\",\\\"ref_videos.ref_video_0\\\",\\\"309\\\",0,\\\"IMAGE\\\"],[\\\"373\\\",\\\"ref_videos.ref_video_1\\\",\\\"309\\\",1,\\\"IMAGE\\\"],[\\\"373\\\",\\\"ref_videos.ref_video_2\\\",\\\"309\\\",2,\\\"IMAGE\\\"],[\\\"373\\\",\\\"ref_audios.ref_audio_0\\\",\\\"311\\\",0,\\\"AUDIO\\\"],[\\\"373\\\",\\\"ref_audios.ref_audio_1\\\",\\\"311\\\",1,\\\"AUDIO\\\"],[\\\"373\\\",\\\"ref_audios.ref_audio_2\\\",\\\"311\\\",2,\\\"AUDIO\\\"],[\\\"373\\\",\\\"ref_images.ref_image_7\\\",\\\"306\\\",7,\\\"IMAGE\\\"],[\\\"373\\\",\\\"ref_images.ref_image_8\\\",\\\"306\\\",8,\\\"IMAGE\\\"],[\\\"407\\\",\\\"value_0\\\",\\\"373\\\",0,\\\"*\\\"],[\\\"311\\\",\\\"reference_set\\\",\\\"305\\\",0,\\\"SONDER_REFERENCE_SET\\\"],[\\\"309\\\",\\\"reference_set\\\",\\\"304\\\",0,\\\"SONDER_REFERENCE_SET\\\"],[\\\"741\\\",\\\"positive\\\",\\\"753\\\",0,\\\"CONDITIONING\\\"],[\\\"741\\\",\\\"latent\\\",\\\"804\\\",0,\\\"LATENT\\\"],[\\\"741\\\",\\\"image\\\",\\\"820\\\",0,\\\"IMAGE\\\"],[\\\"753\\\",\\\"ref_images.ref_image_0\\\",\\\"763\\\",0,\\\"IMAGE\\\"],[\\\"753\\\",\\\"prompt\\\",\\\"788\\\",1,\\\"STRING\\\",\\\"\\\"],[\\\"763\\\",\\\"reference_set\\\",\\\"762\\\",0,\\\"SONDER_REFERENCE_SET\\\"],[\\\"765\\\",\\\"string_b\\\",\\\"772\\\",2,\\\"STRING\\\",\\\"\\\"],[\\\"766\\\",\\\"string_a\\\",\\\"765\\\",0,\\\"STRING\\\",\\\"\\\"],[\\\"768\\\",\\\"string_a\\\",\\\"769\\\",0,\\\"STRING\\\",\\\"\\\"],[\\\"769\\\",\\\"string_b\\\",\\\"772\\\",2,\\\"STRING\\\",\\\"\\\"],[\\\"772\\\",\\\"reference_set\\\",\\\"762\\\",0,\\\"SONDER_REFERENCE_SET\\\"],[\\\"786\\\",\\\"driver_ref\\\",\\\"785\\\",0,\\\"SONDER_DRIVER_REF\\\"],[\\\"788\\\",\\\"b0_l0\\\",\\\"746\\\",0,\\\"MODEL\\\"],[\\\"788\\\",\\\"b0_l1\\\",\\\"768\\\",0,\\\"STRING\\\"],[\\\"788\\\",\\\"b1_l0\\\",\\\"745\\\",0,\\\"MODEL\\\"],[\\\"788\\\",\\\"b1_l1\\\",\\\"766\\\",0,\\\"STRING\\\"],[\\\"789\\\",\\\"b0_l0\\\",\\\"788\\\",0,\\\"MODEL\\\"],[\\\"789\\\",\\\"b0_l1\\\",\\\"741\\\",0,\\\"CONDITIONING\\\"],[\\\"789\\\",\\\"b1_l0\\\",\\\"788\\\",0,\\\"MODEL\\\"],[\\\"789\\\",\\\"b1_l1\\\",\\\"741\\\",0,\\\"CONDITIONING\\\"],[\\\"790\\\",\\\"model\\\",\\\"791\\\",0,\\\"MODEL\\\"],[\\\"790\\\",\\\"conditioning\\\",\\\"792\\\",0,\\\"CONDITIONING\\\"],[\\\"792\\\",\\\"clip\\\",\\\"791\\\",1,\\\"CLIP\\\"],[\\\"794\\\",\\\"mask\\\",\\\"790\\\",0,\\\"MASK\\\"],[\\\"795\\\",\\\"frames\\\",\\\"820\\\",0,\\\"IMAGE\\\"],[\\\"802\\\",\\\"samples\\\",\\\"803\\\",0,\\\"LATENT\\\"],[\\\"802\\\",\\\"mask\\\",\\\"824\\\",0,\\\"MASK\\\"],[\\\"804\\\",\\\"video_latent\\\",\\\"802\\\",0,\\\"LATENT\\\"],[\\\"804\\\",\\\"audio_latent\\\",\\\"803\\\",1,\\\"LATENT\\\"],[\\\"820\\\",\\\"destination\\\",\\\"786\\\",0,\\\"IMAGE\\\"],[\\\"820\\\",\\\"source\\\",\\\"794\\\",0,\\\"IMAGE\\\"],[\\\"820\\\",\\\"mask\\\",\\\"821\\\",0,\\\"MASK\\\"],[\\\"821\\\",\\\"mask\\\",\\\"824\\\",0,\\\"MASK\\\"],[\\\"824\\\",\\\"mask\\\",\\\"790\\\",0,\\\"MASK\\\"]]}\"}, \"preset_categories\": {\"oBx2uSFAiDec\": {\"name\": \"Task\", \"description\": \"Choose what to generate or replace. All four swap choices keep the sound already on your timeline.\", \"order\": 0, \"choices\": [\"MSNPWo89hrIJ\", \"uldahAb7ndmn\", \"f8NCpTkDnehQ\", \"eCGOEKYiIuFb\", \"je4hOUHsWvOe\", \"r5EJHrZ6hQfm\", \"dSCXGIa5_Sdz\"]}}, \"presets\": {\"MSNPWo89hrIJ\": {\"name\": \"Standard Generation\", \"description\": \"Generate video and new sound. Optionally use Guides and References. For new content, set Change Strength (Denoise) to 1.\", \"order\": 2, \"members\": {\"8tOUWcNKjR-8\": {\"value\": \"Standard Mode Generation\"}, \"lkwA0UoOPgAC\": {\"value\": true}, \"tGy7OPyCaN-L\": {\"value\": true}, \"XQW1eT4vuNde\": {\"value\": true}}, \"execution\": {\"SvXPhXfUopkH\": {\"modes\": {\"741\": \"muted\", \"745\": \"muted\", \"746\": \"muted\", \"753\": \"muted\", \"762\": \"muted\", \"763\": \"muted\", \"765\": \"muted\", \"766\": \"muted\", \"768\": \"muted\", \"769\": \"muted\", \"772\": \"muted\", \"785\": \"muted\", \"786\": \"muted\", \"788\": \"muted\"}}, \"mc-2wEaeHEpH\": {\"modes\": {\"303\": \"enabled\", \"304\": \"enabled\", \"305\": \"enabled\", \"306\": \"enabled\", \"309\": \"enabled\", \"311\": \"enabled\", \"373\": \"enabled\"}}, \"YNb-54zglNU0\": {\"modes\": {\"790\": \"bypassed\", \"791\": \"bypassed\", \"792\": \"bypassed\", \"794\": \"bypassed\", \"795\": \"bypassed\", \"802\": \"bypassed\", \"803\": \"bypassed\", \"804\": \"bypassed\", \"820\": \"bypassed\", \"821\": \"bypassed\", \"824\": \"bypassed\"}}}}, \"eCGOEKYiIuFb\": {\"name\": \"Character Swap\", \"description\": \"Replace a whole character using a picture Reference and source Driver. Keeps timeline audio. See Swap a character or head.\", \"order\": 3, \"members\": {\"8tOUWcNKjR-8\": {\"value\": \"Swap Character\"}, \"lkwA0UoOPgAC\": {\"value\": false}, \"XQW1eT4vuNde\": {\"value\": false}, \"tGy7OPyCaN-L\": {\"value\": true}}, \"execution\": {\"SvXPhXfUopkH\": {\"modes\": {\"741\": \"enabled\", \"745\": \"enabled\", \"746\": \"enabled\", \"753\": \"enabled\", \"762\": \"enabled\", \"763\": \"enabled\", \"765\": \"enabled\", \"766\": \"enabled\", \"768\": \"enabled\", \"769\": \"enabled\", \"772\": \"enabled\", \"785\": \"enabled\", \"786\": \"enabled\", \"788\": \"enabled\"}}, \"mc-2wEaeHEpH\": {\"modes\": {\"303\": \"muted\", \"304\": \"muted\", \"305\": \"muted\", \"306\": \"muted\", \"309\": \"muted\", \"311\": \"muted\", \"373\": \"muted\"}}, \"YNb-54zglNU0\": {\"modes\": {\"790\": \"bypassed\", \"791\": \"bypassed\", \"792\": \"bypassed\", \"794\": \"bypassed\", \"795\": \"bypassed\", \"802\": \"bypassed\", \"803\": \"bypassed\", \"804\": \"bypassed\", \"820\": \"bypassed\", \"821\": \"bypassed\", \"824\": \"bypassed\"}}}}, \"je4hOUHsWvOe\": {\"name\": \"Head Swap\", \"description\": \"Replace the head using a picture Reference and source Driver. Keeps timeline audio. See Swap a character or head.\", \"order\": 4, \"members\": {\"8tOUWcNKjR-8\": {\"value\": \"Swap only the Head\"}, \"XQW1eT4vuNde\": {\"value\": false}, \"lkwA0UoOPgAC\": {\"value\": false}, \"tGy7OPyCaN-L\": {\"value\": true}}, \"execution\": {\"mc-2wEaeHEpH\": {\"modes\": {\"303\": \"muted\", \"304\": \"muted\", \"305\": \"muted\", \"306\": \"muted\", \"309\": \"muted\", \"311\": \"muted\", \"373\": \"muted\"}}, \"SvXPhXfUopkH\": {\"modes\": {\"741\": \"enabled\", \"745\": \"enabled\", \"746\": \"enabled\", \"753\": \"enabled\", \"762\": \"enabled\", \"763\": \"enabled\", \"765\": \"enabled\", \"766\": \"enabled\", \"768\": \"enabled\", \"769\": \"enabled\", \"772\": \"enabled\", \"785\": \"enabled\", \"786\": \"enabled\", \"788\": \"enabled\"}}, \"YNb-54zglNU0\": {\"modes\": {\"790\": \"bypassed\", \"791\": \"bypassed\", \"792\": \"bypassed\", \"794\": \"bypassed\", \"795\": \"bypassed\", \"802\": \"bypassed\", \"803\": \"bypassed\", \"804\": \"bypassed\", \"820\": \"bypassed\", \"821\": \"bypassed\", \"824\": \"bypassed\"}}}}, \"uldahAb7ndmn\": {\"name\": \"Generate Video with Existing Audio\", \"description\": \"Generate video while keeping the sound on your Audio lanes. Optionally use Guides and References.\", \"order\": 5, \"members\": {\"tGy7OPyCaN-L\": {\"value\": true}, \"lkwA0UoOPgAC\": {\"value\": false}, \"XQW1eT4vuNde\": {\"value\": false}, \"8tOUWcNKjR-8\": {\"value\": \"Standard Mode Generation\"}}, \"execution\": {\"mc-2wEaeHEpH\": {\"modes\": {\"303\": \"enabled\", \"304\": \"enabled\", \"305\": \"enabled\", \"306\": \"enabled\", \"309\": \"enabled\", \"311\": \"enabled\", \"373\": \"enabled\"}}, \"SvXPhXfUopkH\": {\"modes\": {\"741\": \"muted\", \"745\": \"muted\", \"746\": \"muted\", \"753\": \"muted\", \"762\": \"muted\", \"763\": \"muted\", \"765\": \"muted\", \"766\": \"muted\", \"768\": \"muted\", \"769\": \"muted\", \"772\": \"muted\", \"785\": \"muted\", \"786\": \"muted\", \"788\": \"muted\"}}, \"YNb-54zglNU0\": {\"modes\": {\"790\": \"bypassed\", \"791\": \"bypassed\", \"792\": \"bypassed\", \"794\": \"bypassed\", \"795\": \"bypassed\", \"802\": \"bypassed\", \"803\": \"bypassed\", \"804\": \"bypassed\", \"820\": \"bypassed\", \"821\": \"bypassed\", \"824\": \"bypassed\"}}}}, \"f8NCpTkDnehQ\": {\"name\": \"Generate Audio with Existing Video\", \"description\": \"Create a new soundtrack for the footage visible on your Video lanes. The picture is kept.\", \"order\": 6, \"members\": {\"lkwA0UoOPgAC\": {\"value\": true}, \"tGy7OPyCaN-L\": {\"value\": false}, \"XQW1eT4vuNde\": {\"value\": true}, \"8tOUWcNKjR-8\": {\"value\": \"Standard Mode Generation\"}}, \"execution\": {\"mc-2wEaeHEpH\": {\"modes\": {\"303\": \"enabled\", \"304\": \"enabled\", \"305\": \"enabled\", \"306\": \"enabled\", \"309\": \"enabled\", \"311\": \"enabled\", \"373\": \"enabled\"}}, \"SvXPhXfUopkH\": {\"modes\": {\"741\": \"muted\", \"745\": \"muted\", \"746\": \"muted\", \"753\": \"muted\", \"762\": \"muted\", \"763\": \"muted\", \"765\": \"muted\", \"766\": \"muted\", \"768\": \"muted\", \"769\": \"muted\", \"772\": \"muted\", \"785\": \"muted\", \"786\": \"muted\", \"788\": \"muted\"}}, \"YNb-54zglNU0\": {\"modes\": {\"790\": \"bypassed\", \"791\": \"bypassed\", \"792\": \"bypassed\", \"794\": \"bypassed\", \"795\": \"bypassed\", \"802\": \"bypassed\", \"803\": \"bypassed\", \"804\": \"bypassed\", \"820\": \"bypassed\", \"821\": \"bypassed\", \"824\": \"bypassed\"}}}}, \"r5EJHrZ6hQfm\": {\"name\": \"Masked Character Swap\", \"description\": \"Focus a character swap on a detected subject. Needs matching Video and Driver footage plus a picture Reference. Keeps timeline audio. See Focus a swap with a mask.\", \"order\": 7, \"members\": {\"8tOUWcNKjR-8\": {\"value\": \"Swap Character\"}, \"tGy7OPyCaN-L\": {\"value\": true}, \"lkwA0UoOPgAC\": {\"value\": false}, \"XQW1eT4vuNde\": {\"value\": false}}, \"execution\": {\"YNb-54zglNU0\": {\"modes\": {\"790\": \"enabled\", \"791\": \"enabled\", \"792\": \"enabled\", \"794\": \"enabled\", \"795\": \"enabled\", \"802\": \"enabled\", \"803\": \"enabled\", \"804\": \"enabled\", \"820\": \"enabled\", \"821\": \"enabled\", \"824\": \"enabled\"}}, \"SvXPhXfUopkH\": {\"modes\": {\"741\": \"enabled\", \"745\": \"enabled\", \"746\": \"enabled\", \"753\": \"enabled\", \"762\": \"enabled\", \"763\": \"enabled\", \"765\": \"enabled\", \"766\": \"enabled\", \"768\": \"enabled\", \"769\": \"enabled\", \"772\": \"enabled\", \"785\": \"enabled\", \"786\": \"enabled\", \"788\": \"enabled\"}}, \"mc-2wEaeHEpH\": {\"modes\": {\"303\": \"muted\", \"304\": \"muted\", \"305\": \"muted\", \"306\": \"muted\", \"309\": \"muted\", \"311\": \"muted\", \"373\": \"muted\"}}}}, \"dSCXGIa5_Sdz\": {\"name\": \"Masked Head Swap\", \"description\": \"Focus a head swap on a detected area. Needs matching Video and Driver footage plus a picture Reference. Keeps timeline audio. See Focus a swap with a mask.\", \"order\": 8, \"members\": {\"8tOUWcNKjR-8\": {\"value\": \"Swap only the Head\"}, \"tGy7OPyCaN-L\": {\"value\": true}, \"lkwA0UoOPgAC\": {\"value\": false}, \"XQW1eT4vuNde\": {\"value\": false}}, \"execution\": {\"YNb-54zglNU0\": {\"modes\": {\"790\": \"enabled\", \"791\": \"enabled\", \"792\": \"enabled\", \"794\": \"enabled\", \"795\": \"enabled\", \"802\": \"enabled\", \"803\": \"enabled\", \"804\": \"enabled\", \"820\": \"enabled\", \"821\": \"enabled\", \"824\": \"enabled\"}}, \"SvXPhXfUopkH\": {\"modes\": {\"741\": \"enabled\", \"745\": \"enabled\", \"746\": \"enabled\", \"753\": \"enabled\", \"762\": \"enabled\", \"763\": \"enabled\", \"765\": \"enabled\", \"766\": \"enabled\", \"768\": \"enabled\", \"769\": \"enabled\", \"772\": \"enabled\", \"785\": \"enabled\", \"786\": \"enabled\", \"788\": \"enabled\"}}, \"mc-2wEaeHEpH\": {\"modes\": {\"303\": \"muted\", \"304\": \"muted\", \"305\": \"muted\", \"306\": \"muted\", \"309\": \"muted\", \"311\": \"muted\", \"373\": \"muted\"}}}}}}"
+    },
+    "class_type": "SonderControlRelay",
+    "_meta": {
+      "title": "Sonder Control Relay"
+    }
+  },
+  "741": {
+    "inputs": {
+      "frame_idx": 0,
+      "positive": [
+        "753",
+        0
+      ],
+      "latent": [
+        "804",
+        0
+      ],
+      "vae": [
+        "121",
+        0
+      ],
+      "audio_vae": [
+        "122",
+        0
+      ],
+      "image": [
+        "820",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3AddGuide",
+    "_meta": {
+      "title": "Add Guide for MiniMax H3"
+    }
+  },
+  "745": {
+    "inputs": {
+      "lora_name": "H3\\minimax_h3_head_swap_v1.0_r32.safetensors",
+      "strength_model": 1,
+      "model": [
+        "214",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  "746": {
+    "inputs": {
+      "lora_name": "H3\\minimax_h3_character_swap_v1.1_ref2va_fro.safetensors",
+      "strength_model": 1,
+      "model": [
+        "214",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  "753": {
+    "inputs": {
+      "prompt": [
+        "788",
+        1
+      ],
+      "width": [
+        "136",
+        8
+      ],
+      "height": [
+        "136",
+        9
+      ],
+      "length": [
+        "136",
+        6
+      ],
+      "ref_image_size": "max",
+      "clip": [
+        "130",
+        0
+      ],
+      "vae": [
+        "121",
+        0
+      ],
+      "audio_vae": [
+        "122",
+        0
+      ],
+      "ref_images.ref_image_0": [
+        "763",
+        0
+      ]
+    },
+    "class_type": "MiniMaxH3ReferenceToVideo",
+    "_meta": {
+      "title": "MiniMax H3 Reference to Video"
+    }
+  },
+  "762": {
+    "inputs": {
+      "reference_lanes": "0",
+      "project": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "SonderReferenceSelector",
+    "_meta": {
+      "title": "Sonder Swap Reference Selector"
+    }
+  },
+  "763": {
+    "inputs": {
+      "unused_slots": "nothing",
+      "reference_set": [
+        "762",
+        0
+      ]
+    },
+    "class_type": "SonderReferenceImageBridge",
+    "_meta": {
+      "title": "Sonder Reference Image Bridge"
+    }
+  },
+  "765": {
+    "inputs": {
+      "string_a": "head_swap:\n\nsubject_definitions:\n\n<Subject 1> is the reference head identity from <Picture 1>, including the complete head, facial identity, facial structure, head shape, hairstyle, hairline, skin appearance, proportions, and all distinctive visual features.\n\nFacial details of <Subject 1>:\n",
+      "string_b": [
+        "772",
+        2
+      ],
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "766": {
+    "inputs": {
+      "string_a": [
+        "765",
+        0
+      ],
+      "string_b": "\n\n<Subject 2> is the original person in <Video 1>, whose body, neck, clothing, pose, physical proportions below the head, actions, motion, timing, and interaction with the environment must remain unchanged.\n\n<Video 1> is the source video for the target video edit, providing the original body performance, motion, camera movement, framing, timing, lighting, environment, scene composition, and temporal structure.\n\nsummary:\n\n[video editing + reference generation]\n\nThe target video is an edited version of <Video 1>. Replace only the entire head of <Subject 2> with the reference head identity defined by <Subject 1> from <Picture 1>. Preserve the source video's body, clothing, performance, motion, camera behavior, environment, lighting, timing, and composition.\n\nretention_analysis:\n\n<Subject 1> (appears throughout the target video): attribute_transfer - the complete head identity from <Picture 1>, including facial identity, facial structure, hairstyle, head shape, proportions, skin appearance, and distinctive features, is transferred consistently onto the body of <Subject 2>.\n\n<Subject 2> (appears throughout the target video): partially_preserved - the original body, neck position, clothing, pose, motion, gestures, actions, and physical performance are preserved, while only the original head is replaced.\n\n<Video 1> (entire target timeline): partially_preserved - the original video timing, body motion, camera movement, framing, lighting, background, environment, scene composition, and temporal structure are preserved; only the subject's head appearance is modified.\n\ndetailed_description:\n\nPreserve <Video 1> as the complete temporal and compositional foundation of the target video. <Subject 2> retains the exact original body, clothing, pose, body proportions, movement, gestures, actions, speed, timing, and interaction with the environment.\n\nReplace only the entire original head of <Subject 2> with <Subject 1>, the reference head identity from <Picture 1>. Preserve the complete recognizable identity of <Subject 1>, including facial structure, skull and head shape, hairstyle, hairline, skin appearance, facial proportions, eyes, eyebrows, nose, mouth, jawline, ears, and distinctive identifying features.\n\nThe transferred head follows the original head motion and performance of <Subject 2> throughout <Video 1>, including head rotation, tilt, pitch, yaw, natural translation, facial orientation, gaze direction, and perspective changes. Maintain anatomically correct head scale and a seamless connection between the transferred head and the original neck.\n\nPreserve the lighting conditions of <Video 1> on the transferred head. The head naturally responds to changes in illumination, shadows, highlights, color temperature, exposure, depth of field, motion blur, occlusion, camera angle, and perspective while continuously maintaining the identity established by <Picture 1>.\n\nMaintain strong temporal consistency across every frame. The identity, facial geometry, hairstyle, head size, skin appearance, and distinguishing features of <Subject 1> remain stable during motion and viewpoint changes. Prevent identity drift, facial morphing, hairstyle changes, head-size fluctuations, geometry instability, texture crawling, temporal flickering, frame-to-frame inconsistency, or sudden changes in facial appearance.\n\nDo not alter the body, clothing, hands, pose, gestures, action, background, objects, environment, camera trajectory, framing, lens behavior, scene timing, or composition inherited from <Video 1>. The final result should appear as though <Subject 1>'s head naturally belonged to <Subject 2>'s body during the original recorded performance.\n\noverall_soundscape:\n\nPreserve the original audiovisual timing and visible action structure of <Video 1>. No visual modifications are made outside the head replacement.\n\nnon_diegetic_music:\nN/A",
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text",
+      "cnr_id": "comfy-core",
+      "ver": "0.33.0"
+    }
+  },
+  "768": {
+    "inputs": {
+      "string_a": [
+        "769",
+        0
+      ],
+      "string_b": "shown in <Picture 1>, whose identity, face, head, hair or fur, skin, body shape, proportions and clothing define the character in the target video. The guide video provides the scene and the performance: its background, environment, lighting, camera, framing, body pose, hand and arm movement, head rotation, gaze direction, lip movement and facial expression, frame by frame; only the main subject of the guide video is replaced: its face, hair, body and clothing become <Subject 1>.  summary: [video generation + reference] Replace the guide subject with <Subject 1>, keeping the scene, camera and the complete motion and performance of the guide video.  detailed_description: [Shot 1] <Subject 1> takes the exact place of the guide subject and moves with the same timing, body pose, gestures, head motion, gaze, speech and facial expressions, while keeping the complete identity from <Picture 1>: facial structure, hair or fur, skin, body shape and clothing stay stable in every frame. The background, lighting, colors and camera of the guide video are preserved. Prevent identity drift, clothing changes, texture crawling and flicker.",
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    }
+  },
+  "769": {
+    "inputs": {
+      "string_a": "body_swap: subject_definitions: <Subject 1> is the ",
+      "string_b": [
+        "772",
+        2
+      ],
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    }
+  },
+  "772": {
+    "inputs": {
+      "reference_set": [
+        "762",
+        0
+      ]
+    },
+    "class_type": "SonderReferencePromptBridge",
+    "_meta": {
+      "title": "Sonder Reference Prompt Bridge"
+    }
+  },
+  "785": {
+    "inputs": {
+      "driver_lane_index": 0,
+      "driver_selector_overrides_json": "{}",
+      "project": [
+        "136",
+        0
+      ]
+    },
+    "class_type": "SonderDriverSelector",
+    "_meta": {
+      "title": "Sonder Swap Driver Selector"
+    }
+  },
+  "786": {
+    "inputs": {
+      "driver_ref": [
+        "785",
+        0
+      ]
+    },
+    "class_type": "SonderDriverBridge",
+    "_meta": {
+      "title": "Sonder Driver Bridge"
+    }
+  },
+  "788": {
+    "inputs": {
+      "select": [
+        "814",
+        1
+      ],
+      "branches": 2,
+      "lanes": 2,
+      "b0_l0": [
+        "746",
+        0
+      ],
+      "b0_l1": [
+        "768",
+        0
+      ],
+      "b1_l0": [
+        "745",
+        0
+      ],
+      "b1_l1": [
+        "766",
+        0
+      ]
+    },
+    "class_type": "SonderLazyCluster",
+    "_meta": {
+      "title": "Sonder Cluster"
+    }
+  },
+  "789": {
+    "inputs": {
+      "select": [
+        "814",
+        1
+      ],
+      "branches": 3,
+      "lanes": 2,
+      "b0_l0": [
+        "788",
+        0
+      ],
+      "b0_l1": [
+        "741",
+        0
+      ],
+      "b1_l0": [
+        "788",
+        0
+      ],
+      "b1_l1": [
+        "741",
+        0
+      ],
+      "b2_l0": [
+        "214",
+        0
+      ],
+      "b2_l1": [
+        "408",
+        0
+      ]
+    },
+    "class_type": "SonderLazyCluster",
+    "_meta": {
+      "title": "Sonder Cluster"
+    }
+  },
+  "790": {
+    "inputs": {
+      "threshold": 0.5,
+      "refine_iterations": 2,
+      "individual_masks": false,
+      "model": [
+        "791",
+        0
+      ],
+      "image": [
+        "136",
+        1
+      ],
+      "conditioning": [
+        "792",
+        0
+      ]
+    },
+    "class_type": "SAM3_Detect",
+    "_meta": {
+      "title": "SAM3 Detect"
+    }
+  },
+  "791": {
+    "inputs": {
+      "ckpt_name": "sam3.1_multiplex_int8_convrot_selective_fp16clip_fp32source.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "792": {
+    "inputs": {
+      "text": "",
+      "clip": [
+        "791",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Who do you want to mask and swap in your target video?"
+    }
+  },
+  "794": {
+    "inputs": {
+      "mask": [
+        "790",
+        0
+      ]
+    },
+    "class_type": "MaskToImage",
+    "_meta": {
+      "title": "Convert Mask to Image"
+    }
+  },
+  "795": {
+    "inputs": {
+      "fps": 24,
+      "autoplay_preview": false,
+      "frames": [
+        "820",
+        0
+      ]
+    },
+    "class_type": "SonderPreviewVideo",
+    "_meta": {
+      "title": "Masked Driver Preview"
+    }
+  },
+  "802": {
+    "inputs": {
+      "samples": [
+        "803",
+        0
+      ],
+      "mask": [
+        "824",
+        0
+      ]
+    },
+    "class_type": "SetLatentNoiseMask",
+    "_meta": {
+      "title": "Set Latent Noise Mask"
+    }
+  },
+  "803": {
+    "inputs": {
+      "av_latent": [
+        "451",
+        0
+      ]
+    },
+    "class_type": "LTXVSeparateAVLatent",
+    "_meta": {
+      "title": "Separate AV Latent"
+    }
+  },
+  "804": {
+    "inputs": {
+      "video_latent": [
+        "802",
+        0
+      ],
+      "audio_latent": [
+        "803",
+        1
+      ]
+    },
+    "class_type": "LTXVConcatAVLatent",
+    "_meta": {
+      "title": "Concat AV Latent"
+    }
+  },
+  "814": {
+    "inputs": {
+      "choice": "Standard Mode Generation",
+      "choice_list": "Swap Character\nSwap only the Head\nStandard Mode Generation\n"
+    },
+    "class_type": "SonderSelector",
+    "_meta": {
+      "title": "Sonder Selector"
+    }
+  },
+  "820": {
+    "inputs": {
+      "x": 0,
+      "y": 0,
+      "resize_source": false,
+      "destination": [
+        "786",
+        0
+      ],
+      "source": [
+        "794",
+        0
+      ],
+      "mask": [
+        "821",
+        0
+      ]
+    },
+    "class_type": "ImageCompositeMasked",
+    "_meta": {
+      "title": "Image Composite Masked"
+    }
+  },
+  "821": {
+    "inputs": {
+      "mask": [
+        "824",
+        0
+      ]
+    },
+    "class_type": "InvertMask",
+    "_meta": {
+      "title": "Invert Mask"
+    }
+  },
+  "824": {
+    "inputs": {
+      "expand": 48,
+      "incremental_expandrate": 0,
+      "tapered_corners": true,
+      "flip_input": false,
+      "blur_radius": 24,
+      "lerp_alpha": 0.8,
+      "decay_factor": 0.5,
+      "fill_holes": false,
+      "mask": [
+        "790",
+        0
+      ]
+    },
+    "class_type": "GrowMaskWithBlur",
+    "_meta": {
+      "title": "Grow Mask With Blur"
+    }
+  }
+}

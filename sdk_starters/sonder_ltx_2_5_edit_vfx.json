@@ -1,0 +1,1393 @@
+{
+  "120": {
+    "inputs": {
+      "text": "blurry, low quality, still frame, frames, watermark, overlay, titles, has blurbox, has subtitles.",
+      "clip": [
+        "3066",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)",
+      "cnr_id": "comfy-core",
+      "ver": "0.3.56"
+    }
+  },
+  "146": {
+    "inputs": {
+      "vae_name": "LTX\\ltx-2.5-video-vae-conv-bf16.safetensors",
+      "device": "main_device",
+      "weight_dtype": "bf16"
+    },
+    "class_type": "VAELoaderKJ",
+    "_meta": {
+      "title": "VAELoader KJ Video",
+      "cnr_id": "comfyui-kjnodes",
+      "ver": "1.2.5"
+    }
+  },
+  "147": {
+    "inputs": {
+      "vae_name": "LTX\\ltx-2.5-audio-vae-bf16.safetensors",
+      "device": "main_device",
+      "weight_dtype": "bf16"
+    },
+    "class_type": "VAELoaderKJ",
+    "_meta": {
+      "title": "VAELoader KJ Audio",
+      "cnr_id": "comfyui-kjnodes",
+      "ver": "1.2.5"
+    }
+  },
+  "2849": {
+    "inputs": {
+      "project": "+ Create New",
+      "project_name": "My Project",
+      "fps": 24,
+      "width": 1280,
+      "height": 720,
+      "scene_id": "ba0024fc",
+      "selection_start": 0,
+      "selection_end": 0,
+      "pre_context_frames": 56,
+      "post_context_frames": 0,
+      "mask_pre_offset": 0,
+      "mask_post_offset": 0,
+      "take_placement_mode": "trimmed",
+      "take_placement_linked": true,
+      "take_placement_muted": false,
+      "render_cache_max_bytes": 0,
+      "render_queue_active": false,
+      "take_fit_mode": "cover",
+      "take_crop_position": "center",
+      "take_keep_padding": false
+    },
+    "class_type": "SonderEditor",
+    "_meta": {
+      "title": "Sonder Editor",
+      "cnr_id": "sonder-editor",
+      "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+      "ver": "8434cbdeb905e449c457adca64ec208542305e63"
+    }
+  },
+  "2975": {
+    "inputs": {
+      "filename_prefix": "Sonder LTX 2_5 Edit",
+      "fps": [
+        "2849",
+        7
+      ],
+      "mode": "Take",
+      "place_audio_on_timeline": true,
+      "mark_queue_complete": false,
+      "embed_metadata": false,
+      "save_preset": "High Quality MP4",
+      "custom_output_kind": "Video File",
+      "custom_container": "mp4",
+      "custom_video_codec": "libx264",
+      "custom_pix_fmt": "yuv420p",
+      "custom_crf": 18,
+      "custom_encoder_preset": "slow",
+      "custom_audio_codec": "aac",
+      "custom_audio_bitrate_kbps": 192,
+      "custom_png_compression": 0,
+      "autoplay_preview": false,
+      "color_drift_correction": true,
+      "project": [
+        "2849",
+        0
+      ],
+      "frames": [
+        "3132:3037",
+        0
+      ],
+      "audio": [
+        "3132:145",
+        0
+      ]
+    },
+    "class_type": "SonderSaveVideo",
+    "_meta": {
+      "title": "Sonder Save Video",
+      "cnr_id": "sonder-editor",
+      "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+      "ver": "8434cbdeb905e449c457adca64ec208542305e63"
+    }
+  },
+  "3033": {
+    "inputs": {
+      "unet_name": "ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model",
+      "cnr_id": "comfy-core",
+      "ver": "0.20.1"
+    }
+  },
+  "3035": {
+    "inputs": {
+      "iclora_model": [
+        "3391",
+        1
+      ]
+    },
+    "class_type": "GetICLoRAParameters",
+    "_meta": {
+      "title": "Get IC-LoRA Parameters",
+      "cnr_id": "comfy-core",
+      "ver": "0.28.0"
+    }
+  },
+  "3039": {
+    "inputs": {
+      "lora_name": "LTX\\edit_anything_v2_ltx2.5.safetensors",
+      "strength_model": [
+        "3371",
+        0
+      ],
+      "model": [
+        "3106",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA",
+      "cnr_id": "comfy-core",
+      "ver": "0.28.0"
+    }
+  },
+  "3047": {
+    "inputs": {
+      "text": [
+        "3348",
+        0
+      ],
+      "clip": [
+        "3066",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)",
+      "cnr_id": "comfy-core",
+      "ver": "0.3.56"
+    }
+  },
+  "3064": {
+    "inputs": {
+      "frame_rate": [
+        "2849",
+        7
+      ],
+      "positive": [
+        "3391",
+        0
+      ],
+      "negative": [
+        "120",
+        0
+      ]
+    },
+    "class_type": "LTXVConditioning",
+    "_meta": {
+      "title": "LTXVConditioning",
+      "cnr_id": "comfy-core",
+      "ver": "0.3.56"
+    }
+  },
+  "3066": {
+    "inputs": {
+      "clip_name": "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors",
+      "type": "ltxv",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP",
+      "cnr_id": "comfy-core",
+      "ver": "0.37.0"
+    }
+  },
+  "3106": {
+    "inputs": {
+      "lora_name": "LTX\\ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
+      "strength_model": 0.5,
+      "model": [
+        "3033",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA Turbo",
+      "cnr_id": "comfy-core",
+      "ver": "0.37.0"
+    }
+  },
+  "3138": {
+    "inputs": {
+      "lora_name": "LTX\\LTX25_Ripple_v11.safetensors",
+      "strength_model": [
+        "3371",
+        0
+      ],
+      "model": [
+        "3106",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA",
+      "cnr_id": "comfy-core",
+      "ver": "0.28.0"
+    }
+  },
+  "3139": {
+    "inputs": {
+      "lora_name": "LTX\\ltx-2.5-22b-ic-lora-alpha-gen-0.9.safetensors",
+      "strength_model": [
+        "3371",
+        0
+      ],
+      "model": [
+        "3106",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA",
+      "cnr_id": "comfy-core",
+      "ver": "0.28.0"
+    }
+  },
+  "3140": {
+    "inputs": {
+      "lora_name": "LTX\\ltx-2.5-22b-ic-lora-clean-plate-1.0.safetensors",
+      "strength_model": [
+        "3371",
+        0
+      ],
+      "model": [
+        "3106",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA",
+      "cnr_id": "comfy-core",
+      "ver": "0.28.0"
+    }
+  },
+  "3154": {
+    "inputs": {
+      "value": "edit_anything:"
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "Text",
+      "cnr_id": "comfy-core",
+      "ver": "0.37.0"
+    }
+  },
+  "3156": {
+    "inputs": {
+      "value": "Use the reference video for motion, timing, camera movement, composition, and unchanged scene content, while consistently propagating the visual edit established in the first frame throughout the video."
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "Text",
+      "cnr_id": "comfy-core",
+      "ver": "0.37.0"
+    }
+  },
+  "3157": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "Text",
+      "cnr_id": "comfy-core",
+      "ver": "0.37.0"
+    }
+  },
+  "3158": {
+    "inputs": {
+      "value": "An empty clean plate of the exact same location: identical background, environment, structures and lighting as the source video, with no people, no humans, no figures, and no body parts such as arms, hands or legs anywhere in the frame. Static photorealistic footage, natural light, high detail."
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "Text",
+      "cnr_id": "comfy-core",
+      "ver": "0.37.0"
+    }
+  },
+  "3174": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "Text",
+      "cnr_id": "comfy-core",
+      "ver": "0.37.0"
+    }
+  },
+  "3229": {
+    "inputs": {
+      "project": [
+        "2849",
+        0
+      ],
+      "flow_control": [
+        "3232",
+        0
+      ],
+      "value_0": [
+        "3230",
+        0
+      ],
+      "value_1": [
+        "3230",
+        1
+      ],
+      "value_2": [
+        "3230",
+        2
+      ]
+    },
+    "class_type": "SonderGuidesBridgeEnd",
+    "_meta": {
+      "title": "Sonder Guides Bridge End",
+      "cnr_id": "sonder-editor",
+      "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+      "ver": "8434cbdeb905e449c457adca64ec208542305e63"
+    }
+  },
+  "3230": {
+    "inputs": {
+      "frame_idx": [
+        "3232",
+        2
+      ],
+      "strength": [
+        "3232",
+        3
+      ],
+      "positive": [
+        "3232",
+        4
+      ],
+      "negative": [
+        "3232",
+        5
+      ],
+      "vae": [
+        "146",
+        0
+      ],
+      "latent": [
+        "3232",
+        6
+      ],
+      "image": [
+        "3231",
+        0
+      ]
+    },
+    "class_type": "LTXVAddGuide",
+    "_meta": {
+      "title": "LTXVAddGuide",
+      "cnr_id": "comfy-core",
+      "ver": "0.19.3"
+    }
+  },
+  "3231": {
+    "inputs": {
+      "img_compression": 36,
+      "image": [
+        "3232",
+        1
+      ]
+    },
+    "class_type": "LTXVPreprocess",
+    "_meta": {
+      "title": "LTXV Preprocess",
+      "cnr_id": "comfy-core",
+      "ver": "0.19.3"
+    }
+  },
+  "3232": {
+    "inputs": {
+      "iteration_index": 0,
+      "bridge_overrides_json": "{}",
+      "project": [
+        "2849",
+        0
+      ],
+      "value_0": [
+        "3064",
+        0
+      ],
+      "value_1": [
+        "3064",
+        1
+      ],
+      "value_2": [
+        "3274",
+        0
+      ]
+    },
+    "class_type": "SonderGuidesBridgeStart",
+    "_meta": {
+      "title": "Sonder Guides Bridge Start",
+      "cnr_id": "sonder-editor",
+      "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+      "ver": "8434cbdeb905e449c457adca64ec208542305e63"
+    }
+  },
+  "3273": {
+    "inputs": {
+      "lora_name": "LTX\\ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
+      "strength_model": [
+        "3371",
+        0
+      ],
+      "model": [
+        "3106",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  "3274": {
+    "inputs": {
+      "video_fps": [
+        "2849",
+        7
+      ],
+      "video_start_time": [
+        "3277",
+        0
+      ],
+      "video_end_time": [
+        "3277",
+        1
+      ],
+      "audio_start_time": [
+        "3277",
+        2
+      ],
+      "audio_end_time": [
+        "3277",
+        3
+      ],
+      "max_length": "partial",
+      "existing_mask_mode": "overwrite",
+      "video_latent": [
+        "3276",
+        0
+      ],
+      "audio_latent": [
+        "3275",
+        0
+      ]
+    },
+    "class_type": "LTXVAudioVideoMask",
+    "_meta": {
+      "title": "LTXVAudioVideoMask",
+      "cnr_id": "comfyui-kjnodes",
+      "ver": "1.4.7"
+    }
+  },
+  "3275": {
+    "inputs": {
+      "audio": [
+        "2849",
+        10
+      ],
+      "audio_vae": [
+        "147",
+        0
+      ]
+    },
+    "class_type": "LTXVAudioVAEEncode",
+    "_meta": {
+      "title": "LTXV Audio VAE Encode",
+      "cnr_id": "comfy-core",
+      "ver": "0.19.3"
+    }
+  },
+  "3276": {
+    "inputs": {
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 128,
+      "temporal_overlap": 32,
+      "pixels": [
+        "2849",
+        1
+      ],
+      "vae": [
+        "146",
+        0
+      ]
+    },
+    "class_type": "VAEEncodeTiled",
+    "_meta": {
+      "title": "VAE Encode (Tiled)",
+      "cnr_id": "comfy-core",
+      "ver": "0.20.1"
+    }
+  },
+  "3277": {
+    "inputs": {
+      "edit_video": true,
+      "edit_audio": true,
+      "project": [
+        "2849",
+        0
+      ]
+    },
+    "class_type": "SonderMasksBridge",
+    "_meta": {
+      "title": "Sonder Masks Bridge",
+      "cnr_id": "sonder-editor",
+      "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+      "ver": "8434cbdeb905e449c457adca64ec208542305e63"
+    }
+  },
+  "3278": {
+    "inputs": {
+      "output": "depth",
+      "moge_geometry": [
+        "3283",
+        0
+      ]
+    },
+    "class_type": "MoGeRender",
+    "_meta": {
+      "title": "Render MoGe Geometry",
+      "cnr_id": "comfy-core",
+      "ver": "0.21.1"
+    }
+  },
+  "3279": {
+    "inputs": {
+      "video_latent": [
+        "3281",
+        2
+      ],
+      "audio_latent": [
+        "3274",
+        1
+      ]
+    },
+    "class_type": "LTXVConcatAVLatent",
+    "_meta": {
+      "title": "Concat AV Latent",
+      "cnr_id": "comfy-core",
+      "ver": "0.7.0"
+    }
+  },
+  "3280": {
+    "inputs": {
+      "frame_idx": [
+        "3285",
+        1
+      ],
+      "strength": [
+        "3285",
+        2
+      ],
+      "positive": [
+        "3229",
+        0
+      ],
+      "negative": [
+        "3229",
+        1
+      ],
+      "vae": [
+        "146",
+        0
+      ],
+      "latent": [
+        "3229",
+        2
+      ],
+      "image": [
+        "3377",
+        0
+      ],
+      "iclora_parameters": [
+        "3035",
+        0
+      ]
+    },
+    "class_type": "LTXVAddGuide",
+    "_meta": {
+      "title": "LTXVAddGuide",
+      "cnr_id": "comfy-core",
+      "ver": "0.28.0"
+    }
+  },
+  "3281": {
+    "inputs": {
+      "select": [
+        "3282",
+        1
+      ],
+      "branches": 2,
+      "lanes": 3,
+      "b0_l0": [
+        "3229",
+        0
+      ],
+      "b0_l1": [
+        "3229",
+        1
+      ],
+      "b0_l2": [
+        "3229",
+        2
+      ],
+      "b1_l0": [
+        "3280",
+        0
+      ],
+      "b1_l1": [
+        "3280",
+        1
+      ],
+      "b1_l2": [
+        "3280",
+        2
+      ]
+    },
+    "class_type": "SonderLazyCluster",
+    "_meta": {
+      "title": "Sonder Cluster - Skips if no driver present",
+      "cnr_id": "sonder-editor",
+      "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+      "ver": "8434cbdeb905e449c457adca64ec208542305e63"
+    }
+  },
+  "3282": {
+    "inputs": {
+      "driver_lane_index": 0,
+      "driver_selector_overrides_json": "{}",
+      "project": [
+        "2849",
+        0
+      ]
+    },
+    "class_type": "SonderDriverSelector",
+    "_meta": {
+      "title": "Sonder Driver Selector",
+      "cnr_id": "sonder-editor",
+      "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+      "ver": "8434cbdeb905e449c457adca64ec208542305e63"
+    }
+  },
+  "3283": {
+    "inputs": {
+      "resolution_level": 9,
+      "fov_x_degrees": 0,
+      "batch_size": 4,
+      "force_projection": true,
+      "apply_mask": true,
+      "refine_steps": 3,
+      "moge_model": [
+        "3284",
+        0
+      ],
+      "image": [
+        "3285",
+        0
+      ]
+    },
+    "class_type": "MoGeInference",
+    "_meta": {
+      "title": "Run MoGe Inference",
+      "cnr_id": "comfy-core",
+      "ver": "0.21.1"
+    }
+  },
+  "3284": {
+    "inputs": {
+      "model_name": "moge_2_vitl_normal_fp16.safetensors"
+    },
+    "class_type": "LoadMoGeModel",
+    "_meta": {
+      "title": "Load MoGe Model",
+      "cnr_id": "comfy-core",
+      "ver": "0.21.1"
+    }
+  },
+  "3285": {
+    "inputs": {
+      "driver_ref": [
+        "3282",
+        0
+      ]
+    },
+    "class_type": "SonderDriverBridge",
+    "_meta": {
+      "title": "Sonder Driver Bridge",
+      "cnr_id": "sonder-editor",
+      "aux_id": "SonderSaid/ComfyUI-Sonder-Editor",
+      "ver": "8434cbdeb905e449c457adca64ec208542305e63"
+    }
+  },
+  "3289": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "Text",
+      "cnr_id": "comfy-core",
+      "ver": "0.37.0"
+    }
+  },
+  "3333": {
+    "inputs": {
+      "low_threshold": 0.4,
+      "high_threshold": 0.8,
+      "image": [
+        "3285",
+        0
+      ]
+    },
+    "class_type": "Canny",
+    "_meta": {
+      "title": "Detect Edges (Canny)"
+    }
+  },
+  "3334": {
+    "inputs": {
+      "batch_size": 16,
+      "model": [
+        "3338",
+        0
+      ],
+      "vae": [
+        "3338",
+        2
+      ],
+      "image": [
+        "3285",
+        0
+      ]
+    },
+    "class_type": "SDPoseKeypointExtractor",
+    "_meta": {
+      "title": "SDPose Keypoint Extractor"
+    }
+  },
+  "3335": {
+    "inputs": {
+      "draw_body": true,
+      "draw_hands": true,
+      "draw_face": true,
+      "draw_feet": false,
+      "stick_width": 4,
+      "face_point_size": 2,
+      "score_threshold": 0.3,
+      "draw_head": true,
+      "keypoints": [
+        "3334",
+        0
+      ]
+    },
+    "class_type": "SDPoseDrawKeypoints",
+    "_meta": {
+      "title": "SDPose Draw Keypoints"
+    }
+  },
+  "3338": {
+    "inputs": {
+      "ckpt_name": "sdpose_wholebody_fp16.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "3346": {
+    "inputs": {
+      "select": [
+        "3383",
+        1
+      ],
+      "branches": 9,
+      "lanes": 2,
+      "b0_l0": [
+        "3106",
+        0
+      ],
+      "b0_l1": [
+        "3174",
+        0
+      ],
+      "b1_l0": [
+        "3273",
+        0
+      ],
+      "b1_l1": [
+        "3289",
+        0
+      ],
+      "b2_l0": [
+        "3273",
+        0
+      ],
+      "b2_l1": [
+        "3289",
+        0
+      ],
+      "b3_l0": [
+        "3273",
+        0
+      ],
+      "b3_l1": [
+        "3289",
+        0
+      ],
+      "b4_l0": [
+        "3039",
+        0
+      ],
+      "b4_l1": [
+        "3154",
+        0
+      ],
+      "b5_l0": [
+        "3138",
+        0
+      ],
+      "b5_l1": [
+        "3156",
+        0
+      ],
+      "b6_l0": [
+        "3140",
+        0
+      ],
+      "b6_l1": [
+        "3158",
+        0
+      ],
+      "b7_l0": [
+        "3139",
+        0
+      ],
+      "b7_l1": [
+        "3157",
+        0
+      ],
+      "b8_l0": [
+        "3106",
+        0
+      ]
+    },
+    "class_type": "SonderLazyCluster",
+    "_meta": {
+      "title": "Sonder Cluster"
+    }
+  },
+  "3348": {
+    "inputs": {
+      "string_a": [
+        "3346",
+        1
+      ],
+      "string_b": [
+        "3396",
+        0
+      ],
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    }
+  },
+  "3349": {
+    "inputs": {
+      "seed": 0
+    },
+    "class_type": "SeedNode",
+    "_meta": {
+      "title": "Seed"
+    }
+  },
+  "3364": {
+    "inputs": {
+      "manifest": "{\"v\": 1, \"bindings\": {\"UYFY1PCEpGXd\": {\"label\": \"Video Model\", \"group\": \"Models and LoRAs\", \"order\": -7500, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3033\", \"input\": \"unet_name\"}], \"seed_mode\": null}, \"S0jRl4V049JM\": {\"label\": \"Advance queue after take\", \"group\": \"\", \"order\": -5000, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"2975\", \"input\": \"mark_queue_complete\"}], \"seed_mode\": null}, \"djVz5bouVRMY\": {\"label\": \"Text Encoder\", \"group\": \"Models and LoRAs\", \"order\": -5000, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3066\", \"input\": \"clip_name\"}], \"seed_mode\": null}, \"vHzHCv9syoGw\": {\"label\": \"Video VAE\", \"group\": \"Models and LoRAs\", \"order\": -3750, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"146\", \"input\": \"vae_name\"}], \"seed_mode\": null}, \"Vixn4vLBWwKF\": {\"label\": \"Audio VAE\", \"group\": \"Models and LoRAs\", \"order\": -2500, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"147\", \"input\": \"vae_name\"}], \"seed_mode\": null}, \"m2kEgmboPsag\": {\"label\": \"Depth Output\", \"group\": \"Depth Settings\", \"order\": 0, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3278\", \"input\": \"output\"}], \"seed_mode\": null}, \"2dEDqQYY9DgE\": {\"label\": \"Draw Body\", \"group\": \"Pose Settings\", \"order\": 0, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3335\", \"input\": \"draw_body\"}], \"seed_mode\": null}, \"mEQeKIxQYZqS\": {\"label\": \"Edit With Words LoRA\", \"group\": \"Task LoRAs\", \"order\": 0, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3039\", \"input\": \"lora_name\"}], \"seed_mode\": null}, \"CcEGRyvJBQOM\": {\"label\": \"Low Edge Threshold\", \"group\": \"Outline Settings\", \"order\": 0, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3333\", \"input\": \"low_threshold\"}], \"seed_mode\": null}, \"5QmA5MgmAtk5\": {\"label\": \"Sampling Method\", \"group\": \"Generation Settings\", \"order\": 0, \"advanced\": true, \"note\": \"Choose the sampling method. Start with the supplied setting; changing it can affect speed and the result.\", \"targets\": [{\"path\": \"3132:3109\", \"input\": \"sampler_name\"}], \"seed_mode\": null}, \"7l00tTrXHSzK\": {\"label\": \"Task\", \"group\": \"Effect Settings\", \"order\": 0, \"advanced\": true, \"note\": \"Set by **Modes → Task**, together with **Edit video**. Choose sound separately under **Modes → Sound**.\", \"targets\": [{\"path\": \"3383\", \"input\": \"choice\"}], \"seed_mode\": null}, \"q4DqfoUgiNmk\": {\"label\": \"Edit video\", \"group\": \"\", \"order\": 1, \"advanced\": true, \"note\": \"Set by **Modes → Task**. **Keep Existing Video** turns picture regeneration off.\", \"targets\": [{\"path\": \"3277\", \"input\": \"edit_video\"}], \"seed_mode\": null}, \"135V-CwLQ7WC\": {\"label\": \"Edit audio\", \"group\": \"\", \"order\": 2, \"advanced\": true, \"note\": \"Set by **Modes → Sound**: **Generate New Audio** creates sound; **Use Timeline Audio** preserves the sound on your Audio lanes.\", \"targets\": [{\"path\": \"3277\", \"input\": \"edit_audio\"}], \"seed_mode\": null}, \"1AvrkYPehsAi\": {\"label\": \"Place take audio on timeline\", \"group\": \"\", \"order\": 3, \"advanced\": true, \"note\": \"Set by **Modes → Sound**. Generated sound is added as an Audio clip. Preserved timeline sound is not added again; saved files can still include it.\", \"targets\": [{\"path\": \"2975\", \"input\": \"place_audio_on_timeline\"}], \"seed_mode\": null}, \"nn-k8LIDMgp6\": {\"label\": \"File name\", \"group\": \"\", \"order\": 4, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"2975\", \"input\": \"filename_prefix\"}], \"seed_mode\": null}, \"U-Jt6MNKOnd3\": {\"label\": \"Save as\", \"group\": \"\", \"order\": 5, \"advanced\": false, \"note\": \"**Take** adds the result to the timeline. **Video** saves it in Assets without placing it.\", \"targets\": [{\"path\": \"2975\", \"input\": \"mode\"}], \"seed_mode\": null}, \"bzImegdjiHn1\": {\"label\": \"Output Format\", \"group\": \"\", \"order\": 8, \"advanced\": false, \"note\": \"Use **Lossless FFV1 (RGB)** or **Editing Master MP4** for further editing; **High Quality MP4** for a finished video.\", \"targets\": [{\"path\": \"2975\", \"input\": \"save_preset\"}], \"seed_mode\": null}, \"PI8pqC5jicOc\": {\"label\": \"Sampling Preview VAE\", \"group\": \"Models and LoRAs\", \"order\": 625, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3386\", \"input\": \"tiny_vae\"}], \"seed_mode\": null}, \"Qpu0os2kcwjm\": {\"label\": \"Turbo LoRA\", \"group\": \"Models and LoRAs\", \"order\": 3750, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3106\", \"input\": \"lora_name\"}], \"seed_mode\": null}, \"sLCqHZ3lptTN\": {\"label\": \"Draw Hands\", \"group\": \"Pose Settings\", \"order\": 5000, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3335\", \"input\": \"draw_hands\"}], \"seed_mode\": null}, \"tY8KLaY37qiw\": {\"label\": \"Effect Strength\", \"group\": \"Effect Settings\", \"order\": 5000, \"advanced\": false, \"note\": \"Adjust how strongly the effect is applied. Used when editing or following a video on Driver.\", \"targets\": [{\"path\": \"3371\", \"input\": \"value\"}], \"seed_mode\": null}, \"Emj_Cu3aQiKx\": {\"label\": \"Follow Tasks LoRA\", \"group\": \"Task LoRAs\", \"order\": 5000, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3273\", \"input\": \"lora_name\"}], \"seed_mode\": null}, \"xVH7JNXYTn2_\": {\"label\": \"High Edge Threshold\", \"group\": \"Outline Settings\", \"order\": 5000, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3333\", \"input\": \"high_threshold\"}], \"seed_mode\": null}, \"Z0lpTqd_AcN4\": {\"label\": \"Variation Number\", \"group\": \"Generation Settings\", \"order\": 5000, \"advanced\": false, \"note\": \"Seed. Keep the same number when comparing changes. Choose [Randomize](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/controls.md#change-a-setting) to try a different result.\", \"targets\": [{\"path\": \"3349\", \"input\": \"seed\"}], \"seed_mode\": \"fixed\"}, \"7FbqRNtteXt0\": {\"label\": \"Turbo LoRA Strength\", \"group\": \"Models and LoRAs\", \"order\": 6875, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3106\", \"input\": \"strength_model\"}], \"seed_mode\": null}, \"cOe7SS8P7j9O\": {\"label\": \"Draw Face\", \"group\": \"Pose Settings\", \"order\": 7500, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3335\", \"input\": \"draw_face\"}], \"seed_mode\": null}, \"n6CNJ0AUyRhd\": {\"label\": \"Driver Lane\", \"group\": \"Effect Settings\", \"order\": 7500, \"advanced\": false, \"note\": \"Choose which **[Driver](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/generating.md#drivers)** lane guides generation. See [Choosing lanes](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/controls.md#choosing-lanes-and-folders-from-controls).\", \"targets\": [{\"path\": \"3282\", \"input\": \"driver_lane_index\"}], \"seed_mode\": null}, \"WA3vAVWEnsNS\": {\"label\": \"Generation Steps\", \"group\": \"Generation Settings\", \"order\": 7500, \"advanced\": false, \"note\": \"More steps take longer and can improve quality. Start with the supplied setting.\", \"targets\": [{\"path\": \"3132:2497\", \"input\": \"steps\"}, {\"path\": \"3132:3388\", \"input\": \"steps\"}], \"seed_mode\": null}, \"CB7O9II2nk-Q\": {\"label\": \"Subject Mask LoRA\", \"group\": \"Task LoRAs\", \"order\": 7500, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3139\", \"input\": \"lora_name\"}], \"seed_mode\": null}, \"e8MH0J03fhDY\": {\"label\": \"Pose Model\", \"group\": \"Models and LoRAs\", \"order\": 8437, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3338\", \"input\": \"ckpt_name\"}], \"seed_mode\": null}, \"WRPgopH2yIMN\": {\"label\": \"Draw Head\", \"group\": \"Pose Settings\", \"order\": 8750, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3335\", \"input\": \"draw_head\"}], \"seed_mode\": null}, \"1ZRlkJwRZaIW\": {\"label\": \"Remove People LoRA\", \"group\": \"Task LoRAs\", \"order\": 8750, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3140\", \"input\": \"lora_name\"}], \"seed_mode\": null}, \"2e2-sUD54KHC\": {\"label\": \"Video Prompt Strength\", \"group\": \"Generation Settings\", \"order\": 8750, \"advanced\": false, \"note\": \"Video CFG. Adjust how strongly the video follows your written description. Higher values can introduce unwanted details.\", \"targets\": [{\"path\": \"3132:3065\", \"input\": \"video_cfg\"}], \"seed_mode\": null}, \"R1bcn6m4lB2B\": {\"label\": \"Depth Model\", \"group\": \"Models and LoRAs\", \"order\": 9218, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3284\", \"input\": \"model_name\"}], \"seed_mode\": null}, \"Ru6xL6aMymf7\": {\"label\": \"Draw Feet\", \"group\": \"Pose Settings\", \"order\": 9375, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3335\", \"input\": \"draw_feet\"}], \"seed_mode\": null}, \"N-11IuRcFjHs\": {\"label\": \"Edit With a Picture LoRA\", \"group\": \"Task LoRAs\", \"order\": 9375, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3138\", \"input\": \"lora_name\"}], \"seed_mode\": null}, \"Kbjw94LG6jFm\": {\"label\": \"Sound Prompt Strength\", \"group\": \"Generation Settings\", \"order\": 9375, \"advanced\": true, \"note\": \"Audio CFG. Adjust how strongly generated sound follows your written description.\", \"targets\": [{\"path\": \"3132:3065\", \"input\": \"audio_cfg\"}], \"seed_mode\": null}, \"OWMzuY8Jwz5j\": {\"label\": \"Additional LoRAs\", \"group\": \"Models and LoRAs\", \"order\": 9609, \"advanced\": false, \"note\": \"\", \"targets\": [{\"path\": \"3381\", \"input\": \"loras\"}], \"seed_mode\": null}, \"4v0yyMh_TEDh\": {\"label\": \"Pose Line Width\", \"group\": \"Pose Settings\", \"order\": 9687, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3335\", \"input\": \"stick_width\"}], \"seed_mode\": null}, \"rVIHuk45Y-ps\": {\"label\": \"Face Point Size\", \"group\": \"Pose Settings\", \"order\": 9843, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3335\", \"input\": \"face_point_size\"}], \"seed_mode\": null}, \"-a4xOoh01dto\": {\"label\": \"Conditioning Method\", \"group\": \"Generation Settings\", \"order\": 9921, \"advanced\": true, \"note\": \"Set by **Modes → Prompt Method**, which also turns the Prompt Relay group on or off. Choose the method above to set both together.\", \"targets\": [{\"path\": \"3392\", \"input\": \"choice\"}], \"seed_mode\": null}, \"Lx4gYKVOZf75\": {\"label\": \"Minimum Pose Confidence\", \"group\": \"Pose Settings\", \"order\": 9921, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3335\", \"input\": \"score_threshold\"}], \"seed_mode\": null}, \"yaxcJsT8IyL4\": {\"label\": \"Schedule Source\", \"group\": \"Generation Settings\", \"order\": 9940, \"advanced\": true, \"note\": \"Choose where the noise schedule comes from. Manual Sigmas uses Manual Noise Levels; Basic Scheduler uses Basic Noise Schedule and Change Strength (Denoise).\", \"targets\": [{\"path\": \"3132:3390\", \"input\": \"choice\"}], \"seed_mode\": null}, \"LJFD4PB1c7vI\": {\"label\": \"Maximum Noise Shift\", \"group\": \"Generation Settings\", \"order\": 9960, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3132:2497\", \"input\": \"max_shift\"}], \"seed_mode\": null}, \"YJxY1PFdvCw8\": {\"label\": \"Base Noise Shift\", \"group\": \"Generation Settings\", \"order\": 9980, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3132:2497\", \"input\": \"base_shift\"}], \"seed_mode\": null}, \"aSbb7xyH_tF_\": {\"label\": \"Manual Noise Levels\", \"group\": \"Generation Settings\", \"order\": 9990, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3132:3387\", \"input\": \"sigmas\"}], \"seed_mode\": null}, \"w8mTvCpbPPdg\": {\"label\": \"Basic Noise Schedule\", \"group\": \"Generation Settings\", \"order\": 9995, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3132:3388\", \"input\": \"scheduler\"}], \"seed_mode\": null}, \"H92wuRXUPdmg\": {\"label\": \"Change Strength (Denoise)\", \"group\": \"Generation Settings\", \"order\": 9997, \"advanced\": true, \"note\": \"\", \"targets\": [{\"path\": \"3132:3388\", \"input\": \"denoise\"}], \"seed_mode\": null}}, \"notes\": {\"5LFPtgsk7fgM\": {\"text\": \"**Start here**\\n\\n1. **Choose what to do with the picture.** Under **[Modes](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/controls.md#modes) → Task**, choose an editing or generation task. Its description tells you what media you need. Use **Keep Existing Video** when you only want to generate sound.\\n2. **Choose the sound.** Under **Modes → Sound**, select **Use Timeline Audio** to keep sound on your Audio lanes, or **Generate New Audio** to make sound. The two categories are independent: for example, **Follow Outlines + Use Timeline Audio** makes video guided by your outlines and existing sound.\\n3. **Import your media.** Open **Assets** at the upper left. Drag files from your computer into the asset gallery, or click **Import** to choose them.\\n4. **Add media to your timeline.** [Drag files from Assets onto the lanes](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#dropping-assets-onto-the-timeline) named in your Task choice. The **Prepare your media** note below explains Driver, Guides and Audio.\\n5. **Create a prompt in your timeline.** Double-click empty **[Prompt](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#prompt-sections)** space near the bottom, describe what you want, then click **Create**. Scroll down inside the timeline if Prompt is out of view.\\n6. **Choose the part to generate.** Set **[In / Out](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/generating.md#ways-to-set-in-and-out)** above the timeline; press **Enter** after each value. Start with a short range inside your footage when editing.\\n7. **Make your first version.** Open **[Render Queue](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/generating.md#the-render-queue)** at the bottom of the Assets sidebar and turn **Queue Active** off. In ComfyUI, click **✕ Exit** at the upper right, then **Run**. Or click **[Generate](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/sonder-app.md#generate)** in Sonder App with **×1** selected.\\n\\n**Choose how prompts change over time.** Leave **Modes → Prompt Method → Standard** for normal LTX prompting. Choose **Timed Prompts (Prompt Relay)** to follow changing prompt sections along the timeline; install the optional extension listed in **Requirements and setup** first.\\n\\n**Nothing selected for regeneration:** **Keep Existing Video + Use Timeline Audio** keeps both the picture and sound. Choose another Task or **Generate New Audio** to make something new.\", \"group\": \"\", \"order\": 9}, \"ltx_requirements_setup\": {\"text\": \"**Requirements and setup**\\n\\n**Install the required nodes.** Install [Sonder Editor](https://github.com/SonderSaid/ComfyUI-Sonder-Editor), [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes), and [RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF) through [ComfyUI Manager](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/README.md#installation); search **Sonder Editor**, **KJNodes**, and **RES4LYF**, install all three, then restart ComfyUI and refresh your browser. RES4LYF supplies the **res_2s** method saved in **Generation Settings → Sampling Method**. LTX, MoGe and SDPose nodes come with ComfyUI; update ComfyUI if they are missing. The **Models and downloads** note below lists the model files.\\n\\n**Prepare the editor for LTX.** Above the timeline, use **[Model](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/generating.md#model-templates): LTX 2.3 / 2.5** and **[Channels](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/prompts.md#channel-templates): Standard**. Channels changes the project's prompt fields.\\n\\n**Use frame numbers for these examples.** If the toolbar shows **Duration**, click **TC** above the timeline so it shows **Frames** instead. The In / Out and context values below are frame counts.\\n\\n**Try a short preview first.** Use **896 × 512**, **24 FPS**, and **In 0 / Out 121**. Set **Ctx: Pre/Post 0** and **Mask −/+ 0** above the timeline for this first preview. Keep the range inside your footage when editing.\\n\\n**Put results on the timeline.** In **Controls → Editor**, use **Save as: [Take](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/assets-and-gallery.md#takes)**.\\n\\n**Optional — timed prompts.** For **Modes → Prompt Method → Timed Prompts (Prompt Relay)**, install [ComfyUI-PromptRelay](https://github.com/kijai/ComfyUI-PromptRelay) using its repository's installation instructions, then restart ComfyUI and refresh your browser. **Standard** leaves the Prompt Relay group muted.\", \"group\": \"\", \"order\": 10}, \"ltx_models_downloads\": {\"text\": \"**Models and downloads**\\n\\nClick a filename to open its download page. Put it in the folder shown, inside **ComfyUI/models/**. These folders match the choices saved in this workflow.\\n\\n**Main models**\\n\\n- **Video model:** [ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors](https://huggingface.co/Lightricks/LTX-2.5/blob/main/diffusion_models/ltx-2.5-22b-dev-transformer-comfy-int8-convrot.safetensors) → **diffusion_models/**\\n- **Text encoder:** [gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors](https://huggingface.co/Lightricks/LTX-2.5/blob/main/text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors) → **text_encoders/**\\n- **Video VAE:** [ltx-2.5-video-vae-conv-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/blob/main/vae/ltx-2.5-video-vae-conv-bf16.safetensors) → **vae/LTX/**\\n- **Audio VAE:** [ltx-2.5-audio-vae-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/blob/main/vae/ltx-2.5-audio-vae-bf16.safetensors) → **vae/LTX/**\\n- **Turbo LoRA:** [ltx-2.5-22b-distilled-lora-450-bf16.safetensors](https://huggingface.co/Lightricks/LTX-2.5/blob/main/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors) → **loras/LTX/**\\n\\n**Task LoRAs** — put these in **loras/LTX/**.\\n\\n- **Edit With Words:** [edit_anything_v2_ltx2.5.safetensors](https://huggingface.co/Alissonerdx/EditAnything/blob/main/edit_anything_v2_ltx2.5.safetensors)\\n- **Edit With a Picture:** [LTX25_Ripple_v11.safetensors](https://huggingface.co/WepeNerd/LTX-Ripple/blob/main/LTX25_Ripple_v11.safetensors)\\n- **Remove People:** [ltx-2.5-22b-ic-lora-clean-plate-1.0.safetensors](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Clean-Plate/blob/main/ltx-2.5-22b-ic-lora-clean-plate-1.0.safetensors)\\n- **Make a Subject Mask:** [ltx-2.5-22b-ic-lora-alpha-gen-0.9.safetensors](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Alpha-Gen/blob/main/ltx-2.5-22b-ic-lora-alpha-gen-0.9.safetensors)\\n- **All three Follow tasks:** [ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control/blob/main/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors)\\n\\n**Extra models for layout and movement**\\n\\n- **Follow Scene Layout also uses:** [moge_2_vitl_normal_fp16.safetensors](https://huggingface.co/Comfy-Org/MoGe/blob/main/geometry_estimation/moge_2_vitl_normal_fp16.safetensors) → **geometry_estimation/**\\n- **Follow Body Movement also uses:** [sdpose_wholebody_fp16.safetensors](https://huggingface.co/Comfy-Org/SDPose/blob/main/checkpoints/sdpose_wholebody_fp16.safetensors) → **checkpoints/**\\n\\n**For the sampling preview**\\n\\n- [taeltx2_3.safetensors](https://github.com/madebyollin/taehv/blob/main/safetensors/taeltx2_3.safetensors) → **vae_approx/**\\n\\nSome Lightricks files require signing in and accepting access on Hugging Face first.\\n\\nAfter adding files, restart ComfyUI. If **advanced hidden** appears below Modes, click it; then open **Models and LoRAs** and **Task LoRAs** to select your files if you saved them in a different folder. Keep the supplied LTX 2.3 union adapter for the three Follow tasks.\", \"group\": \"\", \"order\": 11}, \"ltx_prepare_media\": {\"text\": \"**Prepare your media**\\n\\n- **Choose the video you want to edit or follow.** The **[Driver](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#driver-clips)** is your source video. Editing tasks make a changed version of it. The three **Follow** tasks use its layout, movement or outlines to guide a new video. Drag that video from Assets onto a **Video** lane, then right-click its clip and choose **Convert to Driver**. It moves to **Driver** and disappears from normal preview; the original file stays in Assets.\\n- **Guide the result with a picture.** Drag a picture from Assets onto **[Guides](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#guide-frames)** at the frame it should guide. For **Edit With a Picture**, use a picture you have already edited and place it at **In**.\\n- **Add existing sound.** Drag a sound file from Assets onto **[Audio](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#audio-tracks)**. To add a video's picture and sound together, drop the video onto the [numbered ruler](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#dropping-assets-onto-the-timeline) above the timeline lanes. Dropping onto **Video** adds only the picture.\\n- **Keep the original sound while editing the picture.** Keep its Audio clip unmuted and choose **Modes → Sound → Use Timeline Audio**. To make replacement sound instead, choose **Generate New Audio** and mute any old Audio clips you do not want playing after the result arrives.\\n\\n**Check the processed Driver.** Choose **Follow Scene Layout**, **Follow Body Movement**, or **Follow Outlines** under **Modes → Task**. Open a viewport pane's source menu and choose **Processed Driver**. Click that pane's **Run** to preview the depth, pose, or outlines without running diffusion. Each Follow task enables only its matching processing group and this preview. Other tasks mute all three processing groups and the preview.\", \"group\": \"\", \"order\": 12}, \"QP0FsWudkhPl\": {\"text\": \"**Review and export**\\n\\n- **Watch your result.** With **Controls → Editor → Save as: Take**, each result appears as a new timeline clip. A [take](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/assets-and-gallery.md#takes) is one generated version. Click **Play** below the preview. If the clip is muted, right-click it and choose **Unmute Selected**.\\n- **Choose the version to keep.** In **Assets**, double-click a result and open **[Compare](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/assets-and-gallery.md#compare-mode)**. Back on the timeline, keep the winner visible on **Video** and mute competing takes. A favorite star marks an asset; it does not choose the version used in your video.\\n- **Check the soundtrack.** Keep only the sound you want playing. Linked picture and sound mute together; to mute just one, right-click its clip and choose **[Unlink Linked Items](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#linked-groups)** first.\\n- **Save your finished video.** Click **[Export](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/assets-and-gallery.md#export-timeline)** above the timeline. Choose the full scene or selection, include the picture and sound you want, and use **High Quality MP4**. Open the saved file to check its picture, sound and length.\", \"group\": \"\", \"order\": 13}, \"F3rAfAEwQj-6\": {\"text\": \"**Make your video longer**\\n\\n1. **Keep the part you like.** Leave your chosen video visible on a **Video** lane. If an original Driver is still active, hide it using the eye at the left of its lane.\\n2. **Set the total length.** Increase **Frames** at the right of the toolbar above the timeline. At **24 FPS**, **241 frames** is about **10 seconds** in total.\\n3. **Choose the picture and sound for the new part.** Set **Modes → Task → Make a New Video**. Under **Modes → Sound**, choose **Use Timeline Audio** for existing sound, or **Generate New Audio** to make sound too. Existing Audio needs to cover the finished length when you use it.\\n4. **Choose only the part you are adding.** Set **[In](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/generating.md#ways-to-set-in-and-out)** at the end of the kept video and **Out** at the new end. Press **Enter** after each value.\\n5. **Help the new part match.** Above the timeline, **[Ctx: Pre](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/generating.md#the-generation-window)** includes earlier frames as a reference. Start with **49**, or fewer if your kept video is shorter. Keep **Post 0** and **Mask −/+ 0**.\\n6. **Describe what happens next.** Double-click empty **Prompt** space at the start of the new part, type your description and click **Create**.\\n7. **Generate and check the join.** Generate the selected range, then play across the join to check the picture, motion and sound.\\n\\n**Learn more:** [Extend a video](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/getting-started.md#extend-a-video) · [Generate long-form video](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/getting-started.md#generate-long-form-video)\", \"group\": \"\", \"order\": 14}}, \"groups\": {\"Effect Settings\": {\"order\": 0}, \"Generation Settings\": {\"order\": 1}, \"Depth Settings\": {\"order\": 2}, \"Pose Settings\": {\"order\": 3}, \"Outline Settings\": {\"order\": 4}, \"Models and LoRAs\": {\"order\": 5}, \"Task LoRAs\": {\"order\": 6}, \"Processing Switches\": {\"order\": 7}}, \"description\": \"## LTX 2.5 Edit & VFX\\n\\nEdit or generate video, follow a source video’s layout or movement, remove people, or make masks. Keep existing sound or generate new audio.\", \"presets\": {\"p652f934a8ff8fe93f3a8\": {\"name\": \"Make a New Video\", \"description\": \"Create video from a description. Describe what you want in **[Prompt](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#prompt-sections)**; optionally add pictures on **[Guides](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#guide-frames)**.\", \"order\": 4, \"members\": {\"q4DqfoUgiNmk\": {\"value\": true}, \"7l00tTrXHSzK\": {\"value\": \"Make a New Video\"}}, \"execution\": {\"sAuDmH45ICUt\": {\"modes\": {\"3278\": \"muted\", \"3283\": \"muted\", \"3284\": \"muted\"}}, \"ZhSTS-O4rKOL\": {\"modes\": {\"3334\": \"muted\", \"3335\": \"muted\", \"3338\": \"muted\"}}, \"9N41JuLkg37o\": {\"modes\": {\"3333\": \"muted\"}}, \"vvJRhXeMhrz5\": {\"mode\": \"muted\", \"node\": {\"path\": \"3393\", \"class_type\": \"SonderPreviewVideo\"}}}}, \"pd89fc79b0ba7d956c4ee\": {\"name\": \"Follow Scene Layout\", \"description\": \"Create a new scene using the shapes and distances in your footage. Put the original on **[Driver](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#driver-clips)** and describe the new scene in **[Prompt](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#prompt-sections)**.\", \"order\": 5, \"members\": {\"q4DqfoUgiNmk\": {\"value\": true}, \"7l00tTrXHSzK\": {\"value\": \"Follow Scene Layout\"}}, \"execution\": {\"sAuDmH45ICUt\": {\"modes\": {\"3278\": \"enabled\", \"3283\": \"enabled\", \"3284\": \"enabled\"}}, \"ZhSTS-O4rKOL\": {\"modes\": {\"3334\": \"muted\", \"3335\": \"muted\", \"3338\": \"muted\"}}, \"9N41JuLkg37o\": {\"modes\": {\"3333\": \"muted\"}}, \"vvJRhXeMhrz5\": {\"mode\": \"enabled\", \"node\": {\"path\": \"3393\", \"class_type\": \"SonderPreviewVideo\"}}}}, \"pdb95fd6e9d72c4309d1b\": {\"name\": \"Follow Body Movement\", \"description\": \"Create new footage that follows the body movements in your video. Put the original on **[Driver](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#driver-clips)** and describe the new scene in **[Prompt](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#prompt-sections)**.\", \"order\": 6, \"members\": {\"7l00tTrXHSzK\": {\"value\": \"Follow Body Movement\"}, \"q4DqfoUgiNmk\": {\"value\": true}}, \"execution\": {\"sAuDmH45ICUt\": {\"modes\": {\"3278\": \"muted\", \"3283\": \"muted\", \"3284\": \"muted\"}}, \"ZhSTS-O4rKOL\": {\"modes\": {\"3334\": \"enabled\", \"3335\": \"enabled\", \"3338\": \"enabled\"}}, \"9N41JuLkg37o\": {\"modes\": {\"3333\": \"muted\"}}, \"vvJRhXeMhrz5\": {\"mode\": \"enabled\", \"node\": {\"path\": \"3393\", \"class_type\": \"SonderPreviewVideo\"}}}}, \"pdddef722e091f5c38692\": {\"name\": \"Follow Outlines\", \"description\": \"Create new footage that follows the outlines in your video. Put the original on **[Driver](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#driver-clips)** and describe the new scene in **[Prompt](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#prompt-sections)**.\", \"order\": 7, \"members\": {\"q4DqfoUgiNmk\": {\"value\": true}, \"7l00tTrXHSzK\": {\"value\": \"Follow Outlines\"}}, \"execution\": {\"sAuDmH45ICUt\": {\"modes\": {\"3278\": \"muted\", \"3283\": \"muted\", \"3284\": \"muted\"}}, \"ZhSTS-O4rKOL\": {\"modes\": {\"3334\": \"muted\", \"3335\": \"muted\", \"3338\": \"muted\"}}, \"9N41JuLkg37o\": {\"modes\": {\"3333\": \"enabled\"}}, \"vvJRhXeMhrz5\": {\"mode\": \"enabled\", \"node\": {\"path\": \"3393\", \"class_type\": \"SonderPreviewVideo\"}}}}, \"pf25cfd79b224ad04ca45\": {\"name\": \"Edit With Words\", \"description\": \"Change your footage by describing what you want. Put the original on **[Driver](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#driver-clips)** and describe the change in **[Prompt](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#prompt-sections)**.\", \"order\": 1, \"members\": {\"q4DqfoUgiNmk\": {\"value\": true}, \"7l00tTrXHSzK\": {\"value\": \"Edit With Words\"}}, \"execution\": {\"sAuDmH45ICUt\": {\"modes\": {\"3278\": \"muted\", \"3283\": \"muted\", \"3284\": \"muted\"}}, \"ZhSTS-O4rKOL\": {\"modes\": {\"3334\": \"muted\", \"3335\": \"muted\", \"3338\": \"muted\"}}, \"9N41JuLkg37o\": {\"modes\": {\"3333\": \"muted\"}}, \"vvJRhXeMhrz5\": {\"mode\": \"muted\", \"node\": {\"path\": \"3393\", \"class_type\": \"SonderPreviewVideo\"}}}}, \"pab06be1e9050477f6384\": {\"name\": \"Edit With a Picture\", \"description\": \"Show how you want your footage to look. Put the original on **[Driver](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#driver-clips)** and an already edited picture on **[Guides](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#guide-frames)** at **In**.\", \"order\": 0, \"members\": {\"q4DqfoUgiNmk\": {\"value\": true}, \"7l00tTrXHSzK\": {\"value\": \"Edit With a Picture\"}}, \"execution\": {\"sAuDmH45ICUt\": {\"modes\": {\"3278\": \"muted\", \"3283\": \"muted\", \"3284\": \"muted\"}}, \"ZhSTS-O4rKOL\": {\"modes\": {\"3334\": \"muted\", \"3335\": \"muted\", \"3338\": \"muted\"}}, \"9N41JuLkg37o\": {\"modes\": {\"3333\": \"muted\"}}, \"vvJRhXeMhrz5\": {\"mode\": \"muted\", \"node\": {\"path\": \"3393\", \"class_type\": \"SonderPreviewVideo\"}}}}, \"pee8a884f1287b37acaab\": {\"name\": \"Remove People\", \"description\": \"Try to remove people and fill in the background. Put the original on **[Driver](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#driver-clips)**.\", \"order\": 2, \"members\": {\"q4DqfoUgiNmk\": {\"value\": true}, \"7l00tTrXHSzK\": {\"value\": \"Remove People\"}}, \"execution\": {\"sAuDmH45ICUt\": {\"modes\": {\"3278\": \"muted\", \"3283\": \"muted\", \"3284\": \"muted\"}}, \"ZhSTS-O4rKOL\": {\"modes\": {\"3334\": \"muted\", \"3335\": \"muted\", \"3338\": \"muted\"}}, \"9N41JuLkg37o\": {\"modes\": {\"3333\": \"muted\"}}, \"vvJRhXeMhrz5\": {\"mode\": \"muted\", \"node\": {\"path\": \"3393\", \"class_type\": \"SonderPreviewVideo\"}}}}, \"p4db2c73bf20cfb00757d\": {\"name\": \"Make a Subject Mask\", \"description\": \"Try to separate a subject into a black-and-white video for use in another editing tool. Put the original on **[Driver](https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/editor-basics.md#driver-clips)**. The model decides what to separate.\", \"order\": 3, \"members\": {\"q4DqfoUgiNmk\": {\"value\": true}, \"7l00tTrXHSzK\": {\"value\": \"Make a Subject Mask\"}}, \"execution\": {\"sAuDmH45ICUt\": {\"modes\": {\"3278\": \"muted\", \"3283\": \"muted\", \"3284\": \"muted\"}}, \"ZhSTS-O4rKOL\": {\"modes\": {\"3334\": \"muted\", \"3335\": \"muted\", \"3338\": \"muted\"}}, \"9N41JuLkg37o\": {\"modes\": {\"3333\": \"muted\"}}, \"vvJRhXeMhrz5\": {\"mode\": \"muted\", \"node\": {\"path\": \"3393\", \"class_type\": \"SonderPreviewVideo\"}}}}, \"pa9271e7372a656d0d06a\": {\"name\": \"Keep Existing Video\", \"description\": \"Keep the picture visible on Video. Choose Sound → Generate New Audio to make a soundtrack for it.\", \"order\": 8, \"members\": {\"q4DqfoUgiNmk\": {\"value\": false}, \"7l00tTrXHSzK\": {\"value\": \"Make a New Video\"}}, \"execution\": {\"sAuDmH45ICUt\": {\"modes\": {\"3278\": \"muted\", \"3283\": \"muted\", \"3284\": \"muted\"}}, \"ZhSTS-O4rKOL\": {\"modes\": {\"3334\": \"muted\", \"3335\": \"muted\", \"3338\": \"muted\"}}, \"9N41JuLkg37o\": {\"modes\": {\"3333\": \"muted\"}}, \"vvJRhXeMhrz5\": {\"mode\": \"muted\", \"node\": {\"path\": \"3393\", \"class_type\": \"SonderPreviewVideo\"}}}}, \"pe6484b2bf276cccf352c\": {\"name\": \"Use Timeline Audio\", \"description\": \"Keep the sound on your Audio lanes. When generating video, the supplied sound also guides it. New takes do not add another Audio clip to the timeline.\", \"order\": 9, \"members\": {\"135V-CwLQ7WC\": {\"value\": false}, \"1AvrkYPehsAi\": {\"value\": false}}}, \"edit_vfx_generate_audio\": {\"name\": \"Generate New Audio\", \"description\": \"Generate sound for the selected range. New takes also add the generated sound to the timeline. Mute any old sound you want to replace.\", \"order\": 10, \"members\": {\"135V-CwLQ7WC\": {\"value\": true}, \"1AvrkYPehsAi\": {\"value\": true}}}, \"edit_vfx_prompt_standard\": {\"name\": \"Standard\", \"description\": \"Combine the prompts for the selected range using normal LTX conditioning. No Prompt Relay required.\", \"order\": 11, \"members\": {\"-a4xOoh01dto\": {\"value\": \"Normal Conditioning\"}}, \"execution\": {\"op_33vxa3RqV\": {\"modes\": {\"3384\": \"muted\", \"3385\": \"muted\"}}}}, \"edit_vfx_prompt_timed\": {\"name\": \"Timed Prompts (Prompt Relay)\", \"description\": \"Apply changing prompt sections along the timeline. Requires ComfyUI-PromptRelay.\", \"order\": 12, \"members\": {\"-a4xOoh01dto\": {\"value\": \"Prompt Relay Conditioning\"}}, \"execution\": {\"op_33vxa3RqV\": {\"modes\": {\"3384\": \"enabled\", \"3385\": \"enabled\"}}}}}, \"execution\": {\"v\": 1, \"controls\": {\"op_33vxa3RqV\": {\"label\": \"\", \"group\": \"Processing Switches\", \"order\": 0, \"advanced\": true, \"note\": \"Set by **Modes → Prompt Method**. **Standard** mutes this group; **Timed Prompts (Prompt Relay)** enables it.\", \"target\": {\"kind\": \"group\", \"group_id\": 66}, \"status\": \"ok\", \"title\": \"Prompt Relay\", \"member_count\": 2, \"members\": [{\"path\": \"3384\", \"class_type\": \"SonderPromptRelayBridge\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Sonder Prompt Relay Bridge\"}, {\"path\": \"3385\", \"class_type\": \"PromptRelaySmartEncode\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Prompt Relay Encode (Smart)\"}]}, \"sAuDmH45ICUt\": {\"label\": \"\", \"group\": \"Processing Switches\", \"order\": 5000, \"advanced\": true, \"note\": \"Set by **Modes → Task**. Enabled only for **Follow Scene Layout**.\", \"target\": {\"kind\": \"group\", \"group_id\": 57}, \"status\": \"ok\", \"title\": \"Depth Processing\", \"member_count\": 3, \"members\": [{\"path\": \"3278\", \"class_type\": \"MoGeRender\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Render MoGe Geometry\"}, {\"path\": \"3283\", \"class_type\": \"MoGeInference\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Run MoGe Inference\"}, {\"path\": \"3284\", \"class_type\": \"LoadMoGeModel\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Load MoGe Model\"}]}, \"ZhSTS-O4rKOL\": {\"label\": \"\", \"group\": \"Processing Switches\", \"order\": 7500, \"advanced\": true, \"note\": \"Set by **Modes → Task**. Enabled only for **Follow Body Movement**.\", \"target\": {\"kind\": \"group\", \"group_id\": 58}, \"status\": \"ok\", \"title\": \"Pose Processing\", \"member_count\": 3, \"members\": [{\"path\": \"3334\", \"class_type\": \"SDPoseKeypointExtractor\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"SDPose Keypoint Extractor\"}, {\"path\": \"3335\", \"class_type\": \"SDPoseDrawKeypoints\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"SDPose Draw Keypoints\"}, {\"path\": \"3338\", \"class_type\": \"CheckpointLoaderSimple\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Load Checkpoint\"}]}, \"9N41JuLkg37o\": {\"label\": \"\", \"group\": \"Processing Switches\", \"order\": 8750, \"advanced\": true, \"note\": \"Set by **Modes → Task**. Enabled only for **Follow Outlines**.\", \"target\": {\"kind\": \"group\", \"group_id\": 59}, \"status\": \"ok\", \"title\": \"Outline Processing\", \"member_count\": 1, \"members\": [{\"path\": \"3333\", \"class_type\": \"Canny\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Detect Edges (Canny)\"}]}, \"vvJRhXeMhrz5\": {\"label\": \"\", \"group\": \"Processing Switches\", \"order\": 9375, \"advanced\": true, \"note\": \"Set by **Modes → Task**. The three **Follow** tasks enable this preview; other tasks mute it.\", \"target\": {\"kind\": \"node\"}, \"status\": \"ok\", \"title\": \"Processed Driver\", \"member_count\": 1, \"members\": [{\"path\": \"3393\", \"class_type\": \"SonderPreviewVideo\", \"mode\": \"enabled\", \"kind\": \"node\", \"title\": \"Processed Driver\"}]}}, \"routing\": \"{\\\"v\\\":1,\\\"nodes\\\":{\\\"3278\\\":{\\\"i\\\":[[\\\"moge_geometry\\\",\\\"MOGE_GEOMETRY\\\",{\\\"m\\\":[\\\"3283\\\",0,\\\"MOGE_GEOMETRY\\\"]}],[\\\"output\\\",\\\"COMBO\\\",null]],\\\"o\\\":[[\\\"IMAGE\\\"]]},\\\"3283\\\":{\\\"i\\\":[[\\\"moge_model\\\",\\\"MOGE_MODEL\\\",{\\\"m\\\":[\\\"3284\\\",0,\\\"MOGE_MODEL\\\"]}],[\\\"image\\\",\\\"IMAGE\\\",{\\\"a\\\":[\\\"3285\\\",0]}],[\\\"resolution_level\\\",\\\"INT\\\",null],[\\\"fov_x_degrees\\\",\\\"FLOAT\\\",null],[\\\"batch_size\\\",\\\"INT\\\",null],[\\\"force_projection\\\",\\\"BOOLEAN\\\",null],[\\\"apply_mask\\\",\\\"BOOLEAN\\\",null],[\\\"refine_steps\\\",\\\"INT\\\",null]],\\\"o\\\":[[\\\"MOGE_GEOMETRY\\\"]]},\\\"3284\\\":{\\\"i\\\":[[\\\"model_name\\\",\\\"COMBO\\\",null]],\\\"o\\\":[[\\\"MOGE_MODEL\\\"]]},\\\"3333\\\":{\\\"i\\\":[[\\\"image\\\",\\\"IMAGE\\\",{\\\"a\\\":[\\\"3285\\\",0]}],[\\\"low_threshold\\\",\\\"FLOAT\\\",null],[\\\"high_threshold\\\",\\\"FLOAT\\\",null]],\\\"o\\\":[[\\\"IMAGE\\\"]]},\\\"3334\\\":{\\\"i\\\":[[\\\"model\\\",\\\"MODEL\\\",{\\\"m\\\":[\\\"3338\\\",0,\\\"MODEL\\\"]}],[\\\"vae\\\",\\\"VAE\\\",{\\\"m\\\":[\\\"3338\\\",2,\\\"VAE\\\"]}],[\\\"image\\\",\\\"IMAGE\\\",{\\\"a\\\":[\\\"3285\\\",0]}],[\\\"bboxes\\\",\\\"BOUNDING_BOX\\\",null],[\\\"batch_size\\\",\\\"INT\\\",null]],\\\"o\\\":[[\\\"POSE_KEYPOINT\\\"]]},\\\"3335\\\":{\\\"i\\\":[[\\\"keypoints\\\",\\\"POSE_KEYPOINT\\\",{\\\"m\\\":[\\\"3334\\\",0,\\\"POSE_KEYPOINT\\\"]}],[\\\"draw_body\\\",\\\"BOOLEAN\\\",null],[\\\"draw_hands\\\",\\\"BOOLEAN\\\",null],[\\\"draw_face\\\",\\\"BOOLEAN\\\",null],[\\\"draw_feet\\\",\\\"BOOLEAN\\\",null],[\\\"stick_width\\\",\\\"INT\\\",null],[\\\"face_point_size\\\",\\\"INT\\\",null],[\\\"score_threshold\\\",\\\"FLOAT\\\",null],[\\\"draw_head\\\",\\\"BOOLEAN\\\",null]],\\\"o\\\":[[\\\"IMAGE\\\"]]},\\\"3338\\\":{\\\"i\\\":[[\\\"ckpt_name\\\",\\\"COMBO\\\",null]],\\\"o\\\":[[\\\"MODEL\\\"],[\\\"CLIP\\\"],[\\\"VAE\\\"]]},\\\"3384\\\":{\\\"i\\\":[[\\\"project\\\",\\\"SONDER_PROJECT\\\",{\\\"a\\\":[\\\"2849\\\",0]}]],\\\"o\\\":[[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"],[\\\"STRING\\\"]]},\\\"3385\\\":{\\\"i\\\":[[\\\"model\\\",\\\"MODEL\\\",{\\\"a\\\":[\\\"3381\\\",0]}],[\\\"clip\\\",\\\"CLIP\\\",{\\\"a\\\":[\\\"3066\\\",0]}],[\\\"latent\\\",\\\"LATENT\\\",{\\\"a\\\":[\\\"3276\\\",0]}],[\\\"global_prompt\\\",\\\"STRING\\\",{\\\"m\\\":[\\\"3384\\\",0,\\\"STRING\\\"]}],[\\\"smart_prompt\\\",\\\"STRING\\\",{\\\"m\\\":[\\\"3384\\\",1,\\\"STRING\\\"]}],[\\\"normalize_by_tokens\\\",\\\"BOOLEAN\\\",null],[\\\"epsilon\\\",\\\"FLOAT\\\",null]],\\\"o\\\":[[\\\"MODEL\\\"],[\\\"CONDITIONING\\\"]]},\\\"3393\\\":{\\\"i\\\":[[\\\"frames\\\",\\\"IMAGE\\\",{\\\"a\\\":[\\\"3377\\\",0]}],[\\\"audio\\\",\\\"AUDIO\\\",null],[\\\"fps\\\",\\\"FLOAT\\\",{\\\"a\\\":[\\\"2849\\\",7]}],[\\\"autoplay_preview\\\",\\\"BOOLEAN\\\",null]],\\\"o\\\":[]}},\\\"edges\\\":[[\\\"3278\\\",\\\"moge_geometry\\\",\\\"3283\\\",0,\\\"MOGE_GEOMETRY\\\"],[\\\"3283\\\",\\\"moge_model\\\",\\\"3284\\\",0,\\\"MOGE_MODEL\\\"],[\\\"3334\\\",\\\"model\\\",\\\"3338\\\",0,\\\"MODEL\\\"],[\\\"3334\\\",\\\"vae\\\",\\\"3338\\\",2,\\\"VAE\\\"],[\\\"3335\\\",\\\"keypoints\\\",\\\"3334\\\",0,\\\"POSE_KEYPOINT\\\"],[\\\"3377\\\",\\\"branches.item1\\\",\\\"3278\\\",0,\\\"IMAGE\\\"],[\\\"3377\\\",\\\"branches.item2\\\",\\\"3335\\\",0,\\\"IMAGE\\\"],[\\\"3377\\\",\\\"branches.item3\\\",\\\"3333\\\",0,\\\"IMAGE\\\"],[\\\"3385\\\",\\\"global_prompt\\\",\\\"3384\\\",0,\\\"STRING\\\",\\\"\\\"],[\\\"3385\\\",\\\"smart_prompt\\\",\\\"3384\\\",1,\\\"STRING\\\",\\\"\\\"],[\\\"3391\\\",\\\"b1_l0\\\",\\\"3385\\\",1,\\\"CONDITIONING\\\"],[\\\"3391\\\",\\\"b1_l1\\\",\\\"3385\\\",0,\\\"MODEL\\\"],[\\\"3396\\\",\\\"branches.item1\\\",\\\"3384\\\",1,\\\"STRING\\\"]]}\"}, \"views\": {\"v\": 1, \"items\": {\"QH4Xir4fAycm\": {\"label\": \"\", \"order\": 15, \"status\": \"ok\", \"path\": \"3386\", \"class_type\": \"ModelPreviewOverrideKJ\", \"title\": \"Model Preview Override\", \"feed\": \"sampling\"}, \"3drcgKjDO2ZE\": {\"label\": \"\", \"order\": 20, \"status\": \"ok\", \"path\": \"3393\", \"class_type\": \"SonderPreviewVideo\", \"title\": \"Processed Driver\", \"timing\": {\"mode\": \"editor_window\", \"anchor\": \"generation_start\", \"source_offset\": 0, \"fps\": \"editor\"}}}}, \"preset_categories\": {\"1F9eZoV4GNdf\": {\"name\": \"Task\", \"description\": \"Choose what to do with the picture. Choose whether to keep or generate sound separately below.\", \"order\": 0, \"choices\": [\"p652f934a8ff8fe93f3a8\", \"pf25cfd79b224ad04ca45\", \"pab06be1e9050477f6384\", \"pd89fc79b0ba7d956c4ee\", \"pdb95fd6e9d72c4309d1b\", \"pdddef722e091f5c38692\", \"pee8a884f1287b37acaab\", \"p4db2c73bf20cfb00757d\", \"pa9271e7372a656d0d06a\"]}, \"edit_vfx_sound\": {\"name\": \"Sound\", \"description\": \"Keep your timeline sound, or generate new sound. Changing Sound leaves Task unchanged.\", \"order\": 1, \"choices\": [\"pe6484b2bf276cccf352c\", \"edit_vfx_generate_audio\"]}, \"edit_vfx_prompt_method\": {\"name\": \"Prompt Method\", \"description\": \"Choose how prompt sections guide the selected range. Timed Prompts requires the Prompt Relay extension.\", \"order\": 2, \"choices\": [\"edit_vfx_prompt_standard\", \"edit_vfx_prompt_timed\"]}}}"
+    },
+    "class_type": "SonderControlRelay",
+    "_meta": {
+      "title": "Sonder Control Relay"
+    }
+  },
+  "3371": {
+    "inputs": {
+      "value": 1
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "Effect Strength"
+    }
+  },
+  "3377": {
+    "inputs": {
+      "select": [
+        "3383",
+        1
+      ],
+      "branches.item0": [
+        "3285",
+        0
+      ],
+      "branches.item1": [
+        "3278",
+        0
+      ],
+      "branches.item2": [
+        "3335",
+        0
+      ],
+      "branches.item3": [
+        "3333",
+        0
+      ],
+      "branches.item4": [
+        "3285",
+        0
+      ],
+      "branches.item5": [
+        "3285",
+        0
+      ],
+      "branches.item6": [
+        "3285",
+        0
+      ],
+      "branches.item7": [
+        "3285",
+        0
+      ]
+    },
+    "class_type": "SonderLazySwitch",
+    "_meta": {
+      "title": "Sonder Switch"
+    }
+  },
+  "3381": {
+    "inputs": {
+      "loras.0.lora_name": "LTX\\VBVR-official-comfyui.safetensors",
+      "loras.0.strength": 0.8,
+      "loras.0.enabled": false,
+      "model": [
+        "3346",
+        0
+      ]
+    },
+    "class_type": "LoadLoraModel",
+    "_meta": {
+      "title": "Load LoRA (Model)"
+    }
+  },
+  "3383": {
+    "inputs": {
+      "choice": "Make a New Video",
+      "choice_list": "Make a New Video\nFollow Scene Layout\nFollow Body Movement\nFollow Outlines\nEdit With Words\nEdit With a Picture\nRemove People\nMake a Subject Mask\n"
+    },
+    "class_type": "SonderSelector",
+    "_meta": {
+      "title": "Sonder Selector"
+    }
+  },
+  "3384": {
+    "inputs": {
+      "project": [
+        "2849",
+        0
+      ]
+    },
+    "class_type": "SonderPromptRelayBridge",
+    "_meta": {
+      "title": "Sonder Prompt Relay Bridge"
+    }
+  },
+  "3385": {
+    "inputs": {
+      "global_prompt": [
+        "3384",
+        0
+      ],
+      "smart_prompt": [
+        "3384",
+        1
+      ],
+      "normalize_by_tokens": false,
+      "epsilon": 0.001,
+      "model": [
+        "3381",
+        0
+      ],
+      "clip": [
+        "3066",
+        0
+      ],
+      "latent": [
+        "3276",
+        0
+      ]
+    },
+    "class_type": "PromptRelaySmartEncode",
+    "_meta": {
+      "title": "Prompt Relay Encode (Smart)"
+    }
+  },
+  "3386": {
+    "inputs": {
+      "max_resolution": 512,
+      "jpeg_quality": 80,
+      "suppress_default_preview": true,
+      "preview_frames": 24,
+      "preview_fps": 8,
+      "tiny_vae": "taeltx2_3.safetensors",
+      "model": [
+        "3391",
+        1
+      ]
+    },
+    "class_type": "ModelPreviewOverrideKJ",
+    "_meta": {
+      "title": "Model Preview Override"
+    }
+  },
+  "3391": {
+    "inputs": {
+      "select": [
+        "3392",
+        1
+      ],
+      "branches": 2,
+      "lanes": 2,
+      "b0_l0": [
+        "3047",
+        0
+      ],
+      "b0_l1": [
+        "3381",
+        0
+      ],
+      "b1_l0": [
+        "3385",
+        1
+      ],
+      "b1_l1": [
+        "3385",
+        0
+      ]
+    },
+    "class_type": "SonderLazyCluster",
+    "_meta": {
+      "title": "Sonder Cluster"
+    }
+  },
+  "3392": {
+    "inputs": {
+      "choice": "Normal Conditioning",
+      "choice_list": "Normal Conditioning\nPrompt Relay Conditioning\n"
+    },
+    "class_type": "SonderSelector",
+    "_meta": {
+      "title": "Sonder Selector"
+    }
+  },
+  "3393": {
+    "inputs": {
+      "fps": [
+        "2849",
+        7
+      ],
+      "autoplay_preview": false,
+      "frames": [
+        "3377",
+        0
+      ]
+    },
+    "class_type": "SonderPreviewVideo",
+    "_meta": {
+      "title": "Processed Driver"
+    }
+  },
+  "3396": {
+    "inputs": {
+      "select": [
+        "3392",
+        1
+      ],
+      "branches.item0": [
+        "2849",
+        5
+      ],
+      "branches.item1": [
+        "3384",
+        1
+      ]
+    },
+    "class_type": "SonderLazySwitch",
+    "_meta": {
+      "title": "Sonder Switch"
+    }
+  },
+  "3132:2187": {
+    "inputs": {
+      "av_latent": [
+        "3132:2206",
+        0
+      ]
+    },
+    "class_type": "LTXVSeparateAVLatent",
+    "_meta": {
+      "title": "Separate AV Latent",
+      "cnr_id": "comfy-core",
+      "ver": "0.5.1"
+    }
+  },
+  "3132:2194": {
+    "inputs": {
+      "positive": [
+        "3281",
+        0
+      ],
+      "negative": [
+        "3281",
+        1
+      ],
+      "latent": [
+        "3132:2187",
+        0
+      ]
+    },
+    "class_type": "LTXVCropGuides",
+    "_meta": {
+      "title": "LTXVCropGuides",
+      "cnr_id": "comfy-core",
+      "ver": "0.3.68"
+    }
+  },
+  "3132:2206": {
+    "inputs": {
+      "noise": [
+        "3132:2192",
+        0
+      ],
+      "guider": [
+        "3132:3065",
+        0
+      ],
+      "sampler": [
+        "3132:3109",
+        0
+      ],
+      "sigmas": [
+        "3132:3389",
+        0
+      ],
+      "latent_image": [
+        "3279",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced",
+      "cnr_id": "comfy-core",
+      "ver": "0.16.4"
+    }
+  },
+  "3132:3109": {
+    "inputs": {
+      "sampler_name": "res_2s"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect",
+      "cnr_id": "comfy-core",
+      "ver": "0.37.0"
+    }
+  },
+  "3132:2497": {
+    "inputs": {
+      "steps": 8,
+      "max_shift": 2.05,
+      "base_shift": 0.95,
+      "stretch": true,
+      "terminal": 0.1,
+      "latent": [
+        "3279",
+        0
+      ]
+    },
+    "class_type": "LTXVScheduler",
+    "_meta": {
+      "title": "LTXVScheduler",
+      "cnr_id": "comfy-core",
+      "ver": "0.20.1"
+    }
+  },
+  "3132:2192": {
+    "inputs": {
+      "noise_seed": [
+        "3349",
+        0
+      ]
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "RandomNoise",
+      "cnr_id": "comfy-core",
+      "ver": "0.16.4"
+    }
+  },
+  "3132:3037": {
+    "inputs": {
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 128,
+      "temporal_overlap": 32,
+      "samples": [
+        "3132:2194",
+        2
+      ],
+      "vae": [
+        "146",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": {
+      "title": "VAE Decode (Tiled)",
+      "cnr_id": "comfy-core",
+      "ver": "0.28.0"
+    }
+  },
+  "3132:145": {
+    "inputs": {
+      "samples": [
+        "3132:2187",
+        1
+      ],
+      "audio_vae": [
+        "147",
+        0
+      ]
+    },
+    "class_type": "LTXVAudioVAEDecode",
+    "_meta": {
+      "title": "LTXV Audio VAE Decode",
+      "cnr_id": "comfy-core",
+      "ver": "0.7.0"
+    }
+  },
+  "3132:3065": {
+    "inputs": {
+      "video_cfg": 1,
+      "audio_cfg": 1,
+      "model": [
+        "3386",
+        0
+      ],
+      "positive": [
+        "3281",
+        0
+      ],
+      "negative": [
+        "3281",
+        1
+      ]
+    },
+    "class_type": "LTXVDualCFGGuider",
+    "_meta": {
+      "title": "LTXV Dual CFG Guider",
+      "cnr_id": "comfy-core",
+      "ver": "0.28.0"
+    }
+  },
+  "3132:3387": {
+    "inputs": {
+      "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+    },
+    "class_type": "ManualSigmas",
+    "_meta": {
+      "title": "ManualSigmas"
+    }
+  },
+  "3132:3388": {
+    "inputs": {
+      "scheduler": "bong_tangent",
+      "steps": 8,
+      "denoise": 1,
+      "model": [
+        "3386",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "BasicScheduler"
+    }
+  },
+  "3132:3389": {
+    "inputs": {
+      "select": [
+        "3132:3390",
+        1
+      ],
+      "branches.item0": [
+        "3132:2497",
+        0
+      ],
+      "branches.item1": [
+        "3132:3387",
+        0
+      ],
+      "branches.item2": [
+        "3132:3388",
+        0
+      ]
+    },
+    "class_type": "SonderLazySwitch",
+    "_meta": {
+      "title": "Sonder Switch"
+    }
+  },
+  "3132:3390": {
+    "inputs": {
+      "choice": "LTXV Scheduler",
+      "choice_list": "LTXV Scheduler\nManual Sigmas\nBasic Scheduler"
+    },
+    "class_type": "SonderSelector",
+    "_meta": {
+      "title": "Sonder Selector"
+    }
+  }
+}
