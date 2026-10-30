@@ -157,6 +157,7 @@ def test_starter_without_initial_modes_does_not_create_controls_sidecar(starter)
 
 @pytest.mark.parametrize('slug, choices', [
     ('sonder_ltx_2_5_edit_vfx', ['Make a New Video', 'Generate New Audio', 'Standard']),
+    ('sonder_ltx_2_5_edit_vfx_standard', ['Make a New Video', 'Generate New Audio']),
     ('sonder_ltx_2_5_refine_upscale', ['Refine and Upscale Pass', 'Mask Off']),
     ('sonder_minimax_h3_references_swaps', ['Standard Generation']),
 ])
@@ -191,3 +192,53 @@ def test_shipped_starter_sources_and_initial_choices(slug, choices):
     seeds = [node['inputs']['seed'] for node in graph.values() if node['class_type'] in ('SeedNode', 'SeedGenerator')]
     assert seeds and set(seeds) == {0}
     assert {entry['seed_mode'] for entry in menu['bindings'].values() if entry.get('seed_mode')} == {'fixed'}
+
+
+def test_standard_edit_starter_removes_relay_dependency_without_changing_other_tasks():
+    from server import control_manifest as cm, control_routing
+
+    folder = Path(st.__file__).resolve().parents[1] / 'sdk_starters'
+    full = json.loads((folder / 'sonder_ltx_2_5_edit_vfx.json').read_text(encoding='utf-8'))
+    simple = json.loads((folder / 'sonder_ltx_2_5_edit_vfx_standard.json').read_text(encoding='utf-8'))
+    assert 'promptrelay' not in json.dumps(simple).lower()
+    assert 'prompt relay' not in json.dumps(simple).lower()
+    assert 'PromptRelaySmartEncode' in {n['class_type'] for n in full.values()}
+    relay = cm.find_relay(full)['key']
+    full_menu = json.loads(full[relay]['inputs']['manifest'])
+    menu = json.loads(simple[relay]['inputs']['manifest'])
+    removed = {'3384', '3385', '3391', '3392', '3396'}
+    assert set(simple) == set(full) - removed
+    assert full['3392']['inputs']['choice'] == 'Normal Conditioning'
+    assert full['3392']['inputs']['choice_list'].splitlines()[0] == 'Normal Conditioning'
+    expected_links = {
+        ('3035', 'iclora_model'): full['3391']['inputs']['b0_l1'],
+        ('3064', 'positive'): full['3391']['inputs']['b0_l0'],
+        ('3386', 'model'): full['3391']['inputs']['b0_l1'],
+        ('3348', 'string_b'): full['3396']['inputs']['branches.item0'],
+    }
+    for key, node in simple.items():
+        if key == relay:
+            continue
+        expected = json.loads(json.dumps(full[key]))
+        for (consumer, field), value in expected_links.items():
+            if consumer == key:
+                expected['inputs'][field] = value
+        assert node == expected
+    assert menu['preset_categories'] == {k: v for k, v in full_menu['preset_categories'].items()
+                                         if k != 'edit_vfx_prompt_method'}
+    assert menu['presets'] == {k: v for k, v in full_menu['presets'].items()
+                              if k not in ('edit_vfx_prompt_standard', 'edit_vfx_prompt_timed')}
+    assert menu['bindings'] == {k: v for k, v in full_menu['bindings'].items() if k != '-a4xOoh01dto'}
+    assert menu['views'] == full_menu['views']
+    routing, error = control_routing.read_routing(menu['execution']['routing'])
+    assert error is None
+    assert not removed.intersection(routing['nodes'])
+    for preset in menu['presets'].values():
+        assert set(preset['members']) <= set(menu['bindings'])
+        assert set(preset.get('execution', {})) <= set(menu['execution']['controls'])
+    for binding in menu['bindings'].values():
+        assert all(t['path'] in simple for t in binding['targets'])
+    assert all(v['path'] in simple for v in menu['views']['items'].values())
+    assert all(m['path'] in simple for s in menu['execution']['controls'].values() for m in s['members'])
+    meta = json.loads((folder / 'sonder_ltx_2_5_edit_vfx.meta.json').read_text(encoding='utf-8'))
+    assert meta['name'].endswith('Prompt Relay')

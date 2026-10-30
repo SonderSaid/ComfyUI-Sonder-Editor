@@ -201,12 +201,13 @@ def test_category_reader_edits_and_grammar_mirror_the_frontend(tmp_path):
     dropped = copy.deepcopy(expected)
     pc.drop_choice(dropped, "a")
     targets = {f: (cd.is_structural(f"preset_category:c:{f}"), cd.parse_target(f"preset_category:c:{f}")) for f in sorted(pc.FIELDS)}
+    blank_names = ["﻿", "\x1c", "\x1f", "\x85", " ", " ", "﻿A", "A"]
     script = f'''import assert from 'node:assert/strict';
     const b = await import({json.dumps((root / 'web/js/control_bindings.js').as_uri())});
     const t = await import({json.dumps((root / 'web/js/control_targets.js').as_uri())});
     assert.deepEqual(b.readPresetCategories({json.dumps(raw)}), {json.dumps(cm.read_preset_categories(raw))});
     assert.deepEqual(b.readPresets({json.dumps(presets)}), {json.dumps(cm.read_presets(presets))});
-    for (const text of {json.dumps(["﻿", "\x1c", "\x1f", "\x85", " ", " ", "﻿A", "A"])})
+    for (const text of {json.dumps(blank_names)})
         assert.equal(b.blankName(text), !/A/.test(text), JSON.stringify(text));
     for (const [field, [structural, parsed]] of Object.entries({json.dumps(targets)})) {{
         const target = `preset_category:c:${{field}}`;

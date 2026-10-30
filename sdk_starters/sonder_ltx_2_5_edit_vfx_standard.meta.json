@@ -1,0 +1,39 @@
+{
+  "name": "LTX 2.5 Edit & VFX",
+  "model_family": "LTX 2.5",
+  "order": 1,
+  "initial_node_modes": {
+    "3278": {
+      "mode": "muted",
+      "class_type": "MoGeRender"
+    },
+    "3283": {
+      "mode": "muted",
+      "class_type": "MoGeInference"
+    },
+    "3284": {
+      "mode": "muted",
+      "class_type": "LoadMoGeModel"
+    },
+    "3334": {
+      "mode": "muted",
+      "class_type": "SDPoseKeypointExtractor"
+    },
+    "3335": {
+      "mode": "muted",
+      "class_type": "SDPoseDrawKeypoints"
+    },
+    "3338": {
+      "mode": "muted",
+      "class_type": "CheckpointLoaderSimple"
+    },
+    "3333": {
+      "mode": "muted",
+      "class_type": "Canny"
+    },
+    "3393": {
+      "mode": "muted",
+      "class_type": "SonderPreviewVideo"
+    }
+  }
+}

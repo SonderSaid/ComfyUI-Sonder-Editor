@@ -53,8 +53,8 @@ Do this once, in a browser on the ComfyUI machine.
 
 Choose a supplied workflow under **Starters** in the Launcher, or import your
 own. See **[Sonder App Workflows](sonder-app-workflows.md)** for an introduction
-to **LTX 2.5 Edit & VFX**, **LTX 2.5 Refine & Upscale**, and
-**MiniMax H3 — References & Swaps**.
+to **LTX 2.5 Edit & VFX** (also as **LTX 2.5 Edit & VFX — Prompt Relay**),
+**LTX 2.5 Refine & Upscale**, and **MiniMax H3 — References & Swaps**.
 
 <a id="import-a-workflow"></a>
 
