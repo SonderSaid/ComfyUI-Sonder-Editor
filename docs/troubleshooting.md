@@ -5,6 +5,10 @@ projects. For a first setup, see [Getting Started](getting-started.md).
 
 ## Installation & environment
 
+- **Controls compatibility:** ComfyUI-Custom-Scripts' **Preset Text** extension
+  (`pysssss.PresetText`) can make exposed Controls appear as disabled "Setting"
+  rows even when their nodes are still in the workflow.
+
 ### The Editor is blank or shows raw controls after installing through Manager
 
 After Manager finishes restarting ComfyUI, refresh the browser page as well
@@ -82,7 +86,7 @@ enable long-path support in Windows, then export again.
 ### I can't link a project on another drive or a UNC share
 
 Enable **Allow External Project Links** in Editor Settings first, then use
-**Link project folder...** from the project menu and paste the server-visible
+**Link project folder…** from the project menu and paste the server-visible
 path. Local Windows drives use a junction without elevated privileges; UNC
 paths need a true symlink, which requires Windows Developer Mode or an elevated
 ComfyUI process. Do not toggle the setting while a render or Save Bridge job is
@@ -206,7 +210,7 @@ address.
 
 ## Playback
 
-### A clip shows "No proxy yet", "Proxy queued" or "Proxy waiting for ComfyUI" instead of its picture
+### A clip shows a proxy notice ("Proxy queued", "No proxy yet"…) instead of its picture
 
 Your browser can't play that video's format, and its
 [proxy](assets-and-gallery.md#proxies) isn't ready yet.
@@ -214,6 +218,8 @@ Your browser can't play that video's format, and its
 - To make it now: select the video in the gallery and click **Build now**
   under the notice in the inspector, or right-click it and choose **Build
   Proxy Now**.
+- **Building proxy…**: wait.
+- **Proxy queued**: wait, or build it now as above.
 - **Proxy waiting for ComfyUI**: proxies build once ComfyUI has been idle for
   30 seconds. To build them while you generate, set **Settings ▸ Proxies ▸
   Build Proxies** to **Right away**.

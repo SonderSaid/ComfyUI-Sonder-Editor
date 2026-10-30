@@ -1,8 +1,8 @@
 # Generating
 
 How the editor talks to your generation workflow: what you select, what your
-model is told, what gets queued, and which of your later edits still affect a
-queued job.
+model is told, what gets queued, which of your later edits still affect a
+queued job, and how to watch the workflow's outputs in the viewport.
 
 Editing itself is covered in [Editor Basics](editor-basics.md); assets and
 export in [Assets & Gallery](assets-and-gallery.md).
@@ -37,9 +37,8 @@ are set in the **GEN** box of the toolbar, which also shows their frame counts.
 Moving the playhead (the **F** field, or clicking the ruler) doesn't change
 either.
 
-- **Selection (In/Out)** is the live range a render executes. It persists per
-  project + scene in your browser, so scene switches and refreshes restore
-  it. No selection means **Full scene** — renders and queues then cover the
+- **Selection (In/Out)** is the live range a render executes. No selection
+  means **Full scene** — renders and queues then cover the
   whole scene. Committed In/Out values snap to the active template's frame
   grid; the ▲▼ steppers move directly along it.
 - **Context frames (Ctx Pre/Post)** extend the source window beyond the
@@ -50,7 +49,7 @@ either.
   edit before running; these values do not change In/Out.
 - **Saved Selections** (the bookmark button) capture the *full* recall state
   — in/out, context, and mask offsets — and live in the project, so they're
-  shareable, unlike the live selection.
+  shareable.
 - **✕** in the **GEN** box clears the Selection (the **X** key does too).
 
 ### Ways to set In and Out
@@ -132,8 +131,7 @@ Guide frames condition generation with a reference image at a specific frame
   playhead as a new image asset + guide.
 - **Settings ▸ Guides ▸ Collision Auto-Offset (project-wide)**, on by
   default, moves a single-image guide off a frame a Driver already uses (for
-  LTX-style workflows), and the take's details record the move. With it off,
-  queueing warns about the collision instead.
+  LTX-style workflows).
 - Guides reach a graph two ways, and you pick one. The editor node's
   `guide_images` output carries every guide in the window as a single IMAGE
   batch, with `guide_idx` and `guide_strengths` as lists aligned to it, for a
@@ -159,7 +157,7 @@ appearing in output (their editing rules are in
 row from its lane menu and outputs `has_driver`; **Sonder Driver Bridge**
 outputs that row's frames for the generation window. When the template's frame
 rule adds frames to the end of the window, a Driver that runs to the window's
-end holds its last frame over them, so Driver and render frames stay lined up.
+end holds its last frame over them.
 
 ## References
 
@@ -197,8 +195,9 @@ Sonder Editor ──prompt────────> your text encoder ──> sa
 ```
 
 End every graph with **Sonder Save Video** (or **Sonder Save Bridge**) taking
-`project` from the editor, so results come back to the project. Wire `project`
-directly: Get/Set nodes, reroutes and Anything Everywhere break it.
+`project` from the editor, so results come back to the project. The
+connection can pass through other project-carrying Sonder nodes, such as
+**Sonder Metadata Collector**.
 
 Add bridge nodes only for what your graph uses: guides (**Guides Bridge
 Start/End**), masks (**Masks Bridge**), timed prompts (**Prompt Relay
@@ -352,3 +351,113 @@ Rules of thumb:
   content inside a pending job's window changes what it receives. Leave that
   content in place until the job finishes.
 - The queue row always shows the frozen range/context/mask.
+
+## Output Views
+
+A **View** is one of your workflow's output nodes (**Preview Image**,
+**Sonder Preview Video**, **Sonder Save Video** and the like, including ones
+inside a subgraph) shown in a [viewport pane](editor-basics.md#panes). To add
+one, click a pane's source button, choose **Add output…** and click the node.
+To rename, reorder or delete Views,
+see [Manage](controls.md#manage).
+
+### The View pane
+
+A View pane shows the newest result of its output node. Its bar has:
+
+- **Run**: runs just that output's branch of the graph, not the whole
+  workflow. **Cancel** takes it off the queue or stops it while it runs.
+- **Hold**: keeps the result you are looking at when the output runs again.
+  **Release** follows the newest again. Hiding the pane releases it too. To
+  compare before and after, show the same View in two panes and hold one.
+- **◀ 1/3 ▶**: steps through several images.
+- **Fit** / **Fill**: shows the whole output, or fills the pane. The mouse
+  wheel zooms toward the cursor and dragging pans, as in
+  [the inspect overlay](assets-and-gallery.md#the-inspect-overlay).
+- **Unmute** (**Listen** while the pane is linked): hear this pane instead of
+  the timeline. Only one source plays sound at a time; **Mute** gives the
+  sound back to the timeline.
+- **Link** / **Linked**: on video and audio outputs. See
+  [Following the timeline](#following-the-timeline).
+
+The text beside the source button says what is happening:
+
+| Text | What it means |
+|---|---|
+| **No result yet** | No run started here has made this output yet. Click **Run**, or run the workflow. |
+| **Running** / **Waiting for run** | A run that makes this output is queued or in progress. |
+| **Previous result · Running** | A new run has started; the picture is still the last result. |
+| **Last run was canceled** / **Last run failed** | The run ended before this output was made. |
+| **From cache** | ComfyUI reused an earlier result instead of running the node again. |
+| **Switched off** | The node is muted or bypassed; the last result stays. |
+| **Didn't run:** and the reason | **Run** couldn't start, for example because another output is waiting for ComfyUI. |
+| **This View is no longer in the workflow** | Its node was deleted. Pick another source, or delete the View in **Manage**. |
+| **Disconnected** | In a mounted tab: the canvas page is closed or reloading. |
+
+### Following the timeline
+
+A video or audio View pane can play and scrub with the editor, so you can
+compare it with the **Composite** frame by frame. **Linked** on the pane's bar
+means it does; this is on by default. Click it to read **Link** and play the
+output on its own again.
+
+While linked, the pane's own play button and scrub bar are hidden, and the
+editor's **Play**, the playhead and the timeline move it:
+
+- **A take** from **Sonder Save Video** that was placed on the timeline
+  follows the frames its take clip covers.
+- **Any other output** follows the **Timing** you set for its View. Open the
+  **Controls** tab, click **Manage**, and find the View's **Timing** row under
+  **Views**:
+  - **Follows from the render start**: the output's first frame is the first
+    frame the Editor rendered, context included.
+  - **Follows from the generation start**: the output's first frame is the
+    first frame of your selection.
+  - **Skip first**: drops that many frames from the start of the output.
+  - The frame-rate box: leave it empty when the output has the scene's frame
+    rate; otherwise type its rate.
+  - **No timing set** leaves the output unlinked.
+
+What a linked pane shows:
+
+| Text | What it means |
+|---|---|
+| **Outside generated range** | The playhead is outside the frames this output was made for. The picture comes back when the playhead returns. |
+| **Catching up** | The pane fell behind (slow decoding) and is catching up. |
+| **Previous context** | The scene changed inside this output's range after it ran, so it may no longer match what is around it. **Undo** of the change clears it. |
+| **Unlinked:** and the reason | The pane can't follow: for example, the output was made for another scene or frame rate, or its View has no **Timing** (**No timing for this output. Set it in Manage ▸ Views**). |
+
+A linked pane sounds only while the editor plays inside its range.
+
+### Sampling previews
+
+A sampling View shows the picture a sampler draws while it runs, the same one
+ComfyUI shows on the sampler node. To set one up, see
+[Watch a sampler while it runs](getting-started.md#watch-a-sampler-while-it-runs).
+
+A pane's source button lists, under **Sampling previews**, the workflow's
+**KSampler**, **KSampler (Advanced)**, **SamplerCustom**,
+**SamplerCustomAdvanced** and KJNodes **Model Preview Override** nodes, plus
+any other node that sent previews in a recent run (marked **Sent previews in a
+recent run**).
+
+A sampling View has no **Run**: run the workflow as usual. The pane shows the
+newest preview, with **Fit** / **Fill**, wheel zoom and drag to pan. For a
+moving preview of a video model, see
+[Watch a sampler while it runs](getting-started.md#watch-a-sampler-while-it-runs).
+
+The text beside the source button says:
+
+| Text | What it means |
+|---|---|
+| **Sampling · step 12/30** | The sampler is running; the picture is its latest step. |
+| **Last preview · step 30/30** | The sampler finished; this was its last picture. |
+| **Running** / **Waiting for previews** | The run started, and no preview has arrived yet. |
+| **Previous run · Running** | A new run has started; the picture is still the last run's. |
+| **From cache** | ComfyUI reused the sampler's earlier result, so the picture is from the run that made it. |
+| **No previews** and the reason | Previews were off for the run (set **Live preview method**; for the Sonder App, start ComfyUI with `--preview-method auto`), the node came from ComfyUI's cache, or a **Model Preview Override** on the sampler's model took them (add a View on the Override node instead). |
+| **Last run was canceled** / **Last run failed** | The run ended before the node sent a preview. |
+| **Not in the newest run** (added to the text) | Your last run didn't include this node, so the picture is from an earlier one. |
+| **Switched off** | The node is muted or bypassed; the last picture stays. |
+| **Unavailable** | The preview is no longer kept, or is too large to show here. |
+| **Unsupported** | Your browser can't show this preview's format. |

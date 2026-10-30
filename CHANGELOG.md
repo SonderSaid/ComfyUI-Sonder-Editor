@@ -11,96 +11,101 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+The Sonder App release: run a workflow from a page of its own, change its
+settings from the editor with Controls and Modes, and watch its outputs beside
+the scene in up to four viewport panes.
+
+Unless an entry says otherwise, new editor features work the same in
+fullscreen, a mounted tab and the Sonder App.
+
 ### Added
-- Controls show a node's own help for its settings: hover a setting's name, or Tab to its value, to read what the node says about it (a LoRA list's fields too). Works in fullscreen, mounted tabs and the Sonder App.
-- Controls Modes: in Manage, a choice's editor lists the other **Choices in** its category, so you can step between them, and creating a category or choice, updating a choice and saving its name or description each confirm with a short notice.
-- One notification per run, the same on the canvas, in fullscreen, in a mounted tab and in the Sonder App: it shows what the run is doing (Queued, Rendering frames 40/144, Preparing graph inputs, Encoding frames, Saving the take) with a ticking elapsed time, then turns into how it ended, with a short receipt: the range it rendered, whether the Render Queue was off or which queued job ran, and the Modes in effect. A batch keeps one live notification with how many runs are waiting, and each finished run leaves a receipt.
-- **Restore Take Placement** (Settings ▸ Timeline Behavior, on by default): drag a take from Assets onto the timeline and it comes back with its original trim, at its original time in its own scene or where you drop it in another (converted to that scene's frame rate). Drop on the ruler to bring its sound back too. Older takes that don't record their placement, and takes whose media was replaced, drop whole at the cursor. This replaces the old same-scene drop, which put the whole file at the Selection's start; with the setting off a take now drops whole at the cursor. Works in fullscreen, mounted tabs and the Sonder App.
-- **Keep take padding** (Settings ▸ Render): place a new take with the extra frames a model renders to meet its frame rule, when the render generated them, from the take's start to the end of the file. A take whose kept frames run past the scene's end says so. Off by default; a queued job keeps the choice it was queued with.
-- Output Views can show a sampler's live preview: pick a sampler or KJNodes Model Preview Override from a pane's **Sampling previews** list and watch its newest preview, labelled with the step, while the workflow runs. Works in fullscreen, mounted tabs and the Sonder App.
-- Output Views can follow the timeline: a Save Video take, or an output with timing you set in Manage, plays and scrubs with the editor, says when the playhead is outside what it generated, catches up after a stall, marks when the scene changed in its range since it ran, and can take over the sound from the timeline.
-- Viewport panes: show one to four sources at once, side by side, stacked, or in a grid (two by two, or one large pane and two beside it): the composite, Guides, a Driver lane, or a named output View. Pick an output node from a pane to create its View; run that output alone, cancel it, hold a result to compare with the next, and rename, reorder or delete Views in Manage. Works in fullscreen, mounted tabs and the Sonder App.
-- Controls: switch a node, a subgraph or a canvas group **Enabled / Muted / Bypassed** from Controls on the canvas and in mounted tabs (one Undo step; a group whose nodes differ shows Mixed), and save switches in Modes choices beside settings, so one choice can, say, skip a first pass. A setting on a muted or bypassed node keeps its Control, says why it is off and stays editable without turning the node on, and Cleanup no longer offers to remove it. Manage warns before **Export (API)** about nodes that are off; in the Sonder App, switches and choices with switches work too, Generate runs exactly what ComfyUI would run with those nodes off, and it refuses when every Sonder save is switched off.
-- Proxies: video your browser can't play, such as ProRes and Lossless FFV1, now plays everywhere you preview it (viewport, gallery, Inspect, Compare, Crop, Trim & Preview) through a playable copy Sonder builds for it; render, export and guide frames keep using the original. Takes in those formats get theirs before Save Video finishes. Settings ▸ Proxies sets the proxy preset and when proxies build (when ComfyUI is idle, right away, or only when you ask) and regenerates or deletes them by usage; the gallery adds Build now, Create, Rebuild and Remove Proxy and a proxy badge, with progress and Cancel for builds you start. Works in fullscreen, mounted tabs, the Sonder App and the node card.
-- Assets: native LoRA stacks in Controls at run show individual rows with strengths, a coloured On/Off/Skipped status (also on Power LoRA rows), Copy and A/B comparison filters, without needing a Metadata Collector.
-- Controls: **Show notes** (Settings ▸ Controls, on by default) hides the workflow's notes, both the standalone ones and those under a setting, so you see only the settings; their values are unchanged. The **Hide notes** / **N notes hidden** line near the top of the Controls tab switches it from the Controls tab, and, as with Advanced settings, Manage still shows notes and a search shows a matching setting's note. Works in fullscreen, mounted tabs and the Sonder App.
-- Example workflow **Sonder LTX 2.5 Edit & VFX**: LTX 2.5 editing and effects chosen from Controls Modes (edit with a prompt or an edited picture, remove people, subject masks, follow a video's layout, body movement or outlines, add sound, or make new video and sound), with setup, model download and first-take notes in Controls.
-- Controls: a note whose first line is bold text or a heading, with more text after it, shows that line as a header you can click to collapse the note, in fullscreen, mounted tabs and the Sonder App. Each browser remembers which notes you collapsed. Headings in notes and workflow descriptions now match the panel's text size instead of the browser's large defaults.
-- Timeline snapping: a moved item's end snaps as well as its start, so a clip can butt against the next one, the playhead or the scene end, and Reference item edges are snap targets. Settings ▸ Timeline Behavior adds **Snap Playhead on the Ruler** and **Snap Razor Cuts**, both off by default; with Razor snapping on, the snap guide shows where a cut will land.
-- Controls: the Reference Selector's lanes, the Driver Selector's lane and the Save Bridge's target folder can be Controls, in fullscreen, mounted tabs and the Sonder App. Reference lanes list the scene's lanes with Add and Remove and say why a lane can't be added, the Driver lane is a dropdown of the scene's named lanes, and the folder takes any label with the project's folders and Root as suggestions. A setting wired to another Sonder Editor shows a plain field and says why. The Relay shows each as a read-only summary.
-- Controls: ComfyUI's LoRA stack loaders (Load LoRA (Model) and Load LoRA (Text Encoder)) are one Control holding the whole list. Add, remove and edit rows from Controls in fullscreen, mounted tabs and the Sonder App, save the list in Modes choices, and see it in Controls at run. A single row's setting can't be a Control, so removing a row never moves a Control onto another LoRA. On ComfyUI's pinned frontend 1.55, which can't show the rows, the canvas modes say so and the Sonder App still edits them. Takes made from these loaders list their LoRAs in the gallery like Power LoRA rows; takes saved before this keep plain fields.
-- Controls loaded from an API file retain recovery hints and can reconnect verified settings from the editor or Relay in one canvas Undo step. Cleanup keeps reconnectable Controls; Manage adds Restore all for previously exposed settings.
-- Manage Controls: review and clean up missing Controls, orphan anchors, stale app recovery values and individually selected settings in choices for the current workflow. Canvas cleanup is one native Undo step.
-- Sonder App: a Workflow menu at the top of the Controls panel switches to another imported workflow without leaving the project, scene or timeline. Takes already generating finish under their own workflow, and favorites (★, from the menu or the Launcher's ⋮ menu) come first in both places. When no other tab holds them, takes still generating from an earlier visit to the same project join the session you open (or the one you switch to, for that workflow's takes), where Cancel all covers them, and the progress message names each take's workflow.
-- Sonder App Launcher: a workflow that needs node packs this ComfyUI lacks is imported and marked **Missing nodes**, listing the packs that provide them (node names without the Manager); it opens once they are installed. Missing model rows show where each file goes, subfolders included, as a full path on the ComfyUI machine.
-- Controls Modes: a workflow can group whole setups into categories of exclusive choices, shown as a Modes table above the Individual Controls. Click a choice to set its Controls and switches together; the highlight follows the values (Custom once you change one, an outline when two choices match), a notice says when a choice also changed another row, and hover, focus or ? shows the descriptions. Author categories and choices in Manage, which warns about overlapping, linked, missing or repeated choices. Works in fullscreen, mounted tabs and the Sonder App, and travels in the saved workflow and Export (API).
-- Workflow descriptions in Manage and the Launcher, plus Export as API to share Sonder App values and curated Controls with another Sonder App.
-- Controls: create, rename, reorder and ungroup workflow groups in every editor mode, move settings between them, and mark a group Advanced; recorded Advanced settings show an Adv tag in asset details.
-- Controls: compact Rows or Cards, search, personal scale and per-setting Advanced flags in fullscreen, mounted tabs and the Sonder App, with a remembered Editor group and Max frames per batch.
-- Assets: a take, video, PNG sequence or Save Bridge file made from a workflow with Controls records the values its run used. They show as **Controls at run** in the asset details, with labels, groups and seed modes, and `tracked:` and `field:` search finds them.
-- Manage Controls in fullscreen, mounted tabs and the Sonder App: expose, restore, rebind, rename and annotate settings, with editable Relay rows on the canvas and app-only curation in the Sonder App.
-- Projects carry a stamp of the Sonder Editor version that saved them (this version onward), so a later version can name the update a newer project needs.
-- Arrange Controls and their notes by dragging within and between workflow groups, reorder exposed Editor settings among themselves, and filter long option lists with an exact-value choice for capped previews. Manage adds settings from a **+ Setting** button beside + Note and + Group.
-- Controls in Cards: cards in one row share its height, a Control's note stays in its card (two lines, with More), and a value too long for its field shows in full on hover. Manage/Done no longer moves when you switch.
-- Controls sidebar in fullscreen, mounted tabs and the Sonder App: edit workflow values, seed modes and Markdown notes beside shared take settings.
-- Prompt: an empty prompt field shows what it is for, in the timeline editor and in Prompt Management's Global and section rows.
-- Prompt: a Subject mentioned with `@handle` that no definition reaches gets a warning naming the handle and how to fix it.
-- Prompt: Attach offers **New Subject…** (or the format's own identity name) in its Reference list. It opens the identity editor seeded from the chosen picture; **Use for this attachment** then Attach creates the Subject and attaches it in one Undo step, also in Writing mode, where it waits for Apply. Under MiniMax H3 Full Reference this gives the guide's `<Subject 1> is … from <Picture 1>` route in a few clicks.
-- Reference Lane Setup opens by itself after you drop the first item onto a new or empty Reference lane, so you can choose its template. Turn it off in Settings › References › **Open Lane Setup on First Item**.
-- Prompt Management › Reference Prompting: each staged item's derived prompt has **Copy**, **Edit as override** and **Clear**. Under MiniMax H3 Full Reference the row notes that an override reaches only the Prompt Bridge.
-- Sonder Control Relay node: a workflow's Controls menu. It exposes existing node settings, a Sonder Selector's feature list included, in the Controls sidebar with labels, groups and Markdown notes, and the Sonder App reads the same menu from an Export (API) workflow. The settings stay on their own nodes, and a copied node is never exposed twice.
+
+#### Sonder App (experimental, optional)
+- Run your workflows from a page of their own, without the ComfyUI canvas. Install it from the editor's **Settings ▸ Sonder App (experimental)**. It runs through the Comfy SDK (`comfy-sdk`) and a local API proxy (`comfy-api-proxy`) against your running ComfyUI, and every take lands in your project as it would from the canvas.
+- **Launcher:** lists your projects and imported workflows (any ComfyUI **Export (API)** file with a Sonder Editor) and opens the editor on the pair you choose. A workflow that needs node packs this ComfyUI lacks is marked **Missing nodes** with the packs that provide them, and missing model rows show the full path where each file goes.
+- **Generate** (1–8 takes per click) beside **+ Queue**.
+- Three starter workflows, the new example workflows below exported for the API: **LTX 2.5 Edit & VFX**, **LTX 2.5 Refine & Upscale** and **MiniMax H3 — References & Swaps**.
+- A **Workflow** menu at the top of the Controls panel switches to another imported workflow without leaving the project, scene or timeline.
+- **Export as API** shares Sonder App values and curated Controls with another Sonder App.
+
+#### Controls
+- **Sonder Control Relay** node: a workflow's Controls menu. It shows the node settings you choose in the editor's **Controls** tab, with labels, groups and Markdown notes, and the Sonder App reads the same menu from an **Export (API)** workflow.
+- **Controls** tab: edit workflow values, seed modes and notes beside the shared take settings, as compact **Rows** or **Cards**, with search, a personal scale and **Advanced** settings. Hover a setting's name, or Tab to its value, to read the node's own help for it.
+- **Manage:** expose, restore, rebind, rename and annotate settings; add them with **+ Setting** beside **+ Note** and **+ Group**; drag settings and notes within and between groups; create, rename, reorder and ungroup groups and mark one Advanced; give the workflow a description, also shown in the Launcher. Cleanup removes Controls whose settings are gone, and **Restore all** brings back settings exposed before.
+- **Modes:** group whole setups into categories of exclusive choices, shown as a table above the Individual Controls. Click a choice to set its Controls and node switches together. Author them in Manage; Modes travel in the saved workflow and in Export (API).
+- **Node switches (Enabled / Bypassed / Muted):** switch a node, a subgraph or a canvas group from Controls, and save switches in Modes choices, so one choice can, say, skip a first pass.
+- Reference Selector lanes, the Driver Selector's lane and the Save Bridge's target folder can be Controls.
+- ComfyUI's LoRA stack loaders (**Load LoRA (Model)** and **Load LoRA (Text Encoder)**) are one Control holding the whole list: add, remove and edit rows, and save the list in Modes choices.
+- Notes: **Show notes** (Settings ▸ Controls, on by default) hides the workflow's notes so you see only the settings. A note whose first line is bold or a heading collapses from that line.
+
+#### Viewport and Output Views
+- **Viewport panes:** show one to four sources at once, in a row, a column or a grid: the composite, Guides, a Driver lane or an output View.
+- **Output Views:** pick an output node from a pane to show it there. Run that output alone, cancel it, or hold a result to compare with the next; rename, reorder and delete Views in Manage.
+- A View can follow the timeline: a Save Video take, or an output with timing you set in Manage, plays and scrubs with the editor and can take over the sound.
+- **Sampling previews:** watch a sampler's newest preview in a pane, labelled with its step, while the workflow runs. KJNodes **Model Preview Override** works too.
+
+#### Runs and takes
+- One notification per run, the same on the canvas and in every editor host: what the run is doing (Queued, Rendering frames 40/144, Encoding frames, Saving the take) with its elapsed time, then a receipt with the range it rendered, which queued job ran and the Modes in effect.
+- **Restore Take Placement** (Settings ▸ Timeline Behavior, on by default): drag a take from Assets and it comes back with its original trim, at its original time in its own scene or where you drop it in another. Drop it on the ruler to bring its sound back too.
+- **Keep take padding** (Settings ▸ Render, off by default): place a new take with the extra frames a model renders to meet its frame rule.
+- **Controls at run:** a take, video, PNG sequence or Save Bridge file made from a workflow with Controls records the values its run used, in the asset details, and `tracked:` and `field:` search finds them. Native LoRA stacks show their rows with strengths and an On/Off/Skipped status, without a Metadata Collector.
+
+#### Proxies
+- Video your browser can't play, such as ProRes and Lossless FFV1, now plays everywhere you preview it, through a playable copy Sonder builds. **Settings ▸ Proxies** sets the preset and when proxies build, and the gallery can build, rebuild or remove a video's proxy.
+
+#### Prompts and References
+- Attach offers **New Subject…** in its Reference list, to create a Subject from the chosen picture as you attach it.
+- A Subject mentioned with `@handle` that no definition reaches gets a warning.
+- An empty prompt field shows what it is for, in the timeline editor and in Prompt Management.
+- Prompt Management › Reference Prompting: each staged item's derived prompt has **Copy**, **Edit as override** and **Clear**.
+- Reference Lane Setup opens by itself after you drop the first item onto a new or empty Reference lane. Turn it off in Settings › References › **Open Lane Setup on First Item**.
+
+#### Timeline
+- Snapping: a moved item's end snaps as well as its start, and Reference item edges are snap targets. Settings ▸ Timeline Behavior adds **Snap Playhead on the Ruler** and **Snap Razor Cuts**, both off by default.
+
+#### Projects and example workflows
+- Example workflow **Sonder LTX 2.5 Edit & VFX**: editing and effects chosen from Modes: edit with a prompt or an edited picture, remove people, make subject masks, follow a video's layout, body movement or outlines, add sound, or make new video and sound.
+- Example workflow **Sonder LTX 2.5 Refine & Upscale**: refine existing footage, upscale it to twice the timeline's width and height, or both, with optional character or background masking.
+- Example workflow **Sonder MiniMax H3 References & Swaps**: swap a person in existing footage for someone new, keeping the performance and sound, or generate from picture, video and sound References.
+- Projects carry a stamp of the Sonder Editor version that saved them, so a later version can name the update a newer project needs.
 
 ### Changed
-- Controls help waits half a second on each hovered setting or Mode choice, so moving across a dense panel stays quiet. Keyboard help stays immediate; clicking a focused field dismisses it.
-- Controls: a setting on a muted or bypassed node shows only its **Muted** / **Bypassed** tag, with the reason on hover, instead of repeating it under every setting. A node switch's **Enabled / Muted / Bypassed** buttons sit under its name, all the same size, in one row or one per line, never two and one. Modes show each category's name above its choices, and every choice in a category has the same width and height.
-- Controls no longer repeats **Keep take padding** in the Editor group; it stays in Settings ▸ Render.
-- The Sonder Editor node shows ComfyUI's progress bar while it renders frames, filling only when the render is done; the Sonder App's progress shows the Editor's frame count too.
-- Reorganized the documentation around step-by-step goals, with new pages for Controls and the Sonder App.
-- Prompt: the warning about a typed label such as `[Shot 1]` or `<Picture 1>` now says what to do instead: insert it as a chip (Shot, Reference or Vocal Event) or an @handle, so its number follows staging.
-- A mounted editor tab is titled after its project ("Project · Sonder Editor") and follows a project switch.
-- Enqueue errors about a Reference staged in two slots, or missing its definition, name the Reference ("Entity · Member") instead of printing its id.
-- The built-in **LTX 2.3** model template is now labelled **LTX 2.3 / 2.5**: LTX 2.5 uses the same frame and size rules. Projects and workflows that use it are unchanged.
-- New projects are created in the current project storage format, so a new project no longer shows a storage-upgrade notice. Sonder versions before 0.6.0 can't open them. Existing projects upgrade as before, only when an edit needs it.
-- Controls: Save Video, Save Bridge and Masks Bridge settings appear in Editor; Manage offers more Recommended settings, and Relay rows show groups and Advanced labels.
-- Linking a project folder and turning on external project links now work only in a browser on the ComfyUI machine. Elsewhere, Link project folder and the Settings switch are greyed out and say so. Turning links off and unlinking still work from anywhere.
-- Render queue: a job that is waiting again or has failed shows why on a second line, such as a run interrupted before the job completed. Hover for the full text.
-- Reference Lanes: with items on the lane, templates for another media kind are greyed out and say why. Choosing a template with the arrow keys saves once, on Enter or when you leave the list, instead of on every key press; Escape puts the previous template back.
-- MiniMax H3 Full Reference: the empty-field guidance for Subject definitions, retention analysis and the detailed description now follows MiniMax's reference guide: Subjects for characters, props, scenes and styles, standalone Pictures for frame anchors.
-- MiniMax H3 Full Reference: a Reference chip attached to a prompt section, rather than placed in its text, no longer puts its `<Subject N>` mention in front of the description, which doubled the Subject the text already names. Placed in the text it still mentions where it sits, and text you typed into the chip's Inline mention is kept; turn **Scene mention** on in the chip to keep the old behaviour. Existing projects compile this way from now on; jobs already queued are unchanged.
-- Reference Lane Setup (the panel's one name now, in its title, the bar menu and the item editor) shows each item's prompt as a read-only preview with Copy; click it to edit the words in Prompt Management. Under MiniMax H3 it lists each member's `<Picture N>`, role and Library text, and which Subjects cite it. Item options start open.
-- Reference Lane Setup counts a chip as attached to an item under MiniMax H3 when it cites one of the item's members, directly or through a Subject.
+- New projects are created in the current storage format. Sonder versions before 0.6.0 can't open them.
+- MiniMax H3 Full Reference: a Reference chip attached to a prompt section, rather than placed in its text, no longer puts its `<Subject N>` mention in front of the description. Turn **Scene mention** on in the chip to keep the old behaviour. Existing projects compile this way from now on.
+- Linking a project folder and turning on external project links work only in a browser on the ComfyUI machine.
+- The built-in **LTX 2.3** model template is now **LTX 2.3 / 2.5**.
+- Documentation reorganized around step-by-step goals, with new pages for Controls, the Sonder App and its workflows.
+- The Sonder Editor node shows ComfyUI's progress bar while it renders frames.
+- A mounted editor tab is titled after its project ("Project · Sonder Editor").
+- Render Queue: a job that is waiting again or has failed says why on a second line.
+- Reference Lane Setup previews each item's prompt with Copy, and under MiniMax H3 lists each member's `<Picture N>` and which Subjects cite it.
+- MiniMax H3 Full Reference: empty-field guidance follows MiniMax's reference guide (Subjects for characters, props, scenes and styles; standalone Pictures for frame anchors).
+- Prompt: the warning about a typed label such as `[Shot 1]` or `<Picture 1>` says to insert it as a chip or an @handle instead.
+- Enqueue errors about a Reference staged twice or missing its definition name the Reference instead of its id.
 
 ### Fixed
-- Controls Modes: selecting a choice in Manage now loads its settings and node switches first, so the editor shows that choice and **Update from current values** can no longer overwrite it with another choice's setup. A choice that can't load says why, and Update asks first.
-- In a mounted tab, Controls → Manage → **+ Setting** no longer stays on *Loading settings…*, and its filter results follow what you type.
-- Opening Controls in fullscreen or a mounted tab after Assets or References no longer puts the Render Queue above it.
-- Controls buttons pressed right after editing another field, such as a LoRA row's remove button, respond to the first click.
-- A queued job's guides now render with their own fit and crop, as a live run's do (jobs queued before this update keep the defaults they were queued with).
-- Notifications that change between a warning and an error on one subject no longer stack up: each kind keeps one notification that counts its repeats.
-- Cancel stops an Editor render within about a frame instead of waiting for the whole render to finish; a queued job it had claimed still goes back to Pending to run again.
-- A Save Bridge run that errors or is cancelled after the Editor returns its queued job to Pending, with the failing node named after an error, instead of marking it Failed with "Bridge terminal produced no files". Later jobs of its batch stay Pending.
-- Editor renders and timeline exports read each clip's frames in order instead of jumping to every frame, so clips play through at decoding speed: a scene with a large Lossless FFV1 upscale went from about 1.5 s to about 0.13 s per frame in our tests. The render cache starts fresh once after updating.
-- Drivers stay aligned with renders a model's frame rule pads: a Driver that reaches the end of the generation window now holds its last frame over the added frames, so the render's last frames keep their guidance (LTX's guide node used to cut a 120-frame Driver for a 121-frame render down to 113 frames).
-- A Driver whose video decodes a frame or two fewer than its recorded length no longer stops the run with "Driver media ended before expected frame"; it holds its last frame. A file missing more than that still fails.
-- Near the scene end, where post-context is cut short, the generation mask no longer runs further past **Mask Post** than the model's frame rule requires, into frames you asked to keep. Those kept frames now also serve as color-correction references, so Save Video's drift correction can apply where it didn't before.
-- Take placement: Save Video and timeline exports reuse usable empty tail lanes without counting Drivers; concurrent lane edits stay preserved, and a take no longer lands on top of a clip added to its row during generation. Trimmed takes and linked audio follow the Selection plus authored Mask Pre/Post extensions, without extra frames from automatic model alignment.
-- **Queue selected output nodes** no longer takes a Render Queue job for a Save that doesn't run. With Queue Active on, running only a preview leaves the next job pending.
-- A ProRes or FFV1 clip no longer paints the viewport black, latches Compare's play button on Pause, or leaves Crop, Trim & Preview black: each shows its proxy, or a notice saying what the clip waits for.
-- Sonder App takes no longer fail with "This run's SDK session has ended" when ComfyUI runs with `--cache-none` or is short of memory, and in that case the Editor no longer renders twice in one run. Save Video no longer saves a second take, and Save Bridge no longer misses files its saver already wrote. When a Sonder App take is refused, the message now says why: the take already ran, it belongs to another project, or it expired.
-- Prompt: Attach and the Mention menu no longer offer a "Subject: <Reference>" row for a Reference that has no Subject yet. Choosing it made the run fail. A chip already bound that way still says it needs a new source.
-- MiniMax H3 Full Reference: the Preservation detail warning names the label, such as `<Subject 1>`, and the field, and its **Fix** button in Prompt Management opens that chip on the field. Preserved prose from outside the render window no longer raises the warning.
-- Timeline snapping: dragging a guide no longer stops the prompt section with the same number from being a snap target, and a drag no longer snaps to where a swap preview briefly moved a neighbour.
-- Prompt: a Shot inserted at the cursor now appears where you put it, as its own numbered shot (`[Shot 2]`, `[Shot 3]` …) counted across the render window. Before, every Shot in a section became one `[Shot N]` at the start of the section, and they all showed the same number and time. A Shot at the very start of the text, or one attached to the section with + Attach, still opens the section and can include its start time. A Shot after other text can't, so its "Include section time" option is greyed out with the reason. Insert at cursor offers Shot only in the field that carries shot markers. `@shot` references and "appears in [Shot N]" lists follow the new numbers, and a section holding only a Shot and no text no longer pushes later shot references one number ahead. Prompt Relay output still carries no shot markers.
-- Guides Bridge Start and Driver Selector panels now follow editor edits, scene switches and project switches instead of staying stale until Refresh, and the Driver Selector follows a lane changed elsewhere. Reference Selector and Reference Bridge nodes now also follow a project switch on their editor. Overrides for guides or lanes that left the scene are kept and counted ("N stale overrides — Refresh to clear") until you click Refresh, so an Undo that brings them back keeps them.
-- Save Bridge Target Folder: what you type is applied when you press Enter or leave the box (Ctrl+Enter queues with it), Escape abandons it, and the box no longer writes old text back over a folder set elsewhere.
-- Controls on the canvas: a workflow with `{a|b}` dynamic-prompt text no longer refuses every Controls edit as "The workflow changed", and such text shows and saves as written instead of as one random choice.
-- Sonder Selector: a choice or choice list fed by a link no longer fails ComfyUI's check before the run; the node checks the value when it runs.
-- Link project folder: a project that is already in the projects folder is now refused with that reason. It used to be reported as a name collision.
-- Mounted editor: a brief websocket interruption no longer drops canvas presence while its HTTP heartbeats continue.
-- Assets: Open Source Workflow is greyed out in the mounted editor tab, where it could not open anything, and for takes saved without a workflow. It used to stay clickable and report the workflow as unavailable.
-- Queue: a save node whose "mark queue complete" is set by a Primitive Boolean now completes the job when it is on. It used to be read as off, so the same job re-rendered.
-- Queue: a render that fails or is interrupted after taking a queue job now returns that job to pending right away, even when no editor is open. It used to stay running until an open canvas reset it about five seconds later.
-- Save Bridge: the "bridge asset saved" notice and the final refresh now wait until the bridge has finished saving its files. A slow finalization used to be cut short after five seconds.
+- Editor renders and timeline exports read each clip's frames in order instead of seeking for every frame: a scene with a large Lossless FFV1 upscale went from about 1.5 s to about 0.13 s per frame in our tests. The render cache starts fresh once after updating.
+- Cancel stops an Editor render within about a frame.
+- Drivers stay aligned with renders a model's frame rule pads: a Driver that reaches the end of the generation window holds its last frame over the added frames. A Driver a frame or two short no longer stops the run.
+- Near the scene end, the generation mask no longer runs past **Mask Post** further than the model's frame rule requires.
+- Take placement: a take lands on a free row, never on a clip added during generation, and covers the Selection plus Mask Pre/Post without extra frames.
+- With `--cache-none` or short of memory, the Editor no longer renders twice in one run, Save Video no longer saves a second take, and Save Bridge no longer misses files its saver already wrote.
+- A ProRes or FFV1 clip no longer paints the viewport black, latches Compare's play button on Pause, or leaves Crop, Trim & Preview black.
+- A Save Bridge run that errors or is cancelled returns its queued job to Pending instead of marking it Failed.
+- **Queue selected output nodes** no longer takes a Render Queue job for a Save that doesn't run.
+- Queue: a save node whose "mark queue complete" comes from a Primitive Boolean completes the job when it is on, and a render that fails after taking a job returns it to Pending right away, even with no editor open.
+- A queued job's guides render with their own fit and crop, as a live run's do.
+- Notifications that switch between a warning and an error on one subject no longer stack up.
+- Prompt: a Shot inserted at the cursor appears where you put it, as its own numbered shot (`[Shot 2]`, `[Shot 3]` …) counted across the render window.
+- Prompt: Attach and the Mention menu no longer offer a "Subject: <Reference>" row for a Reference with no Subject yet, which made the run fail.
+- MiniMax H3 Full Reference: the Preservation detail warning names the label and the field, its **Fix** opens that chip, and preserved prose from outside the render window no longer raises it.
+- Guides Bridge Start and Driver Selector panels follow editor edits, scene switches and project switches instead of staying stale until Refresh; Reference Selector and Reference Bridge nodes follow a project switch too.
+- Save Bridge Target Folder applies what you type on Enter or when you leave the box, and no longer writes old text back over a folder set elsewhere. The "bridge asset saved" notice waits until the bridge has finished saving.
+- Sonder Selector: a choice fed by a link no longer fails ComfyUI's check before the run.
+- Timeline snapping: dragging a guide no longer stops the same-numbered prompt section from being a snap target, and a drag no longer snaps to where a swap preview briefly moved a neighbour.
+- Link project folder refuses a project already in the projects folder with that reason, instead of reporting a name collision.
+- Mounted editor: a brief websocket interruption no longer drops canvas presence.
+- Assets: Open Source Workflow is greyed out in a mounted tab and for takes saved without a workflow.
 
 ## [0.7.8] - 2026-10-14
 

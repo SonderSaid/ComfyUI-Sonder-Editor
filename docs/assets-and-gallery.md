@@ -43,20 +43,17 @@ rules are in [Editor Basics](editor-basics.md#dropping-assets-onto-the-timeline)
 - **Move to Trash** is a soft delete: the asset moves to the **Trash**
   virtual folder at the bottom of the gallery, references stay recoverable,
   and **Restore** returns it to its original folder. Only **Delete
-  Permanently** and **Empty Trash** are destructive, and both ask for
-  confirmation. Trash can auto-purge by age/size (Settings ▸ Render).
-- Deleting an asset that's still in use warns first with its usages. Timeline
-  and queue usages become **Missing** placeholders after permanent deletion;
-  Reference Library memberships are removed because they are explicit asset
-  edges. Soft Trash, missing files, and automatic Trash purges preserve those
-  Library memberships for repair or restore.
+  Permanently** and **Empty Trash** are destructive. Trash can auto-purge by
+  age/size (Settings ▸ Render).
+- After **Delete Permanently** or **Empty Trash**, an asset's uses on the
+  timeline and in the queue become **Missing** placeholders, and it leaves any
+  Reference it belonged to.
 - **Missing assets** (file moved or deleted on disk) keep their entry and
   references — **Relink…** points them at the file again and everything
   reconnects.
 - **Where Used…** answers "can I safely delete this?" — a grouped summary with
   per-reference rows for clips, guides, audio, generation jobs, and Reference
-  Library members. Timeline-addressed usages can navigate to their scene;
-  Library rows identify the owning entity and member instead.
+  Library members.
 - **Open Source Workflow** loads the ComfyUI workflow embedded in a
   generated file (PNG/MP4/M4V/MOV/MKV) straight onto the canvas.
 
@@ -93,23 +90,15 @@ How takes land is set in **Settings** (the **⚙** at the right end of the
 toolbar) **▸ Render**. **Takes start muted** and **Link take video + audio**
 also appear in the **Editor** group of the [Controls](controls.md) tab:
 
-- **Take Placement Mode:** **Trimmed** places the Selection plus any context
-  you deliberately include with **Mask Pre/Post**. Automatic model alignment
-  does not extend that placement. **Untrimmed** also places the context frames,
-  for checking seams. Both modes leave model-frame padding out of the timeline
-  unless **Keep Take Padding** is on; the saved file always contains the
-  complete output.
+- **Take Placement Mode:** **Trimmed** places the Selection, plus any context
+  you include with the **GEN** box's **Mask** − / + fields. **Untrimmed** also
+  places the context frames, for checking seams.
 - **Link Take Video + Audio:** picture and sound move and mute together.
 - **New Takes Start Muted:** a new take doesn't change what plays until you
   unmute it.
 - **Keep Take Padding:** off by default. Some models need a set number of
   frames, so they render a few extra at the end. Tick it to place those frames
-  too: the take still starts where it would, but runs to the end of the file.
-  The extra frames are generated only when no post-context sits outside
-  **Mask Post**; otherwise the take is trimmed as usual. At the end of a scene
-  the kept frames land past its end, and the take says so: lengthen the scene
-  to see and hear them. A take that is queued keeps the choice it was queued
-  with.
+  too.
 
 ### Placing a take again
 
@@ -128,12 +117,6 @@ Behavior**, on by default) controls this:
   that scene has another frame rate, the trim is converted to keep the same
   seconds.
 - The frames outside the trim stay in the clip: drag its edges to show them.
-- Older takes that don't record their placement, and takes whose media was
-  swapped with **Replace File…**, drop whole at the cursor.
-- If its sound can't be recovered on a ruler drop, the picture is placed and
-  a message says so.
-- If the take or the timeline changes while the drop reads the take, nothing
-  is placed; drop it again.
 
 With **Restore Take Placement** off, a take drops whole at the cursor like any
 other media, in its own scene too.
@@ -169,8 +152,7 @@ the take first ([Linked groups](editor-basics.md#linked-groups)).
 **Manage** toggles multi-select (checkboxes; Ctrl/Shift-click also work in
 normal browsing). With a multi-selection, a bulk toolbar appears: **Move**
 and **Trash** for active assets, **Restore** and **Delete Permanently** for
-trashed ones. Bulk actions apply across both the fullscreen and dormant
-galleries.
+trashed ones.
 
 ## The inspect overlay
 
@@ -183,18 +165,14 @@ Double-click (or Space) a gallery asset for fullscreen inspection.
   playhead; the scrub bar handles absolute seeks.
 - **Audio** — an interactive waveform: click/drag seeks, the played portion
   highlights.
-- ↑/↓ cycle through assets without leaving the overlay. Toggling the
-  **Metadata** panel never reloads the media — scrub position and play
-  state survive.
+- ↑/↓ cycle through assets without leaving the overlay.
 
 ## Compare mode
 
-To open comparison, click **Assets** at the upper left, double-click a result
-to inspect it, then click **Compare** in the inspection overlay (or press
-**C** there). To make the winner the take that plays, see [Takes](#takes).
-
-**Compare** (`C` in the overlay) puts two same-type assets side by side —
-built for take review.
+**Compare** puts two same-type assets side by side, for take review. To open
+it, click **Assets** at the upper left, double-click a result to inspect it,
+then click **Compare** in the inspection overlay (or press **C** there). To
+make the winner the take that plays, see [Takes](#takes).
 
 - **Layouts** — a screen-fixed **divider** over one shared stage (pan/zoom
   moves both together), or explicit **side-by-side**, where a further toggle
@@ -204,7 +182,7 @@ built for take review.
   and keeps its own scroll position; a sticky toggle chooses which side the
   arrow keys cycle, so you can hold one take fixed and flip the other through
   candidates.
-- **Video** — linked transport with drift recovery; an **A | B | None**
+- **Video** — linked transport; an **A | B | None**
   control picks which side's audio plays.
 - **Audio** — stacked waveforms; monitor **A / B / Both / Mute** on keys
   `1 / 2 / 3 / 0`, hold Shift to momentarily flip sides.
@@ -218,12 +196,6 @@ built for take review.
   weaker take and the next one in that side's list steps in, until the last
   favorite of that type is left, shown in single view. Single Inspect in the
   Favorites scope moves on to the next favorite instead of closing.
-- **Undo** — whenever an unfavorite takes an asset out of what you are looking
-  at (the Favorites scope, in the list or in Inspect), the notice that confirms
-  it offers **Undo**. It makes the asset a favorite again and puts it back on
-  its side, as long as the take that replaced it is still on screen; a viewer
-  that closed stays closed. Only the latest removal keeps its notice. It stays up for a few
-  seconds, and hovering over it holds it open.
 
 ![Compare mode in Divider layout: one shared stage split by a vertical divider, with the Gallery A and Gallery B pickers either side](images/compare-divider.webp)
 
@@ -231,28 +203,29 @@ built for take review.
 
 ## Proxies
 
-Your browser can't play some video formats, such as ProRes and Lossless FFV1
-(RGB). For those, Sonder makes a **proxy**: a playable copy that the
-viewport, the gallery, Inspect, Compare and **Crop, Trim & Preview** show
-instead. Render, export, Add frame to guides and the graph always use the
-original file. A proxy's sound is a lossless copy of the original's.
+You don't add proxies yourself. Your browser can't play some video formats,
+such as ProRes and Lossless FFV1 (RGB), so when such a video arrives (an
+import, a take, a Save Bridge file, an export), Sonder makes a **proxy**: a
+playable copy, unless **Build Proxies** is set to **Only when I ask**. The viewport, the gallery, Inspect, Compare and **Crop, Trim &
+Preview** show the proxy; render, export, Add frame to guides and the graph
+always use the original file.
 
-You don't add proxies yourself. When such a video arrives (an import, a take,
-a Save Bridge file, an export), Sonder builds its proxy. A take saved in one of
-those formats gets its proxy before the Save Video node finishes. Until a
-proxy is ready, the viewport shows a notice where the clip would be, and the
-first one you meet in an editor shows a toast with **Build now** and
-**Settings**.
+Until a proxy is ready, the viewport shows a notice where the clip would be,
+and the gallery's inspector shows a badge next to the video's name:
 
-What the gallery's inspector shows next to a video's name:
+| Gallery badge | Viewport notice | What it means |
+|---|---|---|
+| **Proxy** | (the clip plays) | Previews play its proxy. |
+| **Building Proxy** | **Building proxy…** | The proxy is being made. |
+| **Proxy Queued** | **Proxy waiting for ComfyUI** | It builds once ComfyUI has been idle for 30 seconds. |
+| **Proxy Queued** | **Proxy queued** | A build is queued. |
+| **Proxy Queued** | **Can't play this video here** | Your browser couldn't play the original, so a build is queued. |
+| **Proxy Failed** | **Proxy failed** | No proxy could be made. |
+| **No Preview** | **No proxy yet** | Proxies are built only when you ask, or this one was deleted. |
 
-| Badge | Meaning |
-|---|---|
-| **Proxy** | Previews play its proxy. |
-| **Building Proxy** | The proxy is being made. |
-| **Proxy Queued** | The proxy waits its turn, or waits for ComfyUI to be idle. |
-| **Proxy Failed** | No proxy could be made. |
-| **No Preview** | No proxy, and none is built until you ask. |
+![The gallery inspector for a ProRes clip: a No Preview badge beside its name, and over the preview a No proxy yet notice with a Build now button](images/proxy-notice.webp)
+<p align="center"><em>The inspector for a ProRes clip in a project set to
+<strong>Only when I ask</strong>.</em></p>
 
 To build a proxy now, whatever the timing setting:
 
@@ -268,9 +241,6 @@ Other gestures, by right-clicking a video in the gallery:
   again until you build it.
 - With several videos selected: **Create Proxies for N videos**.
 
-A toast shows the progress of builds you start, with **Cancel**; while the
-builds wait, it reads "Waiting for ComfyUI to be idle".
-
 In **Settings** (the **⚙** at the right end of the toolbar) **▸ Proxies**:
 
 - **Proxy Preset (project-wide)** — **Compatible MP4**, **High Quality MP4**
@@ -285,9 +255,8 @@ In **Settings** (the **⚙** at the right end of the toolbar) **▸ Proxies**:
   **Used in scenes**, **Used by References** and **Unused**.
   - **Regenerate Proxies…** rebuilds the proxies in the checked groups and
     builds missing ones for videos that can't play.
-  - **Delete Proxies…** deletes the proxies in the checked groups (only
-    **Unused** is checked at first). Proxies of trashed videos are always
-    deleted.
+  - **Delete Proxies…** deletes the proxies in the checked groups. Proxies of
+    trashed videos are always deleted.
 
 ## Export timeline
 
@@ -301,22 +270,16 @@ The toolbar's **Export** dialog offers:
 - **Include video / audio** checkboxes, and **Place as take** to drop the
   result straight onto a fresh lane in the active scene (with optional
   linked, muted take placement).
-- Exports show determinate progress and land in the gallery's `Exports`
-  folder; place-as-take exports land in Root.
+- Exports land in the gallery's `Exports` folder; place-as-take exports land
+  in Root.
 
 ## Audio fidelity
 
-Saved and previewed results may be lowered in volume to leave peak headroom.
-The completion message reports a reduction; quiet material is not boosted.
-Check the result in the gallery before delivery.
+Saved and previewed results may be lowered in volume to leave peak headroom;
+quiet material is not boosted. Check the result in the gallery before
+delivery.
 
 A video export has no audio stream when its window has no audible tracks.
-For an audio-only export, a silent window still produces a file. If corrupt
-audio blocks an export, the error names the source to replace or mute.
-
-If **Sonder Save Video** or Preview cannot prepare supplied audio, it keeps
-the video and shows a warning about the missing sound. Check that warning
-before using the file.
 
 Choose the delivery format your editing or playback software accepts.
 **Editing Master MP4** uses FLAC audio; check that your editor can read it

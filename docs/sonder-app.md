@@ -1,10 +1,20 @@
 # Sonder App
 
-The Sonder App runs a workflow on a project from its own browser page, without
-the ComfyUI canvas. Its **Launcher** lists your projects and imported workflows
-and opens the editor on the pair you choose, with **Generate** (1–8 takes per
-click) beside **+ Queue** and the workflow's settings in the
-[Controls](controls.md) tab. ComfyUI still does the generating.
+The Sonder App runs exported ComfyUI workflows through the **Comfy SDK**
+(`comfy-sdk`) and a local **API proxy** (`comfy-api-proxy`).
+
+When you click **Generate**, Sonder combines the workflow's API JSON with your
+current editor and Controls settings, then submits it through the SDK. The
+proxy translates those requests into jobs for your running ComfyUI instance,
+which executes the workflow using its installed nodes and models. **Sonder
+Save Video** or **Sonder Save Bridge** returns the results to your project.
+
+The canvas is where you build and wire the workflow. Once exported and
+imported, the app provides its working interface: the timeline, Controls,
+Modes and viewport Views.
+
+Its **Launcher** lists your projects and workflows and opens the editor on
+the pair you choose, with **Generate** (1–8 takes per click) beside **+ Queue**.
 
 The app is optional: the editor and every node work without it.
 
@@ -39,15 +49,52 @@ Do this once, in a browser on the ComfyUI machine.
 - **Show Launcher Button In The Editor**, in the same Settings section, adds a
   Launcher button beside **⚙**.
 
-## Import a workflow
+## Choose a workflow
 
-1. On the ComfyUI canvas, open your workflow and set its nodes as you want
-   them (the **In the graph** steps in [Getting Started](getting-started.md),
-   for example). Use ComfyUI's **Export (API)** to save its API file. It needs
-   exactly one **Sonder Editor** node and a **Sonder Save Video** or **Sonder
-   Save Bridge** that takes `project` from it.
-2. In the Launcher, click **Import…** in the Workflows area, or drop the file
-   there.
+Choose a supplied workflow under **Starters** in the Launcher, or import your
+own. See **[Sonder App Workflows](sonder-app-workflows.md)** for an introduction
+to **LTX 2.5 Edit & VFX**, **LTX 2.5 Refine & Upscale**, and
+**MiniMax H3 — References & Swaps**.
+
+<a id="import-a-workflow"></a>
+
+## Use your own workflow
+
+Prepare your workflow on the ComfyUI canvas before exporting it.
+
+1. **Connect your workflow to the editor.** Use exactly one **Sonder Editor**
+   node. Connect the outputs your workflow needs—such as frames, prompts,
+   sound, dimensions and frame count—to your generation nodes. See
+   [Wiring your graph](generating.md#wiring-your-graph).
+2. **Return results to your project.** Add **Sonder Save Video** or **Sonder
+   Save Bridge**. Connect its `project` input to the Editor's `project` output,
+   passing through other project-carrying nodes such as **Sonder Metadata
+   Collector** if needed.
+3. **Add outputs you want to inspect.** Connect output nodes such as **Preview
+   Image** or **Sonder Preview Video** to useful intermediate results—for
+   example, a mask, processed Driver or first-pass video. In the editor, open
+   a viewport pane's source menu and choose **Add output…** to show one. See
+   [Output Views](generating.md#output-views).
+4. **Prepare branches you want to switch together.** Put their nodes in a
+   canvas group or subgraph. Open the editor's **Controls** tab, click
+   **Manage → + Setting**, and add the group or subgraph's **Enabled / Muted /
+   Bypassed** switch. Create these switches before exporting. See
+   [Switch nodes and groups](controls.md#switch-nodes-and-groups-on-and-off).
+5. **Prepare the settings people will use.** In **Controls → Manage**, expose
+   useful settings, give them clear names, and optionally add Modes and short
+   notes. You can also name your Views and set their timing. See
+   [Manage](controls.md#manage).
+6. **Enable everything the app will need.** Before exporting, enable all
+   required nodes, preview outputs and their parent subgraphs. **Export
+   (API)** leaves out muted or bypassed nodes. If your normal setup turns
+   branches off, save those combinations as Mode choices first.
+7. **Export and import.** Save the canvas workflow, then choose ComfyUI's
+   **Export (API)**. In the Launcher, click **Import…** in the Workflows area,
+   or drop the API file there.
+
+You can add or edit settings, Modes, notes and Views in the app afterward.
+The underlying nodes and the switches that control branches must be prepared
+on the canvas.
 
 A workflow that needs node packs you don't have is still imported, marked
 **Missing nodes** with the packs to install; see
@@ -61,13 +108,32 @@ A workflow that needs node packs you don't have is still imported, marked
 2. Select the project **first**, then the workflow: selecting a project can
    bring back the workflow it last used.
 3. Click **Open** in the bottom bar.
-4. Set up the scene and the Selection with the **In the editor** steps of
-   [Make a first take](getting-started.md#make-a-first-take), from step 4.
-5. Leave the take count beside **Generate** at **×1** and click **Generate**.
-   **+ Queue** adds the job to the Render Queue instead.
+4. Prepare your media and prompts, then set **In / Out** above the timeline.
+   Follow the workflow's notes in **Controls**, or the
+   [Sonder App Workflows](sonder-app-workflows.md) instructions. For editor
+   gestures, see [Make a first take](getting-started.md#make-a-first-take).
+5. In **Controls**, check the required inputs and choose any Modes you need.
+6. Leave the take count beside **Generate** at **×1** for a first test,
+   then click **Generate**. **+ Queue** adds the job to the Render Queue
+   instead.
 
-The workflow's settings are in the **Controls** tab; its **Workflow** menu
-switches workflows in place ([Controls](controls.md#switch-workflows-in-the-sonder-app)).
+Start with a short selection. For a personal workflow, check that the
+result returns to the project and that its picture, sound and dimensions
+match your intended setup.
+
+## Use Controls and Views
+
+Open **Controls** in the editor's left sidebar to change workflow settings.
+Choose your **Modes** first, then adjust individual values.
+
+To inspect an output, open the source menu at the top of a viewport pane and
+choose its View. A mask or processed-video View can have its own **Run**
+button, which runs that output's branch. Sampling previews update while
+generation runs.
+
+See [Controls](controls.md) and [Output Views](generating.md#output-views)
+for the full instructions. The **Workflow** menu at the top of Controls
+[switches workflows in place](controls.md#in-the-sonder-app).
 
 ## The local connection
 

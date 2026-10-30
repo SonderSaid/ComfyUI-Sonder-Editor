@@ -17,6 +17,7 @@ editor steps, then what your graph needs for it. First
 | Steer a generation with a control video (pose, depth, edges, style…) | A video control input | [Drive with a control video](#drive-with-a-control-video) |
 | Use your own character or place | An image (or audio) reference input | [Use a Reference](#use-a-reference) |
 | Use several References as separate inputs | Separate reference inputs (MiniMax H3, for example) | [Use References with separate inputs](#use-references-with-separate-inputs) |
+| Watch the picture form while a sampler runs | Nothing: any sampler | [Watch a sampler while it runs](#watch-a-sampler-while-it-runs) |
 | Save the finished scene as a file | Nothing: no graph runs | [Export the timeline](#export-the-timeline) |
 
 ## Make a first take
@@ -383,6 +384,49 @@ Reference labels follow the selected generation window.
 
 **Learn more:** [MiniMax H3 prompting](references.md#minimax-h3-full-reference) ·
 Worked example: [Sonder MiniMax H3 References](../example_workflows/sonder_minimax_h3_references.json).
+
+## Watch a sampler while it runs
+
+**Goal:** watch the picture form in the editor, step by step, while your
+sampler works.
+
+**Your model needs:** nothing; any graph with a sampler.
+
+**In the editor:**
+1. Click **Open Editor** on the **Sonder Editor** node, then
+   [Mount in Tab](editor-basics.md#mount-in-tab) at the top right of the
+   editor. You will run the graph from the canvas tab.
+2. At the right of the bar above the viewport, click **2**. A second
+   [pane](editor-basics.md#panes) appears; the first keeps the scene preview.
+3. Click the second pane's source button at its top left (**Guides ▾**).
+4. Under **Sampling previews**, click your sampler. For a video model, first
+   add the Override (In the graph, step 3) and click it instead. It becomes a
+   [View](generating.md#output-views), and the pane keeps showing it.
+
+**In the graph:**
+1. Make ComfyUI draw previews: open ComfyUI's **Settings** (the gear icon),
+   search for `preview`, and set **Live preview method** to **auto**,
+   **latent2rgb** or **taesd**. With **default**, ComfyUI draws previews only
+   if it was started with `--preview-method`.
+2. Sample with one of the samplers listed in
+   [Sampling previews](generating.md#sampling-previews); one inside a subgraph
+   works too.
+3. For a video model, put KJNodes **Model Preview Override** between your
+   model and the sampler, and set its `preview_frames` above `1` (for example
+   `16`). ComfyUI's own preview shows only a video's first frame; the Override
+   then plays frames from across the clip as a short loop.
+4. In the canvas tab, click **Run** at the top right.
+
+**You'll see:** the pane's picture sharpen step by step, with **Sampling ·
+step 4/8** beside its source button, then **Last preview · step 8/8** when the
+sampler finishes.
+
+![A viewport pane showing a KSampler's preview sharpen from noise into a lighthouse on a rocky coast, step by step, from Sampling · step 1/10 to Last preview · step 10/10 beside the pane's source button](images/sampler-preview.webp)
+<p align="center"><em>A sampler's preview in a pane, from the first step to the
+last.</em></p>
+
+**Learn more:** [Sampling previews](generating.md#sampling-previews) ·
+[Output Views](generating.md#output-views)
 
 ## Export the timeline
 

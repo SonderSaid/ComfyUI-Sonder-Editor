@@ -2,18 +2,24 @@
 
 **Version 0.7.8** — see the [CHANGELOG](CHANGELOG.md) for release notes.
 
-Sonder Editor is a timeline-based video editor for ComfyUI, built for iterative
-long-form generation. Arrange scenes, clips, audio, guide frames and prompts on
-a multi-lane timeline, then select the range you want to process.
+Sonder Editor is a timeline-based video editing studio for ComfyUI, built for
+iterative long-form video.
 
-Your Reference Library keeps a character, a location, an outfit or a voice in
-one place. Mark where on the timeline each one applies and point your prompts
-at them by name. Render any range and the right images, video, audio and
-wording reach your graph for that range.
+Create a project and arrange its scenes on a timeline: video clips, sound,
+prompts that change as the scene moves, keyframes, and references for the
+characters, places and voices you want to keep consistent, each placed where it
+applies. Then select any range of the timeline and generate it with your own
+ComfyUI workflow. Each result comes back onto the timeline as a take you can
+compare with earlier ones, keep or redo.
 
-Generation stays in ComfyUI: your graph renders the selection, and the result
-comes back to the timeline to review or keep. What you can generate depends on
-the model and workflow you connect.
+You can drive your workflow without leaving the editor: change its settings,
+switch between whole setups such as text-to-video, editing or upscaling in one
+click, and turn parts of it on or off. Watch up to four views side by side: the
+scene, your workflow's outputs, even a sampler's live preview while it
+generates.
+
+It works with the model you choose: LTX, Wan, HunyuanVideo, MiniMax H3 and
+more.
 
 ![The Sonder Editor fullscreen surface: asset gallery and Reference Library in
 the left sidebar, viewport with transport controls in the centre, and a
@@ -22,18 +28,13 @@ lanes](docs/images/editor.webp)
 <p align="center"><em>The fullscreen editor: gallery and References at the left,
 viewport centre, timeline below.</em></p>
 
-**[▶ Watch the 90-second overview](https://youtu.be/lixgY2G80xE)**
+**[▶ Watch the launch overview](https://youtu.be/lixgY2G80xE)** (recorded at the first release)
 
 ## What it is
 
-Sonder Editor adds a timeline-based editing surface to ComfyUI without taking
-generation out of the node graph. You import media into a project, lay clips,
-audio, guides, and prompts onto a multi-lane timeline, select a range (or stage
-a batch of render jobs), and hand that off to the generation workflow you've
-wired up downstream. Outputs come back as project assets you can review,
-compare, and place back on the timeline.
-
-A project holds everything; scenes hold timelines; timelines hold lanes:
+A project holds your media and scenes; scenes hold timelines; timelines hold
+lanes. Your ComfyUI workflow carries its own Controls and Views, so they travel
+with the workflow:
 
 ```
 Project
@@ -43,9 +44,17 @@ Project
     └── Timeline        the lanes you arrange, shown in the viewport
         ├── Video and audio lanes
         ├── Prompt lanes      text that changes along the timeline
-        ├── Guide lane        still images pinned to exact frames
+        ├── Guide lane        keyframes pinned to exact frames
         ├── Driver lanes      video that steers without appearing
         └── Reference lanes   when each Reference applies
+
+Workflow (your ComfyUI graph)
+├── Sonder Editor       the node that hands the timeline to your graph
+└── Controls            the settings shown in the editor's Controls tab
+    ├── Settings        any node widget you expose, in groups with notes
+    ├── Modes           whole setups switched in one click
+    ├── Switches        nodes and groups turned on or off
+    └── Views           outputs shown in the viewport panes
 ```
 
 <p align="center">
@@ -71,7 +80,9 @@ What you can do from the editor:
 | Describe what happens | [Global text and timed Prompt sections](docs/prompts.md), from a plain text field to structured instructions |
 | Guide the result | [Guides and Drivers](docs/generating.md#guides), or [reusable References](docs/references.md) staged where they apply |
 | Choose what to generate or change | [In/Out, surrounding context and picture/sound masks](docs/generating.md#the-generation-window) |
-| Generate, review and try again | Workflow [Controls and Modes](docs/controls.md), [takes](docs/assets-and-gallery.md#takes), [inspection and A/B comparison](docs/assets-and-gallery.md#compare-mode) |
+| Set up your workflow from the editor | Workflow [Controls, Modes and node switches](docs/controls.md) |
+| Watch your workflow's outputs | [Output Views](docs/generating.md#output-views): up to four viewport panes beside the scene, including a sampler's live preview |
+| Review takes and try again | [Takes](docs/assets-and-gallery.md#takes), with [inspection and A/B comparison](docs/assets-and-gallery.md#compare-mode) |
 | Prepare several generations | The [Render Queue and Batch](docs/generating.md#the-render-queue) controls |
 | Export the finished scene | [Timeline Export](docs/assets-and-gallery.md#export-timeline), which combines the arranged picture and sound into a file |
 | Generate from a page of its own | The [Sonder App](docs/sonder-app.md) (experimental, optional) |
@@ -114,6 +125,57 @@ Driver Selector** and **Sonder Driver Bridge** resolve and decode that lane for
 the generation window.
 
 https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
+
+## Examples
+
+<a id="example-workflows"></a>
+<a id="example-projects"></a>
+Five ready-wired workflows. Drop any of the files onto the ComfyUI canvas, or open
+them from ComfyUI's **Templates**, under **Extensions › sonder-editor**.
+
+**[Sonder LTX 2.3 Playground](example_workflows/sonder_ltx_2_3_playground.json)** —
+prompt relay, multi-pass upscaling, image guides, and driver-controlled generation.
+Its matching project is **Project-Sample**, listed under
+[**Project Sample — LTX 2.3**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample--ltx-23) on Hugging Face,
+with four scenes of media, prompts, guides and generated takes.
+
+**[Sonder MiniMax H3 References](example_workflows/sonder_minimax_h3_references.json)** —
+References driving MiniMax H3: Reference lanes reaching the model through the
+Reference Selector and the Image and Audio bridges, first- and last-frame guides
+through the Guides Bridge, separated AV latents, and the Masks Bridge writing
+latent noise masks so a window can be regenerated in place.
+Its matching project is
+[**Project Sample: MiniMax H3 References**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample-minimax-h3-references)
+on Hugging Face, the project behind the western showcase, and needs Sonder
+Editor 0.6.0 or newer.
+
+**[Sonder MiniMax H3 References & Swaps](example_workflows/sonder_minimax_h3_references_swaps.json)** —
+swap a person in existing footage for someone new, keeping the original
+performance and sound, or generate with MiniMax H3 from picture, video and sound
+references. Pick the task in [Modes](docs/controls.md#modes). Its notes in
+Controls cover setup, models and the steps for each task.
+
+**[Sonder LTX 2.5 Edit & VFX](example_workflows/sonder_ltx_2_5_edit_vfx.json)** —
+LTX 2.5 editing and effects, each one a choice in [Modes](docs/controls.md#modes):
+edit footage with a prompt or an edited picture, remove people, make a subject
+mask, follow a video's layout, body movement or outlines, add sound to a video,
+or make new video and sound. Its notes in Controls list the node packs and model
+files and walk through a first take.
+
+**[Sonder LTX 2.5 Refine & Upscale](example_workflows/sonder_ltx_2_5_refine_upscale.json)** —
+refine existing footage at the timeline resolution, upscale it to twice the
+timeline's width and height, or do both. Optional character or background masking
+focuses the refine pass. Its notes in Controls cover setup, models and downloads,
+mask preparation, and saving results with sound.
+
+The last three also ship with the [Sonder App](docs/sonder-app.md)
+(experimental, optional) as its starter workflows, exported for the API.
+[Sonder App Workflows](docs/sonder-app-workflows.md) has the steps for each of
+their tasks in the app.
+
+Every sample project, with its matching workflow, showcase video, tested editor
+version and opening instructions, is on
+[Hugging Face](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects).
 
 ## Models
 
@@ -217,60 +279,28 @@ pip install -r requirements.txt
 Then restart ComfyUI. The pack registers its nodes and serves its web UI
 automatically.
 
-## Examples
-
-<a id="example-workflows"></a>
-<a id="example-projects"></a>
-Three ready-wired workflows. Drop any of the files onto the ComfyUI canvas, or open
-it from ComfyUI's **Templates**, under **Extensions › sonder-editor**.
-
-**[Sonder LTX 2.3 Playground](example_workflows/sonder_ltx_2_3_playground.json)** —
-prompt relay, multi-pass upscaling, image guides, and driver-controlled generation.
-Its matching project is **Project-Sample**, listed under
-[**Project Sample — LTX 2.3**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample--ltx-23) on Hugging Face,
-with four scenes of media, prompts, guides and generated takes.
-
-**[Sonder MiniMax H3 References](example_workflows/sonder_minimax_h3_references.json)** —
-References driving MiniMax H3: Reference lanes reaching the model through the
-Reference Selector and the Image and Audio bridges, first- and last-frame guides
-through the Guides Bridge, separated AV latents, and the Masks Bridge writing
-latent noise masks so a window can be regenerated in place.
-Its matching project is
-[**Project Sample: MiniMax H3 References**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample-minimax-h3-references)
-on Hugging Face, the project behind the western showcase, and needs Sonder
-Editor 0.6.0 or newer.
-
-**[Sonder LTX 2.5 Edit & VFX](example_workflows/sonder_ltx_2_5_edit_vfx.json)** —
-LTX 2.5 editing and effects, each one a choice in [Modes](docs/controls.md#modes):
-edit footage with a prompt or an edited picture, remove people, make a subject
-mask, follow a video's layout, body movement or outlines, add sound to a video,
-or make new video and sound. Its notes in Controls list the node packs and model
-files and walk through a first take. It needs no sample project.
-
-Every sample project, with its matching workflow, showcase video, tested editor
-version and opening instructions, is on
-[Hugging Face](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects).
-
 ## Documentation
 
 - **[Getting Started](docs/getting-started.md)** — step-by-step instructions: a first
   take, extending, batching, redoing part of a clip, guides, Drivers,
-  References and export.
+  References, watching a sampler, and export.
 - **[Editor Basics](docs/editor-basics.md)** — opening the editor, projects,
-  layout, timeline, item types, gestures, and shortcuts.
+  layout, the viewport and its panes, timeline, item types, gestures, and
+  shortcuts.
 - **[Generating](docs/generating.md)** — the generation window, model
-  templates, guides, Drivers, wiring your graph, the render queue, and what's
-  frozen vs. live in queued jobs.
+  templates, guides, Drivers, wiring your graph, the render queue, what's
+  frozen vs. live in queued jobs, and Output Views.
 - **[Prompts](docs/prompts.md)** — Prompt Management, how a prompt is composed,
   Channel Templates, prompt formats, Context chips and Prompt Relay.
 - **[References](docs/references.md)** — the Reference Library, Reference
   lanes and recipes, Reference prompting, and the Reference nodes.
 - **[Assets & Gallery](docs/assets-and-gallery.md)** — asset lifecycle,
   tracked metadata, takes, inspect/compare, timeline export, and audio fidelity.
-- **[Controls](docs/controls.md)** — workflow settings and Modes in the
-  editor, Manage, and sharing Controls.
+- **[Controls](docs/controls.md)** — workflow settings, Modes and node
+  switches in the editor, Manage, and sharing Controls.
 - **[Sonder App](docs/sonder-app.md)** (experimental, optional) — setup, the
-  Launcher, and generating without the canvas.
+  Launcher, preparing your own workflows, and the
+  [Sonder App Workflows](docs/sonder-app-workflows.md) instructions.
 - **[Troubleshooting](docs/troubleshooting.md)** — installation and
   environment problems, project storage and Windows path limits, the Sonder App,
   and playback.
