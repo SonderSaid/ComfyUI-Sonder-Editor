@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-31
+
 ### Added
 - Masks Bridge accepts a moving spatial mask for LTX and MiniMax H3 video. Edits stay inside the generation window and respect existing video pins.
 
