@@ -149,6 +149,59 @@ def test_starter_initial_modes_ignore_invalid_modes_and_unrelated_metadata(start
     assert values['bindings'] == {}
 
 
+def test_starter_initial_modes_record_each_switchs_shipped_members(starter):
+    identity, source = starter
+    prompt = json.loads(source.read_text(encoding='utf-8'))
+    controls = {'pass': {'members': [{'path': '5', 'class_type': 'KSampler'}]},
+                'other': {'members': [{'path': '2', 'class_type': 'SonderSaveVideo'}, 'bad']}}
+    prompt['8'] = {'class_type': 'SonderControlRelay',
+                   'inputs': {'manifest': json.dumps({'v': 1, 'bindings': {}, 'execution': {'v': 1, 'controls': controls}})}}
+    source.write_text(json.dumps(prompt), encoding='utf-8')
+    _set_initial_modes(source, {'5': {'mode': 'muted', 'class_type': 'KSampler'}})
+    assert st.read_control_values(identity)['switch_members'] == {'pass': ['5'], 'other': ['2']}
+
+
+def test_a_record_less_sidecar_reads_the_starters_previous_membership(starter):
+    identity, source = starter
+    path = source.with_suffix('.meta.json')
+    meta = json.loads(path.read_text(encoding='utf-8'))
+    meta['previous_switch_members'] = {'pass': ['5'], 'bad': 'x'}
+    path.write_text(json.dumps(meta), encoding='utf-8')
+    controls = Path(st._template_paths(identity)[2])
+    controls.parent.mkdir(parents=True, exist_ok=True)
+    controls.write_text(json.dumps({'node_modes': {'5': {'mode': 'muted', 'class_type': 'KSampler'}}}), encoding='utf-8')
+    assert st.read_control_values(identity)['switch_members'] == {'pass': ['5']}
+    # A sidecar that already records membership keeps its own.
+    controls.write_text(json.dumps({'switch_members': {'pass': ['5', '6']}}), encoding='utf-8')
+    assert st.read_control_values(identity)['switch_members'] == {'pass': ['5', '6']}
+
+
+def test_refine_starter_upgraded_from_0_8_0_defaults_keeps_its_mask_group_off(tmp_path, monkeypatch):
+    from server import control_execution as ce, control_manifest as cm, control_routing as cr
+    monkeypatch.setitem(sys.modules, 'folder_paths', types.SimpleNamespace(get_user_directory=lambda: str(tmp_path)))
+    monkeypatch.setattr(st, 'STARTERS_DIR', str(Path(st.__file__).resolve().parents[1] / 'sdk_starters'))
+    slug = 'sonder_ltx_2_5_refine_upscale'
+    identity = hashlib.sha256(b'sonder-starter:' + slug.encode()).hexdigest()[:16]
+    assert identity in st.starter_sources()
+    # The sidecar 0.8.0 seeded: its Mask Off defaults, with no membership record.
+    controls = Path(st._template_paths(identity)[2])
+    controls.parent.mkdir(parents=True, exist_ok=True)
+    old = {path: {'mode': 'muted', 'class_type': cls} for path, cls in [
+        ('9462', 'LTXVPreprocessMasks'), ('9508', 'MaskToImage'), ('9509', 'SonderPreviewVideo'),
+        ('9510', 'SonderDriverBridge'), ('9511', 'SonderDriverSelector'), ('9512', 'ImageToMask')]}
+    controls.write_text(json.dumps({'node_modes': old}), encoding='utf-8')
+    stored = st.read_control_values(identity)
+    prompt = st.parse_template_bytes(Path(st.starter_sources()[identity]).read_bytes())
+    menu = json.loads(prompt[cm.find_relay(prompt)['key']]['inputs']['manifest'])
+    view = {'bindings': [], 'execution': [
+        {'execution_id': cid, 'status': 'ok', 'members': [{**m, 'mode': 'enabled'} for m in entry['members']]}
+        for cid, entry in menu['execution']['controls'].items()]}
+    effective = ce.apply_sdk_state(view, prompt, stored, set())
+    assert {d['execution_id']: d['mode'] for d in view['execution']}['KAl11_kzAAT_'] == 'muted'
+    compiled = cr.compile_modes(prompt, view['_routing'], effective)
+    assert '9579' not in compiled and 'spatial_mask' not in compiled['9576']['inputs']
+
+
 def test_starter_without_initial_modes_does_not_create_controls_sidecar(starter):
     identity, _ = starter
     st.read_control_values(identity)
@@ -158,7 +211,7 @@ def test_starter_without_initial_modes_does_not_create_controls_sidecar(starter)
 @pytest.mark.parametrize('slug, choices', [
     ('sonder_ltx_2_5_edit_vfx', ['Make a New Video', 'Generate New Audio', 'Standard']),
     ('sonder_ltx_2_5_edit_vfx_standard', ['Make a New Video', 'Generate New Audio']),
-    ('sonder_ltx_2_5_refine_upscale', ['Refine and Upscale Pass', 'Mask Off']),
+    ('sonder_ltx_2_5_refine_upscale', ['Refining Pass Only', 'Mask Off']),
     ('sonder_minimax_h3_references_swaps', ['Standard Generation']),
 ])
 def test_shipped_starter_sources_and_initial_choices(slug, choices):

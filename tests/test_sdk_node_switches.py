@@ -277,3 +277,85 @@ def test_an_instance_holding_the_editor_is_never_a_switch():
     prompt = {"20:1": _node("SonderEditor"), "20:2": _node("KSampler")}
     descriptor = ce.describe_one(prompt, "inst", {**switch([{**member("20", "uuid-sub"), "kind": "instance"}], kind="instance")})
     assert descriptor["status"] == "unsupported" and descriptor["problem"] == "infrastructure"
+
+
+def grown():
+    """The template's next export: the "both" group switch gains node 9."""
+    prompt = template()
+    manifest = json.loads(prompt["8"]["inputs"]["manifest"])
+    members = [member("6", title="Pass 1"), member("7", title="Pass 2"), member("9", title="Pass 0")]
+    manifest["execution"]["controls"]["both"].update(members=members, member_count=3)
+    routing = json.loads(json.dumps(ROUTING))
+    routing["nodes"]["9"] = {"i": [], "o": [["LATENT"]]}
+    manifest["execution"]["routing"] = json.dumps(routing)
+    prompt["8"]["inputs"]["manifest"] = json.dumps(manifest)
+    prompt["9"] = _node("KSampler", {"seed": 7, "steps": 5}, title="Pass 0")
+    return prompt
+
+
+def store_modes(world, node_modes, members=None):
+    """Write the sidecar as an earlier version would have left it."""
+    def mutate(data):
+        data["node_modes"] = node_modes
+        if members is None:
+            data.pop("switch_members", None)
+        else:
+            data["switch_members"] = members
+    sdk_templates.update_control_values(world.template_id, mutate)
+
+
+MUTED = {"mode": "muted", "class_type": "KSampler"}
+STALE = {"5": {"mode": "muted", "class_type": "RemovedNode"}}
+
+
+def test_a_node_added_to_a_switch_follows_its_recorded_state(world):
+    install(world, template())
+    session = open_session(world)
+    change(world, session, {"execution:both:mode": "muted"})
+    assert sdk_templates.read_control_values(world.template_id)["switch_members"]["both"] == ["6", "7"]
+    install(world, grown())
+    view = asyncio.run(world.runner.controls_view(session))["view"]
+    assert by_id(view, "execution", "both")["mode"] == "muted"
+    generate(world, session)
+    graph = world.client.submitted[-1]
+    assert not {"6", "7", "9"} & set(graph)
+
+
+def test_a_record_less_sidecar_never_guesses_which_node_is_new(world):
+    install(world, grown())
+    session = open_session(world)
+    # Without a membership record nothing proves node 9 is new, even when a
+    # stored mode for a node that is gone shows the workflow changed.
+    for modes in ({"6": MUTED, "7": MUTED}, {"6": MUTED, "7": MUTED, **STALE}):
+        store_modes(world, modes)
+        view = asyncio.run(world.runner.controls_view(session))["view"]
+        assert [m["mode"] for m in by_id(view, "execution", "both")["members"]] == ["muted", "muted", "enabled"]
+
+
+def test_a_deliberately_mixed_switch_and_a_renumbered_node_never_inherit(world):
+    install(world, grown())
+    session = open_session(world)
+    # Recorded members keep their own state, even after the workflow changed.
+    store_modes(world, {"6": MUTED, **STALE}, {"both": ["6", "7", "9"]})
+    view = asyncio.run(world.runner.controls_view(session))["view"]
+    assert [m["mode"] for m in by_id(view, "execution", "both")["members"]] == ["muted", "enabled", "enabled"]
+    # Without a record, a stored mode for another kind of node at 9 is a
+    # renumber, not a new node, and 7 stored nothing either way.
+    store_modes(world, {"6": MUTED, "7": MUTED, "9": {"mode": "bypassed", "class_type": "TextNode"}, **STALE})
+    view = asyncio.run(world.runner.controls_view(session))["view"]
+    assert [m["mode"] for m in by_id(view, "execution", "both")["members"]] == ["muted", "muted", "enabled"]
+
+def test_added_members_follow_only_a_switch_whose_recorded_members_were_all_off_alike():
+    switch_ = {"members": [member("6"), member("7"), member("9")]}
+    muted = {"6": "muted", "7": "muted"}
+    assert ce.added_member_modes(switch_, muted, muted, ["6", "7"]) == {"9": "muted"}
+    assert ce.added_member_modes(switch_, muted, muted, None) == {}
+    # Enabled is absence: a recorded member with no stored mode was on.
+    assert ce.added_member_modes(switch_, {"6": "muted"}, {"6": "muted"}, ["6", "7"]) == {}
+    disagree = {"6": "muted", "7": "bypassed"}
+    assert ce.added_member_modes(switch_, disagree, disagree, ["6", "7"]) == {}
+    # A recorded member that left the switch no longer counts.
+    assert ce.added_member_modes(switch_, muted, muted, ["5", "6", "7"]) == {"9": "muted"}
+    # A renumbered member (stored as another kind) is neither counted nor new.
+    renumbered = {**muted, "9": ("bypassed", "TextNode")}
+    assert ce.added_member_modes(switch_, muted, renumbered, ["6", "7"]) == {}

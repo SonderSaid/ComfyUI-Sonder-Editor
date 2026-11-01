@@ -229,7 +229,7 @@ from the VAE itself, so it is correct on LTX, MiniMax H3 and Wan without any
 per-model setting. What is *not* universal is composition — see the last two
 notes below.
 
-Notes worth knowing:
+For a spatial edit, also follow [Edit a moving region](#edit-a-moving-region).
 
 - **Freeze** emits an all-zero mask, so that channel is kept from source. This
   is how you regenerate audio over locked picture, or the reverse. A frozen
@@ -247,9 +247,12 @@ Notes worth knowing:
 - Masking only one stream leaves the other fully regenerated, because **Concat
   AV Latent** fills an absent mask with all-ones. Mask both, or Freeze the one
   you want kept.
-- **On LTX with guides or a start image, use `LTXVAudioVideoMask` (kjnodes)
-  instead of Set Latent Noise Mask.** Drive it from this node's four *time*
-  outputs rather than the MASK outputs, and place it **before** the guide chain:
+- **Without spatial_mask, on LTX with guides or a start image, use
+  `LTXVAudioVideoMask` (kjnodes) instead of Set Latent Noise Mask.** A spatial
+  edit uses a different video writer, described in
+  [Edit a moving region](#edit-a-moving-region). Drive `LTXVAudioVideoMask`
+  from this node's four *time* outputs rather than the MASK outputs, and place
+  it **before** the guide chain:
 
   ```
   Separate AV Latent -> LTXVAudioVideoMask -> [guide chain] -> Concat AV Latent
@@ -279,8 +282,8 @@ Notes worth knowing:
   your window reaches the end of the clip, or survive with a silently shifted
   window when it does not. MiniMax H3 is exempt throughout, because its guide
   node returns only conditioning.
-- **A mask replaces, it never composes.** Anything that already wrote a
-  `noise_mask` upstream loses it — including start-image and continuation nodes
+- **Without spatial_mask, a mask replaces, it never composes.** Anything that
+  already wrote a `noise_mask` upstream loses it — including start-image and continuation nodes
   such as `WanImageToVideo`, `WanAnimateToVideo`, the Cosmos image-to-video
   pair, HunyuanVideo's *v2 (replace)* mode and SCAIL continuation, all of which
   pin their reference frames that way. Those pins are silently destroyed.
@@ -288,9 +291,70 @@ Notes worth knowing:
   as encoded frames inside the window rather than as a producer-written pin.
   Stock `SetLatentNoiseMask` behaves identically; this is not specific to the
   Masks Bridge.
-- Masks are hard 0/1, so the boundary latent is fully regenerated and the seam
-  is a hard cut at latent resolution — around a third of a second for LTX
+- Without spatial_mask, masks are hard 0/1, so the boundary latent is fully
+  regenerated and the seam is a hard cut at latent resolution — around a third of a second for LTX
   video, and much finer for audio.
+
+### Edit a moving region
+
+On **Sonder Masks Bridge**, connect a MASK batch to **spatial_mask**. Supply one
+mask for every Editor frame at the generation window's exact width and height,
+including pre-context, post-context and padding. The Sonder Editor's
+**rendered_frames** output has exactly that length and size, so a mask made
+from it fits. A mask that covers only part of the window, such as one made
+from a short Driver segment, must be extended to the full window upstream,
+normally with black frames. White permits generation inside the edit window,
+black protects, and grey limits strength. Author inversion, growth or
+feathering upstream.
+
+Connect the window's encoded video latent to **video_latent** and the VAE that
+encoded it to **video_vae**. Spatial edits support native LTX video VAEs and
+MiniMax H3 video VAEs, including Sol, as long as the loaded VAE includes its
+encoder. A still mask for a longer window, a cropped or resized source, an
+unsupported VAE, or a boundary inside a latent frame produces an error with
+the expected geometry. When a boundary is off-grid, choose the matching
+[model template](#model-templates), **LTX 2.3 / 2.5** or **MiniMax H3**, in the
+toolbar's scene-geometry group.
+
+The Bridge takes the maximum mask value across each latent frame's pixel-frame
+group, then averages each latent cell: 32 pixels square on LTX and 16 on
+MiniMax H3. A cell that a region only partly covers turns grey, so the edge of
+a region is partly regenerated. To edit or protect an area completely, grow it
+upstream by one cell: 32 pixels on LTX, 16 on MiniMax H3. **Freeze** keeps video protected. Audio still
+uses its own **edit_audio** setting and **audio_mask** output.
+
+- **LTX** — connect **video_mask** to **masks** on **LTXV Set Video Latent Noise
+  Masks** from ComfyUI-LTXVideo. Connect the separated video latent to that
+  node's **samples**, then send its output through Guides before sampling.
+  Apply this video mask once. A later mask setter can replace both the region
+  and Guide pins. Connect **audio_mask** to **mask** on a **Set Latent Noise
+  Mask** whose **samples** is the separated audio latent, then rejoin both with
+  **Concat AV Latent**. Skipping the audio setter regenerates all audio, even
+  with **edit_audio** on Freeze.
+- **MiniMax H3** — connect **video_mask** to **mask** on **Set Latent Noise Mask**,
+  with the separated video latent connected to **samples**. Apply **audio_mask**
+  to the audio latent with a second setter, then rejoin with **Concat AV Latent**.
+
+If the incoming video latent already carries protection, the spatial Bridge
+limits its result with those pins. On LTX, an existing full-size 5D mask needs
+an isolated writer branch. Feed the original latent into the Bridge. Add
+**Latent From Batch**, set **batch_index** to **0** and **length** to **1**, and
+connect the original latent to its **samples** input. Connect its copied output
+only to the LTX setter's **samples** input. This prevents the setter from
+rewriting the original pins and blocking a different region on the next run.
+An encoded latent without a stored mask can go straight to the setter.
+
+A sampler's output keeps the mask it was sampled with. If a second pass at the
+same size feeds the Bridge a sampled latent, the first pass's region becomes a
+pin, and the second edit happens only where the two regions overlap. To edit a
+different region, encode the frames again for the second pass.
+
+**LTXV Set Video Latent Noise Masks** cannot expand compact pins such as
+`[1,1,T,1,1]` while writing a spatial mask, and a Latent From Batch copy keeps
+that compact shape. Apply the Bridge's mask to a branch with the same samples
+and no stored mask, while the Bridge still reads the protected original. **Set
+Latent Noise Mask** stores a 4D mask and is incompatible with LTX Guide
+consumers.
 
 ## The render queue
 

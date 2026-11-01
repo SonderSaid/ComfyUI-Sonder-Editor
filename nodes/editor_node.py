@@ -1500,6 +1500,7 @@ class SonderEditor:
             proj._execution_context = {
                 "scene_id": scene.scene_id,
                 "scene_name": scene.name,
+                "_render_raster_hw": (proj_h, proj_w),
                 "selection_start": generation_start,
                 "selection_end": generation_end,
                 "context_start": context_start,

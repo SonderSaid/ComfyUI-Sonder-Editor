@@ -164,6 +164,34 @@ def stored_node_modes(stored: dict) -> dict:
             and entry.get("mode") in control_routing.OFF_MODES and isinstance(entry.get("class_type"), str)}
 
 
+def stored_switch_members(stored: dict) -> dict:
+    """The sidecar's ``switch_members``: ``{execution_id: [root path]}``, each
+    switch's members when its modes were last stored. Anything else is ignored."""
+    raw = stored.get("switch_members") if isinstance(stored, dict) else None
+    return {key: paths for key, paths in (raw.items() if isinstance(raw, dict) else [])
+            if isinstance(paths, list) and all(isinstance(path, str) for path in paths)}
+
+
+def added_member_modes(descriptor: dict, own: dict, stored_paths, recorded) -> dict:
+    """Modes for nodes added to a switch after its state was stored: they take
+    the switch's mode when every recorded member still here was off the same
+    way, as the canvas switch would set them.
+
+    ``own`` is the switch's valid stored modes (enabled is absence) and
+    ``recorded`` its membership when they were stored; without a record no
+    node counts as new. A member with any stored entry is never new: another
+    stored kind is a renumber, which keeps its own rule (enabled)."""
+    if not recorded:
+        return {}
+    members = descriptor.get("members", [])
+    states = {own.get(m["path"], "enabled") for m in members
+              if m["path"] in recorded and (m["path"] not in stored_paths or m["path"] in own)}
+    if len(states) != 1 or "enabled" in states:
+        return {}
+    mode = states.pop()
+    return {m["path"]: mode for m in members if m["path"] not in recorded and m["path"] not in stored_paths}
+
+
 def apply_sdk_state(view: dict, prompt: dict, stored: dict, hidden: set) -> dict:
     """Make the app's switches match its sidecar; return the node modes a run
     applies. A switch is switchable only when the export ran every one of its
@@ -176,6 +204,7 @@ def apply_sdk_state(view: dict, prompt: dict, stored: dict, hidden: set) -> dict
     routing, problem = control_routing.read_routing(manifest.get("execution_routing"))
     stored_modes = stored_node_modes(stored)
     descriptors = view.get("execution", []) or []
+    recorded = stored_switch_members(stored)
     effective, switchable = {}, []
     for descriptor in descriptors:
         descriptor["hidden"] = f"execution:{descriptor['execution_id']}" in hidden
@@ -191,8 +220,11 @@ def apply_sdk_state(view: dict, prompt: dict, stored: dict, hidden: set) -> dict
             descriptor["read_only"] = False
             switchable.append(descriptor)
             if not descriptor["hidden"]:
-                effective.update({m["path"]: stored_modes[m["path"]][0] for m in descriptor["members"]
-                                  if stored_modes.get(m["path"], (None, None))[1] == m["class_type"]})
+                own = {m["path"]: stored_modes[m["path"]][0] for m in descriptor["members"]
+                       if stored_modes.get(m["path"], (None, None))[1] == m["class_type"]}
+                effective.update(own)
+                effective.update(added_member_modes(descriptor, own, stored_modes,
+                                                    recorded.get(descriptor["execution_id"])))
     for descriptor in switchable:
         for member in descriptor["members"]:
             member["mode"] = effective.get(member["path"], "enabled")

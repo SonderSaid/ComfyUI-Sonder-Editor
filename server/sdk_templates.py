@@ -820,7 +820,7 @@ def _normalized_controls(data: dict, presentation_hash: str) -> dict:
     data = dict(data)
     data["version"] = CONTROLS_VERSION
     for name in ("bindings", "labels", "notes", "layout", "local", "local_notes", "hidden", "presets", "preset_categories",
-                 "node_modes", "views"):
+                 "node_modes", "switch_members", "views"):
         if not isinstance(data.get(name), dict):
             data[name] = {}
     if data.get("presentation_hash") != presentation_hash:
@@ -847,16 +847,39 @@ def _read_controls_locked(template_id: str, controls_path: str) -> dict:
     empty one, is user state and never receives the starter defaults again.
     """
     existed = os.path.isfile(controls_path)
-    data = _normalized_controls(read_json_sidecar(controls_path), _presentation_hash(template_id))
-    source = starter_sources().get(template_id) if not existed else None
-    if source:
+    raw = read_json_sidecar(controls_path)
+    data = _normalized_controls(raw, _presentation_hash(template_id))
+    source = starter_sources().get(template_id)
+    if source and not existed:
         shipped = read_json_sidecar(source[:-5] + ".meta.json")
         modes = control_execution.stored_node_modes({"node_modes": shipped.get("initial_node_modes")})
         if modes:
             data["node_modes"] = {path: {"mode": mode, "class_type": class_type}
                                   for path, (mode, class_type) in modes.items()}
+            data["switch_members"] = _shipped_switch_members(source)
             write_json_atomic(controls_path, data)
+    elif source and not isinstance(raw.get("switch_members"), dict):
+        # A sidecar from before switch_members (0.8.0) stored its modes against
+        # the membership its starter shipped then; the meta lists it, so a node
+        # added since follows its switch. Kept in memory; a later write persists
+        # it. Expiry: drop with the meta key once 0.8.x sidecars need no upgrade.
+        shipped = read_json_sidecar(source[:-5] + ".meta.json")
+        data["switch_members"] = control_execution.stored_switch_members(
+            {"switch_members": shipped.get("previous_switch_members")})
     return data
+
+
+def _shipped_switch_members(source: str) -> dict:
+    """Each switch's members as the starter's export lists them, so a node a
+    later pack version adds to a switch follows its seeded state."""
+    try:
+        prompt = parse_template_bytes(_read_bytes(source) or b"")
+        relay = control_descriptors.control_manifest.find_relay(prompt)
+        controls = json.loads(prompt[relay["key"]]["inputs"]["manifest"])["execution"]["controls"]
+        return {cid: [m["path"] for m in entry["members"] if isinstance(m, dict) and isinstance(m.get("path"), str)]
+                for cid, entry in controls.items() if isinstance(entry, dict) and isinstance(entry.get("members"), list)}
+    except (TemplateError, OSError, AttributeError, KeyError, TypeError, ValueError):
+        return {}
 
 
 def read_control_values(template_id: str) -> dict:
@@ -1104,13 +1127,18 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
             if source == "execution" and field in ("mode", "modes"):
                 # Node state, as on the canvas: a node two switches share takes
                 # the last mode set. Enabled is the export's own state.
-                for member in switches.get(identity, {}).get("members", []):
+                members = switches.get(identity, {}).get("members", [])
+                for member in members:
                     path = member["path"]
                     mode = value.get(path) if field == "modes" else value
                     if mode in control_execution.control_routing.OFF_MODES:
                         data["node_modes"][path] = {"mode": mode, "class_type": member["class_type"]}
                     else:
                         data["node_modes"].pop(path, None)
+                # Which nodes this state covered, so a node a later export adds
+                # to the switch follows it (control_execution.added_member_modes).
+                if members:
+                    data["switch_members"][identity] = [member["path"] for member in members]
                 continue
             if source == "preset":
                 authored = control_manifest_of(prompt).get("presets", {})

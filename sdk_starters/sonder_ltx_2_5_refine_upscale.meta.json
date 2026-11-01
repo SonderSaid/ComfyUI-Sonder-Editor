@@ -3,9 +3,45 @@
   "model_family": "LTX 2.5",
   "order": 2,
   "initial_node_modes": {
-    "9462": {
+    "9314": {
       "mode": "muted",
-      "class_type": "LTXVPreprocessMasks"
+      "class_type": "LTXVGetTilingSizes"
+    },
+    "9336": {
+      "mode": "muted",
+      "class_type": "CLIPTextEncode"
+    },
+    "9351": {
+      "mode": "muted",
+      "class_type": "LatentUpscaleModelLoader"
+    },
+    "9356": {
+      "mode": "muted",
+      "class_type": "LTXVConditioning"
+    },
+    "9385": {
+      "mode": "muted",
+      "class_type": "VAEDecodeTiled"
+    },
+    "9395": {
+      "mode": "muted",
+      "class_type": "LoraLoaderModelOnly"
+    },
+    "9398": {
+      "mode": "muted",
+      "class_type": "SonderSaveVideo"
+    },
+    "9400": {
+      "mode": "muted",
+      "class_type": "445254c0-b672-4fd4-9c65-e6b7ee7d71ed"
+    },
+    "9426": {
+      "mode": "muted",
+      "class_type": "ComfyMathExpression"
+    },
+    "9431": {
+      "mode": "muted",
+      "class_type": "LoraLoaderModelOnly"
     },
     "9508": {
       "mode": "muted",
@@ -26,6 +62,57 @@
     "9512": {
       "mode": "muted",
       "class_type": "ImageToMask"
+    },
+    "9573": {
+      "mode": "muted",
+      "class_type": "SonderMasksBridge"
+    },
+    "9577": {
+      "mode": "muted",
+      "class_type": "LTXVSetVideoLatentNoiseMasks"
+    },
+    "9579": {
+      "mode": "muted",
+      "class_type": "GrowMaskWithBlur"
     }
+  },
+  "previous_switch_members": {
+    "KAl11_kzAAT_": [
+      "9462",
+      "9508",
+      "9509",
+      "9510",
+      "9511",
+      "9512"
+    ],
+    "7zo4IiqNFgUJ": [
+      "9314",
+      "9336",
+      "9351",
+      "9356",
+      "9385",
+      "9395",
+      "9398",
+      "9400",
+      "9426",
+      "9431",
+      "9573",
+      "9574"
+    ],
+    "LXShuS78YmSL": [
+      "9326",
+      "9397",
+      "9406",
+      "9412",
+      "9415",
+      "9421",
+      "9424",
+      "9433",
+      "9436",
+      "9439",
+      "9555",
+      "9556",
+      "9561"
+    ]
   }
 }

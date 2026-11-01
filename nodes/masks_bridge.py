@@ -11,7 +11,7 @@ is generated for it (the channel is kept from source and can drive the
 other). This removes the friction of manually plugging/unplugging the
 downstream temporal-mask nodes.
 
-It additionally compiles that same window into hard 0/1 latent noise masks
+It additionally compiles that same window into latent noise masks
 when the matching latent and VAE are wired, so the window reaches the sampler
 without a seconds round-trip and without a retyped fps. Two shapes are NOT
 interchangeable, and both are load-bearing (see `comfy/utils.py reshape_mask`):
@@ -21,6 +21,9 @@ interchangeable, and both are load-bearing (see `comfy/utils.py reshape_mask`):
 * audio — a **single** mask image shaped to the audio latent's last two axes.
   A batch never reaches a 4D latent's time axis at all; the axis itself is
   model-dependent (LTX `[B,C,T,F]`, MiniMax H3 `[B,C,F,T]`).
+
+The optional spatial_mask restricts video generation to a per-pixel region
+on verified LTX and MiniMax H3 layouts. Audio remains temporal.
 
 The pixel→latent map is `vae.downscale_ratio[0]`, a per-model callable, never
 `downscale_index_formula` (a tiling stride, wrong for H3's fractional 17:5).
@@ -420,22 +423,23 @@ class SonderMasksBridge:
         "start when Edit Audio is on; equals the end (zero width) when frozen.",
         "Audio generation-mask end time (seconds). Collapses to the start time "
         "when Edit Audio is off, freezing the audio channel.",
-        "Hard 0/1 noise mask for the VIDEO latent — one mask per latent frame "
-        "(1 = generate, 0 = keep). Feed Set Latent Noise Mask on the video "
-        "latent. Not interchangeable with audio_mask. All-zeros when the video "
-        "latent and VAE are not both wired, or when Edit Video is off. "
-        "On LTX, a graph that also uses guides or a start image should drive "
-        "LTXVAudioVideoMask from the time outputs above instead of feeding this "
-        "mask to Set Latent Noise Mask — see docs/generating.md. A mask also "
-        "replaces rather than composes, so it overwrites any pin a start-image "
-        "or continuation node set upstream.",
+        "One MASK per video latent frame. White permits generation inside the edit "
+        "window, black protects, grey limits strength. With spatial_mask connected, "
+        "upstream video pins limit the result. For LTX spatial edits use LTXV Set "
+        "Video Latent Noise Masks before Guides. With an existing full-size 5D mask, "
+        "give only that setter a LatentFromBatch copy (index 0, length 1). Its writer "
+        "cannot expand compact pins in place. All-zeros when the video latent and "
+        "VAE are not both wired, or when Edit Video is off. Without spatial_mask the "
+        "mask is hard 0/1 and replaces upstream protection; on LTX with Guides or a "
+        "start image, drive LTXVAudioVideoMask from the time outputs instead. See "
+        "docs/generating.md.",
         "Hard 0/1 noise mask for the AUDIO latent — a SINGLE mask image shaped "
         "to the audio latent's last two axes, not a batch (1 = generate, 0 = "
         "keep). Feed Set Latent Noise Mask on the audio latent. Not "
         "interchangeable with video_mask. All-zeros when the audio latent and "
-        "VAE are not both wired, or when Edit Audio is off. Like the video "
-        "mask it replaces rather than composes, so it overwrites any noise "
-        "mask set upstream.",
+        "VAE are not both wired, or when Edit Audio is off. It replaces rather "
+        "than composes, so it overwrites any noise mask set upstream on the "
+        "audio latent.",
     )
     FUNCTION = "execute"
     DESCRIPTION = (
@@ -445,9 +449,10 @@ class SonderMasksBridge:
         "nothing is generated for it — useful to keep audio fixed while it drives "
         "video, or vice versa. Wire the times into a downstream temporal mask "
         "node, or wire each latent and its VAE here and take the compiled MASK "
-        "outputs straight to Set Latent Noise Mask: Separate AV Latent -> this "
-        "bridge -> two Set Latent Noise Mask -> Concat AV Latent. Requires a "
-        "project that executed through a Sonder Editor."
+        "outputs. Connect spatial_mask for moving or soft regions on native LTX "
+        "or MiniMax H3 video. Use the LTX video mask setter before Guides, or "
+        "Set Latent Noise Mask on separated H3 streams before rejoining. Requires "
+        "a project that executed through a Sonder Editor."
     )
 
     @classmethod
@@ -492,12 +497,21 @@ class SonderMasksBridge:
                     "tooltip": "Optional. The VAE that encoded the audio latent — "
                                "supplies its latent rate (LTX 25/s, MiniMax H3 40/s).",
                 }),
+                "spatial_mask": ("MASK", {
+                    "tooltip": "One mask per Editor frame at the exact render resolution, "
+                               "including all context and padding. White permits edits, black "
+                               "protects, grey limits strength. Native LTX or MiniMax H3 video "
+                               "latent and encoding VAE required. Max within each latent interval, then "
+                               "the mean of each latent cell, so partly covered cells turn grey.",
+                }),
             },
             "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
-    def _compile_video(self, result, video_latent, video_vae):
+    def _compile_video(self, result, video_latent, video_vae, spatial_mask=None, raster=None):
         """(mask, provenance) for the video stream."""
+        if spatial_mask is not None and (video_latent is None or video_vae is None):
+            raise RuntimeError("SonderMasksBridge: spatial_mask requires video_latent and its encoding video_vae.")
         if video_latent is None and video_vae is None:
             return _no_op_mask(), None
         if video_latent is None or video_vae is None:
@@ -515,12 +529,20 @@ class SonderMasksBridge:
             result["frame_count"], latent_frames, start_pixel, end_pixel,
             video_downscale_fn(video_vae),
         )
-        return _video_mask_tensor(latent_frames, lo, hi), {
+        provenance = {
             "latent_frames": latent_frames,
             "pixel_span": [int(start_pixel), int(end_pixel)],
             "latent_span": [int(lo), int(hi)],
             "frame_count": int(result["frame_count"]),
         }
+
+        temporal = _video_mask_tensor(latent_frames, lo, hi)
+        if spatial_mask is not None:
+            from .spatial_mask import compile_spatial_mask
+            temporal, provenance["spatial"] = compile_spatial_mask(
+                spatial_mask, video_latent, video_vae, raster, temporal, provenance,
+            )
+        return temporal, provenance
 
     def _compile_audio(self, result, audio_latent, audio_vae):
         """(mask, provenance) for the audio stream."""
@@ -572,10 +594,12 @@ class SonderMasksBridge:
         }
 
     def execute(self, project, edit_video=True, edit_audio=True, video_latent=None,
-                audio_latent=None, video_vae=None, audio_vae=None, unique_id=None):
+                audio_latent=None, video_vae=None, audio_vae=None, unique_id=None, spatial_mask=None):
         result = resolve_mask_times(project, edit_video, edit_audio)
 
-        video_mask, video_prov = self._compile_video(result, video_latent, video_vae)
+        video_mask, video_prov = self._compile_video(
+            result, video_latent, video_vae, spatial_mask, project._execution_context.get("_render_raster_hw"),
+        )
         audio_mask, audio_prov = self._compile_audio(result, audio_latent, audio_vae)
 
         # Provenance: public (non-underscore) ctx keys auto-flow into

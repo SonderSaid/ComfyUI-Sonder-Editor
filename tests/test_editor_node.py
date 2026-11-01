@@ -1959,6 +1959,7 @@ def test_execute_consumes_pending_queue_job_snapshot(tmp_path, monkeypatch):
     assert result[7] == 30.0
     assert result[8] == 8
     assert result[9] == 6
+    assert project._execution_context["_render_raster_hw"] == (6, 8)
     assert result[11] == pytest.approx(4 / 30.0)
     assert result[12] == pytest.approx(24 / 30.0)
     assert project._execution_context["queue_job_id"] == "job-1"

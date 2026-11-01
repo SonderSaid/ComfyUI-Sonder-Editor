@@ -11,6 +11,15 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- Masks Bridge accepts a moving spatial mask for LTX and MiniMax H3 video. Edits stay inside the generation window and respect existing video pins.
+
+### Changed
+- **LTX 2.5 Refine & Upscale** (example and Sonder App starter) masks through the Masks Bridge with **Grow Mask With Blur**, replacing the removed `LTXVPreprocessMasks`. Its Mask Settings match MiniMax H3's, and it now starts on **Refining Pass Only** with **Mask Off**. If you used the 0.8.0 starter in the Sonder App, choose **Passes** and **Refine Pass Spatial Mask** again: a few earlier choices don't carry over.
+
+### Fixed
+- In the Sonder App, a node a workflow update adds to a switched group now follows the group's saved setting instead of running on its own.
+
 ## [0.8.0] - 2026-10-30
 
 The Sonder App release: run a workflow from a page of its own, change its

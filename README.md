@@ -210,7 +210,7 @@ adapters, grouped under the `Sonder`, `Sonder/IO`, `Sonder/Logic`, and
 | **Sonder Reference Image Bridge** | Outputs the selected lanes' images (and MiniMax H3 video sequences) on `r01`–`r16`. |
 | **Sonder Reference Audio Bridge** | Outputs the selected lanes' trimmed audio on `a01`–`a16`. |
 | **Sonder Reference Prompt Bridge** | Outputs the selected lanes' prompt text: `reference_prompt`, `reference_names`, and `p01`–`p16`. |
-| **Sonder Masks Bridge** | Outputs the generation window's picture and sound masks, each set to **Edit** or **Freeze**; see [Masking an audio-video latent](docs/generating.md#masking-an-audio-video-latent). |
+| **Sonder Masks Bridge** | Outputs the generation window's picture and sound masks, each set to **Edit** or **Freeze**; see [Masking an audio-video latent](docs/generating.md#masking-an-audio-video-latent). An optional spatial mask limits the video edit to a moving region; see [Edit a moving region](docs/generating.md#edit-a-moving-region). |
 | **Sonder Prompt Relay Bridge** | Exports the generation window's prompt lanes as ComfyUI-PromptRelay payload strings (no model patching). |
 
 ### Save & preview — `Sonder/IO`
