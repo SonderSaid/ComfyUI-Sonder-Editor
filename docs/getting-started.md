@@ -236,6 +236,8 @@ Then save with **Sonder Save Video**, **mode** **Take**, and click **Run**.
 
 **You'll see:** a take that passes through each image at its frame.
 
+https://github.com/user-attachments/assets/45173cea-0c39-4c88-a834-84def9f45bd6
+
 **Learn more:** [Guide frames](editor-basics.md#guide-frames) ·
 Worked example: the [LTX 2.3 Playground](../README.md#examples) loops
 `LTXVAddGuide` between the Guides Bridges.
@@ -271,6 +273,8 @@ for that kind of signal, such as an IC-LoRA.
 4. **Sonder Save Video**: **mode** **Take**. Click **Run**.
 
 **You'll see:** a take that follows the control video.
+
+![Two viewport panes side by side: a stick-figure pose from the Driver and a robot on the Moon raising its sword in step with it, while the playhead crosses the Driver row on the timeline](images/driver-loop.webp)
 
 **Learn more:** [Driver clips](editor-basics.md#driver-clips) ·
 Worked example: the [LTX 2.3 Playground](../README.md#examples) drives an LTX

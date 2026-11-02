@@ -598,7 +598,7 @@
   },
   "9506": {
     "inputs": {
-      "loras.0.lora_name": "LTX\\VBVR-official-comfyui.safetensors",
+      "loras.0.lora_name": "LTX\\ltx-2.5-22b-distilled-lora-450-bf16.safetensors",
       "loras.0.strength": 0.8,
       "loras.0.enabled": false,
       "model": [

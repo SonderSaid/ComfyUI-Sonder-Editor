@@ -109,41 +109,48 @@ Masking affects the refine pass only.
 ## MiniMax H3 — References & Swaps
 
 Generate using picture, video or sound [References](references.md), or replace
-a character's appearance in existing footage.
+a character or head using the visible timeline footage and a replacement picture.
 
 Above the timeline, choose **Model → MiniMax H3** and **Channels → MiniMax H3
 (full reference)**.
 
-For generation, choose a generation Task under **Controls → Modes → Task**,
-then follow the workflow's **Use References** note. References must be placed
-in time to participate; adding them to the Library alone does not send them
-to the model.
+Under **Controls → Modes**, choose one of the five **Task** choices, then choose
+**Mask On** or **Mask Off** in the separate **Mask** row. Masking affects video;
+the Task decides whether audio is generated or kept. For generation with your
+own media, follow the workflow's **Use References** note. References must be
+placed in time to participate.
 
 For a masked character swap:
 
-1. **Keep the original picture and sound.** Place the footage on **Video** and
-   its soundtrack on **Audio**. Keep one copy of the sound.
-2. **Supply the performance.** Add a second copy of the video to another
-   **Video** lane, then right-click its clip and choose **Convert to Driver**.
-   Match its timing, trim and framing to the visible footage.
-3. **Supply the replacement appearance.** Follow **Use References** in
+1. **Place the source footage.** Put the footage on a **Video** lane and its
+   soundtrack on **Audio**. The visible picture supplies both the source and
+   swap guidance. Check the **Composite** preview.
+2. **Supply the replacement appearance.** Follow **Use References** in
    **Controls** to place one replacement picture on a **MiniMax H3 Pictures**
    Reference lane. Describe the replacement in that Library member's
-   **Prompt**. See [H3 Subject or Picture setup](references.md#minimax-h3-full-reference)
-   for the Reference options.
-4. **Choose the swap.** Select **Modes → Task → Masked Character Swap**.
-   In **Who do you want to mask and swap in your target video?** below Modes,
-   describe the person to replace, such as `the woman`.
-5. **Check the target and generate.** Set **In / Out** inside both source
-   clips. Choose **Masked Driver Preview** from a viewport pane's source menu
-   and click its **Run**. Check the selected person, then click **Generate**.
+   **Prompt**. See [H3 Subject or Picture setup](references.md#minimax-h3-full-reference).
+   Under **Controls → Swap Sources**, set **Replacement Picture Lane** to that
+   lane; show advanced settings if the section is hidden.
+3. **Choose the swap and mask.** Select **Modes → Task → Character Swap**, then
+   **Modes → Mask → Mask On**. In **Who do you want to mask?** below Modes,
+   describe the person to replace, such as `the woman on the left`.
+4. **Check the region.** Set **In / Out** inside the source footage. Choose
+   **Spatial Mask Preview** from a viewport pane's source menu and click its
+   **Run** button. Adjust **Grow / Shrink Mask** and **Mask Edge Softness** under
+   **Mask Settings** if needed, then run the preview again.
+5. **Set the strength and generate.** Under **Generation Settings**, start with
+   **Swap Strength** at **1**. Increase it if the swap is failing; lower it if
+   unintended details change. Turn **Queue Active** off in **Render Queue**
+   below the sidebar to use the live selection, then click **Generate**.
 
-All four swap choices keep the original timeline audio. Their replacement
-description comes from the picture member's **Prompt**; the timeline Prompt
-is ignored.
+For a head replacement, choose **Head Swap** and describe the head when you
+want the mask limited to that area. **Mask Off** runs the same Task without a
+spatial restriction. Both swap Tasks keep timeline audio and use the replacement
+picture member's **Prompt**, rather than the timeline Prompt.
 
-Keep both Video and Driver copies for masked swaps: Video supplies the picture
-outside the mask, while Driver guides the replacement.
+The **Models and downloads** note links both main models. The workflow starts
+with **ref2va** for closer Reference fidelity; **fl2va** offers better sound and
+overall quality at the cost of Reference accuracy.
 
 ## Review your results
 

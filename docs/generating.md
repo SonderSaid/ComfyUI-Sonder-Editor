@@ -425,6 +425,10 @@ one, click a pane's source button, choose **Add output…** and click the node.
 To rename, reorder or delete Views,
 see [Manage](controls.md#manage).
 
+https://github.com/user-attachments/assets/36622192-fcac-4ed8-ad8b-bae93cbb3303
+
+![The viewport in three panes, Grid: the scene preview on the left, a KSampler's last preview top right reading Last preview · step 10/10, and a Preview Image pane whose source menu is open on Editor, Views, Add output… and Sampling previews](images/viewport-panes.webp)
+
 ### The View pane
 
 A View pane shows the newest result of its output node. Its bar has:

@@ -22,6 +22,8 @@ The app is optional: the editor and every node work without it.
 <p align="center"><em>The Launcher: pick a workflow on the left and a project
 on the right, then click <strong>Open</strong>.</em></p>
 
+https://github.com/user-attachments/assets/6740db96-dc0f-438b-9512-52261e1405af
+
 ## Set it up
 
 Do this once, in a browser on the ComfyUI machine.

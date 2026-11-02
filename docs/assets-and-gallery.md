@@ -197,6 +197,8 @@ make the winner the take that plays, see [Takes](#takes).
   favorite of that type is left, shown in single view. Single Inspect in the
   Favorites scope moves on to the next favorite instead of closing.
 
+https://github.com/user-attachments/assets/38af328d-0596-4ed1-8a14-4ab9e9cb79dd
+
 ![Compare mode in Divider layout: one shared stage split by a vertical divider, with the Gallery A and Gallery B pickers either side](images/compare-divider.webp)
 
 ![The same pair in Side by Side layout, where a Linked Zoom toggle appears beside the layout buttons](images/compare-side-by-side.webp)

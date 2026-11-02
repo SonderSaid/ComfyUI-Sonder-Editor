@@ -11,6 +11,18 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- **Sonder LTX 2.5 Edit & VFX**, **Sonder LTX 2.5 Refine & Upscale** and **Sonder MiniMax H3 References & Swaps** now show a thumbnail in ComfyUI's **Templates**.
+
+### Changed
+- **MiniMax H3 References & Swaps** (example and Sonder App starter) uses visible timeline footage for swaps, adds independent Mask On/Off Modes through the Masks Bridge, and shares one Swap Strength control. Existing starter users should choose Task and Mask again after updating.
+- New clips across the README and docs show the editor at work, including the README's See it work section.
+
+### Fixed
+- The LTX 2.5 and **MiniMax H3 References & Swaps** workflows no longer reject a run over a LoRA their notes never listed: the switched-off **Additional LoRAs** row now names a file the workflow already needs.
+- **MiniMax H3 References & Swaps** notes now also say how to open a project and generate in the Sonder App.
+- The **LTX 2.5 Edit & VFX** example now opens on **Make a New Video** and **Standard** with its unused nodes muted, instead of showing **Custom** with nothing selected.
+
 ## [0.8.1] - 2026-10-31
 
 ### Added

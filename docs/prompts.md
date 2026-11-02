@@ -204,6 +204,8 @@ generation. Install [kijai's ComfyUI-PromptRelay](https://github.com/kijai/Comfy
 and use its workflow for your model. Add **Sonder Prompt Relay Bridge**,
 with `project` wired from **Sonder Editor**.
 
+![One take in the editor moving from tears to manic laughter to a cold grin, as the playhead crosses four Prompt sections that light up in turn, with a white card quoting the prompt in play](images/prompt-relay-loop.webp)
+
 | Bridge output | Connect to |
 |---|---|
 | `global_prompt` | The Relay encoder's `global_prompt` input, for scene-wide text |

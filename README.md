@@ -21,12 +21,10 @@ generates.
 It works with the model you choose: LTX, Wan, HunyuanVideo, MiniMax H3 and
 more.
 
-![The Sonder Editor with the Controls tab at the left showing the LTX 2.5 Edit &
-VFX workflow's Modes, the viewport split into three panes (the shot, its depth
-map and a sampler's live preview), and the timeline below with a run
-notification](docs/images/editor-controls-views.webp)
-<p align="center"><em>Controls and Modes at the left; the viewport split into
-the shot, its depth map and a live sampler preview.</em></p>
+https://github.com/user-attachments/assets/7352407c-e427-4697-9abc-da9ca76f4d4e
+
+<p align="center"><em>From a kid in a garden to a warrior in a storm: each take
+lands on the timeline beside the one it replaced.</em></p>
 
 **[▶ Watch the launch overview](https://youtu.be/lixgY2G80xE)** (recorded at the first release)
 
@@ -56,6 +54,13 @@ Workflow (your ComfyUI graph)
     ├── Switches        nodes and groups turned on or off
     └── Views           outputs shown in the viewport panes
 ```
+
+![The Sonder Editor with the Controls tab at the left showing the LTX 2.5 Edit &
+VFX workflow's Modes, the viewport split into three panes (the shot, its depth
+map and a sampler's live preview), and the timeline below with a run
+notification](docs/images/editor-controls-views.webp)
+<p align="center"><em>Controls and Modes at the left; the viewport split into
+the shot, its depth map and a live sampler preview.</em></p>
 
 <p align="center">
   <img src="docs/images/node.png" width="420" alt="The Sonder Editor node in a ComfyUI graph, showing its sockets, project card, and inline viewport preview">
@@ -93,38 +98,38 @@ New here? Install the pack, then follow
 
 ## See it work
 
-Three techniques from the same project, run through the same workflow. Each clip
-shows the timeline alongside the result it produced. You can explore those scenes
-in **Project-Sample**, listed under
-[**Project Sample — LTX 2.3**](https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects#project-sample--ltx-23) on Hugging Face,
-using the [LTX 2.3 Playground](#examples) below.
+Four things you do in the editor, from selecting a range to switching a whole
+setup.
 
-### Prompt Relay
+### Redo just one part
 
-Prompt sections are cut along the timeline, each applying to its own range, so a
-single clip moves through a whole beat instead of holding one prompt for its
-entire length. **Sonder Prompt Relay Bridge** exports the generation window's
-prompt lanes as ComfyUI-PromptRelay payload strings. Compatible with LTX and
-Wan.
+Keep the take you like and redo a stretch of it: set **In** and **Out**, keep the
+frames before as context, and the new take lands on its own row, ready to play
+beside the first. See [Redo a part of a clip](docs/getting-started.md#redo-a-part-of-a-clip).
 
-https://github.com/user-attachments/assets/3c1643f7-3944-4949-b7da-a47ad9c5fa5b
+https://github.com/user-attachments/assets/3b87d262-5496-4870-aff0-2990dfc3ef5a
 
-### Guides
+### Keyframes
 
-Guide frames sit on the timeline where you place them — first and last, or any
-frame in between — and the model fills what falls between them. Guides have their
-own lane and an animatic preview mode; **Sonder Guides Bridge Start / End** wrap
-the generation body to inject them per frame.
+Drop pictures on the timeline at the frames you choose, and the take passes
+through each of them. See [Guide with frames](docs/getting-started.md#guide-with-frames).
 
-https://github.com/user-attachments/assets/31e013a7-7e34-4f8d-8dc2-9114fe157165
+https://github.com/user-attachments/assets/45173cea-0c39-4c88-a834-84def9f45bd6
 
-### IC-LoRA motion transfer
+### References
 
-An OpenPose clip on a Driver lane drives the generation frame for frame. **Sonder
-Driver Selector** and **Sonder Driver Bridge** resolve and decode that lane for
-the generation window.
+Keep characters, places and voices consistent: add them to the Reference Library,
+place them on a lane where they apply, and attach them to a prompt. See
+[Use a Reference](docs/getting-started.md#use-a-reference).
 
-https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
+https://github.com/user-attachments/assets/94c5cc41-ad33-4ad2-8907-bc05f952cc2f
+
+### Controls and Modes
+
+Each button is a whole setup: it switches parts of your workflow on and off and
+sets its values together. See [Modes](docs/controls.md#modes).
+
+https://github.com/user-attachments/assets/d63c740f-1e94-44c9-806f-bcbe36ec2516
 
 ## Examples
 
@@ -133,6 +138,9 @@ https://github.com/user-attachments/assets/7c8459fb-6d10-4b84-9bc6-a1e98308c3f1
 Five ready-wired workflows. Drop any of the files onto the ComfyUI canvas, or open
 them from ComfyUI's **Templates**, under **Extensions › sonder-editor**.
 
+<a id="prompt-relay"></a>
+<a id="guides"></a>
+<a id="ic-lora-motion-transfer"></a>
 **[Sonder LTX 2.3 Playground](example_workflows/sonder_ltx_2_3_playground.json)** —
 prompt relay, multi-pass upscaling, image guides, and driver-controlled generation.
 Its matching project is **Project-Sample**, listed under
@@ -155,6 +163,8 @@ performance and sound, or generate with MiniMax H3 from picture, video and sound
 references. Pick the task in [Modes](docs/controls.md#modes). Its notes in
 Controls cover setup, models and the steps for each task.
 
+https://github.com/user-attachments/assets/c89a15ea-a3c3-4f22-b6b0-a6de1f8923e1
+
 **[Sonder LTX 2.5 Edit & VFX](example_workflows/sonder_ltx_2_5_edit_vfx.json)** —
 LTX 2.5 editing and effects, each one a choice in [Modes](docs/controls.md#modes):
 edit footage with a prompt or an edited picture, remove people, make a subject
@@ -162,11 +172,15 @@ mask, follow a video's layout, body movement or outlines, add sound to a video,
 or make new video and sound. Its notes in Controls list the node packs and model
 files and walk through a first take.
 
+https://github.com/user-attachments/assets/7b998aeb-3db5-4363-af22-fea4a6a6b0bb
+
 **[Sonder LTX 2.5 Refine & Upscale](example_workflows/sonder_ltx_2_5_refine_upscale.json)** —
 refine existing footage at the timeline resolution, upscale it to twice the
 timeline's width and height, or do both. Optional character or background masking
 focuses the refine pass. Its notes in Controls cover setup, models and downloads,
 mask preparation, and saving results with sound.
+
+https://github.com/user-attachments/assets/38af328d-0596-4ed1-8a14-4ab9e9cb79dd
 
 The last three also ship with the [Sonder App](docs/sonder-app.md)
 (experimental, optional) as its starter workflows, exported for the API.

@@ -212,7 +212,7 @@ def test_starter_without_initial_modes_does_not_create_controls_sidecar(starter)
     ('sonder_ltx_2_5_edit_vfx', ['Make a New Video', 'Generate New Audio', 'Standard']),
     ('sonder_ltx_2_5_edit_vfx_standard', ['Make a New Video', 'Generate New Audio']),
     ('sonder_ltx_2_5_refine_upscale', ['Refining Pass Only', 'Mask Off']),
-    ('sonder_minimax_h3_references_swaps', ['Standard Generation']),
+    ('sonder_minimax_h3_references_swaps', ['Standard Generation', 'Mask Off']),
 ])
 def test_shipped_starter_sources_and_initial_choices(slug, choices):
     from server import control_manifest as cm, prompt_graph
@@ -295,3 +295,122 @@ def test_standard_edit_starter_removes_relay_dependency_without_changing_other_t
     assert all(m['path'] in simple for s in menu['execution']['controls'].values() for m in s['members'])
     meta = json.loads((folder / 'sonder_ltx_2_5_edit_vfx.meta.json').read_text(encoding='utf-8'))
     assert meta['name'].endswith('Prompt Relay')
+
+@pytest.mark.parametrize('slug,example', [
+    ('sonder_ltx_2_5_edit_vfx', 'sonder_ltx_2_5_edit_vfx'),
+    ('sonder_ltx_2_5_edit_vfx_standard', 'sonder_ltx_2_5_edit_vfx'),
+    ('sonder_ltx_2_5_refine_upscale', 'sonder_ltx_2_5_refine_upscale'),
+    ('sonder_minimax_h3_references_swaps', 'sonder_minimax_h3_references_swaps'),
+])
+def test_shipped_lora_rows_name_a_file_the_workflow_already_requires(slug, example):
+    # ComfyUI validates a switched-off row's file too, so any other file would
+    # reject the first run for everyone who doesn't have it.
+    root = Path(__file__).resolve().parents[1]
+    api = json.loads((root / 'sdk_starters' / (slug + '.json')).read_text(encoding='utf-8'))
+    meta = json.loads((root / 'sdk_starters' / (slug + '.meta.json')).read_text(encoding='utf-8'))
+    canvas = json.loads((root / 'example_workflows' / (example + '.json')).read_text(encoding='utf-8'))
+    required = {n['inputs']['lora_name'] for key, n in api.items()
+                if n['class_type'] == 'LoraLoaderModelOnly' and key not in meta['initial_node_modes']
+                and isinstance(n['inputs'].get('lora_name'), str)}
+    rows = [value for n in api.values() if n['class_type'] == 'LoadLoraModel'
+            for name, value in n['inputs'].items() if name.endswith('.lora_name')]
+    assert rows and set(rows) <= required
+    canvas_rows = [value for n in canvas['nodes'] if n['type'] == 'LoadLoraModel'
+                   for name, value in n['widgets_values_named'].items() if name.endswith('.lora_name')]
+    assert canvas_rows == rows
+
+
+@pytest.mark.parametrize('slug,example', [
+    ('sonder_ltx_2_5_edit_vfx', 'sonder_ltx_2_5_edit_vfx'),
+    ('sonder_ltx_2_5_refine_upscale', 'sonder_ltx_2_5_refine_upscale'),
+    ('sonder_minimax_h3_references_swaps', 'sonder_minimax_h3_references_swaps'),
+])
+def test_canvas_examples_open_on_their_starters_default_modes(slug, example):
+    # Modes derive their selection from node states, so a mismatch opens as Custom.
+    root = Path(__file__).resolve().parents[1]
+    api = json.loads((root / 'sdk_starters' / (slug + '.json')).read_text(encoding='utf-8'))
+    meta = json.loads((root / 'sdk_starters' / (slug + '.meta.json')).read_text(encoding='utf-8'))
+    canvas = json.loads((root / 'example_workflows' / (example + '.json')).read_text(encoding='utf-8'))
+    names = {2: 'muted', 4: 'bypassed'}
+    opens = {str(n['id']): names[n['mode']] for n in canvas['nodes'] if n.get('mode', 0) in names}
+    expected = {key: entry['mode'] for key, entry in meta['initial_node_modes'].items() if ':' not in key}
+    assert opens == expected
+    assert set(opens) <= set(api) | {key.split(':')[0] for key in api}
+
+
+def _h3_shipped_assets():
+    root = Path(__file__).resolve().parents[1]
+    slug = 'sonder_minimax_h3_references_swaps'
+    canvas = json.loads((root / 'example_workflows' / (slug + '.json')).read_text(encoding='utf-8'))
+    api = json.loads((root / 'sdk_starters' / (slug + '.json')).read_text(encoding='utf-8'))
+    relay = next(n for n in api.values() if n['class_type'] == 'SonderControlRelay')
+    return canvas, api, json.loads(relay['inputs']['manifest'])
+
+
+def test_h3_replacement_starts_on_create_new_and_keeps_note_widget_copies_in_sync():
+    canvas, api, menu = _h3_shipped_assets()
+    editor = next(n for n in canvas['nodes'] if n['type'] == 'SonderEditor')
+    defaults = editor['widgets_values_named']
+    assert defaults['project'] == '+ Create New'
+    assert defaults['scene_id'] == ''
+    assert not defaults['render_queue_active']
+    assert all(defaults[name] == 0 for name in ('selection_start', 'selection_end', 'pre_context_frames',
+                                               'post_context_frames', 'mask_pre_offset', 'mask_post_offset'))
+    assert api[str(editor['id'])]['inputs']['project'] == '+ Create New'
+    assert api[str(editor['id'])]['inputs']['scene_id'] == ''
+    for node in canvas['nodes']:
+        if 'widgets_values_named' in node:
+            assert list(node['widgets_values_named'].values()) == node.get('widgets_values', []), node['id']
+    assert 'minimax_h3_ref2va_pruned_int8_convrot.safetensors' in menu['notes']['h3_models']['text']
+    assert 'minimax_h3_fl2va_pruned_int8_convrot.safetensors' in menu['notes']['h3_models']['text']
+    assert not any(n['class_type'] in ('SonderDriverSelector', 'SonderDriverBridge') for n in api.values())
+
+
+@pytest.mark.parametrize('task,video,audio', [
+    ('Standard Generation', True, True),
+    ('Generate Video with Existing Audio', True, False),
+    ('Generate Audio with Existing Video', False, True),
+    ('Character Swap', True, False),
+    ('Head Swap', True, False),
+])
+@pytest.mark.parametrize('mask', ['Mask On', 'Mask Off'])
+def test_h3_replacement_routes_every_task_and_mask_without_breaking_the_inactive_branch(task, video, audio, mask):
+    import copy
+    from server import control_manifest as cm, control_routing as cr
+
+    _, source, menu = _h3_shipped_assets()
+    graph = copy.deepcopy(source)
+    modes = {}
+    for name in (task, mask):
+        preset = next(p for p in menu['presets'].values() if p['name'] == name)
+        for identity, member in preset['members'].items():
+            for target in menu['bindings'][identity]['targets']:
+                graph[target['path']]['inputs'][target['input']] = member['value']
+        modes.update(cm.execution_effects(preset.get('execution', {})))
+    routing, error = cr.read_routing(menu['execution']['routing'])
+    assert error is None
+    compiled = cr.compile_modes(graph, routing, modes)
+    bridge = next(n for n in compiled.values() if n['class_type'] == 'SonderMasksBridge')
+    save = next(n for n in compiled.values() if n['class_type'] == 'SonderSaveVideo')
+    assert bridge['inputs']['edit_video'] is video
+    assert bridge['inputs']['edit_audio'] is audio
+    assert save['inputs']['place_audio_on_timeline'] is audio
+    assert any(n['class_type'] == 'SonderPreviewVideo' for n in compiled.values()) is (mask == 'Mask On')
+    if task in ('Character Swap', 'Head Swap'):
+        strength = next(b for b in menu['bindings'].values() if b['label'] == 'Swap Strength')['targets'][0]
+        assert graph[strength['path']]['inputs'][strength['input']] == 1
+        swaps = [n for n in compiled.values() if n['class_type'] == 'LoraLoaderModelOnly'
+                 and 'swap' in n['inputs']['lora_name']]
+        assert len(swaps) == 2
+        assert all(n['inputs']['strength_model'] == [strength['path'], 0] for n in swaps)
+        # ComfyUI validates the unused branch too; muting detection processors
+        # left these required inputs absent in the former Mask Off preset.
+        for n in compiled.values():
+            if n['class_type'] == 'ImageCompositeMasked':
+                assert {'destination', 'source', 'mask'} <= set(n['inputs'])
+            elif n['class_type'] == 'InvertMask':
+                assert 'mask' in n['inputs']
+    for node in compiled.values():
+        for value in node['inputs'].values():
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
+                assert value[0] in compiled

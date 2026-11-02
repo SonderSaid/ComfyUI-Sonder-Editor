@@ -210,7 +210,7 @@ before muting only one member.
 
 ## Editing gestures
 
-![A working timeline: imported clips, placed takes, a Driver lane, guide frames, and prompts](images/timeline-editing.webp)
+![Three takes on a Video row: the middle one is dragged left and snaps to the first with a dashed guide, its right edge is trimmed out and snaps to the third, then the C key and a click split it in two](images/editing-gestures-loop.webp)
 
 - **Snapping** (`S` to toggle, or the **Snap** button above the timeline)
   pulls a dragged item's start **or end**, and a trimmed edge, to nearby
@@ -232,6 +232,8 @@ before muting only one member.
 - **Deleting** (`Del`/`Backspace`): deleting the last item on a video/audio
   lane also removes the now-empty lane.
 - **Undo** (`Ctrl+Z` / `Ctrl+Y`) covers timeline edits.
+
+![A working timeline: imported clips, placed takes, a Driver lane, guide frames, and prompts](images/timeline-editing.webp)
 
 ### Dropping assets onto the timeline
 

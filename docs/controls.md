@@ -63,6 +63,8 @@ pass's group and sets the second pass's input. A Mode is not a node switch's
 **Enabled** / **Muted** / **Bypassed**: those are single
 [switches](#switch-nodes-and-groups-on-and-off).
 
+https://github.com/user-attachments/assets/d63c740f-1e94-44c9-806f-bcbe36ec2516
+
 ![The Modes table at the top of the Controls tab: a Look category with Draft and Final, Final highlighted, and a Shot category reading Custom with Lighthouse and Harbour, above the Individual Controls heading](images/controls-modes.webp)
 <p align="center"><em>Two categories. <strong>Shot</strong> reads
 <strong>Custom</strong> because its seed was changed by hand.</em></p>
