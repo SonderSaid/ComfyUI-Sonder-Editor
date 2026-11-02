@@ -22,6 +22,7 @@ a fresh `[Unreleased]` block.
 - The LTX 2.5 and **MiniMax H3 References & Swaps** workflows no longer reject a run over a LoRA their notes never listed: the switched-off **Additional LoRAs** row now names a file the workflow already needs.
 - **MiniMax H3 References & Swaps** notes now also say how to open a project and generate in the Sonder App.
 - The **LTX 2.5 Edit & VFX** example now opens on **Make a New Video** and **Standard** with its unused nodes muted, instead of showing **Custom** with nothing selected.
+- The **Models and downloads** notes of **MiniMax H3 References & Swaps** and **LTX 2.5 Edit & VFX** now say to download every listed file: ComfyUI checks all of them before a run, whichever Task you choose.
 
 ## [0.8.1] - 2026-10-31
 

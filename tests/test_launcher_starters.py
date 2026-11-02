@@ -338,6 +338,26 @@ def test_canvas_examples_open_on_their_starters_default_modes(slug, example):
     assert set(opens) <= set(api) | {key.split(':')[0] for key in api}
 
 
+@pytest.mark.parametrize('slug,note', [
+    ('sonder_ltx_2_5_edit_vfx', 'ltx_models_downloads'),
+    ('sonder_ltx_2_5_edit_vfx_standard', 'ltx_models_downloads'),
+    ('sonder_minimax_h3_references_swaps', 'h3_models'),
+])
+def test_models_note_lists_every_file_the_default_modes_require_and_says_to_get_them_all(slug, note):
+    # ComfyUI checks every unmuted loader's file before a run, whichever Task is chosen.
+    root = Path(__file__).resolve().parents[1]
+    api = json.loads((root / 'sdk_starters' / (slug + '.json')).read_text(encoding='utf-8'))
+    meta = json.loads((root / 'sdk_starters' / (slug + '.meta.json')).read_text(encoding='utf-8'))
+    relay = next(n for n in api.values() if n['class_type'] == 'SonderControlRelay')
+    text = json.loads(relay['inputs']['manifest'])['notes'][note]['text']
+    files = {value.replace('\\', '/').rsplit('/', 1)[-1] for key, n in api.items()
+             if key not in meta['initial_node_modes']
+             for name, value in n['inputs'].items()
+             if name.endswith('_name') and isinstance(value, str) and value.endswith('.safetensors')}
+    assert files and all(name in text for name in files)
+    assert 'even for one Task' in text
+
+
 def _h3_shipped_assets():
     root = Path(__file__).resolve().parents[1]
     slug = 'sonder_minimax_h3_references_swaps'
