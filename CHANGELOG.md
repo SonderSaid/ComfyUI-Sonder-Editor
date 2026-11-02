@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-02
+
 ### Added
 - **Sonder LTX 2.5 Edit & VFX**, **Sonder LTX 2.5 Refine & Upscale** and **Sonder MiniMax H3 References & Swaps** now show a thumbnail in ComfyUI's **Templates**.
 
