@@ -43,6 +43,7 @@ function participationNote(spec) {
 }
 const inEditor = d => d.source === "binding" && d.section === "editor";
 const CANVAS_EMPTY = "No Controls yet. Choose Manage to expose this workflow's settings here.";
+const CANVAS_DISCONNECTED = "The canvas is not connected. Your Controls come back when the ComfyUI tab with this workflow is open.";
 const EMPTY_NOTE = "Double-click to write this note. Start it with a bold line to make it collapsible.";
 const LONG_VALUE = 18; // a choice longer than this gets a wide card
 // A burst of seed steps saves once, this long after the last step.
@@ -1617,7 +1618,8 @@ export function mountControlsPanel(container, host) {
             view.relay?.error ||
             (!empty
                 ? query && !shownTotal && !editorVisible ? `No settings match “${query.trim()}”. Search looks at names, groups and choices.` : ""
-                : view.state === "ready" ? host.emptyMessage || CANVAS_EMPTY : "Loading controls…"));
+                : view.state === "ready" ? host.emptyMessage || CANVAS_EMPTY
+                    : view.state === "disconnected" ? CANVAS_DISCONNECTED : "Loading controls…"));
         tips.refresh();
     }
     let closing = null;

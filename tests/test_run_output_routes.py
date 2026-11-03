@@ -17,7 +17,7 @@ RECEIPT = "dddddddd-0000-4000-8000-000000000001"
 
 @pytest.fixture(autouse=True)
 def registry(monkeypatch, tmp_path):
-    for name in ("_sessions", "_canvas_hosts", "_handoffs", "_widget_state", "_widget_sources", "_controls_relay"):
+    for name in ("_sessions", "_canvas_hosts", "_handoffs", "_tab_reclaims", "_widget_state", "_widget_sources", "_controls_relay"):
         monkeypatch.setattr(sr, name, {})
     monkeypatch.setattr(sr, "_lock", asyncio.Lock())
     monkeypatch.setattr(sr, "_sdk_secret_for_host", None)

@@ -29,6 +29,7 @@ import {
     putEditorWidgetState,
     releaseEditorSession,
 } from "./editor_session_client.js";
+import { randomToken } from "./session_ids.js";
 import { connectProjectSync } from "./cross_tab_sync.js";
 import { blockedState, changedAssetIds, displayVideoSource, proxyStore } from "./media_display_source.js";
 import { mediaFailedToDecode } from "./media_preview_support.js";
@@ -998,7 +999,7 @@ class DormantNodeCard {
                 state: orphaned ? "pending" : "running",
             });
         }
-        if (state.activeOwner && state.activeOwner.host_mode !== "tab" && state.activeOwner.session_id !== this.controller._editorSessionId) {
+        if (state.activeOwner && state.activeOwner.host_mode !== "tab" && !this.controller._ownsSession(state.activeOwner)) {
             badges.push({ text: "Owned", state: "pending" });
         }
         if ((queueCounts.running || 0) > 0) badges.push({ text: `${queueCounts.running} Running`, state: "running" });
@@ -1063,7 +1064,7 @@ class DormantNodeCard {
 
         this._actionRowEl.innerHTML = "";
         const owner = state.activeOwner || null;
-        const ownedByThis = owner?.session_id === this.controller._editorSessionId;
+        const ownedByThis = this.controller._ownsSession(owner);
         const ownedByTab = owner?.host_mode === "tab";
         const ownedExternally = !!owner && !ownedByThis && !ownedByTab;
         const pendingHandoff = !!state.pendingTabHandoff;
@@ -1393,6 +1394,8 @@ export class EditorNodeController {
         this._bridgeAssetSettleSession = null;
         this._frameConstraintHealedFor = "";
         this._editorSessionId = newEditorSessionId("fullscreen");
+        // This session as other pages see it; the server names it on a claim, a seed or a subscribe.
+        this._editorSessionTag = "";
         this._sessionHeartbeatTimer = null;
         this._suppressNextSessionRelease = false;
         this._syncConnection = null;
@@ -1412,7 +1415,7 @@ export class EditorNodeController {
         this._canvasInstanceId = getCanvasInstanceId();
         this._cachedHostNodeId = "";
         this._cachedHostId = "";
-        this._mountedTabWindowName = `sonder-editor-tab-${this._editorSessionId}`;
+        this._mountedTabWindowName = `sonder-editor-tab-${randomToken(8)}`;
         this._diagEvents = [];
         this._diagBoot = null;
         this._diagHotkeyUnregister = null;
@@ -2045,12 +2048,14 @@ export class EditorNodeController {
     _seedWidgetState(values = this._currentWidgetStateValues(), { seed = false } = {}) {
         const projectId = this._projectId();
         if (!projectId) return;
-        putEditorWidgetState(projectId, this._sourceNodeId(), this._editorSessionId, values, { seed, hostId: this._hostId() }).catch((error) => {
+        putEditorWidgetState(projectId, this._sourceNodeId(), this._editorSessionId, values, { seed, hostId: this._hostId() }).then((payload) => {
+            if (payload?.source_tag) this._editorSessionTag = payload.source_tag;
+        }).catch((error) => {
             console.warn("[Sonder] Failed to publish editor widget state:", error);
         });
     }
 
-    _applyRemoteWidgetState(values = {}, source = "unknown", remoteSessionId = "") {
+    _applyRemoteWidgetState(values = {}, source = "unknown", remoteSourceTag = "") {
         if (!values || typeof values !== "object") return false;
         const orderedEntries = Object.entries(values).sort(([left], [right]) => {
             if (left === "scene_id") return -1;
@@ -2073,7 +2078,7 @@ export class EditorNodeController {
         if (!changedFields.length) return false;
         this._recordDiagEvent("widget_state_apply", {
             source,
-            remote_session_id: remoteSessionId || "",
+            remote_source_tag: remoteSourceTag || "",
             fields: changedFields,
         });
 
@@ -2148,7 +2153,7 @@ export class EditorNodeController {
             const values = payload?.state && typeof payload.state === "object"
                 ? payload.state
                 : (payload?.values && typeof payload.values === "object" ? payload.values : {});
-            this._applyRemoteWidgetState(values, "poll", payload?.session_id || "");
+            this._applyRemoteWidgetState(values, "poll", payload?.source_tag || "");
         }).catch((error) => {
             this._recordDiagEvent("widget_state_poll_error", {
                 duration_ms: performance.now() - sentAt,
@@ -2206,21 +2211,25 @@ export class EditorNodeController {
         if (!event || event.project_id !== this._projectId()) return;
         if (String(event.host_id || "") !== this._hostId()) return;
         if (String(event.source_node_id || "") !== this._sourceNodeId()) return;
-        if (String(event.session_id || "") === this._editorSessionId) return;
+        if (event.source_tag && event.source_tag === this._editorSessionTag) return;
         const values = event.values && typeof event.values === "object" ? event.values : {};
         this._recordDiagEvent("ws_widget_state_changed", {
-            remote_session_id: event.session_id || "",
+            remote_source_tag: event.source_tag || "",
             field_count: Object.keys(values).length,
             fields: Object.keys(values).sort(),
         });
-        this._applyRemoteWidgetState(values, "ws", event.session_id || "");
+        this._applyRemoteWidgetState(values, "ws", event.source_tag || "");
+    }
+
+    _ownsSession(owner) {
+        return !!owner?.session_tag && owner.session_tag === this._editorSessionTag;
     }
 
     _ownerSignature(owner) {
         if (!owner) return "";
         return JSON.stringify({
             host_mode: owner.host_mode || "",
-            session_id: owner.session_id || "",
+            session_tag: owner.session_tag || "",
             status: owner.status || "active",
             source_node_id: owner.source_node_id || "",
             workflow_label: owner.workflow_label || "",
@@ -2240,13 +2249,13 @@ export class EditorNodeController {
             changed = true;
         }
 
-        if (owner?.host_mode === "tab" && owner.session_id !== this._editorSessionId && this.state.isFullscreenOpen && this.fullscreenSession) {
+        if (owner?.host_mode === "tab" && this.state.isFullscreenOpen && this.fullscreenSession) {
             const session = this.fullscreenSession;
             this._suppressNextSessionRelease = true;
             this.fullscreenSession = null;
             this._recordDiagEvent("tab_owner_destroy_fullscreen", {
                 source,
-                owner_session_id: owner.session_id || "",
+                owner_session_tag: owner.session_tag || "",
             });
             session.destroy();
             changed = true;
@@ -2277,8 +2286,8 @@ export class EditorNodeController {
             next_signature: signature,
             status: normalized?.status || "",
             host_mode: normalized?.host_mode || "",
-            session_id: normalized?.session_id || "",
-            same_session: normalized?.session_id === this._editorSessionId,
+            session_tag: normalized?.session_tag || "",
+            same_session: this._ownsSession(normalized),
         });
         this.state.lastOwnerSignature = signature;
         // Registry queue membership gates writes; delayed owner reads cannot erase ACK deduplication.
@@ -2357,7 +2366,7 @@ export class EditorNodeController {
         this._recordDiagEvent("ws_session_changed", {
             owner_status: event?.owner?.status || "",
             owner_host_mode: event?.owner?.host_mode || "",
-            owner_session_id: event?.owner?.session_id || "",
+            owner_session_tag: event?.owner?.session_tag || "",
         });
         this._pollOwnerState("ws_notify");
     }
@@ -2378,6 +2387,7 @@ export class EditorNodeController {
         if (!event || event.project_id !== this._projectId()) return;
         if (event.host_id && String(event.host_id) !== this._hostId()) return;
         if (event.source_node_id && String(event.source_node_id) !== this._sourceNodeId()) return;
+        if (event.session_tag) this._editorSessionTag = event.session_tag;
         this._syncSubscribed = true;
         this._recordDiagEvent("ws_sync_subscribed", {
             canvas_host_connected: !!event?.canvas_host_connected,
@@ -2795,23 +2805,23 @@ export class EditorNodeController {
             try {
                 if (opened.location?.href === "about:blank") {
                     opened.close?.();
-                    window.alert?.("The mounted editor tab could not be focused. Use Force Release if the tab was closed.");
+                    window.alert?.("The mounted editor tab could not be brought forward. Look for it in your browser's tabs. If it was closed, use Force Release.");
                     return;
                 }
                 opened.focus?.();
             } catch (_err) {}
             return;
         }
-        window.alert?.("The mounted editor tab could not be focused. Use Force Release if the tab was closed.");
+        window.alert?.("The mounted editor tab could not be brought forward. Look for it in your browser's tabs. If it was closed, use Force Release.");
     }
 
     async forceReleaseOwner(owner) {
         const projectId = this._projectId();
-        const sessionId = owner?.session_id || "";
-        if (!projectId || !sessionId) return;
+        if (!projectId || !owner) return;
         const ok = window.confirm?.("Force release the mounted editor session? Unsaved tab-only widget edits may be lost.") ?? true;
         if (!ok) return;
-        const result = await releaseEditorSession(projectId, sessionId, true, this._hostId(), this._sourceNodeId());
+        // The server ignores the session id under force; this page's own id names nobody else.
+        const result = await releaseEditorSession(projectId, this._editorSessionId, true, this._hostId(), this._sourceNodeId());
         if (!result.ok) {
             window.alert?.(result.code ? `Could not release editor session (${result.code}).` : "Could not release editor session.");
             return;
@@ -2839,7 +2849,7 @@ export class EditorNodeController {
                         this._recordDiagEvent("session_heartbeat_self_stop", {
                             session_id: sessionId,
                             code: result.code || "",
-                            owner_session_id: result.owner?.session_id || "",
+                            owner_session_tag: result.owner?.session_tag || "",
                             owner_host_mode: result.owner?.host_mode || "",
                         });
                         clearInterval(this._sessionHeartbeatTimer);
@@ -2867,7 +2877,6 @@ export class EditorNodeController {
         return {
             host_id: this._hostId(),
             source_node_id: this._sourceNodeId(),
-            browser_instance_id: this._editorSessionId,
             workflow_label: document.title || "ComfyUI workflow",
         };
     }
@@ -2877,7 +2886,7 @@ export class EditorNodeController {
         if (!projectId) throw new Error("No project selected");
         const current = await getEditorSession(projectId, this._hostId(), this._sourceNodeId());
         const owner = current.owner || null;
-        if (owner?.session_id === this._editorSessionId) {
+        if (this._ownsSession(owner)) {
             this._applyOwnerState(owner, "ensure_fullscreen");
             this._startSessionHeartbeat();
             heartbeatEditorSession(projectId, this._editorSessionId, this._hostId(), this._sourceNodeId()).catch(() => {});
@@ -2901,6 +2910,7 @@ export class EditorNodeController {
             const label = owner?.host_mode ? `${owner.host_mode} editor` : "another editor";
             throw new Error(`Project is already owned by ${label}.`);
         }
+        if (claim.session_tag) this._editorSessionTag = claim.session_tag;
         this._applyOwnerState(claim.owner || null, "claim_fullscreen");
         this._seedWidgetState(this._currentWidgetStateValues(), { seed: true });
         this._startSessionHeartbeat();
@@ -3020,7 +3030,7 @@ export class EditorNodeController {
             this.focusMountedTab();
             return;
         }
-        if (owner && owner.session_id !== this._editorSessionId) {
+        if (owner && !this._ownsSession(owner)) {
             window.alert?.("This project is currently owned by another editor session.");
             return;
         }

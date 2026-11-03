@@ -1,5 +1,5 @@
 import { installComfyApiShim } from "./comfy_api_shim.js";
-import { FONT, THEME, applyNativeControlTheme, chromeButtonCss, injectSonderFontFaces, setButtonDisabled, statusPillCss } from "./editor_theme.js";
+import { FONT, THEME, applyNativeControlTheme, chromeButtonCss, injectSonderFontFaces, statusPillCss } from "./editor_theme.js";
 import { mountToastStack } from "./editor_toast_stack.js";
 import { configureNotifications, notify, notifySuccess, notifyWarning } from "./editor_notifications.js";
 import { getEditorSettings, notificationCoreConfig, subscribeEditorSettings } from "./editor_settings.js";
@@ -9,6 +9,8 @@ import { modelMessage } from "./launcher_view.js";
 import { createMountedControlsHost } from "./controls_host_remote.js";
 import { createRunOutputsClient, createRunRequestClient } from "./run_outputs_client.js";
 import { createMountedViewsHost, createSdkViewsHost } from "./views_hosts.js";
+import { newSessionId } from "./session_ids.js";
+import { createPageDisplacement, createRunReadDriver, heartbeatAction, mountedRefusalText, mountedSecret, ownerChangeAction, storedMountedSecret } from "./mounted_session.js";
 
 installComfyApiShim();
 injectSonderFontFaces();
@@ -74,7 +76,8 @@ const rootEditorKey = params.get("editor_key") || "";
 const tabMode = params.get("mode") || "";
 const sdkSessionId = params.get("session") || "";
 const statusEl = document.getElementById("status");
-const sessionId = `tab-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+// Fresh on every load, so the old page's release beacon can never release this one.
+const sessionId = newSessionId("tab");
 
 const DEFAULT_WIDGET_VALUES = {
     scene_id: "",
@@ -267,7 +270,7 @@ class TabWidgetHost {
 function createProjectUpdatedHandler(editor, getProjectVersion) {
     let projectUpdatedDebounceTimer = null;
     let pendingProjectUpdatedEvent = null;
-    return (event) => {
+    const handler = (event) => {
         pendingProjectUpdatedEvent = event;
         clearTimeout(projectUpdatedDebounceTimer);
         projectUpdatedDebounceTimer = setTimeout(() => {
@@ -287,6 +290,25 @@ function createProjectUpdatedHandler(editor, getProjectVersion) {
             }
         }, 250);
     };
+    handler.cancel = () => {
+        clearTimeout(projectUpdatedDebounceTimer);
+        projectUpdatedDebounceTimer = null;
+        pendingProjectUpdatedEvent = null;
+    };
+    return handler;
+}
+
+// The keys a displaced editor must no longer see. A focused field would still
+// type natively, so it loses focus too.
+function blockEditorKeys(register, PRIORITY) {
+    document.activeElement?.blur?.();
+    return register({
+        id: "displaced-page",
+        priority: PRIORITY.OVERLAY * 10,
+        keydown: () => true,
+        keyup: () => true,
+        paste: () => true,
+    });
 }
 
 function mountToastsOnce() {
@@ -370,12 +392,14 @@ async function runSdkTab() {
         { installProjectVersionFetchPatch, rememberProjectVersionFromPayload, getProjectVersion },
         { claimEditorSession, heartbeatEditorSession, releaseEditorSession },
         sdk,
+        { register: registerKeyboardConsumer, PRIORITY: KEYBOARD_PRIORITY },
     ] = await Promise.all([
         import("./cross_tab_sync.js"),
         import("./editor_widget.js"),
         import("./api_client.js"),
         import("./editor_session_client.js"),
         import("./sdk_host.js"),
+        import("./keyboard_ownership.js"),
     ]);
 
     const launcherHref = api.apiURL("/sonder-editor/app");
@@ -444,7 +468,6 @@ async function runSdkTab() {
     // Re-claims name the workflow the session runs now (it can switch).
     const claim = () => claimEditorSession(projectId, sessionId, "sdk", {
         host_id: sdkSessionId,
-        browser_instance_id: sessionId,
         workflow_label: host.templateName ? `Sonder App · ${host.templateName}` : "Sonder App",
         sdk_secret: secret,
     }, "", sdkSessionId);
@@ -559,7 +582,7 @@ async function runSdkTab() {
             blocker.show({
                 text: "Opened in another tab",
                 more: "This workflow and project are open in another tab. Take over to continue here.",
-                action: { label: "Take over", onClick: takeOver },
+                action: { label: "Take over", onClick: () => window.location.reload() },
                 link: { href: launcherHref, label: "Back to the Launcher" },
             });
         } else {
@@ -567,11 +590,34 @@ async function runSdkTab() {
         }
     };
 
+    const onProjectUpdated = createProjectUpdatedHandler(editor, getProjectVersion);
+    const runReads = createRunReadDriver({
+        refresh: (keys) => {
+            tabDiagRecord("run_read", { keys });
+            editor.refresh(keys);
+        },
+    });
+    const displace = createPageDisplacement({
+        blockKeys: () => blockEditorKeys(registerKeyboardConsumer, KEYBOARD_PRIORITY),
+        stopWork: () => {
+            ownership.stop();
+            onProjectUpdated.cancel();
+            runReads.stop();
+            sync.close();
+        },
+        drain: () => editor._drainProjectMutations?.("sdk_tab_displaced"),
+        destroyEditor: () => {
+            editor.destroy();
+            host.destroy();
+        },
+        show: () => {},  // render() draws it, on the same state change
+    });
+
     // The state machine lives in sdk_host.js (createSdkOwnership); this page
     // only draws it.
     const ownership = sdk.createSdkOwnership({
         host,
-        tabSessionId: sessionId,
+        sessionTag: firstClaim.session_tag || "",
         claim,
         heartbeat: () => heartbeatEditorSession(projectId, sessionId, sdkSessionId, ""),
         onChange: (state, previous) => {
@@ -581,6 +627,7 @@ async function runSdkTab() {
             if (state === "active") viewsHost.restored();
             else if (["ended", "displaced", "orphaned"].includes(state)) viewsHost.lost();
             render();
+            if (state === "displaced") displace();
         },
         // A taken-over session reads its running takes' receipts too: they are
         // broadcast only when they change.
@@ -590,23 +637,15 @@ async function runSdkTab() {
         },
     });
 
-    async function takeOver(button) {
-        setButtonDisabled(button, true);
-        try {
-            await ownership.takeOver();
-        } finally {
-            setButtonDisabled(button, false);
-        }
-    }
-
     host.onOwnershipLost = (code) => void ownership.handleOwnershipLost(code);
     ownership.start(firstClaim.owner?.status || "active");
 
     const sync = connectProjectSync(projectId, {
-        onProjectUpdated: createProjectUpdatedHandler(editor, getProjectVersion),
+        onProjectUpdated,
         onGenerationStatus: (event) => {
             host.applyStatus(event);
         },
+        onRunFinished: (event) => runReads.runFinished(event),
         onRunProgress: (event) => host.applyRunProgress(event),
         onSessionChanged: (event) => {
             if (String(event.host_id || "") !== sdkSessionId) return;
@@ -618,6 +657,7 @@ async function runSdkTab() {
             transportState = state;
             tabDiagRecord("transport_state", { state });
             render();
+            runReads.connection(state);
             // Snapshots sent while the socket was down are gone; fetch the latest.
             if (reconnected) {
                 void host.refreshStatus();
@@ -637,16 +677,18 @@ async function runSdkTab() {
 
     // Save the position while the page can still finish a request.
     document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "hidden") void host.flushValues();
+        if (document.visibilityState === "hidden" && !displace.isDisplaced()) void host.flushValues();
     });
 
     // Restored from the back/forward cache: pagehide already released the
-    // claim and stopped the host, so start afresh (the reload re-claims).
+    // claim and stopped the host, so start afresh (the reload re-claims). Not a
+    // displaced page: its reload would take the session back on its own.
     window.addEventListener("pageshow", (event) => {
-        if (event.persisted) window.location.reload();
+        if (event.persisted && !displace.isDisplaced()) window.location.reload();
     });
 
     window.addEventListener("pagehide", () => {
+        if (displace.isDisplaced()) return;
         ownership.stop();
         const savingValues = host.hasUnsavedValues();
         void host.flushValues({ keepalive: true });
@@ -660,7 +702,7 @@ async function runSdkTab() {
         // a last save is in flight: a release processed first would refuse it
         // (not_owner). The owner then lapses to orphaned, which housekeeping
         // also drops, and a reopen takes it over.
-        if (host.ownerState === "displaced" || host.ownerState === "ended" || savingValues) return;
+        if (host.ownerState === "ended" || savingValues) return;
         try {
             const queued = navigator.sendBeacon(
                 api.apiURL(`/sonder-editor/session/${encodeURIComponent(projectId)}/release`),
@@ -682,7 +724,14 @@ async function main() {
         await runSdkTab();
         return;
     }
-    if (!handoffToken) {
+    const tabStorage = (() => {
+        try {
+            return window.sessionStorage;
+        } catch (_err) {
+            return null;
+        }
+    })();
+    if (!handoffToken && !storedMountedSecret(tabStorage)) {
         setStatus("Open the persistent tab from the fullscreen editor.");
         return;
     }
@@ -717,25 +766,45 @@ async function main() {
     }
     rememberProjectVersionFromPayload(projectResp.payload, projectId);
 
-    const initialState = await getEditorWidgetState(projectId, sourceNodeId, hostId);
-    const host = new TabWidgetHost(projectId, hostId, sourceNodeId, sessionId, initialState.values || initialState.state || {});
-    host.setCanvasConnected(!!initialState.canvas_host_connected);
-
+    // The handoff and this tab's secret go together: a reload's token is spent, and
+    // its secret is what reclaims. Claimed before the widget state is read, because
+    // a reclaim is what restores those values.
     const claim = await claimEditorSession(projectId, sessionId, "tab", {
         host_id: hostId,
         source_node_id: sourceNodeId,
-        browser_instance_id: sessionWindowName || sessionId,
+        browser_instance_id: sessionWindowName,
         workflow_label: "Persistent editor tab",
+        reclaim_secret: mountedSecret(tabStorage),
     }, handoffToken, hostId);
     if (!claim.ok) {
-        setStatus("This project is already open in another editor host.");
+        setStatus(mountedRefusalText(claim.owner));
         return;
     }
+    const sessionTag = claim.session_tag || "";
+
+    // Nothing else holds this claim yet: a tab that can't go on gives it back, and
+    // its values wait for a reload. It must not start on defaults and publish them.
+    let initialState;
+    try {
+        initialState = await getEditorWidgetState(projectId, sourceNodeId, hostId);
+    } catch (err) {
+        await releaseEditorSession(projectId, sessionId, false, hostId, sourceNodeId).catch(() => {});
+        setStatus("The editor could not load. Reload this tab to try again.");
+        return;
+    }
+    const host = new TabWidgetHost(projectId, hostId, sourceNodeId, sessionId, initialState.values || initialState.state || {});
+    host.setCanvasConnected(!!initialState.canvas_host_connected);
     host.setSessionStatus(claim.owner?.status || "active");
     host.setPublishingEnabled(true);
 
     const controlsHost = createMountedControlsHost({ projectId, hostId, sessionId,
-        apiURL: path => api.apiURL(path), canWrite: () => host.sessionStatus === "active" && host.canvasHostConnected });
+        apiURL: path => api.apiURL(path),
+        writeBlock: () => {
+            if (!host.canvasHostConnected) return "canvas";
+            if (host.sessionStatus === "active") return "";
+            return host.sessionStatus === "orphaned" || host.sessionStatus === "reconnecting" ? "reconnecting" : "session";
+        },
+    });
     const node = projectWidgetNode();
     const editor = new EditorWidget(node, {
         host, controlsHost,
@@ -808,7 +877,29 @@ async function main() {
     const tabDebugEnabled = window.SONDER_DEBUG_TAB === true;
     blockerDebug.style.display = tabDebugEnabled ? "" : "none";
 
+    // Another tab took this session over (a duplicated tab).
+    const displace = createPageDisplacement({
+        blockKeys: () => blockEditorKeys(registerKeyboardConsumer, KEYBOARD_PRIORITY),
+        stopWork: () => {
+            host.setPublishingEnabled(false);
+            stopPageWork();
+        },
+        drain: () => editor._drainProjectMutations?.("tab_displaced"),
+        destroyEditor: () => editor.destroy(),
+        show: () => {
+            setStatus("");
+            document.body.classList.add("ready");
+            blocker.style.display = "none";
+            createPageBlocker().show({
+                text: "Opened in another tab",
+                more: "This editor is open in another tab. Take over to continue here.",
+                action: { label: "Take over", onClick: () => window.location.reload() },
+            });
+        },
+    });
+
     const updateBlocker = () => {
+        if (displace.isDisplaced()) return;
         if (!host.canvasHostConnected) {
             blockerMessage.textContent = "Canvas not connected";
         } else if (host.sessionStatus === "orphaned") {
@@ -850,6 +941,7 @@ async function main() {
     };
 
     host.onPublishRejected = (code) => {
+        if (displace.isDisplaced()) return;
         if (code === "canvas_host_disconnected") {
             setCanvasConnected(false);
             updatePill();
@@ -864,6 +956,7 @@ async function main() {
     };
     let transportState = "open";
     const updatePill = (state = "") => {
+        if (displace.isDisplaced()) return;
         if (state) transportState = state;
         let label = "Canvas connected";
         let pillState = "running";
@@ -935,9 +1028,10 @@ async function main() {
             });
             if (String(state.host_id || hostId) !== hostId) return;
             if (state.source_node_id && String(state.source_node_id) !== sourceNodeId) return;
-            controlsHost.presence(state);
+            // The tab's own state first: the Controls host reports only while it may write.
             const changed = setCanvasConnected(!!state.canvas_host_connected);
             if (changed) updatePill();
+            controlsHost.presence(state);
             if (state.canvas_host_connected || !tabDebugEnabled) return;
             return fetchJson(`/sonder-editor/session/${encodeURIComponent(projectId)}/debug?host_id=${encodeURIComponent(hostId)}&source_node_id=${encodeURIComponent(sourceNodeId)}`)
                 .then(({ ok, payload }) => {
@@ -973,14 +1067,17 @@ async function main() {
                 ok: !!result.ok,
                 code: result.code || "",
                 owner_status: result.owner?.status || "",
-                owner_session_id: result.owner?.session_id || "",
+                owner_session_tag: result.owner?.session_tag || "",
                 canvas_host_connected: !!result.canvas_host_connected,
-                matches_session: result.owner?.session_id === sessionId,
             });
-            if (result.ok && result.owner?.session_id === sessionId) {
-                setSessionStatus(result.owner.status || "active");
+            if (displace.isDisplaced()) return;
+            const action = heartbeatAction(result);
+            if (action === "own") {
+                setSessionStatus(result.owner?.status || "active");
                 setStatus("");
                 updatePill("open");
+            } else if (action === "displaced") {
+                displace();
             } else {
                 setStatus("Editor tab session is no longer active.");
                 setSessionStatus("released");
@@ -991,6 +1088,7 @@ async function main() {
                 duration_ms: performance.now() - sentAt,
                 error: String(err && err.message ? err.message : err),
             });
+            if (displace.isDisplaced()) return;
             setSessionStatus("reconnecting");
             updatePill("reconnecting");
         });
@@ -1019,23 +1117,33 @@ async function main() {
         return result?.ok ? result.payload : null;
     }, { project: projectId });
 
+    const onProjectUpdated = createProjectUpdatedHandler(editor, getProjectVersion);
+    const runReads = createRunReadDriver({
+        refresh: (keys) => {
+            tabDiagRecord("run_read", { keys });
+            editor.refresh(keys);
+        },
+    });
     const sync = connectProjectSync(projectId, {
-        onProjectUpdated: createProjectUpdatedHandler(editor, getProjectVersion),
+        onProjectUpdated,
+        onRunFinished: (event) => runReads.runFinished(event),
         onRunProgress: (event) => runFeedback.applyRecord(event?.record, { project: event?.project_id }),
         onWidgetStateChanged: (event) => {
             if (String(event.host_id || "") !== hostId) return;
             if (String(event.source_node_id || "") !== sourceNodeId) return;
-            if (String(event.session_id || "") === sessionId) return;
+            if (sessionTag && event.source_tag === sessionTag) return;
             const values = event.values && typeof event.values === "object" ? event.values : {};
             host.apply(values);
             editor.applyWidgetState(values);
         },
         onControlsChanged: (event) => controlsHost.changed(event),
         onHostPresenceChanged: (event) => {
+            // The tab's own state first: the Controls host reports only while it may write.
+            if (String(event.host_id || "") === hostId && String(event.source_node_id || "") === sourceNodeId
+                && setCanvasConnected(!!event.canvas_host_connected)) {
+                updatePill();
+            }
             controlsHost.presence(event);
-            if (String(event.host_id || "") !== hostId) return;
-            if (String(event.source_node_id || "") !== sourceNodeId) return;
-            if (setCanvasConnected(!!event.canvas_host_connected)) updatePill();
         },
         onSubscribed: (event) => {
             void controlsHost.refresh(true);
@@ -1051,12 +1159,16 @@ async function main() {
         onSessionChanged: (event) => {
             if (String(event.host_id || "") !== hostId) return;
             const owner = event.owner || null;
-            if (owner?.session_id === sessionId) {
+            if (displace.isDisplaced()) return;
+            const action = ownerChangeAction(owner, sessionTag);
+            if (action === "own") {
                 setSessionStatus(owner.status || "active");
                 if ((owner.status || "active") === "active") {
                     setStatus("");
                 }
                 updatePill();
+            } else if (action === "displaced") {
+                displace();
             } else {
                 setStatus("Editor tab session was released.");
                 setSessionStatus("released");
@@ -1066,6 +1178,7 @@ async function main() {
         onConnectionState: (state) => {
             tabDiagRecord("transport_state", { state });
             updatePill(state);
+            runReads.connection(state);
         },
     }, {
         clientId: hostId,
@@ -1141,7 +1254,7 @@ async function main() {
         }
     }
 
-    window.addEventListener("pagehide", () => {
+    function stopPageWork() {
         if (diagHotkeyUnregister) {
             try { diagHotkeyUnregister(); } catch (_) {}
             diagHotkeyUnregister = null;
@@ -1149,10 +1262,26 @@ async function main() {
         clearInterval(heartbeat);
         clearInterval(hostPresencePoll);
         controlsHost.destroy();
+        onProjectUpdated.cancel();
+        runReads.stop();
+        runFeedback.destroy();
+        sync.close();
+    }
+
+    // Restored from the back/forward cache: pagehide already released the claim
+    // and stopped this page, so start afresh (the reload reclaims). Not a displaced
+    // page: its reload would take the session back on its own.
+    window.addEventListener("pageshow", (event) => {
+        if (event.persisted && !displace.isDisplaced()) window.location.reload();
+    });
+
+    window.addEventListener("pagehide", () => {
+        // A displaced page owns nothing, and already stopped.
+        if (displace.isDisplaced()) return;
         try {
             editor?._drainProjectMutations?.("tab_pagehide").catch(() => {});
         } catch (_err) {}
-        sync.close();
+        stopPageWork();
         try {
             const queued = navigator.sendBeacon(
                 api.apiURL(`/sonder-editor/session/${encodeURIComponent(projectId)}/release`),

@@ -289,7 +289,7 @@ function ownershipHarness({ claimResults = [], heartbeatResults = [] } = {}) {
     let beats = 0;
     const ownership = host.createSdkOwnership({
         host: h,
-        tabSessionId: "tab-1",
+        sessionTag: "tag-1",
         claim: async () => { claims += 1; const r = claimResults.shift(); if (r instanceof Error) throw r; return r; },
         heartbeat: async () => { beats += 1; const r = heartbeatResults.shift(); if (r instanceof Error) throw r; return r; },
         onChange: (state) => log.push(state),
@@ -299,8 +299,8 @@ function ownershipHarness({ claimResults = [], heartbeatResults = [] } = {}) {
     });
     return { h, ownership, intervals, log, counts: () => ({ claims, beats }) };
 }
-const mine = (status = "active") => ({ ok: true, owner: { session_id: "tab-1", status } });
-const theirs = { ok: false, code: "locked", owner: { session_id: "tab-2", status: "active" } };
+const mine = (status = "active") => ({ ok: true, owner: { session_tag: "tag-1", status } });
+const theirs = { ok: false, code: "locked", owner: { session_tag: "tag-2", status: "active" } };
 const noOwner = { ok: false, code: "no_owner", owner: null };
 const gone = { ok: false, code: "invalid_sdk_session", status: 409 };
 {
@@ -316,19 +316,7 @@ const gone = { ok: false, code: "invalid_sdk_session", status: 409 };
     await o.ownership.handleOwnershipLost("not_owner");
     await settle();
     const passive = { state: o.h.ownerState, counts: o.counts() };
-    await o.ownership.takeOver();
-    out.own_displace = { started, orphaned, displaced, passive,
-        after_take_over: { state: o.h.ownerState, heartbeat: o.ownership.heartbeatRunning, counts: o.counts() }, log: o.log };
-}
-{
-    // A failed Take over leaves the tab displaced, not apparently live.
-    const o = ownershipHarness({ heartbeatResults: [theirs], claimResults: [new Error("offline"), { ok: true, owner: { session_id: "tab-1", status: "active" } }] });
-    o.ownership.start("active");
-    await o.ownership.beat();
-    await o.ownership.takeOver();
-    const afterFailure = { state: o.h.ownerState, heartbeat: o.ownership.heartbeatRunning };
-    await o.ownership.takeOver();
-    out.own_failed_take_over = { afterFailure, retried: o.h.ownerState };
+    out.own_displace = { started, orphaned, displaced, passive, log: o.log };
 }
 {
     // `not_owner` with nobody owning the session: claimed back quietly.
@@ -350,7 +338,6 @@ const gone = { ok: false, code: "invalid_sdk_session", status: 409 };
     await o.ownership.beat();
     await settle();
     const ended = { state: o.h.ownerState, heartbeat: o.ownership.heartbeatRunning };
-    await o.ownership.takeOver();
     const o2 = ownershipHarness();
     o2.ownership.start("active");
     await o2.ownership.handleOwnershipLost("session_ended");
@@ -369,13 +356,13 @@ const gone = { ok: false, code: "invalid_sdk_session", status: 409 };
     // session_changed: mine, another tab's, released; concurrent reclaims claim once.
     const o = ownershipHarness({ claimResults: [mine()] });
     o.ownership.start("active");
-    o.ownership.handleSessionChanged({ owner: { session_id: "tab-1", status: "orphaned" } });
+    o.ownership.handleSessionChanged({ owner: { session_tag: "tag-1", status: "orphaned" } });
     const orphaned = o.h.ownerState;
     o.ownership.handleSessionChanged({ owner: null });
     o.ownership.handleSessionChanged({ owner: null });
     await settle();
     const reclaimed = { state: o.h.ownerState, claims: o.counts().claims };
-    o.ownership.handleSessionChanged({ owner: { session_id: "tab-2", status: "active" } });
+    o.ownership.handleSessionChanged({ owner: { session_tag: "tag-2", status: "active" } });
     const displaced = o.h.ownerState;
     o.ownership.stop();
     o.ownership.handleSessionChanged({ owner: null });
@@ -912,15 +899,7 @@ def test_ownership_displaced_tab_never_claims_on_its_own(results):
     assert o["displaced"] == {"state": "displaced", "heartbeat": False}
     # A beat, a release event and a refused write all leave it displaced, unclaimed.
     assert o["passive"] == {"state": "displaced", "counts": {"claims": 0, "beats": 2}}
-    assert o["after_take_over"] == {"state": "active", "heartbeat": True, "counts": {"claims": 1, "beats": 2}}
-    assert o["log"] == ["active", "orphaned", "displaced", "active", "reclaimed"]
-
-
-def test_ownership_failed_take_over_stays_displaced(results):
-    assert results["own_failed_take_over"] == {
-        "afterFailure": {"state": "displaced", "heartbeat": False},
-        "retried": "active",
-    }
+    assert o["log"] == ["active", "orphaned", "displaced"]
 
 
 def test_ownership_not_owner_asks_who_owns_it(results):
@@ -934,7 +913,7 @@ def test_ownership_not_owner_asks_who_owns_it(results):
 def test_ownership_ends_when_the_server_forgets_the_session(results):
     o = results["own_ended"]
     assert o["ended"] == {"state": "ended", "heartbeat": False}
-    assert o["claims_after"] == 2  # Take over may try again; it stays ended on refusal
+    assert o["claims_after"] == 1
     assert o["by_refusal"] == "ended"
 
 

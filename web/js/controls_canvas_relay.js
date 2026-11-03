@@ -310,7 +310,7 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
                                 current(stamp, id) &&
                                 (latest.payload.pending || []).some(
                                     row =>
-                                        row.request_id === pending.request_id && row.session_id === pending.session_id,
+                                        row.request_id === pending.request_id && row.session_tag === pending.session_tag,
                                 )
                             );
                         },

@@ -116,6 +116,7 @@ from .session_registry import (
     release_session,
     remember_event_loop,
     refresh_canvas_host,
+    session_tag,
     project_event_aliases,
     schedule_project_event,
     seed_widget_state,
@@ -169,6 +170,9 @@ from . import control_descriptors
 from .guide_collision import driver_window_span, resolve_execution_window, resolve_guide_collisions
 
 logger = logging.getLogger("sonder_editor")
+
+# These name live session ids, so they never reach another machine.
+_SESSION_DIAGNOSTICS_MESSAGE = "Session diagnostics are available on the ComfyUI machine only."
 _TIMELINE_EXPORTS = TimelineExportManager()
 _SCENE_RESTORE_RECEIPTS = SceneRestoreReceiptStore()
 # Deferred canvas-host departures; held so the loop cannot collect them early.
@@ -12096,6 +12100,8 @@ if routes is not None:
     @routes.get("/sonder-editor/session/{project_id}/debug")
     async def api_debug_editor_session(request: web.Request) -> web.Response:
         remember_event_loop()
+        if not is_loopback_request(request):
+            return local_only_response(_SESSION_DIAGNOSTICS_MESSAGE)
         payload = await get_project_debug_state(
             request.match_info.get("project_id", ""),
             source_node_id=str(request.query.get("source_node_id") or ""),
@@ -12106,6 +12112,8 @@ if routes is not None:
     @routes.get("/sonder-editor/session/{project_id}/diag")
     async def api_diag_editor_session(request: web.Request) -> web.Response:
         remember_event_loop()
+        if not is_loopback_request(request):
+            return local_only_response(_SESSION_DIAGNOSTICS_MESSAGE)
         payload = get_diag_state(request.match_info.get("project_id", ""))
         return web.json_response(payload)
 
@@ -12124,6 +12132,7 @@ if routes is not None:
             str(body.get("handoff_token") or ""),
             host_id=str(body.get("host_id") or ""),
             sdk_secret=str(body.get("sdk_secret") or ""),
+            reclaim_secret=body.get("reclaim_secret"),
         )
         status = 200 if result.get("ok") else 409
         return web.json_response(result, status=status)
@@ -16495,7 +16504,9 @@ if routes is not None:
                             if subscribed_project_id:
                                 await subscribe(subscribed_project_id, ws)
 
-                            response = {"type": "subscribed", "project_id": subscribed_project_id}
+                            response = {"type": "subscribed", "project_id": subscribed_project_id,
+                                        # Only this socket reads it: its own tag, for echo checks.
+                                        "session_tag": session_tag(data.get("session_id"))}
                             if subscribed_project_id and data.get("role") == "canvas_host":
                                 session_id = str(data.get("session_id") or "")
                                 host_result = await register_canvas_host(

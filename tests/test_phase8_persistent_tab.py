@@ -35,6 +35,7 @@ from server.session_registry import (
     release_session,
     refresh_canvas_host,
     seed_widget_state,
+    session_tag,
     sweep_stale_sessions_once,
     unregister_canvas_host,
     update_widget_state,
@@ -821,15 +822,15 @@ def test_tab_session_requires_handoff_and_transfers_owner():
         assert tab["ok"] is True
 
         owner = await get_owner(project_id, host_id=host_a)
-        assert owner["session_id"] == "tab-1"
+        assert owner["session_tag"] == session_tag("tab-1")
         assert owner["host_mode"] == "tab"
 
         other_owner = await get_owner(project_id, host_id=host_b)
-        assert other_owner["session_id"] == "fs-2"
+        assert other_owner["session_tag"] == session_tag("fs-2")
 
         await release_session(project_id, "tab-1", host_id=host_a)
         assert await get_owner(project_id, host_id=host_a) is None
-        assert (await get_owner(project_id, host_id=host_b))["session_id"] == "fs-2"
+        assert (await get_owner(project_id, host_id=host_b))["session_tag"] == session_tag("fs-2")
         await release_session(project_id, "fs-2", host_id=host_b)
 
     asyncio.run(run())
@@ -1007,7 +1008,7 @@ def test_tab_owner_becomes_orphaned_not_released_after_session_ttl():
         registry._sessions[(project_id, host_id)]["last_seen"] = 0.0
         owner = await get_owner(project_id, host_id=host_id)
 
-        assert owner["session_id"] == "tab-orphan"
+        assert owner["session_tag"] == session_tag("tab-orphan")
         assert owner["status"] == "orphaned"
         assert owner["orphan_expires_at"] > 0
 
@@ -1188,7 +1189,7 @@ def test_sweeper_releases_stale_session_and_clears_widget_state():
 
         assert evicted >= 1
         assert await get_owner(project_id, host_id="host-a") is None
-        assert (await get_owner(project_id, host_id="host-b"))["session_id"] == "fresh-session"
+        assert (await get_owner(project_id, host_id="host-b"))["session_tag"] == session_tag("fresh-session")
         state = await get_widget_state(project_id, "node-a", host_id="host-a")
         assert state["state"] == {}
         fresh_state = await get_widget_state(project_id, "node-b", host_id="host-b")
@@ -1354,7 +1355,7 @@ def test_concurrent_claim_and_release_same_session_race():
             assert state["state"] == {}
         else:
             # Order (b): owner present and active; never partially-applied.
-            assert owner["session_id"] == "race-session"
+            assert owner["session_tag"] == session_tag("race-session")
             assert owner["status"] == "active"
             assert owner["orphan_expires_at"] == 0.0
             await release_session(project_id, "race-session", host_id=host_id)
@@ -1409,7 +1410,7 @@ def test_concurrent_claim_and_force_release_from_different_session():
             # Ordering: force-release ran first, cleared the orphan, then
             # claim found a clean key and succeeded.
             assert owner is not None
-            assert owner["session_id"] == "fs-new"
+            assert owner["session_tag"] == session_tag("fs-new")
             assert owner["status"] == "active"
             await release_session(project_id, "fs-new", host_id=host_id)
         else:
@@ -1457,10 +1458,10 @@ def test_session_changed_event_payloads_on_active_orphaned_released_transitions(
             ]
             assert len(orphan_events) >= 1
             owner_payload = orphan_events[-1]["owner"]
-            for field in ("host_mode", "session_id", "status", "source_node_id", "workflow_label"):
+            for field in ("host_mode", "session_tag", "status", "source_node_id", "workflow_label"):
                 assert field in owner_payload, f"missing field {field} in orphan event"
             assert owner_payload["host_mode"] == "tab"
-            assert owner_payload["session_id"] == "tab-events"
+            assert owner_payload["session_tag"] == session_tag("tab-events")
             assert owner_payload["status"] == "orphaned"
             assert owner_payload["source_node_id"] == "node-a"
 
@@ -1482,10 +1483,10 @@ def test_session_changed_event_payloads_on_active_orphaned_released_transitions(
             ]
             assert len(active_events) >= 1
             active_payload = active_events[-1]["owner"]
-            for field in ("host_mode", "session_id", "status", "source_node_id", "workflow_label"):
+            for field in ("host_mode", "session_tag", "status", "source_node_id", "workflow_label"):
                 assert field in active_payload
             assert active_payload["status"] == "active"
-            assert active_payload["session_id"] == "tab-events"
+            assert active_payload["session_tag"] == session_tag("tab-events")
 
             # orphaned -> released (advance past SESSION_TTL to orphan, then
             # past ORPHAN_TTL to release, trigger via get_owner).

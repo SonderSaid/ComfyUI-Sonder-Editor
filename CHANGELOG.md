@@ -30,6 +30,11 @@ a fresh `[Unreleased]` block.
 - In Controls, a seed's label sits above its field, arrows and mode, so the number stays readable in a narrow sidebar.
 
 ### Fixed
+- Reloading a Mount in Tab page keeps the editor open, on the same scene and selection, and a run in progress keeps reporting. It used to say the project was open in another editor host.
+- A duplicated Mount in Tab or Sonder App tab takes over, and the original stops editing and offers **Take over**. A tab that lost its session could still change the project from the keyboard.
+- A mounted edit made while the canvas page is away says the canvas isn't connected and that nothing changed, and the Controls tab says so too, instead of "This tab no longer owns the editor" and "Loading controls…".
+- The Render Queue in a mounted tab and the Sonder App follows retried jobs through to Completed instead of sometimes stopping on Running or Pending.
+- Editor session ids are no longer shared with other pages on the same ComfyUI, and session diagnostics answer only on the ComfyUI machine.
 - A switched-off LoRA row whose file isn't installed can be edited from Controls in fullscreen, Mount in Tab and the Sonder App.
 - Integer Controls step by the node's declared step (tile size by 32, not 1).
 - A Control note's **More** works on the first click after you leave a field.

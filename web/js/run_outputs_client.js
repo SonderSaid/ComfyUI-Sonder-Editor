@@ -6,6 +6,8 @@
 // `outputs_changed` project events carry no media, only which host or run
 // recorded something; a host refetches on a hint for itself and polls otherwise.
 
+import { randomUuid } from "./session_ids.js";
+
 const SDK_SECRET_HEADER = "X-Sonder-SDK-Session";
 const SDK_TAB_HEADER = "X-Sonder-Tab-Session";
 const DIAG_HINTS = 32;
@@ -175,7 +177,7 @@ const REQUEST_TERMINAL = new Set(["queued", "refused", "unconfirmed", "unknown"]
 export const REQUEST_WAIT_MS = 60000;
 
 function mintId() {
-    return globalThis.crypto.randomUUID();
+    return randomUuid();
 }
 
 export function createRunRequestClient({

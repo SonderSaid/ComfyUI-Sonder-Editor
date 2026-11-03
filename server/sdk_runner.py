@@ -714,7 +714,7 @@ class SdkRunner:
 
     def session_for(self, session_id: str, secret: str) -> SdkSession:
         session = self._sessions.get(str(session_id or ""))
-        if session is None or not hmac.compare_digest(str(secret or ""), session.secret):
+        if session is None or not hmac.compare_digest(str(secret or "").encode("utf-8"), session.secret.encode("utf-8")):
             raise SdkError("This Sonder App session has ended.", "session_ended", 404)
         session.last_activity = self._clock()
         return session
@@ -724,7 +724,7 @@ class SdkRunner:
         self._remember_loop()
         session = self.session_for(session_id, secret)
         owner = await self._get_owner(session.project, host_id=session.session_id)
-        if not owner or owner.get("session_id") != str(tab_session_id or ""):
+        if not owner or not tab_session_id or owner.get("session_tag") != session_registry.session_tag(str(tab_session_id)):
             raise SdkError("This session is open in another tab.", "not_owner", 409)
         return session
 

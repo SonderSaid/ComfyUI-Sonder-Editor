@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import hmac
 import logging
 import os
@@ -19,6 +20,10 @@ SESSION_TTL_SECONDS = 30.0
 CANVAS_HOST_TTL_SECONDS = 90.0
 CANVAS_HOST_DEPARTURE_GRACE_SECONDS = 1.5
 HANDOFF_TTL_SECONDS = 30.0
+# How long a mounted tab's own release stays reclaimable: long enough for a reload
+# on a slow disk, short enough that a tab reopened later reads the expired link.
+TAB_RECLAIM_TTL_SECONDS = 120.0
+TAB_RECLAIM_SECRET_CHARS = (32, 128)
 ORPHAN_TTL_SECONDS = 1800.0
 SWEEP_INTERVAL_SECONDS = 30.0
 
@@ -85,6 +90,10 @@ def _sdk_secret(host_id: str) -> str | None:
 
 _sessions: dict[HostKey, dict[str, Any]] = {}
 _handoffs: dict[str, dict[str, Any]] = {}
+# Per host: the secret of the mounted tab that last claimed it, and what its own
+# release left to restore. Set only through a valid handoff; ephemeral, never
+# sent to any page. `released_at` stays None while an owner exists.
+_tab_reclaims: dict[HostKey, dict[str, Any]] = {}
 _subscribers: dict[str, set[web.WebSocketResponse]] = defaultdict(set)
 _widget_state: dict[HostKey, dict[str, Any]] = {}
 _widget_sources: dict[HostKey, str] = {}
@@ -198,18 +207,26 @@ def get_diag_state(project_id: str = "") -> dict[str, Any]:
     }
 
 
+def session_tag(session_id: str | None) -> str:
+    """What other pages see of a session: enough to tell sessions apart, never to
+    act as one. The gates compare raw ids, so a tag opens nothing."""
+    session_id = _clean_id(session_id)
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32] if session_id else ""
+
+
 def _public_owner(owner: dict[str, Any] | None) -> dict[str, Any] | None:
     if not owner:
         return None
     return {
         "project_id": owner.get("project_id", ""),
         "host_id": owner.get("host_id", ""),
-        "session_id": owner.get("session_id", ""),
+        "session_tag": session_tag(owner.get("session_id", "")),
         "host_mode": owner.get("host_mode", ""),
         "source_node_id": owner.get("source_node_id", ""),
         "workflow_id": owner.get("workflow_id", ""),
         "workflow_label": owner.get("workflow_label", ""),
-        "browser_instance_id": owner.get("browser_instance_id", ""),
+        # A mounted tab's window name, so the canvas can focus it; no other host has one.
+        "browser_instance_id": owner.get("browser_instance_id", "") if owner.get("host_mode") == "tab" else "",
         "claimed_at": owner.get("claimed_at", 0.0),
         "last_seen": owner.get("last_seen", 0.0),
         "status": owner.get("status", "active") or "active",
@@ -224,7 +241,7 @@ def _public_host(host: dict[str, Any] | None) -> dict[str, Any] | None:
         "project_id": host.get("project_id", ""),
         "host_id": host.get("host_id", ""),
         "source_node_id": host.get("source_node_id", ""),
-        "session_id": host.get("session_id", ""),
+        "session_tag": session_tag(host.get("session_id", "")),
         "workflow_id": host.get("workflow_id", ""),
         "workflow_label": host.get("workflow_label", ""),
         "connected_at": host.get("connected_at", 0.0),
@@ -327,7 +344,8 @@ def _widget_state_payload(
         "project_id": key[0],
         "host_id": key[1],
         "source_node_id": source_node_id or _widget_sources.get(key, ""),
-        "session_id": str(session_id or ""),
+        # Who wrote these values, so a page can recognize its own echo.
+        "source_tag": session_tag(session_id),
         "values": dict(state if values is None else values),
         "state": state,
         **_controls_presence_locked(key),
@@ -367,6 +385,17 @@ def _release_owner_locked(
         return None
     _sessions.pop(key, None)
     _clear_controls_locked(key)
+    reclaim = _tab_reclaims.get(key)
+    if reclaim is not None:
+        if reason == "release" and owner.get("host_mode") == "tab":
+            # The tab may be reloading. Its values wait here, not in the shared
+            # state: a canvas's poll applies whatever that holds, so a closed
+            # tab's values must not sit there for the canvas to read.
+            reclaim["released_at"] = _now()
+            reclaim["widget_state"] = dict(_widget_state.get(key, {}))
+            reclaim["widget_source"] = _widget_sources.get(key, "")
+        else:
+            _tab_reclaims.pop(key, None)
     if clear_widget_state:
         _clear_project_widget_state_locked(key[0], key[1])
     _record_debug_event(
@@ -479,6 +508,59 @@ def _schedule_events(events: list[tuple[str, dict[str, Any]]]) -> None:
         schedule_project_event(project_id, event)
 
 
+def _secrets_match(given: str, expected: str) -> bool:
+    # Bytes: compare_digest raises on text with non-ASCII characters, and these
+    # values come straight from a request.
+    return hmac.compare_digest(str(given or "").encode("utf-8"), str(expected or "").encode("utf-8"))
+
+
+def _clean_reclaim_secret(value: Any) -> str:
+    low, high = TAB_RECLAIM_SECRET_CHARS
+    return value if isinstance(value, str) and low <= len(value) <= high else ""
+
+
+def _drop_expired_reclaims_locked() -> None:
+    now = _now()
+    for key, reclaim in list(_tab_reclaims.items()):
+        released_at = reclaim.get("released_at")
+        if released_at is not None and now - released_at > TAB_RECLAIM_TTL_SECONDS:
+            _tab_reclaims.pop(key, None)
+
+
+def _reclaim_tab_locked(
+    key: HostKey,
+    session_id: str,
+    info: dict[str, Any],
+    reclaim: dict[str, Any],
+    owner: dict[str, Any] | None,
+    events: list[tuple[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    """The tab that last claimed this host claims it again: a reload, or a duplicate
+    of that tab. A session the tab already replaced is taken over."""
+    took_over = bool(owner) and owner.get("session_id") != session_id
+    if took_over or not owner:
+        _clear_controls_locked(key)
+    if reclaim.get("widget_state"):
+        # Anything the canvas published or seeded during the window is newer.
+        _widget_state[key] = {**reclaim["widget_state"], **_widget_state.get(key, {})}
+    if reclaim.get("widget_source"):
+        _widget_sources.setdefault(key, reclaim["widget_source"])
+    reclaim.update(released_at=None, widget_state=None, widget_source="")
+    _sessions[key] = _make_owner(key[0], key[1], session_id, "tab", info)
+    _record_debug_event("claim", key, session_id=session_id, host_mode="tab", source_node_id=info.get("source_node_id", ""))
+    _record_diag_event(
+        "claim_ok", key,
+        source="reclaim", session_id=session_id, host_mode="tab",
+        source_node_id=info.get("source_node_id", ""),
+        replaced_owner=bool(owner), took_over=took_over,
+    )
+    event = _session_changed_event(key, _sessions[key])
+    if took_over:
+        event["reason"] = "taken_over"
+    events.append((key[0], event))
+    return {"ok": True, "owner": _public_owner(_sessions[key]), "session_tag": session_tag(session_id), "took_over": took_over}
+
+
 async def claim_session(
     project_id: str,
     session_id: str,
@@ -487,6 +569,7 @@ async def claim_session(
     handoff_token: str = "",
     host_id: str = "",
     sdk_secret: str = "",
+    reclaim_secret: Any = "",
 ) -> dict[str, Any]:
     project_id = _clean_id(project_id)
     session_id = _clean_id(session_id)
@@ -501,11 +584,14 @@ async def claim_session(
     # duplicated tab, Take over). The secret is tab identity, not network auth.
     expected_secret = _sdk_secret(host_id) if host_id else None
     if host_mode == "sdk" or expected_secret is not None:
-        if expected_secret is None or not hmac.compare_digest(str(sdk_secret or ""), expected_secret):
+        if expected_secret is None or not _secrets_match(sdk_secret, expected_secret):
             _record_diag_event("claim_reject", None, code="invalid_sdk_session", project_id=project_id, session_id=session_id, host_mode=host_mode)
             return {"ok": False, "code": "invalid_sdk_session", "owner": None}
         return await _claim_sdk_session(project_id, session_id, host_id, info)
-    if host_mode == "tab" and not handoff_token:
+    # A mounted tab's secret is the same kind of thing: tab identity, not network
+    # auth. Sent with every tab claim, so a reload needs no second request.
+    reclaim_secret = _clean_reclaim_secret(reclaim_secret) if host_mode == "tab" else ""
+    if host_mode == "tab" and not handoff_token and not reclaim_secret:
         _record_diag_event("claim_reject", None, code="invalid_handoff_token", project_id=project_id, session_id=session_id, host_mode=host_mode)
         return {"ok": False, "code": "invalid_handoff", "owner": None}
     if not host_id:
@@ -516,10 +602,15 @@ async def claim_session(
     events: list[tuple[str, dict[str, Any]]] = []
     async with _lock:
         _advance_owner_lifecycle_locked(key, events)
+        _drop_expired_reclaims_locked()
         owner = _sessions.get(key)
+        reclaim = _tab_reclaims.get(key)
 
-        if handoff_token:
-            handoff_key = str(handoff_token)
+        if (reclaim_secret and reclaim and _secrets_match(reclaim_secret, reclaim["secret"])
+                and (not owner or owner.get("host_mode") == "tab")):
+            result = _reclaim_tab_locked(key, session_id, info, reclaim, owner, events)
+        elif handoff_token or host_mode == "tab":
+            handoff_key = str(handoff_token or "")
             handoff = _handoffs.get(handoff_key)
             valid_handoff = (
                 handoff
@@ -543,13 +634,17 @@ async def claim_session(
                 if owner.get("session_id") != session_id:
                     _clear_controls_locked(key)
                 _sessions[key] = _make_owner(project_id, host_id, session_id, host_mode, info)
+                if reclaim_secret:
+                    _tab_reclaims[key] = {"secret": reclaim_secret, "released_at": None, "widget_state": None, "widget_source": ""}
+                else:
+                    _tab_reclaims.pop(key, None)
                 _record_debug_event("claim", key, session_id=session_id, host_mode=host_mode, source_node_id=info.get("source_node_id", ""))
                 _record_diag_event(
                     "claim_ok", key,
                     source="handoff", session_id=session_id, host_mode=host_mode,
                     source_node_id=info.get("source_node_id", ""),
                 )
-                result = {"ok": True, "owner": _public_owner(_sessions[key])}
+                result = {"ok": True, "owner": _public_owner(_sessions[key]), "session_tag": session_tag(session_id)}
                 events.append((project_id, _session_changed_event(key, _sessions[key])))
         elif owner and owner.get("session_id") != session_id:
             _record_debug_event("claim_locked", key, session_id=session_id, host_mode=host_mode, owner_session_id=owner.get("session_id", ""))
@@ -564,6 +659,8 @@ async def claim_session(
             if not owner:
                 _clear_controls_locked(key)
             _sessions[key] = _make_owner(project_id, host_id, session_id, host_mode, info)
+            # Another host took this one: a tab reloading now reads the refusal.
+            _tab_reclaims.pop(key, None)
             _record_debug_event("claim", key, session_id=session_id, host_mode=host_mode, source_node_id=info.get("source_node_id", ""))
             _record_diag_event(
                 "claim_ok", key,
@@ -571,7 +668,7 @@ async def claim_session(
                 source_node_id=info.get("source_node_id", ""),
                 replaced_owner=bool(owner),
             )
-            result = {"ok": True, "owner": _public_owner(_sessions[key])}
+            result = {"ok": True, "owner": _public_owner(_sessions[key]), "session_tag": session_tag(session_id)}
             events.append((project_id, _session_changed_event(key, _sessions[key])))
 
     _schedule_events(events)
@@ -601,7 +698,7 @@ async def _claim_sdk_session(project_id: str, session_id: str, host_id: str, inf
         if took_over:
             event["reason"] = "taken_over"
         events.append((project_id, event))
-        result = {"ok": True, "owner": _public_owner(_sessions[key]), "took_over": took_over}
+        result = {"ok": True, "owner": _public_owner(_sessions[key]), "session_tag": session_tag(session_id), "took_over": took_over}
     _schedule_events(events)
     return result
 
@@ -682,6 +779,10 @@ async def release_session(
             owner = _sessions.get(key)
             if not owner:
                 _clear_controls_locked(key)
+                if force:
+                    # Force Release means that tab is finished, also during its
+                    # reload window (a stale card can still send it).
+                    _tab_reclaims.pop(key, None)
                 _record_diag_event("release_noop", key, session_id=session_id, force=force)
                 result = {"ok": True, "owner": None}
             elif not force and owner.get("session_id") != session_id:
@@ -1056,7 +1157,8 @@ async def _post_control_changes_once(project_id: str, host_id: str, session_id: 
             result = {"ok": False, "code": "queue_full"}
         else:
             rid = uuid.uuid4().hex
-            state["pending"].append({"request_id": rid, "session_id": session_id,
+            # The canvas reads this row; it only compares two rows for equality.
+            state["pending"].append({"request_id": rid, "session_tag": session_tag(session_id),
                                      "view_seq": seq, "prompt_hash": state["prompt_hash"], "changes": cleaned})
             result = {"ok": True, "request_id": rid}
             events.append((key[0], {"type": "control_changes_pending", "project_id": key[0], "host_id": key[1]}))
@@ -1069,7 +1171,8 @@ async def run_owner_gate(project_id: str, host_id: str, session_id: str, *, canv
     active owner tab unless ``canvas_only``. ``code`` is "" when admitted.
 
     The same gate as the Controls relay, and like it isolation rather than a
-    credential: these session ids are presence data other pages can see.
+    credential: session ids aren't broadcast, but a page can still re-register a
+    host under its own id (durable rules, Route and Session Security).
     """
     key, events = _host_key(project_id, host_id), []
     async with _lock:
@@ -1641,6 +1744,7 @@ async def sweep_stale_sessions_once() -> int:
     async with _lock:
         sessions_count = len(_sessions)
         hosts_count = len(_canvas_hosts)
+        _drop_expired_reclaims_locked()
         for key in list(_sessions.keys()):
             evicted += _advance_owner_lifecycle_locked(key, events)
         for key, host in list(_canvas_hosts.items()):

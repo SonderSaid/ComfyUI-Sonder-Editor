@@ -708,7 +708,8 @@ export class SdkWidgetHost {
 // `host.ownerState`:
 //   active / orphaned — this tab owns it (orphaned: a missed heartbeat)
 //   reconnecting      — the server could not be reached; writes still try
-//   displaced         — another tab claimed it; only Take over claims back
+//   displaced         — another tab claimed it; the page stops being an editor,
+//                       and Take over reloads it (mounted_session.js)
 //   ended             — the server no longer knows it (restart, eviction)
 // Every claim with the secret takes the session over, so a displaced tab must
 // never claim on its own or two tabs would trade it back and forth. A
@@ -716,7 +717,8 @@ export class SdkWidgetHost {
 // `claim()` and `heartbeat()` resolve to the session client's payloads.
 export function createSdkOwnership({
     host,
-    tabSessionId,
+    // This tab's own session as other pages see it (`session_tag` from its claim).
+    sessionTag,
     claim,
     heartbeat,
     onChange = () => {},
@@ -745,7 +747,7 @@ export function createSdkOwnership({
         onChange(state, previous);
     };
 
-    function reclaim({ fromDisplaced = false } = {}) {
+    function reclaim() {
         if (reclaiming) return reclaiming;
         reclaiming = Promise.resolve().then(claim).then((result) => {
             if (stopped) return result;
@@ -755,18 +757,12 @@ export function createSdkOwnership({
                 onReclaimed();
             } else if (result?.code === "invalid_sdk_session" || result?.status === 409) {
                 setState("ended");
-            } else if (fromDisplaced) {
-                setState("displaced");
             }
             return result;
         }).catch(() => {
             if (stopped) return null;
-            if (fromDisplaced) {
-                setState("displaced");
-            } else {
-                setState("reconnecting");
-                if (timer == null) startHeartbeat();
-            }
+            setState("reconnecting");
+            if (timer == null) startHeartbeat();
             return null;
         }).finally(() => {
             reclaiming = null;
@@ -778,9 +774,9 @@ export function createSdkOwnership({
         if (stopped || passive()) return Promise.resolve();
         return Promise.resolve().then(heartbeat).then((result) => {
             if (stopped || passive()) return;
-            if (result?.ok && result.owner?.session_id === tabSessionId) {
-                setState(result.owner.status || "active");
-            } else if (result?.code === "locked" && result?.owner && result.owner.session_id !== tabSessionId) {
+            if (result?.ok) {
+                setState(result.owner?.status || "active");
+            } else if (result?.code === "locked" && result?.owner) {
                 setState("displaced");
             } else {
                 return reclaim();
@@ -796,14 +792,11 @@ export function createSdkOwnership({
             setState(initialStatus || "active");
             startHeartbeat();
         },
-        takeOver() {
-            return reclaim({ fromDisplaced: host.ownerState === "displaced" });
-        },
         // `session_changed` for this session's host id.
         handleSessionChanged(event) {
             if (stopped || passive()) return;
             const owner = event?.owner || null;
-            if (owner?.session_id === tabSessionId) setState(owner.status || "active");
+            if (owner && owner.session_tag === sessionTag) setState(owner.status || "active");
             else if (owner) setState("displaced");
             else void reclaim();
         },

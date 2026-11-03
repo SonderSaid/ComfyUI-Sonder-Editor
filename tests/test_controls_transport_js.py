@@ -142,11 +142,12 @@ if(SCENARIO.startsWith('sdk')){
 }
 if(SCENARIO.startsWith('mounted')){
     let seq=1,pending=[],applied=[],rejected=[],savedSeen=[],gets=0,postingResolve=null,delayHide=false,releaseHide=null,remoteVisible=false;
-    const host=remote.createMountedControlsHost({projectId:'P',hostId:'h',sessionId:'tab',apiURL:p=>p,canWrite:()=>true,fetchImpl:async(path,init={})=>{
+    const host=remote.createMountedControlsHost({projectId:'P',hostId:'h',sessionId:'tab',apiURL:p=>p,writeBlock:()=>globalThis.writeBlock||'',fetchImpl:async(path,init={})=>{
         if(path.includes('/controls?')){gets++;if(controlsView.cleared)return{ok:true,json:async()=>({view:null,view_seq:0,applied:[],rejected:[]})};
             return{ok:true,json:async()=>({view:controlsView,view_seq:seq,applied:[...applied],rejected:[...rejected]})};}
         const body=JSON.parse(init.body);
         if(path.endsWith('/control_changes')){
+            if(globalThis.postRefusal)return{ok:false,json:async()=>({ok:false,code:globalThis.postRefusal})};
             if(SCENARIO==='mounted-order'&&body.changes['binding:n:value']==='30')await new Promise(r=>postingResolve=r);
             const rid=pending.length?'r2':'r';pending.push({request_id:rid,changes:body.changes});
             if(SCENARIO==='mounted-post-race')await new Promise(r=>postingResolve=r);
@@ -159,9 +160,9 @@ if(SCENARIO.startsWith('mounted')){
     host.setVisible(true);await settle();assert.equal(gets,1);
     host.presence({controls_view_seq:1});await settle();assert.equal(gets,1);
     if(SCENARIO==='mounted-abandon-restart'||SCENARIO==='mounted-abandon-cleared'){
-        host.presence({host:{session_id:'canvas-1'}});await settle();
+        host.presence({host:{session_tag:'canvas-1'}});await settle();
         const work=host.applyChanges({'binding:n:value':'31'});await settle();
-        if(SCENARIO==='mounted-abandon-restart')host.presence({host:{session_id:'canvas-2'}});
+        if(SCENARIO==='mounted-abandon-restart')host.presence({host:{session_tag:'canvas-2'}});
         else{controlsView.cleared=true;intervalFns.at(-1)();}
         // The server dropped the relay; the request settles instead of polling forever.
         const result=await work;assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/canvas (restarted|closed)/);
@@ -169,8 +170,61 @@ if(SCENARIO.startsWith('mounted')){
         assert.equal(result.unconfirmed,true);
         delete controlsView.cleared;const before=gets;intervalFns.at(-1)();await settle();assert.equal(gets,before);
     }
+    if(SCENARIO==='mounted-disconnected'){
+        const change={'binding:n:value':'31'};
+        // Another host's presence changes nothing here.
+        host.presence({host_id:'other',canvas_host_connected:false});assert.equal(host.getView().state,'ready');
+        // A read already running when the canvas leaves must not repaint what it had.
+        const stale=host.refresh(true);
+        host.presence({host_id:'h',canvas_host_connected:false});assert.equal(host.getView().state,'disconnected');
+        await stale;assert.equal(host.getView().state,'disconnected');
+        // The next reads find no view, or a view from just before: still disconnected,
+        // not "Loading controls...".
+        controlsView.cleared=true;await host.refresh(true);assert.equal(host.getView().state,'disconnected');
+        delete controlsView.cleared;await host.refresh(true);assert.equal(host.getView().state,'disconnected');
+        assert.deepEqual(host.getView().bindings,[]);
+        // Each reason keeps its own words, and nothing is posted.
+        const words={canvas:'The canvas is not connected. Nothing was changed.',reconnecting:'This tab is reconnecting. Nothing was changed.',session:'This tab no longer owns the editor.'};
+        for(const [block,reason] of Object.entries(words)){
+            globalThis.writeBlock=block;
+            const refused=await host.applyChanges(change);
+            assert.equal(refused.ok,false);assert.equal(refused.rejected[0].reason,reason);assert.equal(refused.unconfirmed,undefined);
+        }
+        assert.equal(pending.length,0);
+        // The server's answers read the same when the page didn't know yet.
+        globalThis.writeBlock='';
+        for(const [code,reason] of [['canvas_host_disconnected',words.canvas],['session_orphaned',words.reconnecting],['not_owner',words.session],['queue_full','The canvas could not accept the change.']]){
+            globalThis.postRefusal=code;
+            const refused=await host.applyChanges(change);
+            assert.equal(refused.rejected[0].reason,reason);
+        }
+        delete globalThis.postRefusal;
+        // Back: it reads again at once, and a repeat of the same presence reads nothing more.
+        const before=gets;
+        host.presence({host_id:'h',canvas_host_connected:true});await settle();
+        assert.equal(gets,before+1);assert.equal(host.getView().state,'ready');
+        host.presence({host_id:'h',canvas_host_connected:true});await settle();assert.equal(gets,before+1);
+    }
+    if(SCENARIO==='mounted-canvas-reload'){
+        host.presence({host_id:'h',canvas_host_connected:true,host:{session_tag:'canvas-1'}});await settle();
+        host.presence({host_id:'h',canvas_host_connected:false});assert.equal(host.getView().state,'disconnected');
+        // A reload brings the connection and a new session in one payload: one read,
+        // and it lands, rather than waiting for the next poll.
+        const before=gets;
+        host.presence({host_id:'h',canvas_host_connected:true,host:{session_tag:'canvas-2'}});await settle();
+        assert.equal(gets,before+1);assert.equal(host.getView().state,'ready');
+    }
+    if(SCENARIO==='mounted-stale-read'){
+        // A session change while a read is running: its answer is thrown away, so a
+        // read after it must still run instead of joining it.
+        host.presence({host_id:'h',host:{session_tag:'canvas-1'}});await settle();
+        const before=gets;const stale=host.refresh(true);
+        host.presence({host_id:'h',host:{session_tag:'canvas-2'}});
+        await stale;await settle();
+        assert.equal(gets,before+2);assert.equal(host.getView().state,'ready');
+    }
     if(SCENARIO==='mounted-abandon-recreated'){
-        host.presence({host:{session_id:'canvas-1'}});seq=5;host.changed({host_id:'h'});await settle();
+        host.presence({host:{session_tag:'canvas-1'}});seq=5;host.changed({host_id:'h'});await settle();
         const work=host.applyChanges({'binding:n:value':'31'});await settle();
         // Same canvas session, but its relay was cleared and published afresh.
         seq=1;host.changed({host_id:'h'});
@@ -268,8 +322,8 @@ if(SCENARIO.startsWith('relay')){
         const method=source.slice(source.indexOf('    _applyOwnerState('),source.indexOf('    _stopOwnerPolling()'));
         const prototype=new Function('return ({'+method+'})')();
         const controller={state:{activeOwner:null,lastOwnerSignature:''},_editorSessionId:'canvas',_controlsRelay:relay,
-            _ownerSignature:o=>JSON.stringify(o),_recordDiagEvent(){},_reconcileOwnerStateEffects(){return false;},render(){}};
-        prototype._applyOwnerState.call(controller,{session_id:'new-owner',host_mode:'tab'},'late-poll');await settle();
+            _ownerSignature:o=>JSON.stringify(o),_ownsSession:()=>false,_recordDiagEvent(){},_reconcileOwnerStateEffects(){return false;},render(){}};
+        prototype._applyOwnerState.call(controller,{session_tag:'new-owner',host_mode:'tab'},'late-poll');await settle();
         assert.equal(writes,1);assert.deepEqual(published.applied,['r']);
     }
     if(SCENARIO==='relay-stale'){assert.equal(writes,0);assert.equal(published.rejected[0].request_id,'r');}
@@ -377,11 +431,11 @@ if(SCENARIO==='canvas-http'||SCENARIO==='relay-error-recovery'||SCENARIO==='canv
 }
 console.log('ok');
 '''
-@pytest.mark.parametrize('scenario',['sdk-adopt-status','sdk-adopt-refusal','sdk-lost-answer','sdk-switching','sdk-hold','sdk-switch','sdk-stale-view','sdk-captures','sdk-busy','sdk-manage','mounted-manage','relay-manage','sdk-order','sdk-refusal','sdk-flush','mounted-restore','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','relay-invalid-view','relay-listing','relay-retry-idle'])
+@pytest.mark.parametrize('scenario',['sdk-adopt-status','sdk-adopt-refusal','sdk-lost-answer','sdk-switching','sdk-hold','sdk-switch','sdk-stale-view','sdk-captures','sdk-busy','sdk-manage','mounted-manage','relay-manage','sdk-order','sdk-refusal','sdk-flush','mounted-restore','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','mounted-disconnected','mounted-canvas-reload','mounted-stale-read','relay-invalid-view','relay-listing','relay-retry-idle'])
 def test_controls_transport(scenario):
     node=shutil.which('node')
     if not node:pytest.skip('node required for host adapter tests')
     script=SCRIPT.replace('REMOTE_URL',json.dumps((ROOT/'web/js/controls_host_remote.js').as_uri())).replace('RELAY_URL',json.dumps((ROOT/'web/js/controls_canvas_relay.js').as_uri())).replace('SDK_URL',json.dumps((ROOT/'web/js/sdk_host.js').as_uri())).replace('CANVAS_URL',json.dumps((ROOT/'web/js/controls_host_canvas.js').as_uri())).replace('CONTROLLER_PATH',json.dumps(str(ROOT/'web/js/editor_node_controller.js'))).replace('SCENARIO',json.dumps(scenario))
-    result=subprocess.run([node,'--input-type=module','-e',script],capture_output=True,text=True,timeout=15)
+    result=subprocess.run([node,'--input-type=module','-'],input=script,capture_output=True,text=True,encoding='utf-8',timeout=15)
     assert result.returncode==0,result.stderr
     assert result.stdout.strip()=='ok'

@@ -9,7 +9,7 @@ import types
 
 import pytest
 
-from server import sdk_runner, sdk_runs, sdk_templates
+from server import sdk_runner, sdk_runs, sdk_templates, session_registry
 from server.sdk_proxy import ProxyTarget
 from server.sdk_runner import (
     CANCELED, ENDED, FAILED, FINISHING, LANDED, QUEUED, RUNNING, UNCONFIRMED, SdkError, SdkRunner,
@@ -166,7 +166,11 @@ class World:
         return ProxyTarget(url="http://127.0.0.1:8189", token="", managed=True)
 
     async def get_owner(self, project, host_id=""):
-        return self.owners.get(host_id)
+        owner = self.owners.get(host_id)
+        if owner is None:
+            return None
+        public = {name: value for name, value in owner.items() if name != "session_id"}
+        return {**public, "session_tag": session_registry.session_tag(owner.get("session_id"))}
 
     async def open(self):
         result = await self.runner.open_session(self.template_id, PROJECT)

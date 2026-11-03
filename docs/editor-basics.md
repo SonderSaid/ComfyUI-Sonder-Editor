@@ -36,6 +36,17 @@ graph, and pauses run controls when the canvas is gone. On the canvas, the
 card's button reads **Open Mounted Editor** and brings that tab forward. If the
 tab was closed without exiting, click **Force Release** on the card.
 
+Reloading the tab is safe: it comes back on the same scene and selection, and a
+run in progress keeps reporting. While the canvas is away, the **Controls** tab
+says so and edits there are refused, so nothing changes until the canvas returns.
+
+If you duplicate the tab, the copy takes over and the original reads **Opened in
+another tab**. To continue in the original, click **Take over** on that page. It
+reloads, and the copy then shows the same message.
+
+If the tab says **This tab's link has expired**, go back to the canvas page,
+click **Open Editor** on the card, then click **Mount in Tab** again.
+
 ## Creating a project
 
 A project is a folder holding its media, scenes and generated takes, under

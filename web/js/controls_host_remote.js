@@ -11,6 +11,17 @@ const failure = (changes, reason) => ({
 // No answer arrived, so the change may have landed: a caller reports it as
 // not confirmed, never as not applied (controls_choice_apply.js).
 const unconfirmed = (changes, reason) => ({ ...failure(changes, reason), unconfirmed: true });
+// Why a mounted tab can't write: what `writeBlock` says, and the server's same answers.
+const WRITE_REFUSALS = {
+    canvas: "The canvas is not connected. Nothing was changed.",
+    reconnecting: "This tab is reconnecting. Nothing was changed.",
+    session: "This tab no longer owns the editor.",
+};
+const SERVER_REFUSALS = {
+    canvas_host_disconnected: WRITE_REFUSALS.canvas,
+    session_orphaned: WRITE_REFUSALS.reconnecting,
+    not_owner: WRITE_REFUSALS.session,
+};
 
 export function createSdkControlsHost(owner) {
     let view = idle(),
@@ -185,9 +196,12 @@ export function createMountedControlsHost({
     sessionId,
     apiURL,
     fetchImpl = (...args) => fetch(...args),
-    canWrite = () => true,
+    // "" when this tab may write, else a key of WRITE_REFUSALS.
+    writeBlock = () => "",
 }) {
     let view = idle(),
+        // The server says no canvas holds this host. Presence decides, not a read.
+        canvasGone = false,
         visible = false,
         // A View pane or the pane picker shows here: the canvas keeps describing.
         viewsDemand = false,
@@ -196,6 +210,7 @@ export function createMountedControlsHost({
         seq = -1,
         hostSession = "",
         read = null,
+        readStamp = -1,
         epoch = 0,
         posting = 0,
         reporting = null,
@@ -225,11 +240,11 @@ export function createMountedControlsHost({
         return { ok: response.ok, payload: await response.json() };
     };
     async function report() {
-        if (destroyed || !canWrite()) return;
+        if (destroyed || writeBlock()) return;
         reportRequested = true;
         if (reporting) return reporting;
         reporting = (async () => {
-            while (reportRequested && !destroyed && canWrite()) {
+            while (reportRequested && !destroyed && !writeBlock()) {
                 reportRequested = false;
                 const receipts = [...seen].slice(0, 128),
                     sentVisible = visible;
@@ -260,15 +275,21 @@ export function createMountedControlsHost({
     }
     async function refresh(force = false) {
         if (destroyed || (!visible && !viewsDemand && !waiting.size && !force)) return view;
+        // A read from before the last epoch change will throw its answer away.
+        if (read && readStamp !== epoch) return read.then(() => refresh(force));
         if (read) return read;
         const stamp = epoch;
+        readStamp = stamp;
         read = (async () => {
             try {
                 const response = await fetchImpl(path("controls") + `?host_id=${encodeURIComponent(hostId)}`);
                 const payload = await response.json();
                 if (destroyed || stamp !== epoch) return view;
                 if (!response.ok) throw Error("Controls could not be loaded.");
-                if (payload.view) {
+                if (payload.view && canvasGone) {
+                    // Not adopted: presence says the canvas left, and it reads again
+                    // when presence says it's back. Receipts below still count.
+                } else if (payload.view) {
                     // Sequences only grow within one relay; a lower one means the
                     // relay was cleared and recreated between two reads.
                     if (seq > 0 && payload.view_seq < seq) {
@@ -282,7 +303,7 @@ export function createMountedControlsHost({
                     emit();
                 } else {
                     seq = 0;
-                    view = { ...idle(), state: "loading" };
+                    view = { ...idle(), state: canvasGone ? "disconnected" : "loading" };
                     emit();
                     abandon("The canvas closed before it confirmed this change.");
                 }
@@ -357,7 +378,20 @@ export function createMountedControlsHost({
         },
         presence(payload = {}) {
             if (payload.host_id && payload.host_id !== hostId) return;
-            const next = String(payload.host?.session_id || "");
+            let reread = false;
+            if (payload.canvas_host_connected === false && !canvasGone) {
+                canvasGone = true;
+                epoch++;  // a read already running must not repaint what the canvas had
+                view = { ...idle(), state: "disconnected" };
+                emit();
+            } else if (payload.canvas_host_connected === true && canvasGone) {
+                canvasGone = false;
+                epoch++;
+                view = { ...idle(), state: "loading" };
+                emit();
+                reread = true;
+            }
+            const next = String(payload.host?.session_tag || "");
             if (next && next !== hostSession) {
                 // The first observed session only establishes identity; a later
                 // one is a canvas restart whose relay starts empty.
@@ -366,8 +400,10 @@ export function createMountedControlsHost({
                 epoch++;
                 seq = -1;
                 void report();
-                void refresh(true);
+                reread = true;
             }
+            // One read, after both: a canvas reload brings both in one payload.
+            if (reread) void refresh(true);
             if (payload.controls_visible !== undefined && payload.controls_visible !== visible) void report();
             if (payload.controls_views !== undefined && payload.controls_views !== viewsDemand) void report();
             if (
@@ -383,12 +419,13 @@ export function createMountedControlsHost({
         },
         applyChanges(changes) {
             const owned = { ...changes };
-            if (destroyed || !canWrite()) return Promise.resolve(failure(owned, "This tab no longer owns the editor."));
+            const refusal = () => (destroyed ? "The editor has closed." : WRITE_REFUSALS[writeBlock()] || "");
+            if (refusal()) return Promise.resolve(failure(owned, refusal()));
             posting++;
             return new Promise(resolve => {
                 const post = postTail.then(async () => {
-                    if (destroyed || !canWrite()) {
-                        resolve(failure(owned, "This tab no longer owns the editor."));
+                    if (refusal()) {
+                        resolve(failure(owned, refusal()));
                         return;
                     }
                     const result = await mutation("control_changes", { changes: owned });
@@ -401,7 +438,7 @@ export function createMountedControlsHost({
                             ok: false,
                             rejected:
                                 result.payload.rejected ||
-                                failure(owned, "The canvas could not accept the change.").rejected,
+                                failure(owned, SERVER_REFUSALS[result.payload.code] || "The canvas could not accept the change.").rejected,
                         });
                         return;
                     }

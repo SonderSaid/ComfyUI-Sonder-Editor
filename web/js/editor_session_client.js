@@ -1,3 +1,5 @@
+import { newSessionId } from "./session_ids.js";
+
 const { api } = window.comfyAPI.api;
 
 function apiJson(path, body) {
@@ -29,8 +31,7 @@ function apiGetJson(path) {
 }
 
 export function newEditorSessionId(prefix = "editor") {
-    const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    return `${prefix}-${random}`;
+    return newSessionId(prefix);
 }
 
 function hostQuery(hostId = "", sourceNodeId = "") {

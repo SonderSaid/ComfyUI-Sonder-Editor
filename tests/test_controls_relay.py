@@ -24,7 +24,7 @@ PID, HID, CANVAS, TAB = 'ZZ-controls-relay-20261005', 'host-A', 'canvas-A', 'tab
 
 @pytest.fixture(autouse=True)
 def registry(monkeypatch):
-    for name in ('_sessions', '_canvas_hosts', '_handoffs', '_widget_state', '_widget_sources', '_controls_relay'):
+    for name in ('_sessions', '_canvas_hosts', '_handoffs', '_tab_reclaims', '_widget_state', '_widget_sources', '_controls_relay'):
         monkeypatch.setattr(sr, name, {})
     monkeypatch.setattr(sr, '_lock', asyncio.Lock())
     monkeypatch.setattr(sr, '_sdk_secret_for_host', None)

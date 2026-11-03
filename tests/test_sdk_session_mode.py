@@ -78,7 +78,7 @@ def test_a_claim_with_the_secret_takes_over_and_announces_it(monkeypatch):
         await claim_session(PROJECT, "tab-a", "sdk", {"host_id": SDK_HOST}, sdk_secret=SECRET)
         second = await claim_session(PROJECT, "tab-b", "sdk", {"host_id": SDK_HOST}, sdk_secret=SECRET)
         assert second["ok"] and second["took_over"] is True
-        assert (await get_owner(PROJECT, host_id=SDK_HOST))["session_id"] == "tab-b"
+        assert (await get_owner(PROJECT, host_id=SDK_HOST))["session_tag"] == session_registry.session_tag("tab-b")
         # The displaced tab's heartbeat is refused, so it shows "Opened in another tab".
         assert (await heartbeat_session(PROJECT, "tab-a", host_id=SDK_HOST))["code"] == "locked"
 
