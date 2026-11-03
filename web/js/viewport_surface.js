@@ -8625,12 +8625,14 @@ export function createViewportSurface(options = {}) {
         renderFrame();
     }
 
-    function startPlayback() {
+    // `loopRange` overrides the host's loop for this session (a seek outside
+    // the loop ends it: null); omitted, the host's loop applies.
+    function startPlayback({ loopRange: loopOverride } = {}) {
         if (state.destroyed || state.isPlaying) return;
         if (!state.liveMediaEnabled) {
             state.liveMediaEnabled = true;
         }
-        const loopRange = getLoopRange();
+        const loopRange = loopOverride !== undefined ? loopOverride : getLoopRange();
         if (loopRange && (currentFrame() < loopRange.start || currentFrame() >= loopRange.end)) {
             applyFrame(loopRange.start, { reason: "playback-start-align" });
         }
@@ -8661,6 +8663,29 @@ export function createViewportSurface(options = {}) {
         } else {
             startPlayback();
         }
+    }
+
+    // A seek while playing (the viewport's progress bar): playback goes on
+    // from `frame`. It restarts through stop and start, so the animation
+    // frame, media, prebuffer, rebuffer hold and clock reset exactly as for
+    // Play, and only one tick loop ever runs. "Return to playback start"
+    // still returns to where Play was pressed. A seek outside the loop range
+    // ends the loop for this session; inside it, looping goes on. Returns
+    // false when not playing: the caller moves the playhead as before.
+    function seekPlayback(frame) {
+        if (state.destroyed || !state.isPlaying) return false;
+        const sessionStart = state.playbackSessionStartFrame;
+        const loop = state.playbackLoopRange;
+        stopPlayback({ preservePlayhead: true, reason: "playback-seek" });
+        const target = applyFrame(frame, { reason: "playback-seek" });
+        // A seek to the end (End, or → onto the last frame) stops there: a
+        // restart would end on its first tick and, with "Return to playback
+        // start" on, jump back to where Play was pressed.
+        if (target >= totalFrames()) return true;
+        const keepLoop = !!loop && target >= loop.start && target < loop.end;
+        startPlayback({ loopRange: keepLoop ? loop : null });
+        state.playbackSessionStartFrame = sessionStart;
+        return true;
     }
 
     function clearMediaCache() {
@@ -8772,6 +8797,7 @@ export function createViewportSurface(options = {}) {
         togglePlayback,
         startPlayback,
         stopPlayback,
+        seekPlayback,
         captureSourceFrame,
         clearMediaCache,
         recordTimelineRender,

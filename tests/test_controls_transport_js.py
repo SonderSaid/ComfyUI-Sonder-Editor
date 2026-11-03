@@ -57,7 +57,7 @@ if(SCENARIO.startsWith('sdk')){
         assert.ok(calls.at(-1).path.endsWith('/controls?manage=1&filter=cfg%20%26%20seed'),calls.at(-1).path);
         await host.applyChanges({'binding:n:label':'x'});assert.ok(calls.at(-1).path.includes('manage=1'));
         host.setManage(false,'');await settle();assert.ok(calls.at(-1).path.endsWith('/controls'));
-        assert.deepEqual(host.capabilities,{hide:true,removeAuthored:false,serverRows:true});
+        assert.deepEqual(host.capabilities,{hide:true,removeAuthored:false,serverRows:true,exactIntegers:true});
     }
     if(SCENARIO==='sdk-flush'){owner.flushControlsPanel=async()=>false;assert.equal((await owner.generate(1)).payload.code,'controls_not_saved');assert.equal(calls.some(c=>c.path.endsWith('/generate')),false);}
     if(SCENARIO==='sdk-switch'){

@@ -95,7 +95,8 @@ export function createSdkControlsHost(owner) {
         emptyMessage: SDK_EMPTY,
         // Sonder App curation (A1): hide the workflow's own items, remove only app-only ones.
         // serverRows: the server builds this prompt, so row lists edit without canvas row widgets.
-        capabilities: { hide: true, removeAuthored: false, serverRows: true },
+        // exactIntegers: no canvas widget holds the value, so a seed keeps all 64 bits.
+        capabilities: { hide: true, removeAuthored: false, serverRows: true, exactIntegers: true },
         setManage(on, filter = "") {
             const next = { on: !!on, filter: String(filter || "").slice(0, 120) };
             if (next.on === manage.on && next.filter === manage.filter) return;

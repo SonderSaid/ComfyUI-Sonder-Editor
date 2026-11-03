@@ -13,14 +13,29 @@ a fresh `[Unreleased]` block.
 
 ### Added
 - When the Sonder App refuses **Generate** over a missing model file or node, it names the Mode choice that needs it (for example "Needed by Task → Edit With Words"). The Launcher shows the same names for the selected workflow.
+- Seed Controls have up and down arrows (and ↑/↓ in the field) that step exactly, even past 2^53. In fullscreen and Mount in Tab they stop at the largest number a canvas widget holds.
+- A resized multiline text box in Controls keeps its height in this browser, across renders and when you leave and reopen the editor.
+- The Views pane picker and pane titles show a Driver lane's own name, as the timeline header does.
+- While only In or Out is set, the generation readout's tooltip says **Generate** still uses the full scene until you choose the other point.
 
 ### Changed
 - Sonder App runs no longer need the model files or node packs of Modes that are switched off: a Task needs only its own LoRA, and **MiniMax H3 References & Swaps** needs the SAM3 checkpoint only with **Mask On**. A canvas Run still checks every loader.
 - A workflow with node packs this ComfyUI lacks now opens in the Sonder App; **Generate** refuses only when the chosen Modes use them.
 - The bundled starters' **Models and downloads** notes list each Task's files again, and their switched-off **Additional LoRAs** row reads **None**. Labels, notes and layout you customized on a bundled starter reset once with this update.
+- Reference lanes that share a recipe can be selected together whatever their prompt overrides. The Prompt Bridge's **reference_prompt** is one block in lane order where each lane's override takes that lane's part, without repeating the recipe's opening and closing lines; a lane on its own still uses its override as the whole prompt. A selection that used the same override on several lanes now includes it once per lane.
+- A refusal that changed nothing (a Reference drop that can't be staged, a split with no effect) closes on its own: it follows your warning duration setting, or 6 seconds when that is set to stay until dismissed.
+- On a narrow window the editor toolbar stacks its groups on rows instead of overlapping them.
+- In Controls, a seed's label sits above its field, arrows and mode, so the number stays readable in a narrow sidebar.
 
 ### Fixed
 - A switched-off LoRA row whose file isn't installed can be edited from Controls in fullscreen, Mount in Tab and the Sonder App.
+- Integer Controls step by the node's declared step (tile size by 32, not 1).
+- A Control note's **More** works on the first click after you leave a field.
+- Switching workflows in the Sonder App while a Mode choice is loading is refused with a message, instead of switching on its own once the load ends.
+- Clicking the pane-count or arrangement buttons no longer leaves the keyboard focus ring on them.
+- Another editor tab on the same workflow follows a return to one Views pane.
+- Clicking the viewport's progress bar while playing keeps playing from there instead of jumping back; ←/→/Home while playing do the same, and End stops at the end.
+- **Render Queue** shows its real count as soon as the editor opens, also while collapsed, instead of **(0)** until the first take (Mount in Tab and the Sonder App).
 - The Launcher names the folder for the LTX sampling preview file (**vae_approx/**) on an install that has none yet.
 - The Launcher's **ComfyUI** status reads **Generate unavailable** when the Sonder App packages are missing, including after a failed Generate, instead of **Connection problem**.
 - Workflow rows in the Launcher say **Generate unavailable** instead of **Ready** while the Sonder App packages are missing or unsupported.

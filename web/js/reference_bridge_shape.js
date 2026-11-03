@@ -184,7 +184,6 @@ export function selectorPanelView({
         };
     });
     const anchor = selectedRows.find((row) => row.lane)?.lane || null;
-    const effectiveAnchor = selectedRows.find((row) => row.lane?.item_count)?.lane || null;
     const selectedTotal = selectedRows.reduce((total, row) => total + laneReservedSpan(row.lane), 0);
     const anchorRecipe = anchor?.recipe && typeof anchor.recipe === "object" ? anchor.recipe : {};
     const anchorDetached = Boolean(anchor) && (!String(anchor.recipe_id || "") || !Object.keys(anchorRecipe).length);
@@ -204,10 +203,8 @@ export function selectorPanelView({
                 reasons.push("Materialized recipe differs from the selected lanes.");
             }
             if (anchor && candidateDetached) reasons.push("A blank or detached recipe can only be selected alone.");
-            if (effectiveAnchor && lane?.item_count
-                    && String(lane?.prompt_override || "") !== String(effectiveAnchor.prompt_override || "")) {
-                reasons.push("Prompt override differs from the effective selected lanes.");
-            }
+            // A prompt override is no reason: it changes the lane's text, not
+            // its type, and the Prompt Bridge keeps each lane's own text.
             const nextTotal = selectedTotal + laneReservedSpan(lane);
             if (nextTotal > budget || laneReservedSpan(lane) > laneMemberCap(lane)) {
                 reasons.push(`The reserved total would exceed ${budget} slots.`);

@@ -987,9 +987,10 @@ def test_multi_lane_conflicts_name_materialized_kind_override_and_detached_lanes
     project.scenes[0].reference_lane_recipes[1].media_kind = "audio"
     assert "media kind" in core._conflict_message(core.resolve_reference_set(project, "0,1"))
 
+    # A different prompt override is not a conflict (hardening Phase 5).
     project = _multi_lane_project(tmp_path / "override", recipe, [1, 1])
     project.scenes[0].reference_items[1].prompt_override = "different"
-    assert "prompt override" in core._conflict_message(core.resolve_reference_set(project, "0,1"))
+    assert core.resolve_reference_set(project, "0,1")["conflicts"] == []
 
     detached = ReferenceLaneRecipe(recipe={"hard": {"assembly": "slots", "max_members": 16}})
     project = _multi_lane_project(tmp_path / "detached", detached, [1, 1])
@@ -1570,3 +1571,103 @@ def test_pegs_reach_the_bridge_and_the_selector_fingerprint(monkeypatch, tmp_pat
     before = core.reference_fingerprint(project, 0)
     project.dimension_constraint = {"step": 16, "offset": 0}
     assert core.reference_fingerprint(project, 0) != before
+
+
+# ── Co-selected lanes with prompt overrides (hardening Phase 5) ──────────────
+# One block, each lane's own part in lane order; an override joins as its
+# lane's part, with the recipe's exact opening and closing lines dropped.
+
+def _ingredients_lanes(monkeypatch, tmp_path, member_counts=(1, 1, 1)):
+    core = _import_module(monkeypatch, "reference_core")
+    project = _multi_lane_project(tmp_path, _preset("sonder:ltx_ingredients"), list(member_counts))
+    monkeypatch.setattr(
+        core, "resolve_existing_project_path",
+        lambda project, path, **_kwargs: str(Path(project.project_dir) / path),
+    )
+    soft = project.scenes[0].reference_lane_recipes[0].recipe["soft"]
+    lanes = ",".join(str(index) for index in range(len(member_counts)))
+    decode = lambda: core.decode_reference_prompts(core.resolve_reference_set(project, lanes))
+    return core, project, soft["prompt_prefix"].strip(), soft["prompt_suffix"].strip(), decode
+
+
+def test_co_selected_overrides_are_no_conflict(monkeypatch, tmp_path):
+    core, project, *_ = _ingredients_lanes(monkeypatch, tmp_path)
+    project.scenes[0].reference_items[0].prompt_override = "alpha"
+    project.scenes[0].reference_items[2].prompt_override = "gamma"
+    assert core.resolve_reference_set(project, "0,1,2")["conflicts"] == []
+
+
+def test_co_selected_lanes_join_one_block_with_overrides_inside(monkeypatch, tmp_path):
+    core, project, prefix, suffix, decode = _ingredients_lanes(monkeypatch, tmp_path)
+    assert prefix and suffix, "the Ingredients recipe opens and closes its block"
+    items = project.scenes[0].reference_items
+    baseline = decode()
+    fragments = [value for value in baseline[2:] if value]
+    assert len(fragments) == 3
+    a, b, c = fragments
+    # No override anywhere: today's block, unchanged.
+    assert baseline[0] == f"{prefix} {a}, {b}, {c} {suffix}"
+
+    def joined(*parts):
+        return f"{prefix} {', '.join(parts)} {suffix}"
+
+    # An override made with Edit as override, then edited: its ends are the
+    # recipe's, so they are dropped and the block closes once.
+    items[1].prompt_override = f"{prefix} {b} in a red coat {suffix}"
+    out = decode()
+    assert out[0] == joined(a, f"{b} in a red coat", c)
+    assert out[0].count(suffix) == 1 and out[0].count(prefix) == 1
+    assert out[2:] == baseline[2:], "p01..p16 never carry an override"
+    # A hand-written override is the lane's part as typed.
+    items[1].prompt_override = "a blue sofa"
+    assert decode()[0] == joined(a, "a blue sofa", c)
+    # An edited opening line is not the recipe's: it stays; the exact closing line goes.
+    items[1].prompt_override = f"Sheet: {b} {suffix}"
+    assert decode()[0] == joined(a, f"Sheet: {b}", c)
+    # Two different overrides, each in its own place.
+    items[1].prompt_override = ""
+    items[0].prompt_override = "alpha"
+    items[2].prompt_override = "gamma"
+    assert decode()[0] == joined("alpha", b, "gamma")
+    # The same override on two lanes is each lane's own part.
+    items[0].prompt_override = "same"
+    items[1].prompt_override = "same"
+    items[2].prompt_override = ""
+    assert decode()[0] == joined("same", "same", c)
+    # A whitespace-only override is no override.
+    items[0].prompt_override = "   "
+    items[1].prompt_override = ""
+    assert decode()[0] == baseline[0]
+
+
+def test_the_block_skips_empty_parts(monkeypatch):
+    # A present item always has members (decoding refuses an empty one), so an
+    # empty part reaches the composer only as a lane with nothing to say: it
+    # adds no separator, and an override that is only the recipe's ends adds nothing.
+    _import_module(monkeypatch, "reference_core")
+    formatter = importlib.import_module(f"{TEST_PACKAGE}.server.reference_prompt_formatter")
+    recipe = {"soft": {"prompt_prefix": "Reference sheet:", "prompt_suffix": "Generated video:"}}
+    compose = formatter.compose_multi_lane_prompt
+    lanes = [{"override": "alpha"}, {"fragments": []}, {"fragments": ["c"]}]
+    assert compose(recipe=recipe, lanes=lanes) == "Reference sheet: alpha, c Generated video:"
+    lanes = [{"override": "Reference sheet: Generated video:"}, {"fragments": ["c"]}]
+    assert compose(recipe=recipe, lanes=lanes) == "Reference sheet: c Generated video:"
+    # The separator a dropped end leaves behind goes with it: no ",,".
+    lanes = [{"override": "Reference sheet: a, Generated video:"}, {"fragments": ["b"]}]
+    assert compose(recipe=recipe, lanes=lanes) == "Reference sheet: a, b Generated video:"
+    # An end is dropped only as a whole word.
+    words = {"soft": {"prompt_prefix": "A video of", "prompt_suffix": "end"}}
+    lanes = [{"override": "A video offering a cat, the weekend"}, {"fragments": ["b"]}]
+    assert compose(recipe=words, lanes=lanes) == "A video of A video offering a cat, the weekend, b end"
+    lanes = [{"override": "A video of a cat end"}, {"fragments": ["b"]}]
+    assert compose(recipe=words, lanes=lanes) == "A video of a cat, b end"
+    assert compose(recipe={}, lanes=[{"override": "alpha"}, {"fragments": ["b", ""]}]) == "alpha, b"
+
+
+def test_a_lone_lane_keeps_its_whole_override_and_ignores_whitespace(monkeypatch, tmp_path):
+    _core, project, prefix, suffix, decode = _ingredients_lanes(monkeypatch, tmp_path, (1,))
+    derived = decode()[0]
+    project.scenes[0].reference_items[0].prompt_override = f"{prefix} my own {suffix}"
+    assert decode()[0] == f"{prefix} my own {suffix}", "a lone lane's override replaces the whole grammar"
+    project.scenes[0].reference_items[0].prompt_override = "  "
+    assert decode()[0] == derived

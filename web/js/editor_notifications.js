@@ -37,6 +37,17 @@ function _ttlOverride(value) {
     return Number.isFinite(v) && v > 0 ? v : null;
 }
 
+// An immediate refusal that changed nothing (`transient: true`) follows the
+// tier's configured lifetime, but is never sticky: with the setting at
+// "stay until dismissed" it closes after this long (durable rule 135).
+export const TRANSIENT_MS = 6000;
+
+function _ttlFor(notif) {
+    if (notif._hasDurationOverride) return notif._durationOverride;
+    const ttl = _ttlForTier(notif.tier);
+    return ttl == null && notif._transient && notif.tier !== "progress" ? TRANSIENT_MS : ttl;
+}
+
 // Push lifetime overrides (ms; 0 = sticky). Only known keys are applied.
 export function configureNotifications(patch = {}) {
     for (const key of ["info", "success", "warning", "error"]) {
@@ -205,12 +216,13 @@ function _applyOpts(notif, opts) {
         notif._hasDurationOverride = true;
         notif._durationOverride = _ttlOverride(opts.durationMs);
     }
-    notif._ttl = notif._hasDurationOverride ? notif._durationOverride : _ttlForTier(notif.tier);
+    if ("transient" in opts) notif._transient = !!opts.transient;
+    notif._ttl = _ttlFor(notif);
 }
 
 // ── Core API ───────────────────────────────────────────────────────────────────
 
-// notify({ tier, verb, message, detail, progress, startedAt, foreground, source, onRetry, actions, durationMs })
+// notify({ tier, verb, message, detail, progress, startedAt, foreground, source, onRetry, actions, durationMs, transient })
 // Action descriptors are { label, variant, fn, dismiss? }; dismiss defaults to
 // true in presenters, while false keeps a progress notification mounted.
 // Returns a handle: { id, update, progress, resolve, dismiss }.
@@ -252,10 +264,12 @@ export function notify(opts = {}) {
         _key: key,
         _hasDurationOverride: hasDurationOverride,
         _durationOverride: hasDurationOverride ? _ttlOverride(opts.durationMs) : null,
-        _ttl: hasDurationOverride ? _ttlOverride(opts.durationMs) : _ttlForTier(tier),
+        _transient: !!opts.transient,
+        _ttl: null,
         _remaining: null,
         _armedAt: 0,
     };
+    notif._ttl = _ttlFor(notif);
     s.notifications.set(id, notif);
     _arm(s, notif, { reset: true });
     _emit(s);

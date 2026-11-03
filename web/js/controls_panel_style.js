@@ -46,6 +46,12 @@ export const inputCss = `width:100%;min-width:0;box-sizing:border-box;border:1px
 export const numberInputCss = cards => inputCss + (cards ? "" : "width:76px;flex:0 0 auto;text-align:right;");
 export const seedInputCss = inputCss + "flex:1 1 auto;";
 export const modeSelectCss = inputCss + "width:96px;flex:0 0 auto;cursor:pointer;";
+// The seed's up and down buttons: a narrow pair stacked beside its field.
+export const seedStepsCss = "display:inline-flex;flex-direction:column;flex:0 0 auto;align-self:stretch;";
+export const seedStepCss = `flex:1 1 0;min-height:0;width:18px;padding:0;border:1px solid ${COLORS.border};`
+    + `background:${COLORS.panelMuted};color:${COLORS.textSecondary};font:${TYPE.t10}px ${FONT.sans};line-height:1;cursor:pointer;`;
+export const seedStepUpCss = seedStepCss + `border-radius:${RADIUS.r2}px ${RADIUS.r2}px 0 0;border-bottom-width:0;`;
+export const seedStepDownCss = seedStepCss + `border-radius:0 0 ${RADIUS.r2}px ${RADIUS.r2}px;`;
 
 export const noteCss = `font-size:${TYPE.t11}px;line-height:1.45;color:${COLORS.textDim};overflow-wrap:anywhere;margin:0;`;
 

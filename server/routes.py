@@ -15428,8 +15428,6 @@ if routes is not None:
                 "reserved_member_span": reserved_member_span,
                 "strength": float(getattr(effective_item, "strength", 0.0) or 0.0)
                     if effective_item is not None else 0.0,
-                "prompt_override": str(getattr(effective_item, "prompt_override", "") or "")
-                    if effective_item is not None else "",
                 # Non-slot image assemblies produce one assembled payload on
                 # r01. Slot recipes and audio/prompt bridges grow per member.
                 "image_slot_count": (

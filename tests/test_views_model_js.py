@@ -30,7 +30,8 @@ out.isDefault = [M.isDefaultLayout(null), M.isDefaultLayout({count:1, panes:[{so
 // Junk is read tolerantly; Composite sits in one pane at most.
 out.junk = M.normalizeLayout({ts:5, count:9, arrangement:'diagonal', panes:[{source:{kind:'composite'}},{source:{kind:'composite'}},
     {source:{kind:'driver', index:2}, item:3, fit:'cover', zoom:{scale:2,x:5,y:-5}},{source:{kind:'view', viewId:'bad id'}, zoom:{scale:99,x:0,y:0}}]});
-// The map keeps the newest 64 real records, never the default one.
+// The map keeps the newest 64 dated records, a dated default included:
+// it is how another tab follows a return to one pane.
 const map = {};
 for (let i = 0; i < 70; i++) map[`c:${i}`] = {ts: i + 1, count: 2};
 map['c:default'] = {ts: 999, count: 1};
@@ -47,7 +48,7 @@ out.visible = M.visiblePanes({count:3}).map(p => p.source.kind);
     assert junk["panes"][2] == {"source": {"kind": "driver", "index": 2}, "item": 3, "fit": "cover", "zoom": {"scale": 2, "x": 5, "y": -5},
                                 "link": True}
     assert junk["panes"][3]["zoom"] is None
-    assert out["kept"] == [64, False, True, False, False]
+    assert out["kept"] == [64, False, True, True, False]
     assert out["visible"] == ["composite", "guides", "guides"]
 
 
@@ -334,4 +335,5 @@ out.oldMap = Object.keys(M.normalizeLayoutMap({'c:x': {ts: 4, layout: '2c'}, 'c:
     assert g["4:row"] == ["repeat(4, 1fr)", "1fr", ["", "", "", ""]]
     assert g["4:column"] == ["1fr", "repeat(4, 1fr)", ["", "", "", ""]]
     assert out["old"] == [1, "grid", False, "v1", 1]
-    assert out["oldMap"] == ["c:y"]
+    # An old record that reads as one pane is a dated default now, kept like any other.
+    assert out["oldMap"] == ["c:x", "c:y"]

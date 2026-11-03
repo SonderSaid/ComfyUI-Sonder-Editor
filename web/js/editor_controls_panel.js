@@ -16,9 +16,10 @@ import { openContextMenu } from "./editor_context_menu.js";
 import { disclosureKey, entryVisible, groupPlan, hasAdvanced, hasNotes, hiddenAdvanced, hiddenNotes, matchEntry, noteDisclosureKey, noteShown } from "./controls_panel_view.js";
 import * as S from "./controls_panel_style.js";
 import { renderPanelMarkdown, splitPanelMarkdownTitle } from "./panel_markdown.js";
-import { createDisclosureMemory } from "./disclosure_memory.js";
+import { createDisclosureMemory, createValueMemory } from "./disclosure_memory.js";
+import { CANVAS_INTEGER_CEILING, intStep, seedBounds, stepSeed } from "./controls_seed_step.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
-import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, applyNativeControlTheme, setButtonVariant } from "./editor_theme.js";
+import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, applyNativeControlTheme, setButtonDisabled, setButtonVariant } from "./editor_theme.js";
 
 let nextPanel = 0;
 let nextDescription = 0;
@@ -44,6 +45,12 @@ const inEditor = d => d.source === "binding" && d.section === "editor";
 const CANVAS_EMPTY = "No Controls yet. Choose Manage to expose this workflow's settings here.";
 const EMPTY_NOTE = "Double-click to write this note. Start it with a bold line to make it collapsible.";
 const LONG_VALUE = 18; // a choice longer than this gets a wide card
+// A burst of seed steps saves once, this long after the last step.
+const SEED_STEP_IDLE_MS = 400;
+// A remembered text box height is kept within these bounds (CSS px).
+const TEXT_HEIGHT_MIN = 60;
+const TEXT_HEIGHT_MAX = 1200;
+const clampTextHeight = value => Math.min(TEXT_HEIGHT_MAX, Math.max(TEXT_HEIGHT_MIN, Math.round(value)));
 // Your own editor settings, shown first in the Editor group in every mode. They
 // write through the host's typed setter (editor_settings.js controlsPanelSettingPatch).
 const MIRRORS = [
@@ -74,6 +81,8 @@ export function mountControlsPanel(container, host) {
         pending = new Set(),
         runPending = new Set();
     const disclosure = createDisclosureMemory("sonder-controls-disclosure-v1");
+    // A resized text box's height, per Control, in this browser.
+    const textHeights = createValueMemory("sonder-controls-text-height-v1");
     let destroyed = false,
         lastView = null,
         noteEditor = null,
@@ -193,12 +202,12 @@ export function mountControlsPanel(container, host) {
     quietRow.style.cssText = `flex-wrap:wrap;align-items:baseline;column-gap:${SPACE.s3}px;row-gap:${SPACE.s1}px;`;
     quietRow.append(quietLine, notesLine);
     const workflowHeader = mountWorkflowHeader(host, {flushPending: () => flushPending(), notify: reason => warning(reason),
+        // Asked before the switch saves anything, and again after: a choice
+        // still loading or a Manage save still running refuses the switch.
+        busyReason: () => (modes.busy ? "Wait for the choice to finish loading, then switch workflows."
+            : restore.busy || manage?.modesSaving ? "Wait for the Manage change to save, then switch workflows." : ""),
         // Switching workflows remounts the panel: Manage drafts would be lost.
         canSwitch: () => {
-            if (restore.busy || manage?.modesSaving) {
-                warning("Wait for the Manage change to save, then switch workflows.");
-                return false;
-            }
             return !manage || (manage.canLeave() && (!manage.hasDraft
                 || globalThis.confirm("Discard your unsaved Manage edits and switch workflows?")));
         }});
@@ -634,6 +643,96 @@ export function mountControlsPanel(container, host) {
         row.editStart = value;
         return commit(row, row.target, value, before);
     }
+    // ── Seed steps ──────────────────────────────────────────────────────────
+    // The seed's up and down buttons (and ArrowUp/ArrowDown in its field).
+    // Each step shows at once in the field; a burst saves once, after a short
+    // pause, and flushPending saves a waiting step before any run.
+    // A canvas widget holds a JS number, so a canvas host steps no higher than
+    // 2^53 - 1; a host that keeps big integers exact (the Sonder App) does.
+    const seedCeiling = () => (capabilities().exactIntegers ? null : CANVAS_INTEGER_CEILING);
+    function seedStepButton(row, direction) {
+        const button = make("button", direction > 0 ? "▴" : "▾");
+        button.type = "button";
+        button.dataset.seedStep = direction > 0 ? "up" : "down";
+        button.style.cssText = direction > 0 ? S.seedStepUpCss : S.seedStepDownCss;
+        // A press keeps the field's focus, so typing carries on after a step.
+        button.addEventListener("mousedown", e => e.preventDefault());
+        button.addEventListener("click", () => stepRow(row, direction));
+        return button;
+    }
+    function stepRow(row, direction) {
+        if (!row.input || row.input.disabled || !editable(row.spec)) return false;
+        const next = stepSeed(readInput(row), direction, seedBounds(row.spec, seedCeiling()));
+        if (next === null) return false;
+        // The burst saves against the value stored before its first step, not
+        // `editStart`: a focus in the burst, or a seed changed elsewhere since
+        // the field was last focused, would make the step look like no change.
+        if (!row.seedStepTimer) row.seedStepBase = row.optimistic ?? row.spec.value;
+        setInput(row, next);
+        clearTimeout(row.seedStepTimer);
+        row.seedStepTimer = setTimeout(() => void flushSeedStep(row), SEED_STEP_IDLE_MS);
+        paintSeedSteps(row);
+        return true;
+    }
+    function flushSeedStep(row) {
+        if (!row.seedStepTimer) return null;
+        clearTimeout(row.seedStepTimer);
+        row.seedStepTimer = 0;
+        if (row.suppress || !row.input || row.input.disabled) return null;
+        const value = readInput(row), before = row.seedStepBase;
+        if (same(value, before)) return null;
+        row.editStart = value;
+        return commit(row, row.target, value, before);
+    }
+    // Typing during a burst replaces the step: the typed text saves the usual
+    // way (change, Enter, blur or a run), never half-typed from the timer.
+    function cancelSeedStep(row) {
+        if (!row.seedStepTimer) return;
+        clearTimeout(row.seedStepTimer);
+        row.seedStepTimer = 0;
+        row.editStart = row.seedStepBase;
+    }
+    function paintSeedSteps(row) {
+        const label = row.labelOptimistic || row.spec.label || "seed";
+        const can = !!row.input && !row.input.disabled && editable(row.spec);
+        const bounds = seedBounds(row.spec, seedCeiling()), text = can ? readInput(row) : "";
+        for (const [button, direction, verb] of [[row.seedUp, 1, "Increase"], [row.seedDown, -1, "Decrease"]]) {
+            setButtonDisabled(button, !can || stepSeed(text, direction, bounds) === null);
+            button.setAttribute("aria-label", `${verb} ${label}`);
+            button.title = `${verb} ${label}`;
+        }
+    }
+    // ── Text box heights ────────────────────────────────────────────────────
+    // A multiline text box keeps the height it was dragged to, per Control,
+    // in this browser (presentation only). The browser's resize handle writes
+    // the inline height; styleRow puts the remembered one back on every render
+    // except while a drag is in progress.
+    function watchTextHeight(row, bindingId) {
+        row.heightKey = `text:${bindingId}`;
+        row.input.addEventListener("pointerdown", () => {
+            row.resizing = true;
+            // A release anywhere ends the drag, also outside the box.
+            (globalThis.window || globalThis).addEventListener?.("pointerup", () => {
+                row.resizing = false;
+                rememberTextHeight(row);
+            }, { once: true });
+        });
+        if (globalThis.ResizeObserver) {
+            row.resizeObserver = new ResizeObserver(() => rememberTextHeight(row));
+            row.resizeObserver.observe(row.input);
+        }
+    }
+    function rememberTextHeight(row) {
+        if (destroyed || !row.heightKey || !row.input) return;
+        const height = parseFloat(row.input.style.height);
+        if (!Number.isFinite(height)) return;
+        const next = clampTextHeight(height);
+        if (next !== textHeights.value(row.heightKey)) textHeights.remember(row.heightKey, next);
+    }
+    function rememberedTextHeight(row) {
+        const height = row.heightKey ? textHeights.value(row.heightKey) : null;
+        return Number.isFinite(height) ? `${clampTextHeight(height)}px` : "";
+    }
     // Structural Manage actions (remove, hide, unhide) on one row.
     function structural(changes, button) {
         const affected = (host.getView().presets || []).filter(p => p.members.some(m => `binding:${m.binding_id}:remove` in changes)
@@ -1024,7 +1123,9 @@ export function mountControlsPanel(container, host) {
                 }
                 if (spec.min != null) row.input.min = String(spec.min);
                 if (spec.max != null) row.input.max = String(spec.max);
-                if (spec.kind === "INT") row.input.step = "1";
+                // The node's declared step: the input steps from `min`, as the
+                // canvas widget rounds (frontend 1.57 `useIntWidget`).
+                if (spec.kind === "INT") row.input.step = intStep(spec);
                 if (spec.kind === "FLOAT") row.input.step = String(spec.step || "any");
                 row.control.append(row.picker?.box || row.input);
                 row.input.addEventListener("focus", () => {
@@ -1043,6 +1144,19 @@ export function mountControlsPanel(container, host) {
                 });
                 row.input.addEventListener("compositionstart", () => (row.composing = true));
                 row.input.addEventListener("compositionend", () => (row.composing = false));
+                if (row.input.tagName === "TEXTAREA" && spec.binding_id) watchTextHeight(row, spec.binding_id);
+            }
+            if (spec.kind === "SEED" && row.input && !row.picker) {
+                row.seedSteps = make("span");
+                row.seedSteps.style.cssText = S.seedStepsCss;
+                row.seedUp = seedStepButton(row, 1);
+                row.seedDown = seedStepButton(row, -1);
+                row.seedSteps.append(row.seedUp, row.seedDown);
+                row.control.append(row.seedSteps);
+                row.input.addEventListener("input", () => {
+                    cancelSeedStep(row);
+                    paintSeedSteps(row);
+                });
             }
             if (spec.kind === "SEED") {
                 row.mode = make("select");
@@ -1103,15 +1217,21 @@ export function mountControlsPanel(container, host) {
         if (manageOn && row.grip) row.el.style.paddingRight = `${SPACE.s5}px`;
         if (!row.line) return;
         const inline = spec.kind === "BOOLEAN";
-        row.line.style.cssText = S.lineCss({ cards: isCards, stacked, inline });
+        // A seed's field, steps and mode don't fit beside a label in a narrow
+        // sidebar (the number shrank to a sliver): its label goes above them.
+        row.line.style.cssText = S.lineCss({ cards: isCards, stacked: stacked || spec.kind === "SEED", inline });
         row.label.style.cssText = S.labelCss(isCards);
         row.control.style.cssText = S.controlCss({ cards: isCards, alignEnd: true });
         if (!row.input) return;
+        const draggedHeight = row.input.style.height;
         if (spec.kind === "BOOLEAN") row.input.style.cssText = "margin:0;cursor:pointer;";
         else if (["INT", "FLOAT"].includes(spec.kind)) row.input.style.cssText = S.numberInputCss(isCards);
         else if (spec.kind === "SEED") row.input.style.cssText = S.seedInputCss;
         else row.input.style.cssText = S.inputCss + (row.input.tagName === "SELECT" ? "cursor:pointer;" : "")
-            + (stacked ? "min-height:60px;resize:vertical;" : "");
+            + (stacked ? `min-height:${TEXT_HEIGHT_MIN}px;resize:vertical;` : "");
+        // The cssText above drops the height a user dragged to; put back the
+        // remembered one, or keep the live one while the drag is still going.
+        if (row.heightKey) row.input.style.height = row.resizing ? draggedHeight : rememberedTextHeight(row);
     }
     function styleMirror(row) {
         const isCards = cards();
@@ -1155,6 +1275,9 @@ export function mountControlsPanel(container, host) {
         return [tooltip, row.offReason?.textContent].filter(Boolean).join("\n");
     }
     function dropRow(row) {
+        clearTimeout(row.seedStepTimer);
+        row.seedStepTimer = 0;
+        row.resizeObserver?.disconnect();
         for (const detach of row.tipDetach || []) detach();
         row.picker?.destroy();
         row.editor?.destroy();
@@ -1251,8 +1374,11 @@ export function mountControlsPanel(container, host) {
             }
             row.input.min = spec.min == null ? "" : String(spec.min);
             row.input.max = spec.max == null ? "" : String(spec.max);
-            setInput(row, row.optimistic ?? spec.value);
+            if (spec.kind === "INT" && row.input.type === "number") row.input.step = intStep(spec);
+            // A seed step still waiting to save keeps its text.
+            if (!row.seedStepTimer) setInput(row, row.optimistic ?? spec.value);
         }
+        if (row.seedSteps) paintSeedSteps(row);
         if (row.mode) {
             row.mode.disabled = !editable(spec) || spec.seed_mode == null;
             row.mode.title = spec.seed_mode == null ? "This seed has no mode on this host." : "";
@@ -1286,6 +1412,7 @@ export function mountControlsPanel(container, host) {
             row.noteMore.type = "button";
             row.noteMore.dataset.noteMore = "true";
             row.noteMore.style.cssText = S.quietLineCss;
+            row.noteMore.hidden = true; // until measured, so a short note never flashes it
             row.noteMore.addEventListener("click", () => { row.noteExpanded = !row.noteExpanded; clampNote(row); });
             note.after(row.noteMore);
         }
@@ -1303,10 +1430,15 @@ export function mountControlsPanel(container, host) {
         if (!row.noteMore) return;
         setText(row.noteMore, row.noteExpanded ? "Less" : "More");
         row.noteMore.setAttribute("aria-expanded", String(!!row.noteExpanded));
-        row.noteMore.hidden = true;
-        if (!clamp) return;
+        if (!clamp) {
+            row.noteMore.hidden = true;
+            return;
+        }
         // Shown only when the note overflows its two lines (or is expanded),
         // measured once per frame for every note: all reads, then all writes.
+        // Until then it keeps its visibility: a render from a field's blur
+        // runs between a press on More and its release, and hiding it there
+        // dropped that first click (G1-F01).
         noteChecks.add(row);
         noteFrame = noteFrame || requestAnimationFrame(checkNotes);
     }
@@ -1580,7 +1712,14 @@ export function mountControlsPanel(container, host) {
             if (row.mode === document.activeElement) return PRESERVE_DEFAULT;
             if (row.composing || e.isComposing || e.keyCode === 229) return PRESERVE_DEFAULT;
             if (row.picker && row.picker.keydown(e)) return true;
+            // A seed's field steps like a number input, exactly (BigInt).
+            if (row.seedSteps && row.input === document.activeElement && (e.key === "ArrowUp" || e.key === "ArrowDown")
+                    && !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+                stepRow(row, e.key === "ArrowUp" ? 1 : -1);
+                return true;
+            }
             if (e.key === "Escape") {
+                cancelSeedStep(row);
                 row.suppress = true;
                 setInput(row, row.editStart);
                 row.input.blur();
@@ -1609,6 +1748,11 @@ export function mountControlsPanel(container, host) {
         // Snapshot before awaiting anything: a run save that settles while
         // the note saves was still in flight when the caller asked.
         const blocking = new Set(runPending);
+        // A seed step still waiting for its pause saves now: the run uses it.
+        for (const row of rows.values()) {
+            const saving = flushSeedStep(row);
+            if (saving) blocking.add(saving);
+        }
         const closing = noteEditor ? closeNote(true) : null;
         const row = [...rows.values()].find(row => row.input === document.activeElement);
         if (row && !row.picker) {
@@ -1628,6 +1772,8 @@ export function mountControlsPanel(container, host) {
         render,
         flushPending,
         destroy() {
+            // A waiting seed step is a value the user chose: it still saves.
+            for (const row of rows.values()) void flushSeedStep(row);
             if (noteEditor) void closeNote(false);
             for (const group of groups.values()) group.renaming?.close(false);
             if (manageOn) host.setManage?.(false, "");
@@ -1642,6 +1788,7 @@ export function mountControlsPanel(container, host) {
             for (const row of rows.values()) {
                 row.picker?.destroy();
                 row.editor?.destroy();
+                row.resizeObserver?.disconnect();
             }
             unsubscribe?.();
             // A remounted panel (a workflow switch) declares its own interest.

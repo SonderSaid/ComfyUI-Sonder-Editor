@@ -94,12 +94,61 @@ def format_reference_prompt(*, item=None, members=None, recipe=None) -> tuple[st
     # prefix - "Edit as override" seeds the override from this aggregate, so
     # re-appending would emit the closing label twice. `p01..p16` carry
     # `fragments`, never the aggregate, because the suffix closes the whole
-    # block rather than each member. And multi-lane decoding sources the suffix
-    # from lane 0 only, as `reference_core.decode_reference_prompts` already does
-    # for the prefix.
+    # block rather than each member. And co-selected lanes share one block
+    # (their recipes are identical); a co-selected lane's override joins that
+    # block as its part of the body (`compose_multi_lane_prompt`).
     aggregate = override or " ".join(value for value in (
         prefix, ", ".join(value for value in fragments if value), suffix) if value)
     return aggregate, fragments
+
+
+def _strip_recipe_ends(text: str, prefix: str, suffix: str) -> str:
+    """``text`` without the recipe's exact opening and closing lines.
+
+    An end is dropped only as a whole word (a prefix "A video of" leaves
+    "A video offering" alone), and the separator it leaves behind goes with
+    it, so the joined block never reads ",,".
+    """
+    if prefix and text.startswith(prefix):
+        rest = text[len(prefix):]
+        if not rest or not (prefix[-1].isalnum() and rest[0].isalnum()):
+            text = rest.lstrip(" ,;")
+    if suffix and text.endswith(suffix):
+        rest = text[:-len(suffix)]
+        if not rest or not (suffix[0].isalnum() and rest[-1].isalnum()):
+            text = rest.rstrip(" ,;")
+    return text.strip()
+
+
+def compose_multi_lane_prompt(*, lanes=None, recipe=None) -> str:
+    """The one prompt block of several co-selected lanes, in lane order.
+
+    ``lanes`` holds, per present lane, ``{"override": str, "fragments": [str]}``.
+    A lane without an override contributes its members' fragments; a lane with
+    one contributes its text as that lane's part of the body. The recipe's
+    prefix and suffix open and close the block once. An override made with
+    *Edit as override* holds both ends (it was seeded from the rendered
+    prompt), so an end it starts or finishes with, exactly, is dropped here
+    rather than repeated; an edited end is not recognized and stays. Stored
+    overrides are never changed: this runs only while the prompt is built.
+    A lone lane never comes here: its override replaces its whole grammar.
+    """
+    recipe = recipe if isinstance(recipe, dict) else {}
+    soft = recipe.get("soft") if isinstance(recipe.get("soft"), dict) else {}
+    prefix = str(soft.get("prompt_prefix") or "").strip()
+    suffix = str(soft.get("prompt_suffix") or "").strip()
+    parts: list[str] = []
+    for lane in lanes if isinstance(lanes, list) else []:
+        if not isinstance(lane, dict):
+            continue
+        override = str(lane.get("override") or "").strip()
+        if not override:
+            parts.extend(str(value) for value in (lane.get("fragments") or []) if value)
+            continue
+        override = _strip_recipe_ends(override, prefix, suffix)
+        if override:
+            parts.append(override)
+    return " ".join(value for value in (prefix, ", ".join(parts), suffix) if value)
 
 
 def as_plain_record(value) -> dict:

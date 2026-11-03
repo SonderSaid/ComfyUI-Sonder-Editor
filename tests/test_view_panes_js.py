@@ -1317,3 +1317,109 @@ out.teardown = header.children.length;
     assert out["pickerOpen"] is True and out["pickerClosed"] is True
     assert out["headerBar"] == ["nowrap", "nowrap"]
     assert out["teardown"] == 0
+
+
+def test_another_tab_follows_a_return_to_the_default_layout():
+    # The default layout is stored whole and dated (hardening Phase 5): the
+    # other tab orders it by `ts` instead of finding nothing and keeping two panes.
+    out = run_coordinator("""
+c.setLayout({count: 2}); await settle();
+const tabB = createViewsCoordinator({ host: () => host, controls, layoutStore, audio, notify: () => {},
+    now: () => clock, setTimer: () => 0, clearTimer: () => {}, raf: fn => (fn(), 1), documentRef: document });
+tabB.start(); await settle();
+out.before = tabB.layout().count;
+clock += 10;
+c.setLayout({count: 1}); await settle();
+const stored1 = stored.get('c:wf');
+out.storedDefault = [stored1?.count, stored1?.ts > 1000, Array.isArray(stored1?.panes)];
+tabB.storedLayoutChanged(); await settle();
+out.after = tabB.layout().count;
+// An older record never wins over a newer one.
+stored.set('c:wf', {...stored1, count: 3, ts: 1});
+tabB.storedLayoutChanged(); await settle();
+out.olderIgnored = tabB.layout().count;
+// A record missing altogether (an older build) still reads as the default.
+stored.delete('c:wf'); key = 'c:other';
+const tabC = createViewsCoordinator({ host: () => host, controls, layoutStore, audio, notify: () => {},
+    now: () => clock, setTimer: () => 0, clearTimer: () => {}, raf: fn => (fn(), 1), documentRef: document });
+tabC.start(); await settle();
+out.missing = tabC.layout().count;
+""")
+    assert out["before"] == 2
+    assert out["storedDefault"] == [1, True, True]
+    assert out["after"] == 1
+    assert out["olderIgnored"] == 1
+    assert out["missing"] == 1
+
+
+def test_a_click_clears_the_segment_focus_ring_and_a_key_brings_it_back():
+    # G3-F01: clicking the segment that already has keyboard focus fires no new
+    # focus, so the ring stayed. The pointer clears it; a key press restores it.
+    script = COORDINATOR.replace("COORD_URL", url("views_coordinator.js")).replace("AUDIO_URL", url("audio_ownership.js")) + f"""
+const {{ mountViewPanes }} = await import({url("view_panes.js")});
+const root = document.createElement('div'), header = document.createElement('div');
+document.body.append(root, header);
+const sourceHost = {{ driverLanes: () => [], driverLabel: i => `Driver ${{i + 1}}`, getScene: () => ({{ guide_frames: [] }}),
+    sceneAspect: () => 16 / 9, frame: () => 0, totalFrames: () => 48, isGuideTrackHidden: () => false, clock: {{ subscribe: () => () => {{}} }} }};
+const panes = mountViewPanes({{ root, header, coordinator: c, audio, sourceHost, cache: {{}}, placeComposite: () => {{}} }});
+flushRaf();
+const seg = header.find(el => el.dataset.sonderPaneCount === '2');
+const ring = () => /outline:2px solid/.test(seg.style.cssText);
+seg.dispatch('keydown'); flushRaf();
+out.keyboard = ring();
+seg.dispatch('pointerdown'); flushRaf();
+out.afterClick = ring();
+seg.dispatch('keydown'); flushRaf();
+out.afterKey = ring();
+panes.destroy();
+"""
+    out = node_run(script + "\nconsole.log('RESULT=' + JSON.stringify(out));")
+    assert out == {"keyboard": True, "afterClick": False, "afterKey": True}
+
+
+def test_a_seek_while_playing_runs_one_loop_from_the_new_frame():
+    # Hardening Phase 5: the progress bar's seek restarts playback at the
+    # clicked frame through stop and start. One tick loop only (a second would
+    # never end), "return to playback start" still returns to where Play was
+    # pressed, and a seek outside the loop range ends the loop.
+    out = node_run(FAKE_DOM + f"""
+let rafId = 0; const pending = new Map();
+globalThis.requestAnimationFrame = cb => {{ const id = ++rafId; pending.set(id, cb); return id; }};
+globalThis.cancelAnimationFrame = id => {{ pending.delete(id); }};
+const runTick = t => {{ const [[id, cb]] = [...pending]; pending.delete(id); cb(t); }};
+const {{ createViewportSurface }} = await import({url("viewport_surface.js")});
+let frame = 5, loop = {{ start: 0, end: 24 }};
+const make = () => createViewportSurface({{
+    canvas: {{ width: 320, height: 180, getContext: () => ctxProxy }},
+    getScene: () => ({{ clips: [], guide_frames: [], audio_tracks: [] }}),
+    getFrame: () => frame, setFrame: v => {{ frame = v; }}, getTotalFrames: () => 48, getFps: () => 24,
+    getAssetForSourcePath: () => null, buildViewUrl: p => p, getLoopRange: () => loop,
+    shouldReturnToPlaybackStart: () => true,
+}});
+const surface = make();
+const out = {{}};
+out.notPlaying = surface.seekPlayback(30);
+surface.startPlayback();
+out.afterStart = pending.size;
+out.inside = [surface.seekPlayback(10), frame, pending.size, surface.getClock().anchor.startFrame];
+// Inside the loop it keeps looping: a tick past the end goes back to its start.
+let anchor = surface.getClock().anchor;
+runTick(anchor.startTimeMs + (20 / 24) * 1000 + 1);
+out.looped = frame;
+// Outside the loop the loop ends: the tick plays on past it.
+out.outside = [surface.seekPlayback(30), frame, pending.size];
+anchor = surface.getClock().anchor;
+runTick(anchor.startTimeMs + (10 / 24) * 1000 + 1);
+out.playedOn = frame;
+// Stop returns to where Play was pressed, not to a seek.
+surface.stopPlayback();
+out.stopped = [frame, pending.size];
+console.log('RESULT=' + JSON.stringify(out));
+""")
+    assert out["notPlaying"] is False
+    assert out["afterStart"] == 1
+    assert out["inside"] == [True, 10, 1, 10]
+    assert out["looped"] == 0
+    assert out["outside"] == [True, 30, 1]
+    assert out["playedOn"] == 40
+    assert out["stopped"] == [5, 0]

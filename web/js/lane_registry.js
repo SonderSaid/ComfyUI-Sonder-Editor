@@ -322,6 +322,14 @@ export function laneLabel(scene, trackType, laneIndex, customName = "") {
     return count > 1 ? `${descriptor.labelPrefix}${laneIndex + 1}` : descriptor.labelSingular;
 }
 
+// The name a lane shows wherever it is named: its own name, else the default
+// label. The timeline header and the Views pane picker both read it here.
+export function laneDisplayName(scene, trackType, laneIndex) {
+    const descriptor = descriptorFor(trackType);
+    const config = descriptor?.variable ? scene?.[descriptor.configsField]?.[laneIndex] : scene?.[descriptor?.fixedConfigField];
+    return String(config?.name || "") || laneLabel(scene, trackType, laneIndex);
+}
+
 export function isRenderClip(clip) {
     return !clip?.role || clip.role === "render";
 }
@@ -399,7 +407,7 @@ export function buildTrackLayout({ scene, collapsedKeys = null, theme = {} } = {
                 const config = configs[laneIndex] || {};
                 layout.push({
                     type: descriptor.trackType,
-                    label: config.name || laneLabel(scene, descriptor.trackType, laneIndex),
+                    label: laneDisplayName(scene, descriptor.trackType, laneIndex),
                     customName: config.name || "",
                     laneIndex,
                     collapsed: collapsedKeys?.has(laneCollapseKey(scene, descriptor, laneIndex)) || false,

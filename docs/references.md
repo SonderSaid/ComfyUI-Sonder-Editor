@@ -362,7 +362,9 @@ derived text; **Edit as override** starts an editable version for that item.
 Edit the box and leave it to save; Esc reverts the unsaved edit. **Clear**
 removes the override and returns to the recipe's text.
 
-These overrides affect the Prompt Bridge and Generic chips. For
+These overrides affect the Prompt Bridge and Generic chips. When several
+lanes share one Selector, each lane's override replaces only that lane's part
+of the Prompt Bridge's combined prompt (see [Wiring the nodes](#wiring-the-nodes)). For
 **MiniMax H3 (full reference)**, author the Subject or Picture chip's fields
 instead; see [below](#minimax-h3-full-reference).
 
@@ -557,10 +559,26 @@ It emits:
 - `reference_strength` — the authored strength of the first effective lane in
   lane order, or `0.0`.
 
-Co-selected lanes must agree. A candidate whose media kind,
-recipe settings, or prompt override differs from the lanes already selected is
-listed but disabled, with the reason shown; a blank or detached recipe can only
-be selected alone.
+Co-selected lanes must agree. A candidate whose media kind or recipe
+settings differ from the lanes already selected is listed but disabled, with
+the reason shown; a blank or detached recipe can only be selected alone. A
+prompt override is no reason: lanes with different overrides can be selected
+together.
+
+The Prompt Bridge's `reference_prompt` is one block for all selected lanes,
+in lane order: the recipe's opening line, each lane's part, then its closing
+line. A lane without an override contributes its members' prompts. A lane
+with an override contributes the override instead. If that override starts
+with the recipe's opening line or ends with its closing line exactly (as an
+override made with **Edit as override** does), those lines are left out, so
+they appear only once. An override whose opening or closing line you edited
+keeps it as written. A lane selected on its own uses its override as the
+whole prompt.
+
+If the recipe numbers its images in the prompt (for example `image0`,
+`image1`), an override counts from the first image of its own lane. When the
+lane is selected after other lanes, its images sit later in the combined
+list, so check and correct those numbers in the override.
 
 Each Bridge exposes 16 numbered outputs:
 

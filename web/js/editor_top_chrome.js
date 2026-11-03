@@ -455,6 +455,64 @@ export function buildEditorSceneBar(widget, { sceneBarHeight = 36 } = {}) {
     );
 }
 
+// Below this width (unscaled CSS px) the four groups no longer fit side by
+// side: their items overlapped at a 600 px Sonder App window. The toolbar then
+// stacks them on rows: history and utilities share the first, the tools and
+// the scene geometry take a full row each. It goes back above the second
+// width, so a width near the threshold never flips back and forth.
+export const TOOLBAR_NARROW_BELOW = 760;
+export const TOOLBAR_WIDE_ABOVE = 800;
+
+export function toolbarNarrowNext(narrow, width) {
+    if (!(width > 0)) return narrow;
+    return narrow ? width <= TOOLBAR_WIDE_ABOVE : width < TOOLBAR_NARROW_BELOW;
+}
+
+export function applyNarrowToolbar(parts, narrow) {
+    const { toolbar, history, tools, geometry, utils, dividers } = parts;
+    // The wide layout's own values, read before the first narrow write: the
+    // geometry group's basis comes from its `flex` shorthand (720px), and
+    // clearing the longhand would leave `auto`.
+    const wide = parts.wide || (parts.wide = {
+        toolsBasis: tools.style.flexBasis, geometryBasis: geometry.style.flexBasis,
+        geometryMargin: geometry.style.marginLeft, utilsMargin: utils.style.marginLeft,
+    });
+    toolbar.style.flexWrap = narrow ? "wrap" : "nowrap";
+    history.style.order = narrow ? "0" : "";
+    utils.style.order = narrow ? "1" : "";
+    utils.style.marginLeft = narrow ? "auto" : wide.utilsMargin;
+    tools.style.order = narrow ? "2" : "";
+    tools.style.flexBasis = narrow ? "100%" : wide.toolsBasis;
+    geometry.style.order = narrow ? "3" : "";
+    geometry.style.flexBasis = narrow ? "100%" : wide.geometryBasis;
+    geometry.style.marginLeft = narrow ? "0" : wide.geometryMargin;
+    for (const divider of dividers) divider.style.display = narrow ? "none" : "";
+}
+
+// Shared by every host: the toolbar is the same in fullscreen, mounted and the
+// Sonder App, so the narrow layout follows the width wherever it is.
+function watchNarrowToolbar(widget, parts) {
+    if (typeof ResizeObserver !== "function") return;
+    let narrow = false;
+    const check = () => {
+        const scale = Number(widget._scaleToolbar) > 0 ? Number(widget._scaleToolbar) : 1;
+        // The wrapper's width is the space the scaled toolbar has; unscale it.
+        const next = toolbarNarrowNext(narrow, widget._toolbarWrap.clientWidth / scale);
+        if (next === narrow) return;
+        narrow = next;
+        applyNarrowToolbar(parts, narrow);
+        // The rows changed the toolbar's height: reserve it again, and in
+        // fullscreen refit and redraw the timeline under it (as a window resize does).
+        if (widget.isFullscreen) {
+            widget._recalcFullscreenHeights?.();
+            widget._renderTimeline?.();
+        } else widget._reserveToolbarHeight?.();
+    };
+    widget._toolbarResizeObserver?.disconnect();
+    widget._toolbarResizeObserver = new ResizeObserver(check);
+    widget._toolbarResizeObserver.observe(widget._toolbarWrap);
+}
+
 export function buildEditorToolbar(widget) {
     const toolbar = document.createElement("div");
     // The toolbar is `flex-wrap: nowrap`: it holds four group children (history, tools, geometry,
@@ -743,10 +801,11 @@ export function buildEditorToolbar(widget) {
 
     // Group boundaries: history │ tools  …gap…  geometry │ utilities. The tools↔geometry boundary
     // is the margin-left:auto gap (a stronger separator than a line), so no divider is placed there.
+    const historyDivider = makeGroupDivider(), utilsDivider = makeGroupDivider();
     toolbar.append(
-        toolbarHistoryGroup, makeGroupDivider(),
+        toolbarHistoryGroup, historyDivider,
         toolbarToolsGroup,
-        widget._sceneGeometryGroup, makeGroupDivider(),
+        widget._sceneGeometryGroup, utilsDivider,
         toolbarUtilsGroup
     );
 
@@ -762,6 +821,10 @@ export function buildEditorToolbar(widget) {
     widget._toolbarWrap.style.cssText = "width:100%; overflow:visible; box-sizing:border-box; flex-shrink:0;";
     widget._toolbarWrap.appendChild(toolbar);
     widget.container.appendChild(widget._toolbarWrap);
+    watchNarrowToolbar(widget, {
+        toolbar, history: toolbarHistoryGroup, tools: toolbarToolsGroup,
+        geometry: widget._sceneGeometryGroup, utils: toolbarUtilsGroup, dividers: [historyDivider, utilsDivider],
+    });
     wireForegroundPill(widget);
     syncLauncherButton(widget);
     updateEditorToolbar(widget);

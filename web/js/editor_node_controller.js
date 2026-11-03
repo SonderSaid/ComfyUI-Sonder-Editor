@@ -842,7 +842,7 @@ class FullscreenEditorSession {
         this.controller._setWidgetValue("mask_pre_offset", state.maskPreOffset || 0);
         this.controller._setWidgetValue("mask_post_offset", state.maskPostOffset || 0);
         editor._refreshContextInputs();
-        editor.refresh(["queue"]);
+        // updateProject already read the queue (every host does, collapsed or not).
         editor._enterFullscreen();
     }
 

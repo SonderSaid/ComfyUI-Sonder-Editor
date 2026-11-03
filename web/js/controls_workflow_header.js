@@ -10,10 +10,11 @@ import { setText } from "./controls_dom_order.js";
 let serial = 0;
 
 // Workflow ▾ (Sonder App only, through the host's `workflows` capability):
-// favorites first, a star for the current workflow. Selecting one saves the
+// favorites first, a star for the current workflow. Selecting one is refused
+// while the panel is busy (a choice loading, a Manage save), then saves the
 // panel's edits, asks about Manage drafts, then lets the host switch; on
 // success the editor remounts the panel for the new workflow.
-function mountWorkflowMenu(workflows, { flushPending, notify, canSwitch }) {
+function mountWorkflowMenu(workflows, { flushPending, notify, canSwitch, busyReason }) {
     const row = document.createElement("div"), label = document.createElement("span"),
         select = document.createElement("select"), star = document.createElement("button");
     row.dataset.controlsWorkflowMenu = "true";
@@ -73,11 +74,24 @@ function mountWorkflowMenu(workflows, { flushPending, notify, canSwitch }) {
     select.addEventListener("change", async () => {
         const id = select.value;
         if (switching || !id || id === current().template_id) return;
+        // Refused before anything saves: waiting would switch on its own once
+        // the load finishes, which the user never asked for.
+        const busy = busyReason();
+        if (busy) {
+            notify(busy);
+            paint();
+            return;
+        }
         switching = true;
         paint();
         try {
             if (!await flushPending()) {
                 notify("The workflow was not switched because a Control could not be saved.");
+                return;
+            }
+            const stillBusy = busyReason();
+            if (stillBusy) {
+                notify(stillBusy);
                 return;
             }
             if (!canSwitch()) return;
@@ -106,13 +120,13 @@ function mountWorkflowMenu(workflows, { flushPending, notify, canSwitch }) {
     return { el: row, paint, destroy() { destroyed = true; row.remove(); } };
 }
 
-export function mountWorkflowHeader(host, { flushPending, notify, canSwitch = () => true }) {
+export function mountWorkflowHeader(host, { flushPending, notify, canSwitch = () => true, busyReason = () => "" }) {
     const el = document.createElement("section"), description = document.createElement("div"),
         more = document.createElement("button"), body = document.createElement("div");
     el.dataset.controlsWorkflowHeader = "true";
     el.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;`;
     body.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;`;
-    const workflowMenu = host.workflows ? mountWorkflowMenu(host.workflows, { flushPending, notify, canSwitch }) : null;
+    const workflowMenu = host.workflows ? mountWorkflowMenu(host.workflows, { flushPending, notify, canSwitch, busyReason }) : null;
     more.type = "button";
     more.style.cssText = quietLineCss;
     body.append(description, more);

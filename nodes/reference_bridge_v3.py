@@ -181,7 +181,10 @@ class SonderReferencePromptBridge(io.ComfyNode):
                 io.String.Output(
                     id="reference_prompt",
                     display_name="reference_prompt",
-                    tooltip="Prompt derived from the staged members, or the item's override.",
+                    tooltip=(
+                        "Prompt derived from the staged members. A lane's override replaces its own part; "
+                        "a lone lane's override replaces the whole prompt."
+                    ),
                 ),
                 io.String.Output(
                     id="reference_names",

@@ -485,6 +485,7 @@ import {
     laneAcceptsAssetType,
     laneCollapseKey,
     laneCountFor,
+    laneDisplayName,
     laneItemsForType,
     laneLabel,
     laneLayoutIndex,
@@ -788,6 +789,10 @@ const ITEM_TYPE_BY_LIST_FIELD = Object.freeze({ clips: "clip", audio_tracks: "au
  *  is still in flight: the write would name a member the server is removing. */
 const REFERENCE_MEMBER_BEING_DELETED = "That Library member is being deleted.";
 
+// An immediate drop refusal changed nothing: it clears itself, on its own
+// source so it never shares a lifetime with the server's sticky refusals
+// (`reference-stage-refused`), which coalesce by source.
+const REFERENCE_DROP_REFUSED = Object.freeze({ source: "reference-drop-refused", transient: true });
 const REFERENCE_DROP_REFUSALS = {
     locked: "That Reference lane is locked — unlock it on the lane header.",
     collapsed: "That Reference lane is collapsed — expand it to stage into it.",
@@ -4716,6 +4721,8 @@ export class EditorWidget {
     _viewsSourceHost() {
         if (this._viewsSourceHostApi) return this._viewsSourceHostApi;
         const driverCount = () => Math.max(0, Number(this.activeScene?.motion_driver_lane_count) || 0);
+        const driverName = (index) => (Number.isInteger(index) && index >= 0 && index < driverCount()
+            ? laneDisplayName(this.activeScene, TRACK_TYPE.MOTION_DRIVER, index) : `Driver ${Number(index) + 1}`);
         this._viewsSourceHostApi = {
             getScene: () => this.activeScene,
             frame: () => this.playhead,
@@ -4732,8 +4739,10 @@ export class EditorWidget {
             acquireSceneSource: (sourcePath, options) => this._ensureViewportSurface()?.acquireSceneSource?.(sourcePath, options)
                 || { ready: Promise.resolve(null), release() {} },
             clock: this._viewsClock(),
-            driverLanes: () => Array.from({ length: driverCount() }, (_, index) => ({ index, label: `Driver ${index + 1}` })),
-            driverLabel: (index) => `Driver ${index + 1}`,
+            // The lane's own name, as the timeline header shows it. A stored
+            // pane naming a lane the scene no longer has keeps its number.
+            driverLanes: () => Array.from({ length: driverCount() }, (_, index) => ({ index, label: driverName(index) })),
+            driverLabel: (index) => driverName(index),
         };
         return this._viewsSourceHostApi;
     }
@@ -4915,8 +4924,10 @@ export class EditorWidget {
             // drag. The library reaches the notification bus only through this
             // seam, and `host.notify?.()` optional-chains into silence when the
             // host forgets it — so the mixed-kind refusal explained nothing.
+            // Its only caller is an immediate refusal that changed nothing,
+            // so it clears itself (transient) rather than staying for minutes.
             notify: (message) => notifyWarning(String(message || ""),
-                { source: "reference-drag-refused" }),
+                { source: "reference-drag-refused", transient: true }),
         });
     }
 
@@ -6699,6 +6710,7 @@ export class EditorWidget {
                 );
                 const queue = Array.isArray(result?.payload?.queue) ? result.payload.queue : [];
                 this._renderQueue = queue;
+                this._renderQueueKnown = true;
                 this._applyStoredQueueBatchCollapseState();
                 this._renderQueuePanel();
                 return result;
@@ -9657,16 +9669,21 @@ export class EditorWidget {
     _updateGenReadout() {
         if (!this._genReadout) return;
         const draft = this._selectionDraftAnchor;
+        const start = Math.max(0, Math.round(Number(this.selectionStart) || 0));
+        const end = Math.max(start, Math.round(Number(this.selectionEnd) || 0));
+        const selected = end - start;
         if (draft) {
             const label = draft.edge === "start" ? "In" : "Out";
             const next = draft.edge === "start" ? "Out" : "In";
             this._genReadout.textContent = `${label} ${this._frameToTimecode(draft.frame)} set · Choose ${next}`;
+            // A half-set selection is a draft: it clears the stored range
+            // (`_setSelectionDraft`), and Generate sends the editor's own
+            // values, so it runs the full scene until the draft completes.
+            this._genReadout.title = `Until you choose ${next}, Generate uses the full scene.`;
             this._updateGenDurationHint(0);
             return;
         }
-        const start = Math.max(0, Math.round(Number(this.selectionStart) || 0));
-        const end = Math.max(start, Math.round(Number(this.selectionEnd) || 0));
-        const selected = end - start;
+        this._genReadout.title = "";
         if (selected <= 0) {
             this._genReadout.textContent = "Full scene";
             this._updateGenDurationHint(0);
@@ -13582,12 +13599,12 @@ export class EditorWidget {
     async _placeReferencePayloadWithinGesture(payload, frame, trackRawY) {
         if (!this.activeScene || !this.projectDir || !Array.isArray(payload?.members) || !payload.members.length) return;
         if (payload.members.some((member) => this._referenceMemberBeingDeleted(member?.member_id))) {
-            notifyWarning(REFERENCE_MEMBER_BEING_DELETED, { source: "reference-stage-refused" });
+            notifyWarning(REFERENCE_MEMBER_BEING_DELETED, REFERENCE_DROP_REFUSED);
             return;
         }
         const mediaKind = this._referencePayloadMediaKind(payload);
         if (!mediaKind) {
-            notifyWarning("Stage image/video references separately from voice-reference audio.", { source: "reference-stage-refused" });
+            notifyWarning("Stage image/video references separately from voice-reference audio.", REFERENCE_DROP_REFUSED);
             return;
         }
         const scene = this.activeScene;
@@ -13627,7 +13644,7 @@ export class EditorWidget {
             if (verdict.verdict !== "create") {
                 notifyWarning(REFERENCE_DROP_REFUSALS[verdict.reason]
                     || REFERENCE_DROP_REFUSALS.default,
-                    { source: "reference-stage-refused" });
+                    REFERENCE_DROP_REFUSED);
                 return;
             }
         }
@@ -22509,7 +22526,7 @@ export class EditorWidget {
                         ? "Nothing was cut: the timeline was already divided there."
                         : `Nothing was cut: none of the ${operations.length} items `
                             + "were divided at that frame.",
-                    { source: "timeline-split-no-effect", durationMs: 6000 });
+                    { source: "timeline-split-no-effect", transient: true });
                 await this._fetchScenes(
                     { ignoreMutationGate: true, reason: "split_no_effect" });
                 return;
@@ -24025,7 +24042,11 @@ export class EditorWidget {
         progressWrap.addEventListener("click", (e) => {
             const rect = progressWrap.getBoundingClientRect();
             const pct = (e.clientX - rect.left) / rect.width;
-            this._setPlayhead(Math.round(pct * this.totalFrames), "progress-bar");
+            const frame = Math.round(pct * this.totalFrames);
+            // While playing, playback goes on from the clicked frame; a plain
+            // playhead write would be undone by the next playback tick.
+            if (this.isPlaying && this._seekPlayback(frame, "progress-bar")) return;
+            this._setPlayhead(frame, "progress-bar");
             this._onPlayheadChange();
         });
 
@@ -24448,26 +24469,34 @@ export class EditorWidget {
             }
 
             // ── Arrow keys: frame navigation ──
+            // While playing, a jump goes through the playback seek: a plain
+            // playhead write would be undone by the next playback tick. Each
+            // seek restarts playback, so a held key seeks once, not per repeat.
+            if (this.isPlaying && e.repeat && ["ArrowLeft", "ArrowRight", "Home", "End"].includes(key)) return true;
             if (key === "ArrowLeft") {
-                const step = shift ? 10 : 1;
-                this._setPlayhead(Math.max(0, this.playhead - step), "step");
+                const frame = Math.max(0, this.playhead - (shift ? 10 : 1));
+                if (this.isPlaying && this._seekPlayback(frame, "step")) return true;
+                this._setPlayhead(frame, "step");
                 this._onPlayheadChange();
                 return true;
             }
             if (key === "ArrowRight") {
-                const step = shift ? 10 : 1;
-                this._setPlayhead(Math.min(this.totalFrames, this.playhead + step), "step");
+                const frame = Math.min(this.totalFrames, this.playhead + (shift ? 10 : 1));
+                if (this.isPlaying && this._seekPlayback(frame, "step")) return true;
+                this._setPlayhead(frame, "step");
                 this._onPlayheadChange();
                 return true;
             }
 
             // ── Home / End ──
             if (key === "Home") {
+                if (this.isPlaying && this._seekPlayback(0, "home")) return true;
                 this._setPlayhead(0, "home");
                 this._onPlayheadChange();
                 return true;
             }
             if (key === "End") {
+                if (this.isPlaying && this._seekPlayback(this.totalFrames, "end")) return true;
                 this._setPlayhead(this.totalFrames, "end");
                 this._onPlayheadChange();
                 return true;
@@ -25930,6 +25959,7 @@ export class EditorWidget {
                 }
                 this._markStaleReplayApplied("queue", projectId);
                 this._renderQueue = Array.isArray(data) ? data : [];
+                this._renderQueueKnown = true;
                 this._applyStoredQueueBatchCollapseState();
                 this._renderQueuePanel();
             }
@@ -25955,7 +25985,10 @@ export class EditorWidget {
 
     _updateQueueHeaderLabel() {
         if (!this._queueHeaderLabel) return;
-        this._queueHeaderLabel.textContent = `${this._queueExpanded ? "▾" : "▸"} Render Queue (${(this._renderQueue || []).length})`;
+        // The list is empty until the server answers: the count shows only
+        // once the list is known, never a false 0.
+        const count = this._renderQueueKnown ? ` (${(this._renderQueue || []).length})` : "";
+        this._queueHeaderLabel.textContent = `${this._queueExpanded ? "▾" : "▸"} Render Queue${count}`;
     }
 
     _applyQueueExpandedState() {
@@ -28582,6 +28615,7 @@ export class EditorWidget {
         this._fetchProjectSettings();
 
         this._renderQueue = [];
+        this._renderQueueKnown = false;
         this._renderQueuePanel();
 
         // Entering a full editor surface explicitly owns discovery/repair.
@@ -28590,9 +28624,10 @@ export class EditorWidget {
             reason: "editor_surface_entry",
         }).then(() => this._fetchScenes());
         void this._fetchReferences({ reason: "load_project", force: true });
-        if (this._queueExpanded) {
-            this._fetchRenderQueue({ reason: "load_project" });
-        }
+        // Read even while collapsed: the header shows the count, and every
+        // later refresh reads the queue collapsed too (it read 0 on load,
+        // then 21 after the first take).
+        this._fetchRenderQueue({ reason: "load_project" });
         this._renderTimeline();
     }
 
@@ -29783,6 +29818,45 @@ export class EditorWidget {
         }
     }
 
+    // Playback goes on from `frame` (a seek while playing). The surface owns
+    // it when present; the fallback re-anchors its own clock and media, as
+    // `_restartPlaybackLoop` does, and a seek outside the loop range ends the
+    // loop. Returns false when not playing.
+    _seekPlayback(frame, reason = "seek") {
+        if (!this.isPlaying) return false;
+        const viewportSurface = this._viewportSurface;
+        if (viewportSurface?.seekPlayback) {
+            if (!viewportSurface.seekPlayback(frame)) return false;
+            // As a paused jump does: the frame stays on screen with auto-scroll off.
+            this._ensureFrameVisible(this.playhead);
+            this._updateToolbar();
+            return true;
+        }
+        const target = Math.max(0, Math.min(this.totalFrames, Math.round(Number(frame) || 0)));
+        if (target >= this.totalFrames) {
+            // The end stops there (see the surface's seekPlayback).
+            this._stopPlayback({ preservePlayhead: true });
+            this._setPlayhead(target, reason);
+            this._onPlayheadChange();
+            return true;
+        }
+        if (this._playbackRAF) cancelAnimationFrame(this._playbackRAF);
+        this._playbackRAF = null;
+        this._setPlayhead(target, reason);
+        const loop = this._playbackLoopRange;
+        if (loop && (this.playhead < loop.start || this.playhead >= loop.end)) this._playbackLoopRange = null;
+        this._playbackStartTime = performance.now();
+        this._playbackStartFrame = this.playhead;
+        this._maybeAutoScrollToPlayhead();
+        this._ensureFrameVisible(this.playhead);
+        this._startPlaybackMedia(this.playhead);
+        this._renderViewportFrame();
+        this._renderTimeline();
+        this._updateToolbar();
+        this._playbackRAF = requestAnimationFrame((nextTimestamp) => this._playbackTick(nextTimestamp));
+        return true;
+    }
+
     _restartPlaybackLoop(timestamp) {
         if (!this._playbackLoopRange) return;
         this._setPlayhead(this._playbackLoopRange.start, "playback-loop");
@@ -30127,6 +30201,8 @@ export class EditorWidget {
             this._vpResizeObserver.disconnect();
             this._vpResizeObserver = null;
         }
+        this._toolbarResizeObserver?.disconnect();
+        this._toolbarResizeObserver = null;
         this._unmountViewPanes();
         this._viewsCoordinator?.destroy();
         this._viewsCoordinator = null;

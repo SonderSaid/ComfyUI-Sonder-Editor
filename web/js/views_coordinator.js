@@ -31,7 +31,7 @@
 // fetch at a time; a 409 (a newer run took the node) reads once more, and a
 // refused preview is never asked for twice.
 import {
-    MAX_PANES, assignSource, cancelAvailability, isDefaultLayout, mediaStatus, normalizeLayout, paneCount, refusalText,
+    MAX_PANES, assignSource, cancelAvailability, mediaStatus, normalizeLayout, paneCount, refusalText,
     runAvailability, sameSource, samplingMediaStatus, samplingPaneStatus, viewPaneStatus,
 } from "./views_model.js";
 import { TIMELINE } from "./audio_ownership.js";
@@ -103,7 +103,10 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
     function persist() {
         if (!key) return; // no workflow id: nothing is remembered
         layout = { ...layout, ts: now() };
-        try { layoutStore.write(key, isDefaultLayout(layout) ? null : layout); } catch (error) { console.warn("[Sonder] Views layout save failed:", error); }
+        // The default is stored too, whole and dated: another tab on this
+        // workflow orders it by `ts` and follows a return to one pane. A whole
+        // record also replaces the old one under the settings deep merge.
+        try { layoutStore.write(key, layout); } catch (error) { console.warn("[Sonder] Views layout save failed:", error); }
     }
     function adoptKey() {
         const next = current()?.workflowKey?.() || "";

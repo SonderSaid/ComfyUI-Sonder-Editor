@@ -194,6 +194,7 @@ class Host {{
   _clearVideoCache() {{}}
   _fetchProjectSettings() {{}}
   _renderQueuePanel() {{}}
+  _fetchRenderQueue() {{}}
   _fetchAssets() {{ return Promise.resolve(); }}
   _fetchScenes() {{}}
   _fetchReferences() {{}}

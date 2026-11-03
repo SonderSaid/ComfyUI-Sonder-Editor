@@ -103,22 +103,24 @@ export function normalizeLayout(raw) {
     return record;
 }
 
-// One Composite pane and nothing else chosen: the default, never stored.
+// One Composite pane and nothing else chosen: the default. It is stored
+// dated like any layout, so another tab follows a return to it.
 export function isDefaultLayout(record) {
     const { ts: _ts, ...value } = normalizeLayout(record);
     const { ts: _fresh, ...fresh } = normalizeLayout(null);
     return JSON.stringify(value) === JSON.stringify(fresh);
 }
 
-// The browser-local map {workflowKey: record}: invalid and default records
-// dropped, the newest 64 kept (Writing drafts' LRU pattern).
+// The browser-local map {workflowKey: record}: invalid and undated records
+// dropped, the newest 64 kept (Writing drafts' LRU pattern). A dated default
+// stays: it is how another tab learns the layout went back to one pane.
 export function normalizeLayoutMap(raw) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
     const entries = [];
     for (const [key, value] of Object.entries(raw)) {
         if (typeof key !== "string" || !key || key.length > 200 || !value || typeof value !== "object") continue;
         const record = normalizeLayout(value);
-        if (!record.ts || isDefaultLayout(record)) continue;
+        if (!record.ts) continue;
         entries.push([key, record]);
     }
     entries.sort((a, b) => a[1].ts - b[1].ts);

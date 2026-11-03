@@ -1579,12 +1579,13 @@ console.log(JSON.stringify({{
     assert any("unparseable" in value for value in selected["disclosures"])
     assert all(entry["disabled"] for entry in selected["addable"])
     enabled = [entry["laneIndex"] for entry in out["anchoredAfterOrphan"]["addable"] if not entry["disabled"]]
-    assert enabled == [4], "the first resolvable selected lane anchors compatibility and override parity"
+    # A different prompt override (lane 0 "alpha" vs lane 2 "beta") is no reason (hardening Phase 5).
+    assert enabled == [0, 4], "the first resolvable selected lane anchors compatibility"
     assert any("inactive in this window" in value for value in out["inert"]["disclosures"])
     override_entry = next(
         entry for entry in out["overrideConflict"]["addable"] if entry["laneIndex"] == 2)
-    assert override_entry["disabled"] is True
-    assert "Prompt override" in override_entry["reason"]
+    assert override_entry["disabled"] is False
+    assert "override" not in override_entry["reason"]
     assert out["frozen"]["rows"][0]["status"].endswith("frozen job")
     assert out["unresolved"]["disabled"] is True
     assert out["unresolved"]["status"] == "Connect a Sonder Editor project."

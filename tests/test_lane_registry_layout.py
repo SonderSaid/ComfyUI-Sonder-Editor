@@ -222,3 +222,22 @@ def test_collapse_settings_writer_delegates_to_layout_key_authority():
     method = source.split("    _trackCollapseKey(entry) {", 1)[1].split("\n    }", 1)[0]
     assert "return laneCollapseKey(this.activeScene, descriptorFor(entry.type), entry.laneIndex || 0)" in method
     assert "reference_lane_recipes" not in method
+
+
+def test_lane_display_name_is_the_header_label_wherever_a_lane_is_named():
+    # Hardening Phase 5: the Views pane picker names a Driver lane as the
+    # timeline header does, its own name first, through this one helper.
+    module_url = (ROOT / "web" / "js" / "lane_registry.js").as_uri()
+    out = json.loads(_run_node(f"""
+const mod = await import({json.dumps(module_url)});
+const T = mod.LANE_DESCRIPTORS.find(d => d.laneType === "motion_driver").trackType;
+const one = {{ motion_driver_lane_count: 1, motion_driver_lane_configs: [{{}}] }};
+const two = {{ motion_driver_lane_count: 2, motion_driver_lane_configs: [{{ name: "Hero pass" }}, {{}}] }};
+const header = scene => mod.buildTrackLayout({{ scene }}).filter(row => row.type === T).map(row => row.label);
+console.log(JSON.stringify({{
+  one: [mod.laneDisplayName(one, T, 0), header(one)],
+  two: [mod.laneDisplayName(two, T, 0), mod.laneDisplayName(two, T, 1), header(two)],
+}}));
+"""))
+    assert out["one"] == ["Driver", ["Driver"]]
+    assert out["two"] == ["Hero pass", "Driver 2", ["Hero pass", "Driver 2"]]

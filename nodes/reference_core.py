@@ -35,6 +35,7 @@ from ..server.frozen_reference import decode_frozen_reference_catalog
 from ..server.reference_prompt_formatter import (
     PROJECT_SCOPED_PROMPT_TOKENS,
     build_reference_formatter_context,
+    compose_multi_lane_prompt,
     format_reference_prompt,
     member_prompt_fragment as _shared_member_prompt_fragment,
     reference_member_labels,
@@ -275,13 +276,8 @@ def _reference_conflicts(lanes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         recipe = wrapper.get("recipe") if isinstance(wrapper.get("recipe"), dict) else {}
         if recipe != base_recipe:
             add(lane["lane_index"], f"materialized recipe differs from lane {base['lane_index']}")
-
-    effective = [lane for lane in lanes if lane["has_reference"]]
-    if len(effective) > 1:
-        base_override = str(effective[0]["item"].get("prompt_override") or "")
-        for lane in effective[1:]:
-            if str(lane["item"].get("prompt_override") or "") != base_override:
-                add(lane["lane_index"], f"prompt override differs from lane {effective[0]['lane_index']}")
+    # A prompt override is not a conflict: it changes a lane's text, not its
+    # type, and `decode_reference_prompts` keeps each lane's own text.
     return [
         {"lane_index": lane_index, "reasons": reasons}
         for lane_index, reasons in sorted(conflicts.items())
@@ -1090,18 +1086,32 @@ def decode_reference_prompts(reference_set) -> tuple:
     if not any(context["present"] for context in contexts):
         return ("", "", *("" for _ in range(MAX_REFERENCE_SLOTS)))
     records = []
+    lane_spans = []  # (context, first record, end record) per lane, in lane order
     slot_index = 0
     for context, reserved in zip(contexts, reservations):
+        first = len(records)
         for offset, record in enumerate(context["records"]):
             records.append({**record, "slot_index": slot_index + offset})
+        lane_spans.append((context, first, len(records)))
         slot_index += reserved
     registry = ref.get("registry") if isinstance(ref.get("registry"), dict) else None
-    override = next((
-        str(context["item"].get("prompt_override") or "")
-        for context in contexts if context["present"] and context["item"].get("prompt_override")
-    ), "")
-    prompt, slot_prompts = _formatted_prompts(
-        {"prompt_override": override}, records, contexts[0]["recipe"], registry)
+    present = [context for context in contexts if context["present"]]
+    lane_override = lambda context: str(context["item"].get("prompt_override") or "")
+    if len(present) > 1 and any(lane_override(context).strip() for context in present):
+        # Co-selected lanes with an override: one block, each lane's own part
+        # in lane order (an override as its lane's part). p01..p16 never
+        # carried an override, so they are the same fragments as always.
+        _, slot_prompts = _formatted_prompts({}, records, contexts[0]["recipe"], registry)
+        prompt = compose_multi_lane_prompt(recipe=contexts[0]["recipe"], lanes=[
+            {"override": lane_override(context), "fragments": slot_prompts[first:end]}
+            for context, first, end in lane_spans if context["present"]
+        ])
+    else:
+        # A lone lane, or lanes without an override: unchanged. A lone lane's
+        # override replaces its whole grammar, ends included.
+        override = next((lane_override(context) for context in present if lane_override(context)), "")
+        prompt, slot_prompts = _formatted_prompts(
+            {"prompt_override": override}, records, contexts[0]["recipe"], registry)
     names = ", ".join(reference_member_labels(
         getattr(record["reference"], "name", ""),
         getattr(record["member"], "name", ""),

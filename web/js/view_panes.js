@@ -98,6 +98,18 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         el.addEventListener("click", onClick);
         el.addEventListener("focus", () => { el._focusRing = focusVisible(el); paintLayoutControl(); });
         el.addEventListener("blur", () => { el._focusRing = false; paintLayoutControl(); });
+        // A click on the segment that already has focus fires no new focus, so
+        // the pointer clears the ring here and the keyboard brings it back.
+        el.addEventListener("pointerdown", () => {
+            if (!el._focusRing) return;
+            el._focusRing = false;
+            paintLayoutControl();
+        });
+        el.addEventListener("keydown", () => {
+            if (el._focusRing) return;
+            el._focusRing = true;
+            paintLayoutControl();
+        });
         parent.append(el);
         return { value, el };
     };
