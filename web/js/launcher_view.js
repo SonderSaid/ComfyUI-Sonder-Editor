@@ -39,6 +39,20 @@ export function modelMessage(item) {
     return target ? `${name} → ${target} (${item.node})` : `${name} → folder unknown (${item.node} · ${item.input || ''})`;
 }
 export function badge(label, kind = '') { return el('span', `sl-badge ${kind}`, label); }
+// Whether the named lists ('templates', 'projects') can be shown: 'ready' once all
+// have loaded, 'failed' when one failed before it ever loaded, else 'loading', or
+// 'slow' once that first load has taken a while.
+export function listState(state, ...lists) {
+    if (lists.every(name => state.loaded[name])) return 'ready';
+    if (lists.some(name => !state.loaded[name] && state.loadFailed[name])) return 'failed';
+    return state.listsSlow ? 'slow' : 'loading';
+}
+// A pane's loading or couldn't-load line, with Check again when it failed.
+export function listNotice(text, failed, checkAgain) {
+    const node = el('div', 'sl-empty', text);
+    if (failed) { node.append(' '); node.append(button('Check again', checkAgain)); }
+    return node;
+}
 export function mountLauncherStyle() {
     const style = el('style');
     // Dimensions implement the accepted Launcher proportions; visual tokens

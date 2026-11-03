@@ -1,10 +1,12 @@
 import { renderPanelMarkdown } from './panel_markdown.js';
-import { el, button, component, badge, date, input, modelMessage } from './launcher_view.js';
+import { el, button, component, badge, date, input, modelMessage, listState, listNotice } from './launcher_view.js';
 import { isUnfinishedRun } from './sdk_host.js';
 export const SAMPLE_PROJECTS_URL = 'https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects';
 export const MISSING_NODES_HELP_URL = 'https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/troubleshooting.md#the-launcher-says-missing-node-packs';
 export function missingNodes(template) { return template?.validation?.missing_nodes || []; }
-export function workflowBadge(template) {
+// A row's badge. The workflow's own problems come first; a workflow with none is
+// Ready only while this ComfyUI can generate (the header pill's install state).
+export function workflowBadge(template, status = null) {
     const v = template.validation || {};
     if (missingNodes(template).length) return ['Missing nodes', 'bad'];
     if (v.errors?.length || v.blocking?.length) return ['Can’t generate', 'bad'];
@@ -12,7 +14,18 @@ export function workflowBadge(template) {
     if (template.requirements_error) return ['Check failed', 'warn'];
     if (v.warnings?.length) return [`${v.warnings.length} notes`, 'warn'];
     if (!Array.isArray(template.missing_models)) return ['Select to check models', ''];
+    if (status?.install && !status.install.ready) return ['Generate unavailable', 'warn'];
     return ['Ready', 'good'];
+}
+// The workflows pane's line when it has no rows to show. Its order comes with the
+// projects, so it waits for both lists.
+export function workflowsNotice(state, listed, shown) {
+    const list = listState(state, 'templates', 'projects');
+    if (list === 'loading') return { text: 'Loading workflows…', failed: false };
+    if (list === 'slow') return { text: 'Still loading workflows…', failed: false };
+    if (list === 'failed') return { text: 'Workflows couldn’t load.', failed: true };
+    if (!listed) return { text: 'Export an API workflow from ComfyUI, then drop the JSON here or choose Import.', failed: false };
+    return shown ? null : { text: 'No workflows match. Clear the search or show hidden workflows.', failed: false };
 }
 // The selected workflow's Controls line. Advanced Controls stay out of it (it
 // shows the curated menu) but are counted; their warnings still show above.
@@ -115,7 +128,7 @@ export function mountWorkflows(state, actions) {
             line.append(menu);
             const sub = el('div', 'sl-workflow-sub');
             const used = state.memory.last_workflow?.by_template?.[t.template_id];
-            sub.append(el('span', '', t.starter ? t.model_family : `${used ? 'used' : 'imported'} ${date(used || t.imported_at)}`), badge(...workflowBadge(t)));
+            sub.append(el('span', '', t.starter ? t.model_family : `${used ? 'used' : 'imported'} ${date(used || t.imported_at)}`), badge(...workflowBadge(t, state.status)));
             row.append(line, sub);
             if (t.description) {
                 const firstLine = renderPanelMarkdown(t.description.split(/\r?\n/, 1)[0]).textContent;
@@ -146,8 +159,8 @@ export function mountWorkflows(state, actions) {
             list.append(row);
         }
     }
-    if (!ordered.length) list.append(el('p', 'sl-empty', 'Export an API workflow from ComfyUI, then drop the JSON here or choose Import.'));
-    else if (!list.children.length) list.append(el('p', 'sl-empty', 'No workflows match. Clear the search or show hidden workflows.'));
+    const notice = workflowsNotice(state, ordered.length, list.children.length);
+    if (notice) list.append(listNotice(notice.text, notice.failed, actions.checkAgain));
     sidebar.append(list);
     const foot = el('div', 'sl-samples'), link = el('a', '', 'Sample projects ↗');
     link.href = SAMPLE_PROJECTS_URL; link.target = '_blank'; link.rel = 'noopener noreferrer';

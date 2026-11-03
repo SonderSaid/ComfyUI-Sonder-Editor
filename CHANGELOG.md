@@ -11,6 +11,11 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Fixed
+- The Launcher's **ComfyUI** status reads **Generate unavailable** when the Sonder App packages are missing, including after a failed Generate, instead of **Connection problem**.
+- Workflow rows in the Launcher say **Generate unavailable** instead of **Ready** while the Sonder App packages are missing or unsupported.
+- While ComfyUI is still starting, the Launcher shows **Checking…** and loading lines instead of **Unreachable** and an empty project list. If ComfyUI stays slow it says so, and a project or workflow list that can't load says so with a **Check again** button.
+
 ## [0.8.2] - 2026-11-02
 
 ### Added

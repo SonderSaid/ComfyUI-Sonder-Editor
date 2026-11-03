@@ -1,4 +1,13 @@
-import { el, button, component, input, date, badge } from './launcher_view.js';
+import { el, button, component, input, date, badge, listState, listNotice } from './launcher_view.js';
+// The projects pane's line before its tiles: loading, couldn't load, or the empty
+// state, which only shows once the list has really loaded with nothing in it.
+export function projectsNotice(state) {
+    const list = listState(state, 'projects');
+    if (list === 'loading') return { text: 'Loading projects…', failed: false };
+    if (list === 'slow') return { text: 'Still loading projects. ComfyUI may be busy, and a large projects folder can take a while.', failed: false };
+    if (list === 'failed') return { text: 'Projects couldn’t load.', failed: true };
+    return !state.projects.length && !state.projectData.unreadable.length ? { text: 'Start your first project', failed: false } : null;
+}
 export function visibleProjects(state) {
     const query = state.projectSearch.toLowerCase();
     return [...state.projects, ...state.projectData.unreadable.map(p => ({ ...p, name: p.folder, unreadable: true }))]
@@ -78,7 +87,8 @@ export function mountProjects(state, actions) {
             }
         });
     };
-    if (!state.projects.length && !state.projectData.unreadable.length) scroll.append(el('div', 'sl-empty', 'Start your first project'));
+    const notice = projectsNotice(state);
+    if (notice) scroll.append(listNotice(notice.text, notice.failed, actions.checkAgain));
     if (state.prefs.view === 'grid') {
         const grid = el('div', 'sl-grid'); grid.style.setProperty('--tile-min', `${{ S: 160, M: 220, L: 300 }[state.prefs.tileSize]}px`);
         const create = el('div', 'sl-project sl-new'); create.tabIndex = 0; create.setAttribute('role', 'button'); create.setAttribute('aria-label', 'New project');
@@ -119,7 +129,7 @@ export function mountProjects(state, actions) {
         }
         table.append(body); scroll.append(table);
     }
-    if (state.projectSearch && !rows.length) {
+    if (state.projectSearch && !rows.length && listState(state, 'projects') === 'ready') {
         const empty = el('div', 'sl-empty', 'No projects match. '); empty.append(button('Clear search', () => actions.searchProjects(''))); scroll.append(empty);
     }
     const hidden = [...state.projects, ...state.projectData.unreadable].filter(p => p.hidden).length;

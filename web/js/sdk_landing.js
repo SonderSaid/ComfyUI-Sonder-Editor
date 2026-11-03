@@ -20,9 +20,19 @@ import { mountProjectFormatControls } from './project_format_controls.js';
 
 let api, root, views = [], popup = null, popupAnchor = null, dialog = null, exitPollTimer = null, exitFlag = null;
 let active = true, refreshSerial = 0, requirementsSerial = 0, thumbTimer = null, thumbPollTimer = null, thumbWanted = [];
+let statusCheck = null, refreshing = null, listsSlowTimer = null;
 const thumbRequested = new Map(); // folder -> the key already asked for
+// A cold ComfyUI answers in seconds, a starved one may not. A first answer later than
+// the *_SLOW_MS reads as slow; a call past its timeout fails. The lists get longer:
+// a large projects folder on a slow disk is slow, not broken.
+const STATUS_SLOW_MS = 15000, STATUS_TIMEOUT_MS = 60000, LISTS_SLOW_MS = 15000, LIST_TIMEOUT_MS = 180000;
 const state = {
+    // status: null until the first answer (see environmentState).
     status: null, templates: [], projects: [], memory: {}, thumbnails: {},
+    // Whether each list has ever loaded, and whether its first load failed: until it
+    // loads, the panes say loading or couldn't load, never their empty states.
+    // listsSlow: the first load is taking longer than LISTS_SLOW_MS.
+    loaded: { templates: false, projects: false }, loadFailed: { templates: false, projects: false }, listsSlow: false,
     projectData: { workflow_order: [], unreadable: [], linked_hidden_count: 0 },
     selectedProject: '', selectedTemplateId: '', projectSearch: '', workflowSearch: '', workflowExpanded: false,
     prefs: null, sort: { key: 'modified_at', direction: -1 }, opening: false, openError: null, importProblems: null, exitNotice: null,
@@ -31,8 +41,17 @@ const state = {
     nodePacks: undefined,
 };
 const json = body => ({ headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-async function call(path, init = {}) {
-    const resp = await fetch(api.apiURL(path), init);
+// A call that never reached ComfyUI, or got no answer in time, fails with a written
+// sentence and `network`; the browser's own words go to `detail`.
+async function call(path, init = {}, timeoutMs = 0) {
+    const controller = timeoutMs ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    let resp;
+    try { resp = await fetch(api.apiURL(path), controller ? { ...init, signal: controller.signal } : init); }
+    catch (cause) {
+        const err = new Error(controller?.signal.aborted ? 'ComfyUI didn’t answer in time.' : 'ComfyUI didn’t answer.');
+        err.network = true; err.detail = cause?.message || ''; throw err;
+    } finally { clearTimeout(timer); }
     let payload;
     try { payload = await resp.json(); } catch { throw new Error(`ComfyUI returned an unreadable response (${resp.status}).`); }
     if (!resp.ok || payload?.ok === false) {
@@ -77,18 +96,32 @@ function selectProject(folder, focus = false) {
     state.openError = null; render(true);
     if (focus) Array.from(root.querySelectorAll('[data-project-folder]')).find(n => n.dataset.projectFolder === folder)?.focus();
 }
-async function refresh() {
-    const serial = ++refreshSerial;
-    const results = await Promise.allSettled([call('/sonder-editor/sdk/status'), call('/sonder-editor/sdk/templates'), call('/sonder-editor/launcher/projects'), call('/sonder-editor/launcher/state')]);
-    if (!active || serial !== refreshSerial) return;
-    state.status = results[0].status === 'fulfilled' ? results[0].value : { error: results[0].reason.message };
-    if (results[1].status === 'fulfilled') state.templates = results[1].value.templates || [];
-    if (results[2].status === 'fulfilled') {
-        state.projectData = results[2].value; state.projects = results[2].value.projects || [];
+// The status as environmentState reads it, from one settled status call.
+export function statusFromResult(result) {
+    return result.status === 'fulfilled' ? result.value : { error: result.reason.message, network: !!result.reason.network };
+}
+// The lists' share of a refresh, applied to `state`: data, load flags and the
+// preselection. `results` are the settled templates, projects and Launcher-memory
+// calls. A failure keeps the data already shown; one before a list ever loaded
+// marks it failed. Returns the failures, for the caller to report.
+export function applyRefreshResults(state, [templates, projects, memory]) {
+    for (const [key, result] of [['templates', templates], ['projects', projects]]) {
+        if (result.status === 'fulfilled') { state.loaded[key] = true; state.loadFailed[key] = false; }
+        else if (!state.loaded[key]) state.loadFailed[key] = true;
+    }
+    if (templates.status === 'fulfilled') state.templates = templates.value.templates || [];
+    if (projects.status === 'fulfilled') {
+        state.projectData = projects.value; state.projects = projects.value.projects || [];
         state.thumbnails = Object.fromEntries(state.projects.filter(p => p.thumbnail).map(p => [p.folder, p.thumbnail]));
     }
-    if (results[3].status === 'fulfilled') state.memory = results[3].value;
-    for (const result of results.slice(1)) if (result.status === 'rejected') notifyError(result.reason.message, { source: 'launcher-refresh' });
+    if (memory.status === 'fulfilled') state.memory = memory.value;
+    // Only once both lists are in: a failed first load must not replace the
+    // selection the page came back from the editor with.
+    if (state.loaded.templates && state.loaded.projects) preselect(state);
+    return [templates, projects, memory].filter(r => r.status === 'rejected').map(r => r.reason);
+}
+function preselect(state) {
+    const project = () => state.projects.find(p => p.folder === state.selectedProject);
     const allowed = state.projects.filter(p => state.prefs.showHidden || !p.hidden), previous = state.selectedProject;
     if (!allowed.some(p => p.folder === previous) && !state.projectData.unreadable.some(p => p.folder === previous && (state.prefs.showHidden || !p.hidden))) {
         state.selectedProject = [...allowed].sort((a, b) => String(b.modified_at).localeCompare(String(a.modified_at), undefined, { numeric: true }))[0]?.folder || '';
@@ -96,12 +129,56 @@ async function refresh() {
     const hidden = state.memory.hidden?.workflows || [];
     if (previous !== state.selectedProject || !state.templates.some(t => t.template_id === state.selectedTemplateId && (state.prefs.showHidden || !hidden.includes(t.template_id)))) {
         const unusable = new Set(state.templates.filter(t => missingNodes(t).length).map(t => t.template_id));
-        state.selectedTemplateId = chosenProject()?.workflow || state.projectData.workflow_order.find(id => !hidden.includes(id) && !unusable.has(id)) || '';
+        state.selectedTemplateId = project()?.workflow || state.projectData.workflow_order.find(id => !hidden.includes(id) && !unusable.has(id)) || '';
     }
+}
+// One status call at a time. Overlapping refreshes share the one in flight, so a
+// Check again on a slow ComfyUI never throws away the answer already on its way.
+// `slow()` fires once when an answer the page is still waiting for (`waiting()`)
+// is later than `slowMs`; `apply(status)` takes every answer.
+export function statusChecker({ request, apply, slow, waiting, slowMs, timers = globalThis }) {
+    let inFlight = null, timer = null;
+    const check = () => {
+        if (inFlight) return inFlight;
+        if (waiting()) timer = timers.setTimeout(() => { timer = null; if (inFlight) slow(); }, slowMs);
+        inFlight = Promise.allSettled([request()]).then(([result]) => {
+            timers.clearTimeout(timer); timer = null; inFlight = null;
+            apply(statusFromResult(result));
+        });
+        return inFlight;
+    };
+    check.stop = () => { timers.clearTimeout(timer); timer = null; };
+    return check;
+}
+// The status shows as soon as it answers; the lists wait for each other (the
+// workflow order comes with the projects) under the refresh serial. Resolves when
+// the lists are in: callers act on them, never on the status.
+function refresh() {
+    const pending = refreshLists().finally(() => { if (refreshing === pending) refreshing = null; });
+    refreshing = pending;
+    return pending;
+}
+async function refreshLists() {
+    const serial = ++refreshSerial, current = () => active && serial === refreshSerial;
+    void statusCheck();
+    clearTimeout(listsSlowTimer);
+    if (!state.loaded.templates || !state.loaded.projects) listsSlowTimer = setTimeout(() => { if (current()) { state.listsSlow = true; render(); } }, LISTS_SLOW_MS);
+    const lists = await Promise.allSettled([call('/sonder-editor/sdk/templates', {}, LIST_TIMEOUT_MS), call('/sonder-editor/launcher/projects', {}, LIST_TIMEOUT_MS), call('/sonder-editor/launcher/state', {}, LIST_TIMEOUT_MS)]);
+    if (!current()) return;
+    clearTimeout(listsSlowTimer); state.listsSlow = false;
+    for (const err of applyRefreshResults(state, lists)) notifyError(err.message, { source: 'launcher-refresh', detail: err.detail });
     render();
     void checkRequirements();
     void loadNodePacks();
     scheduleThumbnailPoll();
+}
+// Check again: always asks for the status (joining a call in flight), and joins a
+// refresh in flight rather than queueing the same work behind it on a slow ComfyUI.
+// An Unreachable pill reads Checking… until the new answer.
+function checkAgain() {
+    if (state.status?.error) { state.status = null; render(true); }
+    void statusCheck();
+    return refreshing || refresh();
 }
 // Thumbnails: the page asks only for tiles in view, newest first, and polls while any
 // are queued or rendering. Off asks for nothing.
@@ -149,7 +226,8 @@ async function pollThumbnails() {
 function preference(patch) {
     updateEditorSettings({ sdk: { launcher: patch } }); state.prefs = getEditorSettings().sdk.launcher;
     if (!state.prefs.showHidden && chosenProject()?.hidden) state.selectedProject = '';
-    void run(refresh);
+    // The data doesn't depend on preferences: a refresh in flight renders with them.
+    void run(() => refreshing || refresh());
 }
 function showPopup(anchor, build) {
     const same = popupAnchor === anchor; popup?.(); if (same) return;
@@ -283,8 +361,10 @@ function statusMenu(anchor) {
         const address = state.status?.proxy?.upstream || window.location.origin;
         menu.append(el('div', '', address), button('Copy address', () => void run(() => navigator.clipboard.writeText(address))), el('div', 'sl-dim', 'Bookmark this Launcher for next time.'));
         menu.append(el('div', '', state.status?.proxy?.running ? 'Generation connection: running' : 'Generation connection starts when needed.'));
-        for (const [label, info] of [['comfy-sdk', state.status?.install?.sdk], ['comfy-api-proxy', state.status?.install?.proxy]]) menu.append(el('div', 'sl-dim', `${label}: ${info?.installed ? info.version : 'not installed'}`));
-        menu.append(button('Check again', () => { close(); void run(refresh); }));
+        // Without an answer the page can't know what is installed.
+        const known = !!state.status?.install;
+        for (const [label, info] of [['comfy-sdk', state.status?.install?.sdk], ['comfy-api-proxy', state.status?.install?.proxy]]) menu.append(el('div', 'sl-dim', `${label}: ${!known ? 'unknown' : info?.installed ? info.version : 'not installed'}`));
+        menu.append(button('Check again', () => { close(); void run(checkAgain); }));
     });
 }
 function settingsMenu(anchor) {
@@ -330,7 +410,7 @@ function showExitNotice(next) {
     state.exitNotice = next; root.querySelector('[data-sonder-exit-notice]')?.replaceWith(exitNotice());
 }
 const actions = {
-    statusMenu, settingsMenu, preference, workflowMenu, projectMenu, create: createProject, thumbnailsVisible,
+    statusMenu, settingsMenu, preference, workflowMenu, projectMenu, create: createProject, thumbnailsVisible, checkAgain: () => void run(checkAgain),
     thumbnailURL: (folder, key, ext) => api.apiURL(`/sonder-editor/launcher/thumbnail/${encodeURIComponent(folder)}/${key}.${ext}`),
     import: () => pickFile(importFile), importFile: file => void run(() => importFile(file)),
     searchProjects: value => { state.projectSearch = value; render(); }, searchWorkflows: value => { state.workflowSearch = value; render(); },
@@ -370,8 +450,14 @@ function boot() {
         if (e.key === 'Enter') { void openEditor(); return true; } return false;
     } });
     exitFlag = takeSdkExitFlag(); if (exitFlag) { state.selectedProject = exitFlag.project || ''; state.selectedTemplateId = exitFlag.template_id || ''; }
+    statusCheck = statusChecker({
+        request: () => call('/sonder-editor/sdk/status', {}, STATUS_TIMEOUT_MS), slowMs: STATUS_SLOW_MS,
+        waiting: () => !state.status || !!state.status.slow,
+        slow: () => { if (active && (!state.status || state.status.slow)) { state.status = { slow: true }; render(true); } },
+        apply: status => { if (active) { state.status = status; render(true); } },
+    });
     window.addEventListener('pageshow', event => { if (event.persisted) window.location.reload(); });
-    window.addEventListener('pagehide', () => { active = false; clearTimeout(exitPollTimer); clearTimeout(thumbTimer); clearTimeout(thumbPollTimer); popup?.(); dialog?.(); offKeys(); unsubscribe(); removeStyle(); for (const view of views) view.cleanup(); }, { once: true });
+    window.addEventListener('pagehide', () => { active = false; clearTimeout(exitPollTimer); statusCheck.stop(); clearTimeout(listsSlowTimer); clearTimeout(thumbTimer); clearTimeout(thumbPollTimer); popup?.(); dialog?.(); offKeys(); unsubscribe(); removeStyle(); for (const view of views) view.cleanup(); }, { once: true });
     document.body.classList.add('ready'); render(); void run(async () => { await refresh(); if (exitFlag) void pollExitSession(); });
 }
 if (isLauncherPage()) boot();
