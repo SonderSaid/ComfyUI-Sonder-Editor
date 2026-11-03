@@ -4,11 +4,23 @@ import { isUnfinishedRun } from './sdk_host.js';
 export const SAMPLE_PROJECTS_URL = 'https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects';
 export const MISSING_NODES_HELP_URL = 'https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/troubleshooting.md#the-launcher-says-missing-node-packs';
 export function missingNodes(template) { return template?.validation?.missing_nodes || []; }
+// The nodes the selected row's current run needs and this ComfyUI lacks (its
+// requirements check); null until that check answered.
+export function runMissingNodes(template) {
+    return Array.isArray(template?.run_missing_nodes) ? template.run_missing_nodes : null;
+}
+// " Needed by Passes → Upscale Pass Only." when the server named the Mode choices.
+export function neededBy(item) {
+    return item?.needed_by?.length ? ` Needed by ${item.needed_by.join('; ')}.` : '';
+}
 // A row's badge. The workflow's own problems come first; a workflow with none is
 // Ready only while this ComfyUI can generate (the header pill's install state).
+// Missing nodes don't stop an Open: they are bad when the current run needs them,
+// else a warning (other Modes use them).
 export function workflowBadge(template, status = null) {
     const v = template.validation || {};
-    if (missingNodes(template).length) return ['Missing nodes', 'bad'];
+    if (runMissingNodes(template)?.length) return ['Missing nodes', 'bad'];
+    if (missingNodes(template).length) return ['Missing nodes', 'warn'];
     if (v.errors?.length || v.blocking?.length) return ['Can’t generate', 'bad'];
     if (template.missing_models?.length) return [`${template.missing_models.length} models missing`, 'warn'];
     if (template.requirements_error) return ['Check failed', 'warn'];
@@ -85,6 +97,17 @@ export function missingNodesMessage(classes, mappings) {
     const named = groups.map(group => group.pack ? `${group.pack} (${group.classes.join(', ')})` : `no known pack (${group.classes.join(', ')})`);
     return `Missing node packs: ${named.join(', ')}. Install them, restart ComfyUI, then reload this page.`;
 }
+// The lines about missing nodes, for the row's details and the Open bar: what the
+// current run needs (it can't generate), and what only other Modes use.
+export function missingNodeLines(template, mappings) {
+    const all = missingNodes(template), run = runMissingNodes(template);
+    if (run === null) return all.length ? [{ kind: 'warn', text: missingNodesMessage(all, mappings) }] : [];
+    const needed = run.map(item => item.class_type), lines = [];
+    if (needed.length) lines.push({ kind: 'bad', text: missingNodesMessage(needed, mappings) + run.map(neededBy).join('') });
+    const others = all.filter(name => !needed.includes(name));
+    if (others.length) lines.push({ kind: 'dim', text: `Some Modes of this workflow use nodes that aren’t installed: ${others.join(', ')}. The current Modes don’t need them.` });
+    return lines;
+}
 export function missingNodesHelp() {
     const link = el('a', '', 'How to install missing node packs ↗');
     link.href = MISSING_NODES_HELP_URL; link.target = '_blank'; link.rel = 'noopener noreferrer';
@@ -138,7 +161,10 @@ export function mountWorkflows(state, actions) {
             }
             if (chosen) {
                 const details = el('div', 'sl-workflow-details');
-                if (missingNodes(t).length) details.append(el('p', 'sl-bad', missingNodesMessage(missingNodes(t), state.nodePacks)), missingNodesHelp());
+                const nodeLines = missingNodeLines(t, state.nodePacks);
+                for (const line of nodeLines) details.append(el('p', `sl-${line.kind}`, line.text));
+                if (nodeLines.length) details.append(missingNodesHelp());
+                for (const problem of t.run_problems || []) details.append(el('p', 'sl-bad', problem));
                 for (const problem of [...(t.validation?.errors || []), ...(t.validation?.blocking || [])]) details.append(el('p', 'sl-bad', problem));
                 for (const item of t.missing_models || []) details.append(el('p', 'sl-warn', modelMessage(item)));
                 for (const note of t.validation?.warnings || []) details.append(el('p', 'sl-dim', note));
@@ -149,8 +175,8 @@ export function mountWorkflows(state, actions) {
                     description.addEventListener('click', e => e.stopPropagation());
                     details.append(description);
                 }
-                // Its Controls can't be read until its nodes are installed.
-                if (!missingNodes(t).length) details.append(el('p', '', controlsLine(t.validation?.controls || [])));
+                // Controls of an absent node read "not installed"; the rest work.
+                details.append(el('p', '', controlsLine(t.validation?.controls || [])));
                 row.append(details);
             }
             row.addEventListener('click', () => actions.selectWorkflow(t.template_id));

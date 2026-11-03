@@ -582,6 +582,12 @@ def _read_rows_target(prompt: dict, path: str, input_name: str, class_type: Any,
     rows, linked = control_rows.rows_from_inputs(prompt_graph.node_inputs(prompt, path), input_name,
                                                  [field["id"] for field in spec["fields"]])
     target.update(spec)
+    from .lora_metadata import NATIVE_LORA_STACKS  # pure; kept off the module imports
+
+    if class_type in NATIVE_LORA_STACKS and input_name == "loras":
+        # A row that is off never opens its file, so its file may be one this
+        # ComfyUI lacks (control_rows.coerce_rows).
+        target["row_activity"] = dict(control_rows.NATIVE_ROW_ACTIVITY)
     target.update(status=STATUS_LINKED if linked else STATUS_OK, literal=rows)
     return target
 
@@ -804,6 +810,8 @@ def _describe_rows(prompt: dict, descriptor: dict, entry: dict, target: dict) ->
     """
     for name in ROWS_SPEC_KEYS:
         descriptor[name] = copy.deepcopy(target[name])
+    if target.get("row_activity"):
+        descriptor["row_activity"] = copy.deepcopy(target["row_activity"])
     if target.get("tooltip"):
         descriptor["tooltip"] = target["tooltip"]
     if entry.get("rows_unavailable"):

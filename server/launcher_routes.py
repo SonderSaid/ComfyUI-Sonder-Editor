@@ -63,7 +63,7 @@ def launcher_projects(base_dir: str) -> dict:
     by_project = state["last_workflow"]["by_project"]
     templates = _templates()
     order = workflow_order(state, templates)
-    # Never preselected: it can't be opened until its nodes are installed.
+    # Preferred less: it opens, but its Modes may need nodes that aren't installed.
     missing_nodes = {t["template_id"] for t in templates if (t.get("validation") or {}).get("missing_nodes")}
     projects = []
     for entry in entries:

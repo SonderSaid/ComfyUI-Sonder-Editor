@@ -639,13 +639,11 @@ class SdkRunner:
             return {"ok": True, "template_id": session.template_id, "template_name": self.template_name(session)}
 
     async def _runnable_meta(self, template_id: str) -> dict:
-        """An Open or a switch refuses a workflow with nodes missing now (the Launcher
-        lists them) or one that can't drive the editor."""
+        """An Open or a switch refuses a workflow that can't drive the editor.
+        Missing nodes don't refuse it: Generate judges what will run."""
         try:
             _, meta = await asyncio.to_thread(sdk_templates.runnable_template, template_id, self._node_lookup)
         except sdk_templates.TemplateError as exc:
-            if exc.code == "missing_nodes":
-                raise SdkError(str(exc), exc.code, exc.status, **exc.details) from None
             if exc.code == "invalid_template":
                 raise SdkError(str(exc), exc.code, exc.status) from None
             raise
@@ -881,19 +879,19 @@ class SdkRunner:
             build = await asyncio.to_thread(self._build_base, session, editor_values, render_cache_max_bytes, writer,
                                            template_id)
             self._check_submit_epoch(session, epoch, build)
-            # A Replace may have brought in nodes this ComfyUI lacks: name them
-            # now rather than let ComfyUI refuse the submit.
-            missing_nodes = sdk_templates.missing_node_classes(build["prompt"], self._node_lookup)
-            if missing_nodes:
-                raise SdkError(sdk_templates.missing_nodes_message(missing_nodes), "missing_nodes", 409,
+            # The one judge (Launcher, Generate, branch run) on what will run:
+            # nodes this ComfyUI lacks are named rather than left to ComfyUI.
+            readiness = await asyncio.to_thread(
+                sdk_templates.run_readiness, build["prompt"], editor_key=build["editor_key"],
+                node_lookup=self._node_lookup, class_lookup=self._class_lookup)
+            if readiness["missing_nodes"] or readiness["missing_models"]:
+                readiness = await asyncio.to_thread(self._name_needed_by, template_id, readiness)
+            if readiness["missing_nodes"]:
+                missing_nodes = readiness["missing_nodes"]
+                raise SdkError(self._missing_nodes_text(readiness), "missing_nodes", 409,
                                missing_nodes=missing_nodes, stale=build["stale"])
-            refusals = sdk_templates.generate_refusals(build["view"])
-            if not prompt_graph.nodes_reaching(build["prompt"], build["editor_key"], prompt_graph.SONDER_SAVE_CLASS_TYPES):
-                refusals.append("The current node switches turn off every Sonder Save Video and Save Bridge "
-                                "that takes its project from the editor, so takes would not land. Switch one on.")
-            from .model_requirements import missing_models, missing_model_message
-            missing = await asyncio.to_thread(missing_models, build["prompt"], executable_only=True)
-            refusals.extend(map(missing_model_message, missing))
+            refusals = [*sdk_templates.generate_refusals(build["view"]), *readiness["problems"],
+                        *self._missing_model_texts(readiness)]
             if refusals:
                 raise SdkError("This workflow can't generate yet.", "generate_refused", 409, problems=refusals, stale=build["stale"])
             try:
@@ -904,20 +902,54 @@ class SdkRunner:
             self._check_submit_epoch(session, epoch, build)
             return {**await self._submit_runs(session, client, build, count, epoch), "stale": build["stale"]}
 
+    def _name_needed_by(self, template_id: str, readiness: dict) -> dict:
+        """``readiness`` with the Mode choice each missing item is needed by.
+        Called under this workflow's runner lock, so the values read here are
+        the ones the build used; never fails a refusal it only explains."""
+        try:
+            with sdk_templates.template_lock(template_id):
+                authored, _ = sdk_templates.load_template(template_id)
+                stored = copy.deepcopy(sdk_templates.read_control_values(template_id))
+            attribution = sdk_templates.attribute_requirements(
+                authored, stored, readiness, describe=self._describe, node_lookup=self._node_lookup,
+                class_lookup=self._class_lookup)
+            return sdk_templates.name_needed_by(readiness, attribution)
+        except Exception:  # noqa: BLE001 - the refusal stands without its reasons
+            logger.warning("Naming the Mode choices behind a refusal failed", exc_info=True)
+            return readiness
+
+    @staticmethod
+    def _missing_nodes_text(readiness: dict) -> str:
+        named = readiness.get("needed_by_nodes") or {}
+        return sdk_templates.missing_nodes_message(readiness["missing_nodes"]) + "".join(
+            f" {name} is needed by {'; '.join(named[name])}." for name in readiness["missing_nodes"] if named.get(name))
+
+    @staticmethod
+    def _missing_model_texts(readiness: dict) -> list[str]:
+        from .model_requirements import missing_model_message
+        return [missing_model_message(item) + sdk_templates.needed_by_text(item.get("needed_by"))
+                for item in readiness["missing_models"]]
+
     @staticmethod
     def _check_submit_epoch(session, epoch, build):
         if session.cancel_epoch != epoch:
             raise SdkError("Canceled before it was sent.", "canceled_before_submit", 409, stale=build["stale"])
 
     def _build_base(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: Any, writer,
-                    template_id: str | None = None) -> dict:
+                    template_id: str | None = None, targets: list | None = None) -> dict:
         template_id = template_id or session.template_id
         with sdk_templates.template_lock(template_id):
-            return self._build_base_locked(session, editor_values, render_cache_max_bytes, writer, template_id)
+            return self._build_base_locked(session, editor_values, render_cache_max_bytes, writer, template_id,
+                                           targets)
 
     def _build_base_locked(self, session: SdkSession, editor_values: Any, render_cache_max_bytes: int, writer,
-                           template_id: str) -> dict:
-        """The prompt every run of this Generate shares, plus its Controls view."""
+                           template_id: str, targets: list | None = None) -> dict:
+        """The prompt every run of this Generate shares, plus its Controls view.
+
+        The prompt is the execution copy (``run_preparation``): switched-off
+        nodes compiled out, then inputs proven inactive cut. ``targets`` makes
+        a branch run's copy. ``preparation`` records what was cut.
+        """
         stale = False
         if editor_values is not None:
             result = sdk_templates.write_editor_state(session.project, editor_values, writer=writer)
@@ -946,11 +978,14 @@ class SdkRunner:
             prompt, sdk_templates.describe_stored(prompt, stored, self._describe), stored, describe=self._describe)
         # The switches' node modes, compiled as ComfyUI's serializer would: a
         # switched-off node is not in what runs.
-        prompt = sdk_templates.run_prompt(prompt, view)
+        compiled = sdk_templates.run_prompt(prompt, view)
         # The session's own Editor inputs stand whatever the switches compiled.
-        if editors[0] in prompt:
-            prompt[editors[0]]["inputs"].update({name: editor_inputs[name] for name in (
+        if editors[0] in compiled:
+            compiled[editors[0]]["inputs"].update({name: editor_inputs[name] for name in (
                 *sdk_templates.EDITOR_STATE_FIELDS, "project", "render_cache_max_bytes")})
+        preparation = sdk_templates.prepare_compiled(compiled, view, node_lookup=self._node_lookup,
+                                                     class_lookup=self._class_lookup, targets=targets)
+        prompt = preparation["prompt"]
         # Seeds are keyed by binding; each target (one per consumer of a
         # promoted seed) is only the address a run writes. A hidden seed is
         # not exposed: the workflow's own value runs and nothing advances. A
@@ -977,9 +1012,13 @@ class SdkRunner:
             })
         return {"prompt": prompt, "editor_key": editors[0], "view": view, "seed_bindings": seed_bindings, "stale": stale,
                 "template_id": template_id, "template_name": meta.get("name", ""),
+                "preparation": {key: preparation[key] for key in ("removed", "cut", "packed_rows", "fallback")},
                 # What this app's curation changes about the workflow's Controls,
                 # for the provenance each saved take records (controls_snapshot).
-                "controls_delta": controls_snapshot.sdk_overlay_delta(view, prompt)}
+                # Read from the compiled prompt: the cut one would change default
+                # labels. Stacks preparation packed keep their authored rows.
+                "controls_delta": controls_snapshot.sdk_overlay_delta(
+                    view, compiled, rows=controls_snapshot.prepared_rows(view, preparation["packed_rows"]))}
 
     # ── Branch runs ──────────────────────────────────────────────────────────
 
@@ -1043,7 +1082,7 @@ class SdkRunner:
             if len(session.unfinished()) + 1 > MAX_UNFINISHED_PER_SESSION:
                 raise SdkError("Too many takes are already waiting. Wait or cancel some.", "too_many_runs", 429)
             build = await asyncio.to_thread(self._build_base, session, editor_values, render_cache_max_bytes, writer,
-                                           template_id)
+                                           template_id, [target])
             self._check_submit_epoch(session, epoch, build)
             prompt = build["prompt"]
             node = prompt.get(target)
@@ -1055,18 +1094,25 @@ class SdkRunner:
                 raise SdkError("Only an output node that is switched on can run on its own.", "branch_not_output", 409,
                                stale=build["stale"])
             # ComfyUI refuses a missing node class anywhere in the prompt, before it
-            # narrows to the branch: name them as Generate does.
-            missing_nodes = sdk_templates.missing_node_classes(prompt, self._node_lookup)
-            if missing_nodes:
-                raise SdkError(sdk_templates.missing_nodes_message(missing_nodes), "missing_nodes", 409,
+            # narrows to the branch. The prepared prompt is the branch's closure
+            # (and the Relay); when preparation fell back, model files still
+            # count only inside the branch, which is all that loads them.
+            judged = prompt
+            if build["preparation"]["fallback"]:
+                judged = {key: prompt[key] for key in prompt_graph.upstream_set(prompt, [target])}
+            readiness = await asyncio.to_thread(
+                sdk_templates.run_readiness, judged, editor_key=build["editor_key"],
+                node_lookup=self._node_lookup, class_lookup=self._class_lookup, require_save=False)
+            readiness["missing_nodes"] = sdk_templates.missing_node_classes(prompt, self._node_lookup)
+            if readiness["missing_nodes"] or readiness["missing_models"]:
+                readiness = await asyncio.to_thread(self._name_needed_by, template_id, readiness)
+            if readiness["missing_nodes"]:
+                missing_nodes = readiness["missing_nodes"]
+                raise SdkError(self._missing_nodes_text(readiness), "missing_nodes", 409,
                                missing_nodes=missing_nodes, stale=build["stale"])
-            # Controls problems (an unreadable Relay) refuse as for Generate; model
-            # files count only inside the branch, which is all that loads them.
-            refusals = sdk_templates.generate_refusals(build["view"])
-            closure = {key: prompt[key] for key in prompt_graph.upstream_set(prompt, [target])}
-            from .model_requirements import missing_models, missing_model_message
-            missing = await asyncio.to_thread(missing_models, closure, self._class_lookup, executable_only=True)
-            refusals.extend(map(missing_model_message, missing))
+            # Controls problems (an unreadable Relay) refuse as for Generate.
+            refusals = [*sdk_templates.generate_refusals(build["view"]), *readiness["problems"],
+                        *self._missing_model_texts(readiness)]
             if refusals:
                 raise SdkError("This output can't run yet.", "generate_refused", 409,
                                problems=refusals, stale=build["stale"])
@@ -1112,6 +1158,11 @@ class SdkRunner:
                 status, payload = 0, {}
                 logger.warning("Branch submit outcome unknown: %s", exc)
             if 200 <= status < 300 and payload.get("prompt_id"):
+                skipped = sorted(payload["node_errors"])[:20] if isinstance(payload.get("node_errors"), dict) else []
+                if skipped:
+                    # ComfyUI queued what validated and skipped the rest; the
+                    # target validated, so this names only what it left out.
+                    logger.warning("Branch run %s accepted with node errors: %s", target, skipped)
                 accepted = str(payload["prompt_id"])
                 if accepted != prompt_id:
                     run_control.disable_branch_runs("ComfyUI replaced a preassigned prompt id")
@@ -1125,7 +1176,7 @@ class SdkRunner:
                 if run.cancel_requested or session.cancel_epoch != epoch:
                     await self._cancel_run(run)
                 return {"ok": True, "run_ids": [run.run_id], "seeds_used": seeds_used, "error": None,
-                        "prompt_id": run.prompt_id}
+                        "prompt_id": run.prompt_id, **({"skipped_nodes": skipped} if skipped else {})}
             if 400 <= status < 500:
                 # Refused by validation: it never reached the queue.
                 sdk_runs.forget_token(token)

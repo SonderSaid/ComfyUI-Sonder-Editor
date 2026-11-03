@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from functools import lru_cache
 
 from . import control_descriptors as cd
+from .lora_metadata import NATIVE_LORA_STACKS
 from .prompt_graph import upstream_reaches
 
 logger = logging.getLogger(__name__)
@@ -23,7 +25,23 @@ CLASS_INPUT_FOLDERS = {
     ("LoadMoGeModel", "model_name"): "geometry_estimation",
     ("CLIPVisionLoader", "clip_name"): "clip_vision",
     ("LatentUpscaleModelLoader", "model_name"): "latent_upscale_models",
+    # KJNodes' sampling preview reads models/vae_approx (preview_override_node.py).
+    ("ModelPreviewOverrideKJ", "tiny_vae"): "vae_approx",
 }
+
+
+# A native LoRA stack row's file field is a file whatever it says: a starter's
+# switched-off "None" row has no extension, and when a run still carries it (a
+# row turned on, or a preparation that fell back) it must refuse by name.
+_NATIVE_ROW_FILE = re.compile(r"^loras\.(0|[1-9][0-9]*)\.lora_name$")
+
+
+def _is_model_value(class_type: str, name: str, value) -> bool:
+    if not isinstance(value, str):
+        return False
+    if os.path.splitext(value)[1].lower() in MODEL_EXTENSIONS:
+        return True
+    return class_type in NATIVE_LORA_STACKS and bool(value) and bool(_NATIVE_ROW_FILE.match(name))
 
 
 def _normal(value):
@@ -76,7 +94,7 @@ def missing_models(prompt: dict, class_lookup=None, *, input_cache=None, executa
     for key, node in prompt.items():
         inputs = node.get("inputs", {})
         candidates = [(name, value) for name, value in inputs.items()
-                      if isinstance(value, str) and os.path.splitext(value)[1].lower() in MODEL_EXTENSIONS]
+                      if _is_model_value(node.get("class_type", ""), name, value)]
         if not candidates:
             continue
         if executable_only and not any(upstream_reaches(prompt, output, key) for output in outputs):
@@ -110,6 +128,9 @@ def missing_models(prompt: dict, class_lookup=None, *, input_cache=None, executa
 
 def missing_model_message(item: dict) -> str:
     name = os.path.basename(_normal(item["file"]))
+    if os.path.splitext(name)[1].lower() not in MODEL_EXTENSIONS:
+        return (f"A LoRA row in {item['node']} reads “{name}”, not an installed file. "
+                "Choose a LoRA file for it in Controls, or switch the row off.")
     if item.get("relative"):
         return f"{name} is missing: put it at {item['relative']} ({item['node']})"
     return f"{name} is missing (folder unknown: {item['node']} · {item.get('input', '')})"

@@ -35,8 +35,11 @@ export function date(value) {
 // models/<folder>/<the value's own subfolders>/<file>.
 export function modelMessage(item) {
     const name = String(item.file || '').split(/[\\/]/).pop();
+    // A native LoRA row naming no file (a starter's switched-off "None" turned on).
+    if (!/\.[A-Za-z0-9]+$/.test(name)) return `A LoRA row in ${item.node} reads “${name}”, not an installed file. Choose a LoRA file for it in Controls, or switch the row off.`;
     const target = item.path || item.relative;
-    return target ? `${name} → ${target} (${item.node})` : `${name} → folder unknown (${item.node} · ${item.input || ''})`;
+    const needed = item.needed_by?.length ? ` Needed by ${item.needed_by.join('; ')}.` : '';
+    return (target ? `${name} → ${target} (${item.node})` : `${name} → folder unknown (${item.node} · ${item.input || ''})`) + needed;
 }
 export function badge(label, kind = '') { return el('span', `sl-badge ${kind}`, label); }
 // Whether the named lists ('templates', 'projects') can be shown: 'ready' once all

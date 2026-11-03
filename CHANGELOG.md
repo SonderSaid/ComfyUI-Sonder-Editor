@@ -11,7 +11,17 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- When the Sonder App refuses **Generate** over a missing model file or node, it names the Mode choice that needs it (for example "Needed by Task → Edit With Words"). The Launcher shows the same names for the selected workflow.
+
+### Changed
+- Sonder App runs no longer need the model files or node packs of Modes that are switched off: a Task needs only its own LoRA, and **MiniMax H3 References & Swaps** needs the SAM3 checkpoint only with **Mask On**. A canvas Run still checks every loader.
+- A workflow with node packs this ComfyUI lacks now opens in the Sonder App; **Generate** refuses only when the chosen Modes use them.
+- The bundled starters' **Models and downloads** notes list each Task's files again, and their switched-off **Additional LoRAs** row reads **None**. Labels, notes and layout you customized on a bundled starter reset once with this update.
+
 ### Fixed
+- A switched-off LoRA row whose file isn't installed can be edited from Controls in fullscreen, Mount in Tab and the Sonder App.
+- The Launcher names the folder for the LTX sampling preview file (**vae_approx/**) on an install that has none yet.
 - The Launcher's **ComfyUI** status reads **Generate unavailable** when the Sonder App packages are missing, including after a failed Generate, instead of **Connection problem**.
 - Workflow rows in the Launcher say **Generate unavailable** instead of **Ready** while the Sonder App packages are missing or unsupported.
 - While ComfyUI is still starting, the Launcher shows **Checking…** and loading lines instead of **Unreachable** and an empty project list. If ComfyUI stays slow it says so, and a project or workflow list that can't load says so with a **Check again** button.

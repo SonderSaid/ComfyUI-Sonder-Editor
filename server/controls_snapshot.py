@@ -16,7 +16,10 @@ which already carries every stored value and the seed this run used.
 Only bindings ``describe_bindings`` reports ``ok`` are recorded, and only those
 with a target upstream of the consumer, so a branch that cannot reach the
 saved output is left out. A statically connected branch that a switch turned
-off at run time is still listed; the gallery says so. Notes are never recorded.
+off at run time is still listed on a canvas run; the gallery says so. A Sonder
+App run's prompt has no such branch (``run_preparation`` cut it), so its
+Controls there are left out. A LoRA stack that run packed or bypassed is
+recorded with its authored rows, from the delta. Notes are never recorded.
 
 The section keeps the collector's searchable shape (``label`` and ``fields``,
 keyed by Control label) so ``tracked:``/``field:`` search, pins and Copy work,
@@ -59,13 +62,30 @@ TRUNCATED_MARKER = "… [truncated, full value in the source prompt]"
 
 # ── Sonder App delta (written by sdk_runner, read here) ──────────────────────
 
-def sdk_overlay_delta(view: dict, prompt: dict) -> dict | None:
+def prepared_rows(view: dict, packed_rows: dict) -> dict:
+    """``{binding_id: {"rows", "bypassed"}}`` for each native stack binding whose
+    stack the run's preparation packed or bypassed (``run_preparation``)."""
+    found = {}
+    for descriptor in view.get("bindings", []) if isinstance(view, dict) and packed_rows else []:
+        if descriptor.get("kind") != control_rows.ROWS_KIND or descriptor.get("status") != control_descriptors.STATUS_OK:
+            continue
+        targets = descriptor.get("targets") or []
+        entry = packed_rows.get(str(targets[0].get("path"))) if targets and targets[0].get("input") == "loras" else None
+        if isinstance(entry, dict) and isinstance(descriptor.get("binding_id"), str):
+            found[descriptor["binding_id"]] = {"rows": entry["rows"], "bypassed": entry["bypassed"] is True}
+    return found
+
+
+def sdk_overlay_delta(view: dict, prompt: dict, rows: dict | None = None) -> dict | None:
     """What a Sonder App view changes about the workflow's own Controls.
 
-    ``view`` is the effective view Generate submits with (``apply_stored_values``).
+    ``view`` is the effective view Generate submits with (``apply_stored_values``)
+    and ``prompt`` the compiled prompt before preparation cut it.
     Returns ``None`` when nothing differs, so a plain template run stamps
-    nothing. Values are not part of it: they are already in the prompt. Seed
-    modes are: the app's own mode is not in the prompt, only the export's.
+    nothing. Values are not part of it: they are already in the prompt, except
+    ``rows`` (``prepared_rows``): the authored rows of a stack the run packed
+    or bypassed, which the executed prompt no longer holds. Seed modes are: the
+    app's own mode is not in the prompt, only the export's.
     """
     manifest = control_manifest.find_relay(prompt).get("manifest") or control_manifest.empty_manifest()
     authored = manifest.get("bindings") or {}
@@ -108,11 +128,12 @@ def sdk_overlay_delta(view: dict, prompt: dict) -> dict | None:
             advanced[binding_id] = descriptor.get("advanced") is True
         if mode in control_manifest.SEED_MODES and mode != entry.get("seed_mode"):
             seed_modes[binding_id] = mode
-    if not (labels or groups or orders or seed_modes or advanced or local or hidden):
+    rows = {key: value for key, value in (rows or {}).items() if key not in hidden}
+    if not (labels or groups or orders or seed_modes or advanced or local or hidden or rows):
         return None
     delta: dict[str, Any] = {"v": SDK_DELTA_VERSION}
     for name, value in (("labels", labels), ("groups", groups), ("orders", orders), ("seed_modes", seed_modes),
-                        ("advanced", advanced), ("local", local), ("hidden", hidden)):
+                        ("advanced", advanced), ("local", local), ("hidden", hidden), ("rows", rows)):
         if value:
             delta[name] = value
     return delta
@@ -180,6 +201,19 @@ def _small_local(raw: Any) -> dict | None:
     return local or None
 
 
+def _clean_rows(raw: Any) -> dict:
+    """Authored rows of a stack preparation packed or bypassed: at most
+    ``MAX_BINDINGS`` row lists of the shape a stored row list has."""
+    rows = {}
+    for key, entry in (raw.items() if isinstance(raw, dict) else []):
+        value = entry.get("rows") if isinstance(entry, dict) else None
+        if _clean_id(key) and control_rows.value_shape_ok(value) and value:
+            rows[key] = {"rows": value, "bypassed": entry.get("bypassed") is True}
+        if len(rows) >= control_manifest.MAX_BINDINGS:
+            break
+    return rows
+
+
 def read_sdk_delta(prompt: dict) -> dict:
     """The hygiene-checked delta of the first editor that carries one, else empty.
 
@@ -200,8 +234,10 @@ def read_sdk_delta(prompt: dict) -> dict:
             "advanced": _clean_flags(raw.get("advanced")),
             "local": _small_local(raw.get("local")),
             "hidden": {item for item in hidden[:control_manifest.MAX_BINDINGS] if _clean_id(item)},
+            "rows": _clean_rows(raw.get("rows")),
         }
-    return {"labels": {}, "groups": {}, "orders": {}, "seed_modes": {}, "advanced": {}, "local": None, "hidden": set()}
+    return {"labels": {}, "groups": {}, "orders": {}, "seed_modes": {}, "advanced": {}, "local": None, "hidden": set(),
+            "rows": {}}
 
 
 # ── Snapshot ─────────────────────────────────────────────────────────────────
@@ -214,14 +250,33 @@ def _native_stack(descriptor: dict, prompt: dict) -> bool:
             and isinstance(node, dict) and node.get("class_type") in NATIVE_LORA_STACKS)
 
 
-def _recorded_value(descriptor: dict, prompt: dict) -> Any:
-    """The first target's literal, as the run received it; INT/SEED as decimal text."""
+def _authored_rows(descriptor: dict, entry: Any) -> Any:
+    """The delta's authored rows of a stack preparation packed or bypassed, when
+    they agree with what ran (a bypassed stack ran none, unchanged; a packed one
+    ran exactly the rows that are not off). Anything else is ignored."""
+    if not isinstance(entry, dict):
+        return None
+    authored = entry["rows"]
+    executed = descriptor.get("value")
+    expected = authored if entry["bypassed"] else [row for row in authored if not control_rows.row_is_noop(row)]
+    if entry["bypassed"] and not all(control_rows.row_is_noop(row) for row in authored):
+        return None
+    return authored if control_rows.canonical(executed) == control_rows.canonical(expected) else None
+
+
+def _recorded_value(descriptor: dict, prompt: dict, prepared: Any = None) -> Any:
+    """The first target's literal, as the run received it; INT/SEED as decimal text.
+
+    ``prepared`` is the delta's entry for a stack the run's preparation packed
+    or bypassed: its authored rows are recorded, off rows included.
+    """
     targets = descriptor.get("targets") or []
     first = targets[0] if targets else {}
     kind = descriptor.get("kind")
     if kind == control_rows.ROWS_KIND:
         if _native_stack(descriptor, prompt):
-            rows = captured_native_lora_rows(descriptor.get("value"))
+            authored = _authored_rows(descriptor, prepared)
+            rows = captured_native_lora_rows(authored if authored is not None else descriptor.get("value"))
             if rows is not None:
                 return rows
             return control_rows.detail(descriptor.get("value"), descriptor, TEXT_VALUE_LIMIT, marker=TRUNCATED_MARKER)
@@ -370,7 +425,10 @@ def controls_snapshot(
         if descriptor.get("status") != control_descriptors.STATUS_OK or binding_id in delta["hidden"]:
             continue
         targets = [{"path": t.get("path"), "input": t.get("input")} for t in descriptor.get("targets") or []]
-        if not any(t["path"] in reachable for t in targets):
+        prepared = delta["rows"].get(binding_id)
+        # A stack the run bypassed is kept with nothing consuming it: listed
+        # from the delta, which names only stacks whose consumers ran.
+        if not any(t["path"] in reachable for t in targets) and not (prepared and prepared["bypassed"]):
             continue
         origin = descriptor.get("origin", "authored")
         label = descriptor.get("label") or control_descriptors.DEFAULT_LABEL
@@ -391,7 +449,7 @@ def controls_snapshot(
             "order": order,
             "advanced": advanced,
             "kind": descriptor.get("kind"),
-            "value": _recorded_value(descriptor, prompt),
+            "value": _recorded_value(descriptor, prompt, prepared),
             "targets": targets[:MAX_TARGETS],
         }
         if _native_stack(descriptor, prompt) and isinstance(entry["value"], list):

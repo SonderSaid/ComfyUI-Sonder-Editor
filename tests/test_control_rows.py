@@ -549,3 +549,105 @@ def test_native_stack_near_byte_cap_reserves_the_final_truncation_count():
     assert section is not None and encoded(section) <= controls_snapshot.MAX_SECTION_BYTES
     assert set(section["fields"]) == {"Stack", "Later"} and "truncated" not in section
     assert section["controls"][0]["rows_omitted"] is True
+
+
+# ── Off rows may keep a file this ComfyUI lacks (Phase 3 of the 0.8 hardening) ──
+
+OFF_NONE = row("None", 1.0, False)
+
+
+@pytest.mark.parametrize("rows, accepted", [
+    ([OFF_NONE], True),
+    ([row("gone.safetensors", 0.0, True)], True),  # zero strength is off too
+    ([row("", 1.0, True)], False),                # an on row with no file: the canvas refuses it
+    ([row(), OFF_NONE], True),
+    ([row("None", 1.0, True)], False),            # an on row keeps the full check
+    ([row("", 1.0, False)], True),
+    ([row("x" * 5000, 1.0, False)], False),
+])
+def test_an_off_native_row_may_keep_a_file_that_is_not_installed(rows, accepted):
+    view = describe(prompt())
+    assert stack(view)["row_activity"] == control_rows.NATIVE_ROW_ACTIVITY
+    cleaned, rejected = cd.validate_binding_changes(view, {"binding:stack:value": rows})
+    assert bool(cleaned) is accepted and bool(rejected) is not accepted
+    if accepted:
+        assert cleaned["binding:stack:value"] == rows
+
+
+def test_other_row_groups_keep_the_full_check():
+    spec = {"group_name": "row", "min": 0, "max": 3, "fields": [
+        {"id": "lora_name", "kind": "COMBO", "options": ["a"]}, {"id": "enabled", "kind": "BOOLEAN"},
+        {"id": "strength", "kind": "FLOAT"}]}
+    with pytest.raises(cd.ControlValueError):
+        control_rows.coerce_rows([{"lora_name": "b", "enabled": False, "strength": 1.0}], spec)
+    spec["row_activity"] = {"enabled": "enabled", "strength": "strength", "file": "nope"}  # malformed: ignored
+    with pytest.raises(cd.ControlValueError):
+        control_rows.coerce_rows([{"lora_name": "b", "enabled": False, "strength": 1.0}], spec)
+
+
+def test_a_template_off_row_with_an_absent_file_describes_without_an_error_and_stores():
+    p = prompt([row(), OFF_NONE])
+    view = describe(p)
+    assert stack(view)["error"] is None and stack(view)["value"] == [row(), OFF_NONE]
+    stored = {"bindings": {"stack": {"value": [OFF_NONE], "sig": cd.binding_signature(stack(view))}}}
+    result = sdk_templates.apply_stored_values(p, view, stored, describe=_sdk_describe)
+    assert not stack(result).get("reset") and p["2"]["inputs"]["loras.0.lora_name"] == "None"
+
+
+def test_the_mounted_pre_check_carries_the_off_row_rule(registry):
+    async def run():
+        await setup()
+        body = publication()
+        body["view"] = cd.json_safe(describe(prompt([row()])))
+        assert (await session_registry.publish_controls_view(PID, HID, CANVAS, body))["ok"]
+        queued = await session_registry.post_control_changes(
+            PID, HID, TAB, {"binding:stack:value": {"rows": [row(), OFF_NONE], "base": [row()]}})
+        assert queued["ok"], queued
+        refused = await session_registry.post_control_changes(
+            PID, HID, TAB, {"binding:stack:value": {"rows": [row("None")], "base": [row()]}})
+        assert refused["code"] == "invalid_change"
+
+    asyncio.run(run())
+    broken = cd.json_safe(describe(prompt()))
+    broken["bindings"][0]["row_activity"] = {"enabled": 1}
+    with pytest.raises(ValueError):
+        session_registry._prepare_control_publication({"view_seq": 1, "prompt_hash": "h", "view": broken})
+
+
+OFF_GONE = row("gone.safetensors", 1.0, False)
+
+
+def _delta(rows, bypassed):
+    return {"v": controls_snapshot.SDK_DELTA_VERSION, "rows": {"stack": {"rows": rows, "bypassed": bypassed}}}
+
+
+def test_controls_at_run_records_the_authored_rows_of_a_packed_stack():
+    authored = [OFF_GONE, row(LORAS[1], 0.5)]
+    p = prompt([row(LORAS[1], 0.5)])  # what ran after preparation packed the stack
+    p["1"]["class_type"] = "SonderEditor"
+    p["1"]["_meta"] = {controls_snapshot.SDK_META_KEY: _delta(authored, False)}
+    CLASSES["SonderEditor"] = Sink
+    try:
+        section = controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup)
+        assert [r["name"] for r in section["fields"]["Load LoRA (Model) · LoRAs"]] == ["gone.safetensors", LORAS[1]]
+        # A delta that disagrees with what ran is ignored.
+        p["1"]["_meta"] = {controls_snapshot.SDK_META_KEY: _delta([row(LORAS[2]), row(LORAS[1], 0.5)], False)}
+        section = controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup)
+        assert [r["name"] for r in section["fields"]["Load LoRA (Model) · LoRAs"]] == [LORAS[1]]
+    finally:
+        CLASSES.pop("SonderEditor")
+
+
+def test_controls_at_run_lists_a_bypassed_stack_from_the_delta():
+    p = prompt([OFF_GONE])
+    p["3"]["inputs"]["model"] = ["1", 0]  # preparation rewired the consumer past the stack
+    p["1"]["class_type"] = "SonderEditor"
+    CLASSES["SonderEditor"] = Sink
+    try:
+        assert controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup) is None
+        p["1"]["_meta"] = {controls_snapshot.SDK_META_KEY: _delta([OFF_NONE], True)}
+        section = controls_snapshot.controls_snapshot(p, ["3"], class_lookup=lookup)
+        assert section["fields"]["Load LoRA (Model) · LoRAs"] == [
+            {"slot": 1, "name": "gone.safetensors", "enabled": False, "strength": 1.0, "skipped": True}]
+    finally:
+        CLASSES.pop("SonderEditor")

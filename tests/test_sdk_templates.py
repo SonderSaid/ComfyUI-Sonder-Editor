@@ -74,15 +74,17 @@ def test_validation_requires_one_editor_a_reachable_save_and_installed_nodes():
     assert "more than one" in " ".join(validate(two)["errors"])
     missing = api_prompt(**{"7": {"class_type": "SomePackNode", "inputs": {}}})
     result = validate(missing)
-    # Importable but unusable: listed, not refused (decision H).
-    assert not result["ok"] and result["errors"] == [] and result["missing_nodes"] == ["SomePackNode"]
+    # Importable and openable (decision H; Phase 3 of the 0.8 hardening): a run
+    # refuses only when what it would run needs the missing class.
+    assert result["ok"] and result["errors"] == [] and result["missing_nodes"] == ["SomePackNode"]
+    assert result["version"] == sdk_templates.VALIDATION_VERSION
     none = {"2": {"class_type": "KSampler", "inputs": {}}}
     assert "no Sonder Editor" in " ".join(validate(none)["errors"])
 
 
 def test_a_retired_sonder_control_workflow_names_the_missing_node():
     result = validate(api_prompt(**{"5": {"class_type": "SonderControl", "inputs": {}}}))
-    assert not result["ok"] and result["missing_nodes"] == ["SonderControl"]
+    assert result["ok"] and result["missing_nodes"] == ["SonderControl"]
 
 
 def test_validation_reports_editor_defaults_and_binding_summary():
@@ -324,7 +326,7 @@ def missing_prompt():
                          "8": {"class_type": "Power Lora Loader (rgthree)", "inputs": {}}})
 
 
-def test_a_workflow_with_missing_nodes_is_stored_listed_and_never_described(user_dir):
+def test_a_workflow_with_missing_nodes_is_stored_listed_and_described(user_dir):
     described = []
 
     def describe(prompt):
@@ -333,15 +335,16 @@ def test_a_workflow_with_missing_nodes_is_stored_listed_and_never_described(user
 
     check = lambda p: sdk_templates.validate_template(p, class_lookup=lookup, describe=describe)  # noqa: E731
     template_id = sdk_templates.import_template(raw(missing_prompt()), source_name="kj.json", validate=check)["template_id"]
-    assert not described
+    # Describe reads a target of an absent class as "not installed", so the
+    # Controls summary is there from the import on.
+    assert described == [True]
     listed = sdk_templates.list_templates()
     assert [t["template_id"] for t in listed] == [template_id]
     validation = listed[0]["validation"]
-    assert validation["ok"] is False and validation["errors"] == []
+    assert validation["ok"] is True and validation["errors"] == []
     assert validation["missing_nodes"] == ["Power Lora Loader (rgthree)", "VAELoaderKJ"]
-    # Replace accepts it too, and skips the preset check that would describe it.
     sdk_templates.replace_template(template_id, raw(missing_prompt()), validate=check)
-    assert not described
+    assert len(described) >= 2
 
 
 def test_missing_node_workflows_count_toward_the_cap(user_dir, monkeypatch):
@@ -377,13 +380,25 @@ def test_the_list_rechecks_only_stored_names_and_revalidates_once_when_installed
     assert meta["validation"]["ok"] is True
 
 
-def test_open_refuses_live_missing_nodes_even_ones_uninstalled_after_import(user_dir):
+def test_open_allows_missing_nodes_even_ones_uninstalled_after_import(user_dir):
     template_id = sdk_templates.import_template(raw(api_prompt(**{"5": {"class_type": "KSampler", "inputs": {}}})),
                                                 validate=lambda p: validate(p))["template_id"]
     assert sdk_templates.runnable_template(template_id, lookup)[1]["validation"]["ok"]
     gone = lambda name: None if name == "KSampler" else lookup(name)  # noqa: E731
-    with pytest.raises(TemplateError) as exc:
-        sdk_templates.runnable_template(template_id, gone)
-    assert exc.value.code == "missing_nodes" and exc.value.status == 409
-    assert exc.value.details == {"missing_nodes": ["KSampler"]}
-    assert "KSampler" in str(exc.value) and "restart ComfyUI" in str(exc.value)
+    prompt, meta = sdk_templates.runnable_template(template_id, gone)
+    assert "5" in prompt and meta["validation"]["ok"]
+
+
+def test_an_0_8_meta_whose_nodes_are_still_missing_is_revalidated_and_opens(user_dir, monkeypatch):
+    template_id = sdk_templates.import_template(raw(missing_prompt()), validate=lambda p: validate(p))["template_id"]
+    _, meta_path, _ = sdk_templates._template_paths(template_id)
+    meta = json.loads(open(meta_path, encoding="utf-8").read())
+    # The 0.8.x shape: no version, ok false because nodes were missing.
+    meta["validation"] = {"ok": False, "errors": [], "missing_nodes": ["VAELoaderKJ"], "controls": []}
+    sdk_templates.write_json_atomic(meta_path, meta)
+    monkeypatch.setattr(sdk_templates, "_revalidated", {})
+    prompt, opened = sdk_templates.runnable_template(template_id, lookup)
+    assert opened["validation"]["ok"] and opened["validation"]["version"] == sdk_templates.VALIDATION_VERSION
+    stored = json.loads(open(meta_path, encoding="utf-8").read())["validation"]
+    assert stored["version"] == sdk_templates.VALIDATION_VERSION  # best-effort rewrite
+    assert sdk_templates.list_templates()[0]["validation"]["ok"]

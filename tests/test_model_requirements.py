@@ -119,18 +119,18 @@ def test_disconnected_missing_model_does_not_refuse_executable_graph():
 def test_launcher_checks_stored_binding_values(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, 'folder_paths', types.SimpleNamespace(get_user_directory=lambda: str(tmp_path)))
     p = prompt('missing.ckpt')
+    p['4'] = {'class_type': 'Out', 'inputs': {'model': ['3', 0]}}  # the judge counts only what an output needs
     meta = sdk_templates.import_template(__import__('json').dumps(p).encode(), validate=lambda p: {'ok': True})
-    monkeypatch.setattr(cd, 'comfy_class_lookup', lambda name: loader(['installed.ckpt']))
+    output = type('Out', (), {'OUTPUT_NODE': True, 'INPUT_TYPES': classmethod(lambda cls: {'required': {}})})
+    monkeypatch.setattr(cd, 'comfy_class_lookup', lambda name: output if name == 'Out' else loader(['installed.ckpt']))
     binding = {'binding_id': 'ckpt', 'kind': 'COMBO', 'status': 'ok', 'options': ['installed.ckpt'],
                'targets': [{'path': '3', 'input': 'ckpt_name', 'class_type': 'Loader', 'status': 'ok'}]}
     monkeypatch.setattr(cd, 'describe_bindings', lambda p, **kw: {'relay': {'status': 'ok'}, 'bindings': [binding], 'notes': []})
-    assert sdk_templates.list_templates(requirements=True)[0]['missing_models']
-    assert sdk_templates.template_requirements(meta['template_id'])['missing_models']
+    assert sdk_templates.check_template(meta['template_id'])['missing_models']
     sig = {'class_type': 'Loader', 'input': 'ckpt_name', 'kind': 'COMBO'}
     sdk_templates.update_control_values(meta['template_id'], lambda data: data['bindings'].update(
         {'ckpt': {'value': 'installed.ckpt', 'sig': sig}}))
-    assert not sdk_templates.list_templates(requirements=True)[0]['missing_models']
-    assert not sdk_templates.template_requirements(meta['template_id'])['missing_models']
+    assert not sdk_templates.check_template(meta['template_id'])['missing_models']
 
 
 def test_a_loader_its_input_name_cannot_place_uses_the_class_map():
@@ -166,7 +166,7 @@ def test_the_route_shows_absolute_paths_only_to_a_same_origin_page_on_this_machi
     from aiohttp import web
     from aiohttp.test_utils import make_mocked_request
     from server import sdk_routes
-    monkeypatch.setattr(sdk_templates, "template_requirements", lambda template_id: {
+    monkeypatch.setattr(sdk_templates, "check_template", lambda template_id: {
         "ok": True, "template_id": template_id,
         "missing_models": [{"file": "a.safetensors", "folder": "vae", "relative": "models/vae/a.safetensors",
                             "node": "VAE", "node_id": "1", "input": "vae_name"}]})
@@ -203,3 +203,19 @@ def test_the_folder_listing_exactly_the_options_beats_the_input_name(monkeypatch
                                get_filename_list=lambda key: ["a.safetensors"] if key == "clip_vision" else [])
     monkeypatch.setitem(sys.modules, "folder_paths", fp)
     assert mr.missing_models(prompt("b.safetensors", "clip_name", "SomeVisionLoader"), lambda _: Loader)[0]["folder"] == "clip_vision"
+
+
+def test_a_native_lora_row_naming_no_file_is_a_requirement_with_its_own_message():
+    # The App starters' switched-off "None" row is cut before a run; when a run
+    # still carries it (turned on, or preparation fell back) it must refuse by name.
+    class Stack:
+        @classmethod
+        def INPUT_TYPES(cls):
+            return {"required": {"loras.0.lora_name": (["a.safetensors"],)}}
+
+    graph = {"3": {"class_type": "LoadLoraModel", "inputs": {"loras.0.lora_name": "None"}, "_meta": {"title": "LoRAs"}}}
+    missing = mr.missing_models(graph, lambda _: Stack)
+    assert [m["file"] for m in missing] == ["None"]
+    assert mr.missing_model_message(missing[0]).startswith("A LoRA row in LoRAs reads “None”, not an installed file.")
+    other = {"3": {"class_type": "Loader", "inputs": {"ckpt_name": "None"}}}
+    assert mr.missing_models(other, lambda _: loader([])) == []

@@ -99,7 +99,9 @@ The underlying nodes and the switches that control branches must be prepared
 on the canvas.
 
 A workflow that needs node packs you don't have is still imported, marked
-**Missing nodes** with the packs to install; see
+**Missing nodes** with the packs to install, and still opens. **Generate**
+refuses only when the Modes you chose use one of those nodes, and names the
+choice that needs it. To install them, see
 [The Launcher says *Missing node packs*](troubleshooting.md#the-launcher-says-missing-node-packs).
 
 ## Generate

@@ -249,7 +249,7 @@ def register_sdk_routes(
     @handle
     async def api_sdk_template_requirements(request: web.Request) -> web.Response:
         template_id = sdk_templates.check_template_id(request.match_info.get("template_id"))
-        result = await asyncio.to_thread(sdk_templates.template_requirements, template_id)
+        result = await asyncio.to_thread(sdk_templates.check_template, template_id)
         # Where each file goes on disk is shown only to a browser on the ComfyUI
         # machine, on a same-origin page; others see the models/... form.
         from .routes import _same_origin_request

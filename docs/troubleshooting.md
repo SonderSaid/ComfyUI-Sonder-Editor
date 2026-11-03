@@ -166,8 +166,11 @@ this same ComfyUI.
 
 The workflow uses nodes this ComfyUI doesn't have. The Launcher still imports
 it, marks it **Missing nodes**, and lists the node packs that provide them.
-Without ComfyUI-Manager it lists the node names instead. **Open** stays greyed
-out until every pack is installed.
+Without ComfyUI-Manager it lists the node names instead. **Open** still works:
+if the Modes you choose don't use those nodes, **Generate** works too.
+When the selected workflow's current Modes need a missing node, the bar at the
+bottom of the Launcher says so in red and names the Mode choice that needs it.
+To use those Modes, install the packs:
 
 1. Find the workflow's canvas file: the `.json` shipped next to the API file
    you imported.
@@ -178,7 +181,7 @@ out until every pack is installed.
 4. Click **Install All**, or **Install** beside each pack. Pack names there
    can differ slightly from the Launcher's.
 5. Restart ComfyUI when asked, then reload the Launcher page. The workflow
-   loses its **Missing nodes** mark, and **Open** works.
+   loses its **Missing nodes** mark.
 
 A pack the list names as **no known pack** isn't in ComfyUI-Manager's index.
 Search its node name on [registry.comfy.org](https://registry.comfy.org) or

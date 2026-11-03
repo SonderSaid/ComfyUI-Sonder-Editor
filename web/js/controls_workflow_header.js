@@ -38,9 +38,11 @@ function mountWorkflowMenu(workflows, { flushPending, notify, canSwitch }) {
         // Options are rebuilt only when they change: every panel render paints this.
         const options = list.map(w => [w.template_id, `${w.favorite ? "★ " : ""}${w.name || "Untitled workflow"}`,
             !w.ok && w.template_id !== id,
-            w.ok ? (w.description || "")
-                : w.missing_nodes?.length ? `Missing nodes: ${w.missing_nodes.join(", ")}. Install them, then restart ComfyUI.`
-                : "This workflow can't drive the editor."]);
+            // Missing nodes don't stop a switch: Generate names them when the
+            // chosen Modes need them.
+            !w.ok ? "This workflow can't drive the editor."
+                : [w.description || "", w.missing_nodes?.length
+                    ? `Some Modes use nodes that aren't installed: ${w.missing_nodes.join(", ")}.` : ""].filter(Boolean).join(" ")]);
         const key = JSON.stringify(options);
         if (key !== optionsKey) {
             optionsKey = key;

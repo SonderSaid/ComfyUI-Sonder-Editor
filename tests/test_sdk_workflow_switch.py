@@ -233,7 +233,8 @@ def test_a_workflow_that_cannot_drive_the_editor_is_refused(world, monkeypatch):
     def load(template_id):
         prompt, meta = real(template_id)
         if template_id == world.other_id:
-            meta = {**meta, "validation": {"ok": False}}
+            meta = {**meta, "validation": {"version": sdk_templates.VALIDATION_VERSION, "ok": False,
+                                           "errors": ["The workflow has no Sonder Editor."]}}
         return prompt, meta
 
     monkeypatch.setattr(sdk_templates, "load_template", load)
@@ -248,24 +249,24 @@ def test_a_workflow_that_cannot_drive_the_editor_is_refused(world, monkeypatch):
     assert asyncio.run(go()).template_id == world.template_id
 
 
-def test_open_and_switch_refuse_a_workflow_whose_nodes_are_missing_now(world):
+def test_open_and_switch_allow_a_workflow_whose_nodes_are_missing_now(world):
     world.missing_classes = {"KSampler"}  # uninstalled since the import
 
     async def go():
-        with pytest.raises(SdkError) as opened:
-            await world.runner.open_session(world.other_id, PROJECT)
         world.missing_classes = set()
         session = await world.open()
         world.missing_classes = {"KSampler"}
-        with pytest.raises(SdkError) as switched:
-            await switch(world, session, world.other_id)
-        return session, opened.value, switched.value
+        await switch(world, session, world.other_id)
+        # What runs still needs it (nothing cuts the KSampler), so Generate names it.
+        with pytest.raises(SdkError) as refused:
+            await world.runner.generate(session, tab_session_id="tab-1")
+        # An Open is allowed as well.
+        meta = await world.runner._runnable_meta(world.other_id)
+        return session, refused.value, meta
 
-    session, opened, switched = asyncio.run(go())
-    for error in (opened, switched):
-        assert error.code == "missing_nodes" and error.status == 409
-        assert error.details == {"missing_nodes": ["KSampler"]}
-    assert session.template_id == world.template_id
+    session, refused, meta = asyncio.run(go())
+    assert session.template_id == world.other_id and meta["validation"]["ok"]
+    assert refused.code == "missing_nodes" and refused.details["missing_nodes"] == ["KSampler"]
 
 
 def test_controls_read_and_write_the_new_workflow_and_name_it(world):

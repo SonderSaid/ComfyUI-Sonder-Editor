@@ -32,6 +32,10 @@ MAX_ROWS = 20  # _DynamicGroup._MaxRows; a template cannot declare more
 FIELD_KINDS = ("STRING", "INT", "FLOAT", "BOOLEAN", "COMBO")
 _KEY_RE = re.compile(r"^(0|[1-9][0-9]*)\.([^.]+)$")
 _SAFE_INTEGER = 2 ** 53
+# A native LoRA stack's row fields that decide whether it runs (``row_is_noop``)
+# and the file an off row may keep although this ComfyUI lacks it.
+NATIVE_ROW_ACTIVITY = {"enabled": "enabled", "strength": "strength", "file": "lora_name"}
+MAX_OFF_FILE_LENGTH = 4096
 
 
 def _cd():
@@ -172,12 +176,17 @@ def coerce_rows(raw: Any, spec: dict) -> list[dict]:
         raise cd.ControlValueError(f"At most {maximum} {_plural(noun, maximum)} fit.")
     fields = spec.get("fields") or []
     ids = [field["id"] for field in fields]
+    # A native stack's off row may keep a file this ComfyUI lacks: it never
+    # opens it (row_is_noop). Its file is checked last, once the row's other
+    # fields say whether it is off; an on row keeps the full check.
+    activity = spec.get("row_activity") if _activity_ok(spec.get("row_activity"), ids) else None
+    file_id = activity["file"] if activity else None
     rows = []
     for index, row in enumerate(raw, start=1):
         if not isinstance(row, dict) or set(row) != set(ids):
             raise cd.ControlValueError(f"{noun} {index} must set {', '.join(ids)}.")
         cleaned = {}
-        for field in fields:
+        for field in sorted(fields, key=lambda f: f["id"] == file_id):
             value = row[field["id"]]
             try:
                 if field["kind"] == "BOOLEAN":
@@ -185,12 +194,23 @@ def coerce_rows(raw: Any, spec: dict) -> list[dict]:
                         raise cd.ControlValueError("Choose on or off.")
                 else:
                     value = cd.coerce_control_value(field["kind"], value)
-                _check_bounds(value, field)
+                # Off by its switch or strength only: an empty file on an on row
+                # stays refused (the canvas validates it natively).
+                if field["id"] == file_id and row_is_noop({**cleaned, "lora_name": "off"}):
+                    if not isinstance(value, str) or len(value) > MAX_OFF_FILE_LENGTH:
+                        raise cd.ControlValueError("Choose a file.")
+                else:
+                    _check_bounds(value, field)
             except (cd.ControlValueError, OverflowError) as exc:
                 raise cd.ControlValueError(f"{noun} {index} {field.get('label') or field['id']}: {exc}") from None
             cleaned[field["id"]] = value
-        rows.append(cleaned)
+        rows.append({field["id"]: cleaned[field["id"]] for field in fields})
     return rows
+
+
+def _activity_ok(activity: Any, ids: list[str]) -> bool:
+    return (isinstance(activity, dict) and set(activity) == set(NATIVE_ROW_ACTIVITY)
+            and all(isinstance(activity[key], str) and activity[key] in ids for key in activity))
 
 
 def coerce_change(raw: Any, descriptor: dict, *, defer_base: bool = False) -> list[dict] | dict:
@@ -240,6 +260,53 @@ def canonical(rows: Any) -> str:
     ``web/js/control_rows.js`` ``canonical`` mirrors it byte for byte.
     """
     return json.dumps(_normal(rows), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _row_literal(value: Any) -> tuple[bool, Any]:
+    """``(True, value)`` for a literal as ComfyUI unwraps it, ``(False, None)`` for a link."""
+    if isinstance(value, (list, tuple)):
+        return False, None
+    if isinstance(value, dict) and "__value__" in value:
+        value = value["__value__"]
+    return True, value
+
+
+def row_is_noop(row: Any) -> bool:
+    """Whether a native LoRA stack row is skipped when it runs.
+
+    The one authority for "this row is off" (execution preparation, the row
+    check and provenance). It follows ``nodes_lora_stack`` (``not lora_name or
+    not enabled or strength == 0``) on the values ComfyUI's validation has
+    already converted: BOOLEAN by ``bool()`` (so the text ``"false"`` is on)
+    and FLOAT by ``float()``. A linked field never makes a row a no-op.
+    """
+    if not isinstance(row, dict):
+        return False
+    if "enabled" in row:
+        literal, value = _row_literal(row["enabled"])
+        if literal:
+            try:
+                if not bool(value):
+                    return True
+            except Exception:  # noqa: BLE001 - an unconvertible value fails validation
+                pass
+    if "strength" in row:
+        literal, value = _row_literal(row["strength"])
+        if literal:
+            try:
+                if float(value) == 0:
+                    return True
+            except (TypeError, ValueError, OverflowError):
+                pass
+    if "lora_name" in row:
+        literal, value = _row_literal(row["lora_name"])
+        if literal:
+            try:
+                if not value:
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+    return False
 
 
 def apply_rows(inputs: dict, group: str, rows: list[dict]) -> None:
@@ -313,6 +380,8 @@ def check_publication(descriptor: dict) -> None:
     for bound in ("min", "max"):
         if isinstance(descriptor.get(bound), bool) or not isinstance(descriptor.get(bound), int):
             raise ValueError("A row list needs its row limits.")
+    if "row_activity" in descriptor and not _activity_ok(descriptor["row_activity"], [f["id"] for f in fields]):
+        raise ValueError("A row list's activity fields are invalid.")
     if not isinstance(descriptor.get("value"), list):
         raise ValueError("A row list's value must be a list.")
 

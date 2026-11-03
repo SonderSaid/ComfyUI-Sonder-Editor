@@ -563,7 +563,9 @@ def test_more_than_64_stored_values_apply_and_a_refused_one_resets_alone(world):
     asyncio.run(run())
     inputs = world.client.submitted[0]['9']['inputs']
     assert inputs['v3'] == 1 and inputs['v69'] == 69 and inputs['v64'] == 64
-    assert sdk_templates.list_templates(requirements=True)  # the Launcher still lists it
+    assert sdk_templates.list_templates()  # the Launcher still lists it
+    assert sdk_templates.check_template(world.template_id, class_lookup={**CLASSES, 'Wide': Wide}.get,
+                                        node_lookup={**CLASSES, 'Wide': Wide}.get, describe=world.runner._describe)['ok']
 
 
 def test_advanced_is_view_only_for_authored_and_local_and_marks_changed_values(world):

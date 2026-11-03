@@ -302,9 +302,11 @@ def test_standard_edit_starter_removes_relay_dependency_without_changing_other_t
     ('sonder_ltx_2_5_refine_upscale', 'sonder_ltx_2_5_refine_upscale'),
     ('sonder_minimax_h3_references_swaps', 'sonder_minimax_h3_references_swaps'),
 ])
-def test_shipped_lora_rows_name_a_file_the_workflow_already_requires(slug, example):
-    # ComfyUI validates a switched-off row's file too, so any other file would
-    # reject the first run for everyone who doesn't have it.
+def test_app_lora_rows_are_off_and_none_and_canvas_rows_name_a_required_file(slug, example):
+    # The Sonder App cuts an off row before ComfyUI validates it (run_preparation),
+    # so its starters ship the optional row as "None", switched off. A canvas Run
+    # still validates a switched-off row's file, so the canvas examples keep a
+    # file the workflow already requires (maintainer, 2026-11-02).
     root = Path(__file__).resolve().parents[1]
     api = json.loads((root / 'sdk_starters' / (slug + '.json')).read_text(encoding='utf-8'))
     meta = json.loads((root / 'sdk_starters' / (slug + '.meta.json')).read_text(encoding='utf-8'))
@@ -312,12 +314,13 @@ def test_shipped_lora_rows_name_a_file_the_workflow_already_requires(slug, examp
     required = {n['inputs']['lora_name'] for key, n in api.items()
                 if n['class_type'] == 'LoraLoaderModelOnly' and key not in meta['initial_node_modes']
                 and isinstance(n['inputs'].get('lora_name'), str)}
-    rows = [value for n in api.values() if n['class_type'] == 'LoadLoraModel'
-            for name, value in n['inputs'].items() if name.endswith('.lora_name')]
-    assert rows and set(rows) <= required
+    rows = [{field: n['inputs'][f'loras.{index}.{field}'] for field in ('lora_name', 'enabled')}
+            for n in api.values() if n['class_type'] == 'LoadLoraModel'
+            for index in sorted({k.split('.')[1] for k in n['inputs'] if k.startswith('loras.')})]
+    assert rows and all(row == {'lora_name': 'None', 'enabled': False} for row in rows)
     canvas_rows = [value for n in canvas['nodes'] if n['type'] == 'LoadLoraModel'
                    for name, value in n['widgets_values_named'].items() if name.endswith('.lora_name')]
-    assert canvas_rows == rows
+    assert canvas_rows and set(canvas_rows) <= required
 
 
 @pytest.mark.parametrize('slug,example', [
@@ -338,24 +341,73 @@ def test_canvas_examples_open_on_their_starters_default_modes(slug, example):
     assert set(opens) <= set(api) | {key.split(':')[0] for key in api}
 
 
-@pytest.mark.parametrize('slug,note', [
-    ('sonder_ltx_2_5_edit_vfx', 'ltx_models_downloads'),
-    ('sonder_ltx_2_5_edit_vfx_standard', 'ltx_models_downloads'),
-    ('sonder_minimax_h3_references_swaps', 'h3_models'),
-])
-def test_models_note_lists_every_file_the_default_modes_require_and_says_to_get_them_all(slug, note):
-    # ComfyUI checks every unmuted loader's file before a run, whichever Task is chosen.
+def _choice_files(slug, choice_name):
+    """Model files a Sonder App run of one Mode choice needs, applied over the
+    export's defaults and prepared as Generate prepares it (run_preparation).
+
+    An offline approximation of applying a choice (members' values and switch
+    modes straight from the manifest, no describe or _expand); the real build of
+    every Task choice is judged by ComfyUI's own validator in the Phase 3 live
+    check of the 0.8 hardening.
+    """
+    import copy
+    from server import control_manifest as cm, control_routing as cr, control_rows, prompt_graph, run_preparation
+
     root = Path(__file__).resolve().parents[1]
     api = json.loads((root / 'sdk_starters' / (slug + '.json')).read_text(encoding='utf-8'))
     meta = json.loads((root / 'sdk_starters' / (slug + '.meta.json')).read_text(encoding='utf-8'))
     relay = next(n for n in api.values() if n['class_type'] == 'SonderControlRelay')
-    text = json.loads(relay['inputs']['manifest'])['notes'][note]['text']
-    files = {value.replace('\\', '/').rsplit('/', 1)[-1] for key, n in api.items()
-             if key not in meta['initial_node_modes']
-             for name, value in n['inputs'].items()
-             if name.endswith('_name') and isinstance(value, str) and value.endswith('.safetensors')}
-    assert files and all(name in text for name in files)
-    assert 'even for one Task' in text
+    menu = json.loads(relay['inputs']['manifest'])
+    preset = next(p for p in menu['presets'].values() if p['name'] == choice_name)
+    graph = copy.deepcopy(api)
+    for identity, member in preset['members'].items():
+        for target in menu['bindings'][identity]['targets']:
+            if isinstance(member['value'], list):
+                control_rows.apply_rows(graph[target['path']]['inputs'], target['input'], member['value'])
+            else:
+                graph[target['path']]['inputs'][target['input']] = member['value']
+    modes = {key: entry['mode'] for key, entry in meta['initial_node_modes'].items()}
+    modes.update(cm.execution_effects(preset.get('execution', {})))
+    modes = {key: mode for key, mode in modes.items() if mode != 'enabled'}
+    routing, error = cr.read_routing(menu['execution']['routing'])
+    assert error is None
+    compiled = cr.compile_modes(graph, routing, modes) if modes else graph
+    outputs = {'SonderSaveVideo', 'SonderPreviewVideo'}
+    lookup = lambda name: type('Output', (), {'OUTPUT_NODE': True}) if name in outputs else object  # noqa: E731
+    prepared = run_preparation.prepare(compiled, class_lookup=lookup)['prompt']
+    roots = [key for key, n in prepared.items() if n['class_type'] in outputs]
+    needed = prompt_graph.upstream_set(prepared, roots)
+    return {value.replace('\\', '/').rsplit('/', 1)[-1] for key in needed
+            for value in prepared[key]['inputs'].values()
+            if isinstance(value, str) and value.endswith('.safetensors')}
+
+
+@pytest.mark.parametrize('slug,note,category', [
+    ('sonder_ltx_2_5_edit_vfx', 'ltx_models_downloads', 'Task'),
+    ('sonder_ltx_2_5_edit_vfx_standard', 'ltx_models_downloads', 'Task'),
+    ('sonder_minimax_h3_references_swaps', 'h3_models', 'Task'),
+    ('sonder_minimax_h3_references_swaps', 'h3_models', 'Mask'),
+    ('sonder_ltx_2_5_refine_upscale', 'refine_models', 'Passes'),
+])
+def test_models_note_lists_each_choices_files_and_the_canvas_rule(slug, note, category):
+    # The Sonder App needs only what the chosen Modes run; a canvas Run still
+    # checks every unmuted loader, and the note says both. A smoke guard: it
+    # finds each file anywhere in the note, not under its Task's bullet, and
+    # applies choices offline (no _expand); the real builds of every choice are
+    # judged by ComfyUI's validator in the Phase 3 V1 harness.
+    root = Path(__file__).resolve().parents[1]
+    api = json.loads((root / 'sdk_starters' / (slug + '.json')).read_text(encoding='utf-8'))
+    menu = json.loads(next(n for n in api.values() if n['class_type'] == 'SonderControlRelay')['inputs']['manifest'])
+    text = menu['notes'][note]['text']
+    choices = next(c['choices'] for c in menu['preset_categories'].values() if c['name'] == category)
+    per_choice = []
+    for choice in choices:
+        files = _choice_files(slug, menu['presets'][choice]['name'])
+        assert files and all(name in text for name in files), (choice, files - {n for n in files if n in text})
+        per_choice.append(files)
+    # Preparation narrows: some choice needs less than the choices together.
+    assert any(files < set().union(*per_choice) for files in per_choice)
+    assert 'even for one Task' not in text and 'canvas Run' in text and 'Sonder App' in text
 
 
 def _h3_shipped_assets():

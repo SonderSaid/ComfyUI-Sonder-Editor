@@ -69,6 +69,7 @@ async function checkRequirements() {
         const result = await call(`/sonder-editor/sdk/templates/${template.template_id}/requirements`);
         if (!active || serial !== requirementsSerial || chosenTemplate() !== template) return;
         template.missing_models = result.missing_models; template.requirements_error = null;
+        template.run_missing_nodes = result.missing_nodes || []; template.run_problems = result.problems || [];
     } catch (err) {
         if (!active || serial !== requirementsSerial || chosenTemplate() !== template) return;
         template.requirements_error = 'Model requirements could not be checked. Check again.';
@@ -128,8 +129,10 @@ function preselect(state) {
     }
     const hidden = state.memory.hidden?.workflows || [];
     if (previous !== state.selectedProject || !state.templates.some(t => t.template_id === state.selectedTemplateId && (state.prefs.showHidden || !hidden.includes(t.template_id)))) {
-        const unusable = new Set(state.templates.filter(t => missingNodes(t).length).map(t => t.template_id));
-        state.selectedTemplateId = project()?.workflow || state.projectData.workflow_order.find(id => !hidden.includes(id) && !unusable.has(id)) || '';
+        // As the server's preferred_workflow: one with nothing missing first, else any shown one.
+        const incomplete = new Set(state.templates.filter(t => missingNodes(t).length).map(t => t.template_id));
+        const shown = state.projectData.workflow_order.filter(id => !hidden.includes(id));
+        state.selectedTemplateId = project()?.workflow || shown.find(id => !incomplete.has(id)) || shown[0] || '';
     }
 }
 // One status call at a time. Overlapping refreshes share the one in flight, so a

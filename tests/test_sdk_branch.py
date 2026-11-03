@@ -61,8 +61,10 @@ def test_a_branch_posts_its_own_ids_and_targets_and_advances_seeds(world):
     assert body["prompt"]["1"]["inputs"]["scene_id"] == "scene-a"
     token = body["prompt"]["1"]["_meta"]["sonder_run"]
     assert sdk_runs.token_state(token)["purpose"] == "branch"
-    # Seeds advance per run, as native partial queueing does.
-    assert [b["prompt"]["5"]["inputs"]["seed"] for b in world.branch.bodies] == [10, 11]
+    # The body is the branch's execution copy: the KSampler outside it is cut.
+    assert set(body["prompt"]) == {"1", "2"}
+    # Seeds still advance per run, as native partial queueing does.
+    assert [result["seeds_used"][0]["abcd1234"] for result in (first, second)] == ["10", "11"]
     run = session.runs[0]
     assert (run.purpose, run.state, run.prompt_id) == ("branch", QUEUED, first["prompt_id"])
     assert run.public()["purpose"] == "branch"
@@ -289,11 +291,22 @@ def test_missing_nodes_anywhere_and_an_unreadable_relay_refuse_as_for_generate(w
             await branch(world, session)
         return raised.value
 
-    # The KSampler is outside the branch, but ComfyUI refuses any missing class.
-    missing = asyncio.run(go(missing=["KSampler"]))
-    assert missing.code == "missing_nodes" and missing.details["missing_nodes"]
+    # ComfyUI refuses any missing class in what it is sent, which is the branch.
+    missing = asyncio.run(go(missing=["SonderEditor"]))
+    assert missing.code == "missing_nodes" and missing.details["missing_nodes"] == ["SonderEditor"]
     relay = asyncio.run(go(relay={"status": "error", "key": "9", "error": "Two Relays."}))
     assert relay.code == "generate_refused" and world.branch.bodies == []
+
+
+def test_a_missing_class_outside_the_branch_no_longer_refuses_it(world):
+    async def go():
+        world.missing_classes = set()
+        session = await world.open()
+        world.missing_classes = {"KSampler"}  # outside the branch: preparation cuts it
+        return await branch(world, session)
+
+    result = asyncio.run(go())
+    assert result["ok"] and set(world.branch.bodies[0]["prompt"]) == {"1", "2"}
 
 
 def test_the_capability_gate_refuses_a_tls_comfyui(monkeypatch):
@@ -442,3 +455,14 @@ def test_sdk_live_routes_need_the_session_secret_and_its_tab(world, monkeypatch)
     assert read["sources"]["2"]["state"] == "live" and read["seen"][0]["source"] == "2"
     assert raw == (200, b"RIFFwebp")
     run_outputs.reset_for_tests()
+
+
+def test_an_accepted_branch_reports_the_outputs_comfyui_skipped(world):
+    world.branch.reply = (200, {"prompt_id": "p-1", "number": 1, "node_errors": {"7": {"errors": []}}})
+
+    async def go():
+        session = await world.open()
+        return await branch(world, session)
+
+    result = asyncio.run(go())
+    assert result["ok"] and result["skipped_nodes"] == ["7"]

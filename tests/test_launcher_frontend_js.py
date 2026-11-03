@@ -45,6 +45,14 @@ const missingCases = {
     withoutManager: lw.missingNodesMessage(['VAELoaderKJ'], null),
     badge: lw.workflowBadge(missingTemplate),
     problems: modules.launcher_open_bar.pairProblems({}, missingTemplate, {}, {}, mappings).map(p => [p.kind, p.text]),
+    // Once the row's check answered: what the current Modes need is bad and names the
+    // choice; what only other Modes use is a dim note.
+    checked: modules.launcher_open_bar.pairProblems({}, {validation: {ok: true, errors: [], missing_nodes: ['VAELoaderKJ', 'Other']},
+        run_missing_nodes: [{class_type: 'VAELoaderKJ', needed_by: ['Task → Edit With Words']}], run_problems: ['routing']},
+        {}, {}, null).map(p => [p.kind, p.text]),
+    checkedBadge: lw.workflowBadge({validation: {missing_nodes: ['Other']}, run_missing_nodes: [], missing_models: []}),
+    neededBadge: lw.workflowBadge({validation: {missing_nodes: ['X']}, run_missing_nodes: [{class_type: 'X'}]}),
+    neededModel: modules.launcher_view.modelMessage({file: 'a.safetensors', relative: 'models/loras/a.safetensors', node: 'L', needed_by: ['Passes → Upscale Pass Only']}),
     models: [
         modules.launcher_view.modelMessage({file: 'LTX\\IC Lora\\a.safetensors', relative: 'models/loras/LTX/IC Lora/a.safetensors', path: 'D:\\c\\models\\loras\\LTX\\IC Lora\\a.safetensors', node: 'Load LoRA'}),
         modules.launcher_view.modelMessage({file: 'LTX/a.safetensors', relative: 'models/loras/LTX/a.safetensors', node: 'Load LoRA'}),
@@ -88,8 +96,20 @@ console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,exi
                                       '(Power Lora Loader (rgthree)). Install them, restart ComfyUI, then reload this page.')
     assert missing['withoutManager'] == ('Missing nodes: VAELoaderKJ. Install the node packs that provide them, '
                                          'restart ComfyUI, then reload this page.')
-    assert missing['badge'] == ['Missing nodes', 'bad']
-    assert missing['problems'][0] == ['bad', 'Missing node packs: KJNodes for ComfyUI (VAELoaderKJ). Install them, restart ComfyUI, then reload this page.']
+    # Before the row's check answers, missing nodes warn: the Modes may not use them.
+    assert missing['badge'] == ['Missing nodes', 'warn']
+    assert missing['problems'][0] == ['warn', 'Missing node packs: KJNodes for ComfyUI (VAELoaderKJ). Install them, restart ComfyUI, then reload this page.']
+    assert missing['checked'] == [
+        ['bad', 'Missing nodes: VAELoaderKJ. Install the node packs that provide them, restart ComfyUI, then reload this page.'
+                ' Needed by Task → Edit With Words.'],
+        ['dim', 'Some Modes of this workflow use nodes that aren’t installed: Other. The current Modes don’t need them.'],
+        ['bad', 'routing']]
+    assert missing['checkedBadge'] == ['Missing nodes', 'warn'] and missing['neededBadge'] == ['Missing nodes', 'bad']
+    assert missing['neededModel'] == 'a.safetensors → models/loras/a.safetensors (L) Needed by Passes → Upscale Pass Only.'
+    # Missing nodes never disable Open: the workflow's Modes may not use them.
+    bar = (JS / 'launcher_open_bar.js').read_text(encoding='utf-8')
+    disabled = bar.split('disabled:', 1)[1].splitlines()[0]
+    assert 'missingNodes' not in disabled and 'too_new' in disabled
     assert missing['models'] == [
         r'a.safetensors → D:\c\models\loras\LTX\IC Lora\a.safetensors (Load LoRA)',
         'a.safetensors → models/loras/LTX/a.safetensors (Load LoRA)',
@@ -162,7 +182,7 @@ console.log(JSON.stringify({states, badges, problems, nested, needed: m.launcher
     b = value['badges']
     assert b['notReady'] == b['unsupported'] == ['Generate unavailable', 'warn']
     assert b['ready'] == b['unknown'] == b['unreachable'] == ['Ready', 'good']
-    assert b['missingNodesWin'] == ['Missing nodes', 'bad'] and b['modelsWin'] == ['1 models missing', 'warn']
+    assert b['missingNodesWin'] == ['Missing nodes', 'warn'] and b['modelsWin'] == ['1 models missing', 'warn']
     assert b['unchecked'] == ['Select to check models', '']
     # The notice says how to install; the Open bar points back to it.
     assert value['problems'] == [value['short']] and 'see the note at the top' in value['short']

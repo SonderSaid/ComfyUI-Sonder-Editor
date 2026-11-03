@@ -36,10 +36,11 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 from typing import Any, Callable
 
-from . import control_descriptors, control_execution, control_rows, control_views, prompt_graph, model_requirements
+from . import control_descriptors, control_execution, control_rows, control_views, prompt_graph, model_requirements, run_preparation
 from .external_links import WINDOWS_RESERVED_BASENAMES
 from .editor_inputs import clean_editor_values
 from .path_security import PathSecurityError, safe_route_token
@@ -49,6 +50,8 @@ TEMPLATE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 MAX_TEMPLATE_BYTES = 8 * 1024 * 1024
 MAX_TEMPLATES = 200
 MAX_NAME_LENGTH = 120
+# 2: missing nodes no longer make ``ok`` false (Phase 3 of the 0.8 hardening).
+VALIDATION_VERSION = 2
 CONTROLS_VERSION = 1
 logger = logging.getLogger(__name__)
 STARTERS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sdk_starters")
@@ -167,9 +170,10 @@ def validate_template(
 ) -> dict:
     """Check an API workflow can drive the editor, and summarize its Controls.
 
-    ``errors`` refuse the import. ``missing_nodes`` (classes this ComfyUI lacks)
-    keep it importable but unusable (``ok`` false) until they are installed;
-    describing its Controls needs them, so that is skipped meanwhile.
+    ``errors`` refuse the import, and ``ok`` is false only for them.
+    ``missing_nodes`` (classes this ComfyUI lacks) are information: the
+    workflow opens, Controls of an absent class read "not installed", and a
+    run refuses only when what it would run needs one (``run_readiness``).
     ``blocking`` lists what Generate will refuse until the workflow is fixed;
     ``warnings`` are informational.
     """
@@ -196,7 +200,7 @@ def validate_template(
 
     description = control_descriptors.control_manifest.find_relay(prompt)["manifest"].get("description", "")
     controls_summary: list[dict] = []
-    if not errors and not missing:
+    if not errors:
         described = describe(prompt)
         # What the app can switch: an export's off nodes and its routing decide.
         control_execution.apply_sdk_state(described, prompt, {}, set())
@@ -204,7 +208,8 @@ def validate_template(
         controls_summary, control_warnings = controls_summary_of(described)
         warnings.extend(control_warnings)
     return {
-        "ok": not errors and not missing,
+        "version": VALIDATION_VERSION,
+        "ok": not errors,
         "errors": errors,
         "missing_nodes": missing,
         "blocking": blocking,
@@ -252,14 +257,20 @@ def _refresh_missing_nodes(template_id: str, meta: dict, prompt: dict | None = N
     still missing. Once all are installed the workflow is validated in full, once
     per process, and its meta best-effort updated (an install-level cache, not
     project data).
+
+    A validation from before ``VALIDATION_VERSION`` 2 (0.8.x, where missing
+    nodes made ``ok`` false and skipped the Controls summary) is validated
+    again once per process whether or not nodes are still missing. Expiry:
+    drop that check once no 0.8.x meta can be read.
     """
     validation = meta.get("validation") or {}
     stored = validation.get("missing_nodes") or []
-    if not stored:
+    up_to_date = validation.get("version") == VALIDATION_VERSION
+    if not stored and (up_to_date or validation.get("ok", True)):
         return meta
     class_lookup = class_lookup or control_descriptors.comfy_class_lookup
     live = [name for name in stored if class_lookup(name) is None]
-    if live:
+    if live and up_to_date:
         return {**meta, "validation": {**validation, "missing_nodes": live}}
     cached = _revalidated.get(template_id)
     if not cached or cached[0] != _meta_identity(meta):
@@ -280,13 +291,10 @@ def _refresh_missing_nodes(template_id: str, meta: dict, prompt: dict | None = N
 
 
 def runnable_template(template_id: str, class_lookup: Callable[[str], Any] | None = None) -> tuple[dict, dict]:
-    """The workflow and meta an Open or a switch may use, or a refusal: nodes
-    missing now (including ones uninstalled after import), or a workflow that
-    can't drive the editor."""
+    """The workflow and meta an Open or a switch may use, or a refusal for a
+    workflow that can't drive the editor. Missing nodes don't refuse: the
+    current Modes may not use them, and Generate judges what will run."""
     prompt, meta = load_template(template_id)
-    missing = missing_node_classes(prompt, class_lookup)
-    if missing:
-        raise TemplateError(missing_nodes_message(missing), "missing_nodes", 409, missing_nodes=missing)
     meta = _refresh_missing_nodes(template_id, meta, prompt, class_lookup)
     if not meta.get("validation", {}).get("ok", True):
         raise TemplateError("This workflow can't drive the editor.", "invalid_template", 409)
@@ -375,7 +383,7 @@ def _public_meta(template_id: str, meta: dict) -> dict:
     }
 
 
-def list_templates(*, requirements: bool = False) -> list[dict]:
+def list_templates() -> list[dict]:
     folder = templates_dir()
     result = []
     starters = starter_sources()
@@ -405,22 +413,6 @@ def list_templates(*, requirements: bool = False) -> list[dict]:
             logger.warning("Cannot read bundled workflow %s", template_id, exc_info=True)
     for meta in result:
         _overlay_summary(meta)
-    if requirements:
-        input_cache = {}
-        for meta in result:
-            try:
-                with template_lock(meta["template_id"]):
-                    prompt, _ = load_template(meta["template_id"])
-                    stored = read_control_values(meta["template_id"])
-                    # A stored binding value (a checkpoint, say) changes which
-                    # model files the run needs.
-                    if _has_curation(stored):
-                        prompt = run_prompt(prompt, apply_stored_values(prompt, describe_stored(prompt, stored), stored),
-                                            fallback=True)
-                    meta["missing_models"] = model_requirements.missing_models(prompt, input_cache=input_cache)
-            except Exception:  # one workflow's problem must not hide the whole list
-                logger.warning("Model requirements failed for workflow %s", meta.get("template_id"), exc_info=True)
-                meta["requirements_error"] = "Model requirements could not be checked. Check again."
     result.sort(key=lambda item: (item["name"].lower(), item["template_id"]))
     return result
 
@@ -463,16 +455,6 @@ def _overlay_summary(meta: dict) -> None:
         return
     meta["description"] = cached[3]
     meta["validation"] = {**validation, "controls": copy.deepcopy(cached[1]), "warnings": list(cached[2]), "description": cached[3], "preset_count": cached[4]}
-
-
-def template_requirements(template_id: str) -> dict:
-    """Selected-row fallback: avoid inspecting every schema in a large library."""
-    with template_lock(template_id):
-        prompt, _ = load_template(template_id)
-        stored = read_control_values(template_id)
-        if _has_curation(stored):
-            prompt = run_prompt(prompt, apply_stored_values(prompt, describe_stored(prompt, stored), stored), fallback=True)
-        return {"ok": True, "template_id": template_id, "missing_models": model_requirements.missing_models(prompt)}
 
 
 def import_template(raw: bytes, *, source_name: str = "", name: str = "", validate=validate_template) -> dict:
@@ -536,9 +518,8 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
         layout_reset = len(data["layout"]) + len(data["labels"])
         data.update(notes={}, layout={}, labels={}, presentation_hash=hashlib.sha256(raw).hexdigest(), seq=data["seq"] + 1)
         # Preserved app copies and newly authored presets must remain portable.
-        # The check describes the workflow, which needs every node installed.
-        if not validation.get("missing_nodes"):
-            _check_manifest_projection(prompt, data, describe)
+        # Describe reads a target of an absent class as "not installed".
+        _check_manifest_projection(prompt, data, describe)
         # The file lock makes the three writes one transaction for live readers.
         # Restore exact bytes on a failed write. The hash binding below also
         # prevents old notes appearing over a new export after a process crash.
@@ -564,7 +545,7 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
                     logger.exception("Could not restore workflow file %s", path)
             raise
     local_missing = local_shadowed = 0
-    if data.get("local") and not validation.get("missing_nodes"):
+    if data.get("local"):
         try:
             view = describe_stored(prompt, data, describe)
             for binding in view.get("bindings", []):
@@ -905,20 +886,220 @@ def update_control_values(template_id: str, mutate: Callable[[dict], None]) -> d
         return data
 
 
-def run_prompt(prompt: dict, view: dict, *, fallback: bool = False) -> dict:
-    """What a run submits: ``prompt`` (stored values applied) with the app's
-    switch modes compiled the way ComfyUI's serializer would export them
-    (control_routing). Refuses a route the capsule can't replay; ``fallback``
-    (a model check) reads the uncompiled prompt instead."""
+def run_prompt(prompt: dict, view: dict) -> dict:
+    """What a run submits before preparation: ``prompt`` (stored values
+    applied) with the app's switch modes compiled the way ComfyUI's serializer
+    would export them (control_routing). Refuses a route the capsule can't
+    replay."""
     modes = view.get("_node_modes") or {}
     if not modes:
         return prompt
     try:
         return control_execution.control_routing.compile_modes(prompt, view["_routing"], modes)
     except control_execution.control_routing.RoutingError as exc:
-        if fallback:
-            return prompt
         raise TemplateError(str(exc), "invalid_controls", 409) from None
+
+
+SAVE_SWITCHED_OFF = ("The current node switches turn off every Sonder Save Video and Save Bridge "
+                     "that takes its project from the editor, so takes would not land. Switch one on.")
+
+
+def volatile_inputs(view: dict) -> list[tuple[str, str]]:
+    """The inputs each take rewrites after preparation: every exposed seed's
+    targets (``sdk_runner._graph_for_run``). Preparation never resolves them."""
+    found = []
+    for binding in view.get("bindings", []) if isinstance(view, dict) else []:
+        if binding.get("kind") != "SEED" or binding.get("status") != control_descriptors.STATUS_OK:
+            continue
+        if binding.get("hidden"):
+            continue
+        found.extend((str(t.get("path")), str(t.get("input"))) for t in binding.get("targets") or [])
+    return found
+
+
+def run_readiness(prompt: dict, *, editor_key: str, node_lookup: Callable[[str], Any] | None = None,
+                  class_lookup: Callable[[str], Any] | None = None, require_save: bool = True,
+                  input_cache: dict | None = None) -> dict:
+    """The one judge of a prepared run (``run_preparation.prepare``): the
+    Launcher's check, Generate and a branch run all ask it.
+
+    ``missing_nodes`` are classes this ComfyUI lacks in what would run;
+    ``missing_models`` are model files the run's outputs need; ``problems`` are
+    other refusals. ``require_save`` (Generate, the Launcher) refuses a run
+    whose takes would not land; a branch run of a Preview has no Save.
+    """
+    problems = []
+    if require_save and not prompt_graph.nodes_reaching(prompt, editor_key, prompt_graph.SONDER_SAVE_CLASS_TYPES):
+        problems.append(SAVE_SWITCHED_OFF)
+    return {
+        "missing_nodes": missing_node_classes(prompt, node_lookup),
+        "missing_models": model_requirements.missing_models(prompt, class_lookup, input_cache=input_cache,
+                                                            executable_only=True),
+        "problems": problems,
+    }
+
+
+def prepare_compiled(compiled: dict, view: dict, *, node_lookup: Callable[[str], Any] | None = None,
+                     class_lookup: Callable[[str], Any] | None = None, targets=None) -> dict:
+    """``run_preparation.prepare`` of a ``run_prompt`` result, as every Sonder
+    App path calls it: what the run submits."""
+    lookup = class_lookup or control_descriptors.comfy_class_lookup
+    return run_preparation.prepare(compiled, class_lookup=lookup, node_lookup=node_lookup or lookup,
+                                   targets=targets, volatile=volatile_inputs(view))
+
+
+# Simulated Mode choices per attribution: each is a describe, a compile and a
+# preparation (measured in the Phase 3 evidence of the 0.8 hardening).
+MAX_ATTRIBUTIONS = 48
+
+
+def _judge_stored(authored: dict, stored: dict, *, describe=None, node_lookup=None, class_lookup=None) -> dict:
+    """``run_readiness`` of the workflow with these Control values, built as
+    Generate builds it (values, switch modes, preparation)."""
+    prompt = copy.deepcopy(authored)
+    view = apply_stored_values(prompt, describe_stored(prompt, stored, describe), stored, describe=describe)
+    prepared = prepare_compiled(run_prompt(prompt, view), view, node_lookup=node_lookup, class_lookup=class_lookup)
+    editors = prompt_graph.editor_keys(prepared["prompt"])
+    return run_readiness(prepared["prompt"], editor_key=editors[0] if editors else "",
+                         node_lookup=node_lookup, class_lookup=class_lookup)
+
+
+def _requirement_keys(readiness: dict) -> tuple[set, set]:
+    return (set(readiness.get("missing_nodes") or []),
+            {(m.get("node_id"), m.get("input"), m.get("file")) for m in readiness.get("missing_models") or []})
+
+
+def attribute_requirements(authored: dict, stored: dict, readiness: dict, *, describe=None,
+                           node_lookup=None, class_lookup=None) -> dict:
+    """Which current Mode choice needs each missing item:
+    ``{"nodes": {class: [label]}, "models": {(node_id, input, file): [label]}}``.
+
+    For each category with one selected choice, every other usable choice in it
+    is applied to a copy of the Control values through the canonical path
+    (``validate_preset_changes`` apply, so ``_expand`` and its inclusions, then
+    the store's own writes) and judged as Generate would. An item missing now
+    and not under some other choice is needed by the selected one, labelled
+    "Category → Choice". Pure: the caller's values are never written. Stops
+    at ``MAX_ATTRIBUTIONS`` simulations; items it did not reach stay unnamed.
+    """
+    from . import control_preset_categories as pc
+
+    nodes_now, models_now = _requirement_keys(readiness)
+    result: dict = {"nodes": {}, "models": {}}
+    if not nodes_now and not models_now:
+        return result
+    prompt = copy.deepcopy(authored)
+    view = apply_stored_values(prompt, describe_stored(prompt, stored, describe), stored, describe=describe)
+    simulations = 0
+    for row in pc.derive_modes(view)["rows"]:
+        if row["status"] != "selected":
+            continue
+        current = row["selected"]
+        label = f"{row['name']} → {current.get('name') or ''}"
+        freed: set = set()
+        for choice in row["choices"]:
+            if choice.get("id") == current.get("id") or choice.get("state") in pc._UNUSABLE_STATES:
+                continue
+            if simulations >= MAX_ATTRIBUTIONS:
+                logger.info("Mode attribution stopped after %d simulated choices", simulations)
+                break
+            simulations += 1
+            try:
+                values, rejected = control_presets.validate_preset_changes(
+                    view, {f"preset:{choice.get('id')}:apply": True}, prompt=prompt, structural="sdk")
+                if rejected:
+                    continue  # hidden, drifted or unavailable members: this choice can't apply
+                data = copy.deepcopy(stored)
+                apply_choice_values(data, values, view)
+                nodes, models = _requirement_keys(_judge_stored(authored, data, describe=describe,
+                                                                node_lookup=node_lookup, class_lookup=class_lookup))
+            except (control_descriptors.ControlValueError, TemplateError, KeyError, TypeError, ValueError):
+                continue
+            freed |= {("node", n) for n in nodes_now - nodes} | {("model", m) for m in models_now - models}
+        for kind, key in freed:
+            labels = result["nodes" if kind == "node" else "models"].setdefault(key, [])
+            if label not in labels:
+                labels.append(label)
+    return result
+
+
+def name_needed_by(readiness: dict, attribution: dict) -> dict:
+    """``readiness`` with each item's ``needed_by`` (``attribute_requirements``)."""
+    models = []
+    for item in readiness.get("missing_models") or []:
+        labels = attribution["models"].get((item.get("node_id"), item.get("input"), item.get("file")))
+        models.append({**item, "needed_by": labels} if labels else item)
+    return {**readiness, "missing_models": models,
+            "needed_by_nodes": {name: labels for name, labels in attribution["nodes"].items()}}
+
+
+def needed_by_text(labels) -> str:
+    return f" Needed by {'; '.join(labels)}." if labels else ""
+
+
+# The Launcher's check costs up to about a second with every file missing (the
+# attribution), so concurrent requests for one workflow share one computation
+# and an answer is reused for a few seconds while the workflow and its values
+# are unchanged. Model files are not part of the key: "Check again" after
+# adding one answers within ``CHECK_FRESH_SECONDS``.
+CHECK_FRESH_SECONDS = 5.0
+_check_guard = threading.Lock()
+_check_locks: dict[str, threading.Lock] = {}
+_check_cache: dict[str, tuple] = {}
+
+
+def check_template(template_id: str, *, node_lookup: Callable[[str], Any] | None = None,
+                   class_lookup: Callable[[str], Any] | None = None, describe=None) -> dict:
+    """The Launcher's readiness for a workflow, judged as its Generate would be.
+
+    Reads the workflow and its Control values under the template lock, then
+    builds, prepares and judges outside it: the work is pure, and a Generate,
+    a Controls write or a listing must not wait on it. The project's editor
+    position is not part of it (it never selects a branch). One computation
+    per workflow at a time; a fresh answer for unchanged values is reused.
+    """
+    with _check_guard:
+        lock = _check_locks.setdefault(template_id, threading.Lock())
+    with lock:
+        with template_lock(template_id):
+            prompt, meta = load_template(template_id)
+            stored = copy.deepcopy(read_control_values(template_id))
+        key = (stored.get("seq"), stored.get("presentation_hash"), _meta_identity(meta),
+               id(node_lookup), id(class_lookup), id(describe))
+        cached = _check_cache.get(template_id)
+        if cached and cached[0] == key and time.monotonic() - cached[1] < CHECK_FRESH_SECONDS:
+            return copy.deepcopy(cached[2])
+        result = _check_template(template_id, prompt, stored, node_lookup=node_lookup,
+                                 class_lookup=class_lookup, describe=describe)
+        _check_cache[template_id] = (key, time.monotonic(), copy.deepcopy(result))
+        return result
+
+
+def _check_template(template_id: str, prompt: dict, stored: dict, *, node_lookup, class_lookup, describe) -> dict:
+    authored = copy.deepcopy(prompt)
+    view = apply_stored_values(prompt, describe_stored(prompt, stored, describe), stored, describe=describe)
+    result = {"ok": True, "template_id": template_id, "missing_models": [], "missing_nodes": [], "problems": []}
+    try:
+        prepared = prepare_compiled(run_prompt(prompt, view), view, node_lookup=node_lookup, class_lookup=class_lookup)
+    except TemplateError as exc:
+        result["problems"].append(str(exc))
+        return result
+    editors = prompt_graph.editor_keys(prepared["prompt"])
+    readiness = run_readiness(prepared["prompt"], editor_key=editors[0] if editors else "",
+                              node_lookup=node_lookup, class_lookup=class_lookup)
+    try:
+        named = name_needed_by(readiness, attribute_requirements(
+            authored, stored, readiness, describe=describe,
+            node_lookup=node_lookup, class_lookup=class_lookup))
+    except Exception:  # noqa: BLE001 - the readiness stands without its reasons
+        logger.warning("Naming the Mode choices for workflow %s failed", template_id, exc_info=True)
+        named = {**readiness, "needed_by_nodes": {}}
+    nodes = []
+    for name in readiness["missing_nodes"]:
+        labels = named["needed_by_nodes"].get(name)
+        nodes.append({"class_type": name, "needed_by": labels} if labels else {"class_type": name})
+    result.update(missing_models=named["missing_models"], missing_nodes=nodes, problems=readiness["problems"])
+    return result
 
 
 def describe_stored(prompt: dict, stored: dict, describe=None) -> dict:
@@ -1125,20 +1306,7 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
             if isinstance(value, dict) and value.get("noop"):
                 continue
             if source == "execution" and field in ("mode", "modes"):
-                # Node state, as on the canvas: a node two switches share takes
-                # the last mode set. Enabled is the export's own state.
-                members = switches.get(identity, {}).get("members", [])
-                for member in members:
-                    path = member["path"]
-                    mode = value.get(path) if field == "modes" else value
-                    if mode in control_execution.control_routing.OFF_MODES:
-                        data["node_modes"][path] = {"mode": mode, "class_type": member["class_type"]}
-                    else:
-                        data["node_modes"].pop(path, None)
-                # Which nodes this state covered, so a node a later export adds
-                # to the switch follows it (control_execution.added_member_modes).
-                if members:
-                    data["switch_members"][identity] = [member["path"] for member in members]
+                _store_execution_mode(data, switches, identity, field, value)
                 continue
             if source == "preset":
                 authored = control_manifest_of(prompt).get("presets", {})
@@ -1261,18 +1429,57 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                     entry = data["layout"][base] = {}
                 entry[field] = value
             else:
-                entry = data["bindings"].get(identity)
-                if not isinstance(entry, dict):
-                    entry = data["bindings"][identity] = {}
-                if field == "value":
-                    entry["value"] = value
-                    entry["sig"] = signatures.get(identity)
-                else:
-                    entry[field] = value
+                _store_binding_field(data, signatures, identity, field, value)
         if any((control_descriptors.parse_target(target) or (None,))[0] in ("preset", "preset_category", "view")
                for target in changes):
             _check_manifest_projection(prompt, data)
     return update_control_values(template_id, mutate)
+
+
+def _store_execution_mode(data: dict, switches: dict, identity: str, field: str, value) -> None:
+    """A switch's node modes into the sidecar. Node state, as on the canvas: a
+    node two switches share takes the last mode set. Enabled is the export's
+    own state."""
+    members = switches.get(identity, {}).get("members", [])
+    for member in members:
+        path = member["path"]
+        mode = value.get(path) if field == "modes" else value
+        if mode in control_execution.control_routing.OFF_MODES:
+            data["node_modes"][path] = {"mode": mode, "class_type": member["class_type"]}
+        else:
+            data["node_modes"].pop(path, None)
+    # Which nodes this state covered, so a node a later export adds to the
+    # switch follows it (control_execution.added_member_modes).
+    if members:
+        data["switch_members"][identity] = [member["path"] for member in members]
+
+
+def _store_binding_field(data: dict, signatures: dict, identity: str, field: str, value) -> None:
+    entry = data["bindings"].get(identity)
+    if not isinstance(entry, dict):
+        entry = data["bindings"][identity] = {}
+    if field == "value":
+        entry["value"] = value
+        entry["sig"] = signatures.get(identity)
+    else:
+        entry[field] = value
+
+
+def apply_choice_values(data: dict, changes: dict, view: dict) -> None:
+    """A Mode choice's validated values and switch modes into an in-memory
+    sidecar copy, by the store's own writes (``store_binding_changes``). Only
+    what an apply produces (``binding:<id>:value|seed_mode``,
+    ``execution:<id>:mode|modes``) is accepted; anything else raises."""
+    signatures = {d.get("binding_id"): control_descriptors.binding_signature(d) for d in view.get("bindings", [])}
+    switches = {d.get("execution_id"): d for d in view.get("execution", []) or []}
+    for target, value in changes.items():
+        source, identity, field = control_descriptors.parse_target(target)
+        if source == "execution" and field in ("mode", "modes"):
+            _store_execution_mode(data, switches, identity, field, value)
+        elif source == "binding" and field in ("value", "seed_mode"):
+            _store_binding_field(data, signatures, identity, field, value)
+        else:
+            raise TemplateError("A choice applied more than values and switches.", "invalid_controls")
 
 
 def _check_manifest_projection(prompt, data, describe=None):
