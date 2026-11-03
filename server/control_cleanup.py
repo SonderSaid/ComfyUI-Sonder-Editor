@@ -176,3 +176,21 @@ def remove_members(presets, members):
             if not preset.get("members") and not preset.get("execution"):
                 presets.pop(pid)
     return changed
+
+
+def drop_included(presets, removed):
+    """Take deleted choices out of every ``includes`` in ``presets`` (raw
+    definitions), in the same edit that deletes them; the ids changed. A
+    deleted choice applied nothing, so a parent loses nothing.
+    ``applyCleanupPlan`` mirrors it."""
+    changed = set()
+    for pid, preset in presets.items():
+        includes = preset.get("includes") if isinstance(preset, dict) else None
+        if isinstance(includes, list) and any(item in removed for item in includes):
+            kept = [item for item in includes if item not in removed]
+            if kept:
+                preset["includes"] = kept
+            else:
+                preset.pop("includes")
+            changed.add(pid)
+    return changed

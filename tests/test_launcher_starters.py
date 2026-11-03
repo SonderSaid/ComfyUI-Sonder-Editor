@@ -486,3 +486,91 @@ def test_h3_replacement_routes_every_task_and_mask_without_breaking_the_inactive
         for value in node['inputs'].values():
             if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
                 assert value[0] in compiled
+
+
+# ── Phase 6 of the 0.8 hardening: subgraph names; inclusions ship in no starter ──
+
+def _subgraph_walker():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
+    import starter_subgraph_names
+    return starter_subgraph_names
+
+
+@pytest.mark.parametrize('slug,expected', [
+    ('sonder_ltx_2_5_edit_vfx', {'3132': 'Sampling'}),
+    ('sonder_ltx_2_5_edit_vfx_standard', {'3132': 'Sampling'}),
+    # Host 9400 ships muted; its name is listed all the same.
+    ('sonder_ltx_2_5_refine_upscale', {'9400': 'Upscale'}),
+    ('sonder_minimax_h3_references_swaps', None),
+])
+def test_starters_carry_their_canvas_examples_subgraph_names(slug, expected):
+    from server import control_manifest as cm
+    walker = _subgraph_walker()
+    root = Path(__file__).resolve().parents[1]
+    api = json.loads((root / 'sdk_starters' / (slug + '.json')).read_text(encoding='utf-8'))
+    canvas = json.loads((root / 'example_workflows' / (walker.STARTERS[slug] + '.json')).read_text(encoding='utf-8'))
+    menu = json.loads(api[cm.find_relay(api)['key']]['inputs']['manifest'])
+    assert menu.get('subgraph_names') == expected
+    assert (walker.subgraph_names(canvas) or None) == expected
+    assert cm.parse_manifest(json.dumps(menu))['subgraph_names'] == (expected or {})
+    assert walker.main(['--check']) == 0
+
+
+def test_no_starter_or_canvas_example_ships_an_inclusion():
+    from server import control_manifest as cm
+    root = Path(__file__).resolve().parents[1]
+    starters = [p for p in (root / 'sdk_starters').glob('*.json') if not p.name.endswith('.meta.json')]
+    for path in [*starters, *(root / 'example_workflows').glob('*.json')]:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if 'nodes' in data:
+            texts = [w for n in data['nodes'] if n.get('type') == cm.RELAY_CLASS_TYPE for w in n.get('widgets_values') or []
+                     if isinstance(w, str)]
+        else:
+            texts = [n['inputs']['manifest'] for n in data.values() if n.get('class_type') == cm.RELAY_CLASS_TYPE]
+        for text in texts:
+            assert all('includes' not in p for p in (json.loads(text).get('presets') or {}).values()), path.name
+
+
+def test_refine_upscale_copy_with_an_inclusion_mutes_the_mask_group():
+    # The worked example, built on a copy (never the shipped file): Upscale Pass
+    # Only includes Mask Off. From a sidecar with Mask on Refine Character
+    # (every mask node enabled), applying it mutes the mask group's nodes too.
+    from server import control_execution as ce, control_manifest as cm, control_presets as cp, control_routing as cr
+    slug = 'sonder_ltx_2_5_refine_upscale'
+    prompt = st.parse_template_bytes((Path(st.__file__).resolve().parents[1] / 'sdk_starters' / (slug + '.json')).read_bytes())
+    key = cm.find_relay(prompt)['key']
+    menu = json.loads(prompt[key]['inputs']['manifest'])
+    upscale, mask_off, refine_character = 'MqUaEuN4WLow', 'aLkHz2Nust59', '4SQ9OdBXQ93c'
+    assert (menu['presets'][upscale]['name'], menu['presets'][mask_off]['name']) == ('Upscale Pass Only', 'Mask Off')
+    menu['presets'][upscale]['includes'] = [mask_off]
+    prompt[key]['inputs']['manifest'] = json.dumps(menu)
+    options = {}
+    for preset in menu['presets'].values():
+        for bid, member in preset['members'].items():
+            options.setdefault(bid, []).append(member['value'])
+    bindings = []
+    for bid, values in options.items():
+        target = menu['bindings'][bid]['targets'][0]
+        current = prompt[target['path']]['inputs'][target['input']]
+        kind = 'BOOLEAN' if isinstance(current, bool) else 'COMBO'
+        bindings.append({'binding_id': bid, 'label': menu['bindings'][bid]['label'], 'status': 'ok', 'kind': kind,
+                         'value': current, **({'options': sorted(set(values) | {current})} if kind == 'COMBO' else {}),
+                         'targets': menu['bindings'][bid]['targets']})
+    switches, error = ce.describe_execution(prompt, cm.parse_manifest(prompt[key]['inputs']['manifest']))
+    assert error is None
+    view = {'relay': {'status': 'ok'}, 'bindings': bindings, 'notes': [], 'execution': switches,
+            '_presets': cm.read_presets(menu['presets']), '_preset_categories': cm.read_preset_categories(menu['preset_categories'])}
+    # The sidecar: Mask on Refine Character, so the mask group runs.
+    effective = ce.apply_sdk_state(view, prompt, {'node_modes': {}}, set())
+    view['presets'] = cp.preset_states(view, view['_presets'], prompt=prompt)
+    assert {r['id']: r['state'] for r in view['presets']}[refine_character] == 'match'
+    values, rejected = cp.validate_preset_changes(view, {f'preset:{upscale}:apply': True}, prompt=prompt, structural='sdk')
+    assert not rejected, rejected
+    assert values[f'execution:KAl11_kzAAT_:modes'] == {path: 'muted' for path in ('9508', '9509', '9510', '9511', '9512', '9579')}
+    modes = dict(effective)
+    for target, value in values.items():
+        if target.startswith('execution:') and target.endswith(':modes'):
+            modes.update({path: mode for path, mode in value.items()})
+    compiled = cr.compile_modes(prompt, view['_routing'], {p: m for p, m in modes.items() if m != 'enabled'})
+    assert not {'9508', '9509', '9510', '9511', '9512', '9579'} & set(compiled)
+    assert 'spatial_mask' not in compiled['9576']['inputs']

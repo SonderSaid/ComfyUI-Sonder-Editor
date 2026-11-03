@@ -989,9 +989,11 @@ def describe_bindings(
         return view
     manifest = relay["manifest"]
     if relay["status"] == "none" and orphan_manifest is not None:
-        # A deleted Relay leaves workflow anchors. Accept only their suggestions,
-        # through the same hygiene checks; they confer no exposure or value state.
-        manifest = {**manifest, "suggestions": control_manifest.parse_manifest(orphan_manifest)["suggestions"]}
+        # A deleted Relay leaves workflow anchors. Accept only their suggestions
+        # (and the export's subgraph names, display only), through the same
+        # hygiene checks; they confer no exposure or value state.
+        orphan = control_manifest.parse_manifest(orphan_manifest)
+        manifest = {**manifest, "suggestions": orphan["suggestions"], "subgraph_names": orphan["subgraph_names"]}
     for binding_id, entry in manifest["bindings"].items():
         view["bindings"].append(_describe_one(prompt, binding_id, entry, class_lookup, cache))
     for note_id, entry in manifest["notes"].items():

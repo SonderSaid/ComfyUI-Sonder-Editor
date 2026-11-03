@@ -288,6 +288,11 @@ def add_to_view(view: dict, prompt: dict, manifest: dict, *, authoring: dict | N
     view["views"], error = describe_views(prompt, manifest, authoring=authoring, class_lookup=class_lookup)
     if error:
         view["views_error"] = error
+    # The subgraph names the export carried (Phase 6B): the pane picker and
+    # Manage's Views list name a node's subgraphs with them. Display only.
+    names = cm.read_subgraph_names(manifest.get("subgraph_names"))
+    if names:
+        view["subgraph_names"] = names
     # The exported entries, for the Sonder App's overlay (apply_sdk_views).
     view["_view_entries"] = copy.deepcopy(manifest.get("views") or {})
     inventory, truncated = output_candidates(prompt, authoring, class_lookup=class_lookup)

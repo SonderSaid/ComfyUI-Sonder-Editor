@@ -37,18 +37,39 @@ export const rowOf = (modes, presetId) => modes.rows.find(row => row.choices.som
 /**
  * What a choice sets: its settings, its switches, and every node those
  * switches cover, so a group switch and a node switch over one node meet.
+ * A choice's included choices (one level) set theirs too.
  */
 export function sharedControls(view, presetId) {
-    const preset = (view?.presets || []).find(row => row.id === presetId);
+    const presets = new Map((view?.presets || []).map(row => [row.id, row]));
     const keys = new Set();
+    const preset = presets.get(presetId);
     if (!preset) return keys;
-    for (const member of preset.members || []) keys.add(`binding:${member.binding_id}`);
     const switches = new Map((view.execution || []).map(d => [d.execution_id, d]));
-    for (const member of preset.execution || []) {
-        keys.add(`switch:${member.execution_id}`);
-        for (const node of switches.get(member.execution_id)?.members || []) keys.add(`node:${node.path}`);
+    const included = (preset.includes || []).map(item => presets.get(item.id)).filter(Boolean);
+    for (const part of [preset, ...included]) {
+        for (const member of part.members || []) keys.add(`binding:${member.binding_id}`);
+        for (const member of part.execution || []) {
+            keys.add(`switch:${member.execution_id}`);
+            for (const node of switches.get(member.execution_id)?.members || []) keys.add(`node:${node.path}`);
+        }
     }
     return keys;
+}
+
+/**
+ * "Also applies Refine Pass Spatial Mask → Mask Off." for a choice that
+ * includes others, or "": each included choice named by the row that shows
+ * it (its own name alone when no row does).
+ */
+export function includesText(modes, row) {
+    // A publication cut to fit blanks the names: the choice's own row has it.
+    const nameOf = item => item.name || [...modes.rows.flatMap(r => r.choices), ...modes.uncategorized]
+        .find(choice => choice.id === item.id)?.name || "";
+    const names = (row?.includes || []).filter(item => item.status !== "missing" && nameOf(item)).map(item => {
+        const home = rowOf(modes, item.id);
+        return home ? `${home.name} → ${nameOf(item)}` : nameOf(item);
+    });
+    return names.length ? `Also applies ${listed(names)}.` : "";
 }
 
 const quoted = text => `“${text}”`;

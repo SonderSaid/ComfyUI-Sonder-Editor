@@ -147,32 +147,61 @@ export const compositePane = record => visiblePanes(record).findIndex(pane => pa
 
 // ── Picker ───────────────────────────────────────────────────────────────────
 
+/**
+ * "Outer › Inner" for the subgraphs a node path runs inside, from the
+ * export's `subgraph_names` ({host path: name}), or null when the path is at
+ * the root or any host on it has no name (the caller falls back). Own keys
+ * only: a path segment such as `constructor` passes the path rule.
+ */
+export function subgraphChain(path, names) {
+    if (typeof path !== "string" || !names || typeof names !== "object") return null;
+    const parts = path.split(":");
+    if (parts.length < 2) return null;
+    const chain = [];
+    for (let i = 1; i < parts.length; i++) {
+        const host = parts.slice(0, i).join(":");
+        const name = Object.hasOwn(names, host) ? names[host] : null;
+        if (typeof name !== "string" || !name) return null;
+        chain.push(name);
+    }
+    return chain.join(" › ");
+}
+
 // The pane picker's sections. `views`, `candidates` and `samplingCandidates`
 // come from the Controls view (the server's lists of eligible outputs and core
 // samplers); `seen` from a runs/live read (nodes that sent previews in a recent
 // run); `drivers` from the scene. `nodeState(path)` says, where the page can
 // tell (the canvas), that a seen node is switched off or gone: {inactive} |
-// {missing} | null.
+// {missing} | null. `subgraphNames` (the view's `subgraph_names`) names the
+// subgraphs a node runs inside; without a name a row says "Inside a subgraph".
 export function pickerSections({ views = [], candidates = [], samplingCandidates = [], seen = [], drivers = [], viewsError = null,
-    viewsReady = true, nodeState = () => null } = {}) {
+    viewsReady = true, nodeState = () => null, subgraphNames = null } = {}) {
+    const chainOf = path => subgraphChain(path, subgraphNames);
+    const named = (path, title) => { const chain = chainOf(path); return chain ? `${chain} › ${title}` : title; };
     const editor = [
         { kind: "composite", label: "Composite", source: { kind: "composite" } },
         { kind: "guides", label: "Guides", source: { kind: "guides" } },
         ...drivers.map(lane => ({ kind: "driver", label: lane.label || `Driver ${lane.index + 1}`, source: { kind: "driver", index: lane.index } })),
     ];
-    const viewItems = views.map(view => ({
-        kind: "view", label: view.label || view.default_label || "Output", source: { kind: "view", viewId: view.view_id },
-        status: view.status, detail: view.status !== "ok" ? "Unavailable" : view.participation === "inactive" ? "Switched off" : "",
-        reason: view.reason || "",
-    }));
+    // A View keeps its own label; where it sits shows only when nothing else does.
+    const viewItems = views.map(view => {
+        const chain = chainOf(view.path);
+        return {
+            kind: "view", label: view.label || view.default_label || "Output", source: { kind: "view", viewId: view.view_id },
+            status: view.status, detail: view.status !== "ok" ? "Unavailable" : view.participation === "inactive" ? "Switched off"
+                : chain ? `In ${chain}` : "",
+            reason: view.reason || "",
+        };
+    });
     // One View per node, whatever it shows: a path any View has is taken.
     const taken = new Set(views.map(view => view.path).filter(Boolean));
-    const where = candidate => (candidate.inactive ? inactiveText(candidate.inactive) : candidate.path.includes(":") ? "Inside a subgraph" : "");
+    const where = candidate => (candidate.inactive ? inactiveText(candidate.inactive)
+        : candidate.path.includes(":") && !chainOf(candidate.path) ? "Inside a subgraph" : "");
     const add = candidates.filter(candidate => !taken.has(candidate.path)).map(candidate => ({
-        kind: "candidate", label: candidate.title || candidate.class_type, candidate, detail: where(candidate),
+        kind: "candidate", label: named(candidate.path, candidate.title || candidate.class_type), candidate, detail: where(candidate),
     }));
     const sampling = samplingCandidates.filter(candidate => !taken.has(candidate.path)).map(candidate => ({
-        kind: "sampling", label: candidate.title || candidate.class_type, candidate, detail: where(candidate),
+        kind: "sampling", label: named(candidate.path, candidate.title || candidate.class_type), candidate, detail: where(candidate),
     }));
     const listed = new Set([...taken, ...sampling.map(item => item.candidate.path)]);
     for (const entry of seen) {
@@ -183,7 +212,7 @@ export function pickerSections({ views = [], candidates = [], samplingCandidates
         const state = nodeState(path);
         const off = state?.missing ? "This node is no longer in the workflow"
             : state?.inactive ? `${inactiveText(state.inactive)}. Switch it on to add it` : "";
-        sampling.push({ kind: "sampling", label: candidate.title || candidate.class_type || path, candidate, seen: true,
+        sampling.push({ kind: "sampling", label: named(path, candidate.title || candidate.class_type || path), candidate, seen: true,
             detail: off || "Sent previews in a recent run", disabled: !!off });
     }
     return { editor, views: viewItems, add, sampling, viewsError, viewsReady };

@@ -449,6 +449,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
             samplingCandidates: view.view_sampling_candidates || [], seen: coordinator.liveSeen(), nodeState: coordinator.nodeState,
             // A Relay error (two Relays, a muted one) leaves no Views and no candidates: say why.
             viewsError: view.views_error || view.error || null, viewsReady: view.state === "ready",
+            subgraphNames: view.subgraph_names || null,
         });
     }
     // The Controls view moved on while the picker is open: refresh it in place.

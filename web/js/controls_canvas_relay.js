@@ -63,6 +63,12 @@ export function fitPublicationView(view, envelope) {
     }
     const fits = candidate => publicationBytes({ ...envelope, view: candidate }) <= MAX_PUBLICATION_BYTES;
     if (fits(view)) return view;
+    // Subgraph names only label picker rows ("Inside a subgraph" stands in): first to go.
+    if (view.subgraph_names) {
+        view = { ...view };
+        delete view.subgraph_names;
+        if (fits(view)) return view;
+    }
     // Nodes that could become a View are for the pane picker only; they go first,
     // sampling-preview sources before outputs.
     while (view.view_sampling_candidates?.length && !fits(view)) {
@@ -75,8 +81,10 @@ export function fitPublicationView(view, envelope) {
     }
     if (fits(view)) return view;
     // Preset previews are display-only and shrink before candidate inventories.
+    // An included choice's name too: readers fall back to that choice's own row.
     if (!fits(view) && view.presets?.length) view = { ...view, presets: view.presets.map(p => ({...p,
-        members: p.members.map(m => ({...m, preview: ""}))})) };
+        members: p.members.map(m => ({...m, preview: ""})),
+        ...(Array.isArray(p.includes) ? { includes: p.includes.map(item => ({...item, name: ""})) } : {})})) };
     // Category warnings are for Manage; the Modes table needs only the rows.
     if (!fits(view) && view.preset_categories?.length) view = { ...view,
         preset_categories: view.preset_categories.map(c => ({...c, warnings: []})) };

@@ -1,7 +1,7 @@
 // Canvas graph authority for the shared Controls panel. No app/DOM at import.
 import {
     EXECUTION_VERSION, MAX_MANIFEST_BYTES, NATIVE_MODES, RELAY_CLASS, anchorSnapshot, applyCleanupPlan, definitionAnchorIds, dropAllAnchors,
-    dropExecutionAnchors, executionAnchorSnapshot, graphsOf, applyCategoryEdit, applyGroupPlan, applyPresetEdit, dropAnchors, editManifest, exportManifest,
+    dropExecutionAnchors, executionAnchorSnapshot, graphsOf, applyCategoryEdit, applyGroupPlan, applyPresetEdit, dropAnchors, editManifest, exportManifest, exportSubgraphNames,
     executionCandidatesFor, inactiveBodies, isStructuralTarget, listCandidates, listExecutionCandidates, nodesOf, parseManifest, parseTarget, readAnchors,
     readExecution, readExecutionAnchor, relayCensus, resolveBindings, resolveCandidate, resolveExecution, resolveExecutionCandidate,
     planRestore, readPresetCategories, restoreAnchors, restoreDynamicPrompts, restoreExecutionAnchor, setAnchor, setExecutionAnchor,
@@ -133,7 +133,11 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         const switches = manifest ? Object.entries(resolveExecution(id.root, manifest).controls)
             .map(([sid, r]) => [sid, r.status, r.members.map(m => [m.path, m.mode])]) : [];
         const viewStates = Object.entries(views).map(([vid, v]) => [vid, v.status, v.path || null, v.participation || null]);
-        const graphHash = JSON.stringify([key, output, anchors, relayCensus(id.root).census, inactive, switches, viewStates]);
+        // With a Relay the names ride in its exported manifest; without one, a
+        // renamed subgraph must still describe again (orphan_manifest).
+        const census = relayCensus(id.root).census;
+        const names = census.active ? null : exportSubgraphNames(id.root);
+        const graphHash = JSON.stringify([key, output, anchors, census, inactive, switches, viewStates, names]);
         return {prompt: output, inactive, editor_key: key, graphHash, hash: JSON.stringify([graphHash, listing])};
     };
     const describe = async (shot, changes, extra = {}) => {

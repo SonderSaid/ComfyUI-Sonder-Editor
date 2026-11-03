@@ -17,6 +17,8 @@ a fresh `[Unreleased]` block.
 - A resized multiline text box in Controls keeps its height in this browser, across renders and when you leave and reopen the editor.
 - The Views pane picker and pane titles show a Driver lane's own name, as the timeline header does.
 - While only In or Out is set, the generation readout's tooltip says **Generate** still uses the full scene until you choose the other point.
+- A Mode choice can also apply a choice from another category: in Manage, open the choice and pick it under **Also applies**. One click (and one Undo on the canvas) sets both rows; changing the included row by hand makes the first row read **Custom**. An older Sonder version ignores the link and keeps it only until that choice is updated.
+- The Views pane picker and Manage's Views list name the subgraph a node sits in (for example **Sampling › SamplerCustomAdvanced**) instead of only "Inside a subgraph". Workflows exported before this version, and Sonder App workflows without a Relay, keep the old text.
 
 ### Changed
 - Sonder App runs no longer need the model files or node packs of Modes that are switched off: a Task needs only its own LoRA, and **MiniMax H3 References & Swaps** needs the SAM3 checkpoint only with **Mask On**. A canvas Run still checks every loader.

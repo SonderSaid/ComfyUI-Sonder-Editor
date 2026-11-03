@@ -80,6 +80,12 @@ https://github.com/user-attachments/assets/d63c740f-1e94-44c9-806f-bcbe36ec2516
   you change one of those Controls by hand, the row reads **Custom** and no
   button is highlighted.
 - A choice can change another row too, when both set the same Control.
+- A choice can also apply a choice in another row: hover over its button, and
+  the tooltip's last line says so, for example *Also applies Refine Pass
+  Spatial Mask → Mask Off.* Clicking it highlights both rows' choices, and a
+  message names the other row. If you then click another choice in that other
+  row, the first row reads **Custom**. On the canvas, one **Ctrl+Z** undoes the
+  whole click.
 - Two outlined buttons with *“A” and “B” both match* need a fix in **Manage**: see
   [Fix a warning in Manage](#fix-a-warning-in-manage).
 - The table is hidden while you search, and while **Manage** is open.
@@ -155,6 +161,23 @@ is what the choice holds. Then:
 
 - **Update from current values** saves what the ticked Controls hold now.
 - **Category** moves it to another category, or to **Not in a category**.
+- **Also applies**, under **Category**, has one list per other category.
+  Pick a choice in one of them to apply it together with this one, every time
+  this choice is clicked. Pick **Nothing** to stop. The included choice keeps
+  its own settings: **Update from current values** never saves them into this
+  choice. For example, open **Upscale Pass Only** in the **Passes** category,
+  then set **“Refine Pass Spatial Mask”:** to **Mask Off**, so that one click
+  runs the upscale pass with the mask turned off.
+  - A choice can include one choice per category, and never one from its own
+    category.
+  - The two may not set the same setting or switch the same node. Manage
+    refuses that and says why.
+  - A choice that another one includes can't include others, and can't be
+    deleted until you set the other choice's list back to **Nothing**.
+  - An included choice that is in no category shows as its own line under
+    **Also applies**, with **Remove**.
+  - Sonder 0.8.2 and earlier ignore **Also applies**: the choice then applies
+    only its own settings, and updating the choice there drops the link.
 
 Click **Edit** on a category to rename it, change its description or
 **Delete** it; its choices stay, under **Not in a category**. Choices **Not in
@@ -169,6 +192,8 @@ a category** don't show in the Controls tab.
 | *“A” and “B” can both match* | Give the two choices a shared setting with different values, so each is told apart. |
 | *Shares Steps with Look* | A choice in one category can change the other. Leave it when that is intended; otherwise remove the shared setting from one category's choices. |
 | A choice listed twice, or one that no longer exists | Click **Remove from this category**, **Remove the repeat** or **Remove missing**, or edit that category's choices. |
+| A choice's button is dimmed, and its tooltip starts *Included “Mask Off”:* | The choice it applies (here **Mask Off**) can't apply right now. Repair that choice: the rest of its tooltip says what is wrong. |
+| *An included choice no longer exists* under **Also applies** | Click **Remove** beside it. |
 
 ## Choosing lanes and folders from Controls
 

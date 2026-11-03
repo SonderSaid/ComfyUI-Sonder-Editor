@@ -221,6 +221,20 @@ if(SCENARIO==='no-relay'||SCENARIO==='two-relays') {
     assert.equal(sampler.widgets[0].value,20);assert.equal(captures,0);
     if(SCENARIO==='no-relay')assert.deepEqual(calls.at(-1).relay_census,{active:0,muted:1,bypassed:0,nested:0});
 }
+if(SCENARIO==='no-relay-names') {
+    // Without a Relay the names ride in orphan_manifest, so a renamed subgraph
+    // must describe again although the export is unchanged (Phase 6B).
+    relay.mode=2;
+    const inner=new Graph();add(inner,'KSampler',1,[widget('steps',4)]);
+    const sub={id:9,type:'sub-def',comfyClass:'sub-def',title:'Sampling',subgraph:inner,widgets:[],inputs:[],mode:0,properties:{},graph:root};
+    root._nodes.push(sub);
+    host.setVisible(true);await settle();
+    assert.equal(calls.length,1);assert.deepEqual(JSON.parse(calls[0].orphan_manifest).subgraph_names,{'9':'Sampling'});
+    listeners.get('graphChanged')();await settle();assert.equal(calls.length,1,'unchanged: no describe');
+    sub.title='Detail';listeners.get('graphChanged')();await settle();
+    assert.equal(calls.length,2);assert.deepEqual(JSON.parse(calls[1].orphan_manifest).subgraph_names,{'9':'Detail'});
+    host.setVisible(false);
+}
 if(SCENARIO==='linked-or-gone') {
     sampler.inputs[0].link=99;  // the input became linked after describe
     let result=await host.applyChanges({'binding:steps:value':'31'});
@@ -420,8 +434,15 @@ if(SCENARIO==='preset'||SCENARIO==='preset-rollback'||SCENARIO==='preset-no-rela
         assert.equal(relay.widgets[0].value,text);assert.equal(captures,4);
         result=await host.applyChanges({'preset:p1:name':'Renamed'});
         assert.equal(result.ok,true);assert.equal(manifest().presets.p1.name,'Renamed');
+        // An inclusion (Phase 6A) is one manifest write in one history step, like a rename.
+        const widgetsBefore=[sampler.widgets[0].value,sampler.widgets[1].value];
+        result=await host.applyChanges({'preset:p1:includes':['other']});
+        assert.equal(result.ok,true,JSON.stringify(result));assert.deepEqual(manifest().presets.p1.includes,['other']);
+        assert.equal(captures,8);assert.deepEqual([sampler.widgets[0].value,sampler.widgets[1].value],widgetsBefore);
+        result=await host.applyChanges({'preset:p1:includes':[]});
+        assert.equal(result.ok,true);assert.equal('includes' in manifest().presets.p1,false);
         result=await host.applyChanges({'preset:p1:remove':true});
-        assert.equal(result.ok,true);assert.deepEqual(manifest().presets,{});assert.equal(captures,8);
+        assert.equal(result.ok,true);assert.deepEqual(manifest().presets,{});assert.equal(captures,12);
     }
 }
 if(SCENARIO.startsWith('category')) {
@@ -506,7 +527,7 @@ console.log('ok');
 
 SCENARIOS = ['restore', 'restore-rollback', 'restore-stale', 'restore-rebind', 'description', 'description-new-relay', 'expose', 'expose-rollback', 'expose-new-relay', 'expose-new-relay-rollback', 'expose-noop', 'expose-taken',
              'remove-rebind', 'manage-listing', 'filter-during-write', 'unsafe-seed', 'moved', 'rollback-callbacks', 'presentation', 'presentation-rollback', 'root', 'promoted', 'promoted-seed', 'no-relay', 'two-relays',
-             'linked-or-gone', 'manifest-cap', 'hidden-hash', 'relay-error-view', 'refusal', 'stale-write', 'stale-view',
+             'linked-or-gone', 'manifest-cap', 'hidden-hash', 'no-relay-names', 'relay-error-view', 'refusal', 'stale-write', 'stale-view',
              'destroy', 'rollback', 'serial', 'history-failure', 'precision-refusal', 'hide-during-write',
              'event-during-write', 'group-batch-order', 'groups', 'groups-stale', 'groups-reparse', 'group-new-relay',
              'preset', 'preset-rollback', 'preset-no-relay', 'dynamic-prompt',

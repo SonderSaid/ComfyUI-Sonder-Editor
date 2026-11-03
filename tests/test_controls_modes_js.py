@@ -432,3 +432,40 @@ console.log('ok');
 
 def test_the_workflow_menu_saves_asks_and_switches(tmp_path):
     run(PRELUDE + WORKFLOW_MENU, tmp_path, 'workflow-menu')
+
+
+INCLUDES = r'''
+const {deriveModes,sharedControls,followNotice,includesText}=await import(MODEL_URL);
+const {mountModes}=await import(MODES_URL);
+// Phase 6A: Passes → Upscale Pass Only includes Refine Pass Spatial Mask → Mask Off.
+const mk=(id,name,state,members,extra={})=>P(id,state,{name,members:members.map(binding_id=>({binding_id})),...extra});
+const before={state:'ready',bindings:[],execution:[],presets:[mk('refine','Refining Pass Only','match',['pass']),
+    mk('up','Upscale Pass Only','differs',['pass'],{description:'Upscales only.',includes:[{id:'off',name:'Mask Off',status:'ok'}]}),
+    mk('off','Mask Off','differs',['mask']),mk('char','Refine Character','match',['mask'])],
+    preset_categories:[C('passes','Passes',['refine','up']),C('mask','Refine Pass Spatial Mask',['off','char'])]};
+const state=(v,changes)=>({...v,presets:v.presets.map(p=>p.id in changes?{...p,state:changes[p.id]}:p)});
+// The included choice's Controls count as the click's: the notice names its row.
+assert.deepEqual([...sharedControls(before,'up')].sort(),['binding:mask','binding:pass']);
+const after=state(before,{refine:'differs',up:'match',off:'match',char:'differs'});
+assert.equal(followNotice(deriveModes(before),deriveModes(after),'up',after),
+    '“Upscale Pass Only” also set Refine Pass Spatial Mask to “Mask Off”.');
+// Changing the included choice by hand: Passes reads Custom.
+const custom=state(after,{up:'differs',off:'differs',char:'match'});
+assert.equal(deriveModes(custom).rows[0].status,'custom');
+assert.equal(includesText(deriveModes(before),before.presets[1]),'Also applies Refine Pass Spatial Mask → Mask Off.');
+assert.equal(includesText(deriveModes(before),before.presets[0]),'');
+assert.equal(includesText(deriveModes(before),{includes:[{id:'gone',name:'',status:'missing'},{id:'x',name:'Loose',status:'ok'}]}),
+    'Also applies Loose.','a missing one is left out; one in no row is named alone');
+// The table: the button's description adds the line.
+const modes=mountModes({getView:()=>before,freshView:async()=>({view:before,fresh:true}),applyChanges:async()=>({ok:true})},
+    {flushPending:async()=>true,track:w=>w,notify(){}});
+document.body.append(modes.el);modes.render(before,{});
+const button=walk(modes.el).find(n=>n.dataset.controlsModeChoice==='up');
+const desc=walk(modes.el).find(n=>n.id===button.attributes['aria-describedby']);
+assert.equal(desc.textContent,'Upscales only.\nAlso applies Refine Pass Spatial Mask → Mask Off.');
+console.log('ok');
+'''
+
+
+def test_modes_with_an_included_choice(tmp_path):
+    run(PRELUDE + INCLUDES, tmp_path, 'modes-includes')

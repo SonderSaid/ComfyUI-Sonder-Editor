@@ -894,6 +894,14 @@ def _prepare_control_publication(body: Any) -> dict:
     if "candidates_truncated" in view and not isinstance(view["candidates_truncated"], bool):
         raise ValueError("The candidates flag must be boolean.")
     view = control_descriptors.json_safe(view)
+    # Subgraph names are display text: a malformed map or entry is dropped,
+    # never a reason to refuse the Controls.
+    if "subgraph_names" in view:
+        names = control_descriptors.control_manifest.read_subgraph_names(view["subgraph_names"])
+        if names:
+            view["subgraph_names"] = names
+        else:
+            del view["subgraph_names"]
     for name, field in (("bindings", "note"), ("notes", "text")):
         for descriptor in view[name]:
             text = descriptor.get(field)

@@ -112,15 +112,20 @@ def _conflicts(a: dict, b: dict):
 
 
 def category_rows(categories: dict, presets: dict, conditions: dict, *, labels: dict,
-                  origins: dict | None = None, dropped: Any = ()) -> list:
+                  origins: dict | None = None, dropped: Any = (), linked_conditions: dict | None = None) -> list:
     """The categories a view shows, in order, each with its claimed choices and
     authoring warnings. A choice listed by two categories belongs to the first.
-    ``conditions`` is ``{preset id: {control key: condition}}``; ``dropped``
-    names choices the Sonder App removed itself, left out without a warning."""
+    ``conditions`` is ``{preset id: {control key: condition}}``, what matching
+    uses (an included choice's conditions too); ``linked_conditions``, each
+    choice's own, decides the linked warning (default ``conditions``).
+    ``dropped`` names choices the Sonder App removed itself, left out without
+    a warning."""
     rows, claimed_by = [], {}
     name = lambda pid: presets[pid]["name"]
     # Normalized once: the pair loops below compare every choice with every other.
-    conditions = {pid: {key: _normal(condition) for key, condition in by_key.items()} for pid, by_key in conditions.items()}
+    normal = lambda table: {pid: {key: _normal(condition) for key, condition in by_key.items()} for pid, by_key in table.items()}
+    conditions = normal(conditions)
+    linked_conditions = conditions if linked_conditions is None else normal(linked_conditions)
     for cid in ordered(categories):
         entry = categories[cid]
         choices, warnings, missing, repeated = [], [], [], set()
@@ -167,7 +172,7 @@ def category_rows(categories: dict, presets: dict, conditions: dict, *, labels: 
     links: dict = {row["id"]: [] for row in rows}
     for i, row in enumerate(rows):
         for other in rows[i + 1:]:
-            keys = _shared_conflicts(row["choices"], other["choices"], conditions)
+            keys = _shared_conflicts(row["choices"], other["choices"], linked_conditions)
             if keys:
                 links[row["id"]].append((other, keys))
                 links[other["id"]].append((row, keys))

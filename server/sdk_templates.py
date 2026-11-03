@@ -660,6 +660,14 @@ def _curated_manifest(prompt, relay, stored, view):
     # The categories the app shows, after any preset the export leaves out
     # (a hidden switch's) is gone, so no exported category lists a ghost.
     exported = manifest.get("presets") or {}
+    # Nor does any choice include one it leaves out.
+    if any(set(entry.get("includes") or []) - set(exported) for entry in exported.values()):
+        manifest["presets"] = exported = copy.deepcopy(exported)
+        for entry in exported.values():
+            includes = [pid for pid in entry.get("includes") or [] if pid in exported]
+            entry.pop("includes", None)
+            if includes:
+                entry["includes"] = includes
     if view.get("_preset_categories") or "preset_categories" in saved:
         manifest["preset_categories"] = {
             cid: {**copy.deepcopy(entry), "choices": [pid for pid in entry["choices"] if pid in exported]}
@@ -976,11 +984,14 @@ def attribute_requirements(authored: dict, stored: dict, readiness: dict, *, des
 
     For each category with one selected choice, every other usable choice in it
     is applied to a copy of the Control values through the canonical path
-    (``validate_preset_changes`` apply, so ``_expand`` and its inclusions, then
-    the store's own writes) and judged as Generate would. An item missing now
-    and not under some other choice is needed by the selected one, labelled
-    "Category → Choice". Pure: the caller's values are never written. Stops
-    at ``MAX_ATTRIBUTIONS`` simulations; items it did not reach stay unnamed.
+    (``validate_preset_changes`` apply, then the store's own writes) and judged
+    as Generate would. An item missing now and not under some other choice is
+    needed by the selected one, labelled "Category → Choice". A simulation
+    applies a choice's own members only, so an item is credited to the row
+    whose own choice frees it; when that row's choice was brought in by another
+    row's selected choice, the label says so ("… (from Passes → Upscale)").
+    Pure: the caller's values are never written. Stops at ``MAX_ATTRIBUTIONS``
+    simulations; items it did not reach stay unnamed.
     """
     from . import control_preset_categories as pc
 
@@ -991,11 +1002,15 @@ def attribute_requirements(authored: dict, stored: dict, readiness: dict, *, des
     prompt = copy.deepcopy(authored)
     view = apply_stored_values(prompt, describe_stored(prompt, stored, describe), stored, describe=describe)
     simulations = 0
-    for row in pc.derive_modes(view)["rows"]:
-        if row["status"] != "selected":
-            continue
+    rows = pc.derive_modes(view)["rows"]
+    selected = [row for row in rows if row["status"] == "selected"]
+    for row in selected:
         current = row["selected"]
         label = f"{row['name']} → {current.get('name') or ''}"
+        by = next((other for other in selected if other is not row and any(
+            item.get("id") == current.get("id") for item in other["selected"].get("includes") or [])), None)
+        if by is not None:
+            label += f" (from {by['name']} → {by['selected'].get('name') or ''})"
         freed: set = set()
         for choice in row["choices"]:
             if choice.get("id") == current.get("id") or choice.get("state") in pc._UNUSABLE_STATES:
@@ -1006,7 +1021,7 @@ def attribute_requirements(authored: dict, stored: dict, readiness: dict, *, des
             simulations += 1
             try:
                 values, rejected = control_presets.validate_preset_changes(
-                    view, {f"preset:{choice.get('id')}:apply": True}, prompt=prompt, structural="sdk")
+                    view, {f"preset:{choice.get('id')}:apply": True}, prompt=prompt, structural="sdk", own_only=True)
                 if rejected:
                     continue  # hidden, drifted or unavailable members: this choice can't apply
                 data = copy.deepcopy(stored)
@@ -1387,6 +1402,14 @@ def store_binding_changes(template_id: str, changes: dict, view: dict, prompt: d
                     selected = overlay if pid in control_descriptors.control_manifest.read_presets({pid: overlay}) else authored.get(pid)
                     effective[pid] = copy.deepcopy(selected)
                 changed = control_cleanup.remove_members(effective, plan["preset_members"])
+                # A deleted choice leaves every choice that includes it.
+                deleted = {pid for pid in changed if pid not in effective}
+                for pid, definition in fresh.get("_presets", {}).items():
+                    if pid not in effective and deleted & set(definition.get("includes") or []):
+                        overlay = data["presets"].get(pid)
+                        readable = pid in control_descriptors.control_manifest.read_presets({pid: overlay})
+                        effective[pid] = copy.deepcopy(overlay if readable else authored.get(pid))
+                changed |= control_cleanup.drop_included(effective, deleted)
                 for pid in changed:
                     data["presets"][pid] = effective.get(pid, {"removed": True})
                 if changed:

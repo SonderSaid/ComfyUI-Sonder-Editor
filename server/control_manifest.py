@@ -12,11 +12,18 @@ Saved in a workflow it holds presentation only, keyed by ``binding_id``:
      "views": {"v": 1, "items": {"<id>": {"label", "order", "timing"?, "feed"?: "sampling"}}},
      "description": "<workflow description>",
      "presets": {"<id>": {"name", "description", "order", "members": {"<binding_id>": {"value", "seed_mode"?}},
-                          "execution"?: {"<switch id>": {"mode", "node"} | {"modes"}}}},
+                          "execution"?: {"<switch id>": {"mode", "node"} | {"modes"}},
+                          "includes"?: ["<preset id>", ...]}},
      "preset_categories": {"<id>": {"name", "description", "order", "choices": ["<preset id>", ...]}}}
 
 A preset is one choice; a category groups exclusive choices (Controls Modes)
-and owns their membership and order (``control_preset_categories``).
+and owns their membership and order (``control_preset_categories``). A
+choice's ``includes`` names choices in other categories that it applies with
+its own members, by reference (``control_presets.resolve_inclusions``).
+
+Its API export also carries ``subgraph_names`` ({host execution path: name},
+``read_subgraph_names``), the names of the subgraphs a node path runs inside,
+for display only; ``editManifest`` strips it like the routing capsule.
 
 A node or instance target is located by ``node.properties.sonderExecution`` on a
 root node (as a binding is by its anchor); a group by its root ``group.id``.
@@ -54,6 +61,8 @@ MAX_TARGETS = 64
 MAX_GROUPS = 256
 MAX_PRESETS = 32
 MAX_PRESET_TARGETS = 64
+# Other choices one choice applies with its own (``includes``, Phase 6A).
+MAX_PRESET_INCLUDES = 16
 # Controls Modes: categories of exclusive choices (presets).
 MAX_PRESET_CATEGORIES = 16
 CATEGORY_DESCRIPTION_MAX = 300
@@ -156,7 +165,7 @@ def clean_group(value: Any) -> str:
 def empty_manifest() -> dict:
     return {"v": MANIFEST_VERSION, "bindings": {}, "notes": {}, "groups": {}, "suggestions": [], "description": "", "presets": {},
             "preset_categories": {}, "execution": {}, "execution_error": None, "execution_routing": None, "views": {},
-            "views_error": None}
+            "views_error": None, "subgraph_names": {}}
 
 
 # Python's str.strip() and JavaScript's trim() strip different characters
@@ -523,13 +532,37 @@ def read_presets(raw: Any, *, limit: int | None = MAX_PRESETS) -> dict:
         effects = execution_effects(execution)
         # Distinct node effects count beside value and seed-mode targets; a
         # preset that sets one node two ways is unreadable, never half-applied.
+        # ``includes`` never counts as a member: a choice keeps one of its own.
         if (not (members or execution) or effects is None
                 or sum(1 + ("seed_mode" in m) for m in members.values()) + len(effects) > MAX_PRESET_TARGETS):
+            continue
+        includes = read_includes(entry)
+        if includes is None:
             continue
         if limit is not None and len(result) >= limit:
             break
         result[identity] = {"name": name, "description": description, "order": order, "members": members,
-                            **({"execution": execution} if execution else {})}
+                            **({"execution": execution} if execution else {}),
+                            **({"includes": includes} if includes else {})}
+    return result
+
+
+def read_includes(entry: dict) -> list | None:
+    """A choice's ``includes``: the other choices it applies with its own, by
+    id. Absent reads as none; anything but a list of at most
+    ``MAX_PRESET_INCLUDES`` (counted before anything is dropped) is None, and
+    the choice is skipped. A non-id entry is dropped alone, a repeat keeps the
+    first. Whether an id names a choice is resolved at projection
+    (``control_presets.resolve_inclusions``). ``readPresets`` mirrors it."""
+    if "includes" not in entry:
+        return []
+    raw = entry["includes"]
+    if not isinstance(raw, list) or len(raw) > MAX_PRESET_INCLUDES:
+        return None
+    result: list = []
+    for item in raw:
+        if isinstance(item, str) and ID_RE.fullmatch(item) and item not in FORBIDDEN_KEYS and item not in result:
+            result.append(item)
     return result
 
 
@@ -561,6 +594,39 @@ def read_preset_categories(raw: Any) -> dict:
             break
         result[identity] = {"name": name, "description": description, "order": order,
                             "choices": [c for c in choices if isinstance(c, str) and ID_RE.fullmatch(c) and c not in FORBIDDEN_KEYS]}
+    return result
+
+
+MAX_SUBGRAPH_NAMES = 128
+# C0/C1 controls, bidi embeddings, overrides and isolates, and U+FEFF (which JS
+# trim strips and Python's strip does not): a name is one line of plain text.
+_NAME_CONTROLS = re.compile("[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩﻿]")
+
+
+def clean_subgraph_name(value: Any) -> str | None:
+    """A subgraph's display name: control characters removed, trimmed, at most
+    ``LABEL_MAX`` code points; None when nothing is left. JS ``subgraphName``
+    mirrors it."""
+    if not isinstance(value, str):
+        return None
+    name = _NAME_CONTROLS.sub("", value).strip()[:LABEL_MAX].strip()
+    return name or None
+
+
+def read_subgraph_names(raw: Any) -> dict:
+    """The export-only ``subgraph_names``: ``{host execution path: name}`` for
+    the subgraph instances a node path runs inside (Phase 6B). Display text
+    only, read tolerantly: a non-object reads as empty, an invalid entry is
+    skipped, at most ``MAX_SUBGRAPH_NAMES`` in JavaScript's key order."""
+    result: dict = {}
+    if not isinstance(raw, dict):
+        return result
+    for path in _js_key_order(raw):
+        if len(result) >= MAX_SUBGRAPH_NAMES:
+            break
+        name = clean_subgraph_name(raw[path])
+        if clean_path(path) is not None and name is not None:
+            result[path] = name
     return result
 
 
@@ -608,6 +674,7 @@ def parse_manifest(text: Any) -> dict:
     if isinstance(section, dict) and not manifest["execution_error"]:
         manifest["execution_routing"] = section.get("routing")
     manifest["description"] = _text(raw.get("description"), DESCRIPTION_MAX, "description")
+    manifest["subgraph_names"] = read_subgraph_names(raw.get("subgraph_names"))
     for binding_id, entry in bindings_raw.items():
         manifest["bindings"][_check_id(binding_id)] = _binding(entry)
     for note_id, entry in notes_raw.items():

@@ -5,7 +5,7 @@
 // notices; the host owns reads and writes (freshView, applyChanges); this
 // module owns its DOM and listeners and returns cleanup. Which choice shows is
 // derived from each view (controls_modes_model.js), never stored.
-import { ambiguityText, deriveModes, followNotice, rowOf } from "./controls_modes_model.js";
+import { ambiguityText, deriveModes, followNotice, includesText, rowOf } from "./controls_modes_model.js";
 import { CHOICE_FAILURES, applyChoice } from "./controls_choice_apply.js";
 import { createHoverTip } from "./controls_hover_tip.js";
 import { VISUALLY_HIDDEN_CSS, describedBy, placeInOrder, setText } from "./controls_dom_order.js";
@@ -155,7 +155,7 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         }
     }
 
-    function paintRow(row, mode) {
+    function paintRow(row, mode, modes) {
         setText(row.name, mode.name);
         setText(row.description, mode.description);
         row.description.style.display = mode.description ? "-webkit-box" : "none";
@@ -177,7 +177,9 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         for (const choice of mode.choices) {
             const parts = row.buttons.get(choice.id);
             setText(parts.label, choice.name);
-            parts.text = unusable(choice) ? choice.reason || UNAVAILABLE : plainText(choice.description);
+            // A choice that includes others says so on its own line.
+            parts.text = unusable(choice) ? choice.reason || UNAVAILABLE
+                : [plainText(choice.description), includesText(modes, choice)].filter(Boolean).join("\n");
             setText(parts.description, parts.text);
             describedBy(parts.button, parts.description.id, !!parts.text);
             paintChoice(parts.button, { selected: mode.selected?.id === choice.id,
@@ -217,7 +219,7 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
             if (!row) rows.set(mode.id, row = buildRow(mode.id));
             const key = mode.choices.map(choice => choice.id).join("\u0000");
             if (key !== row.key) { row.key = key; buildChoices(row, mode.choices); }
-            paintRow(row, mode);
+            paintRow(row, mode, modes);
         }
         for (const [id, row] of rows) {
             if (alive.has(id)) continue;

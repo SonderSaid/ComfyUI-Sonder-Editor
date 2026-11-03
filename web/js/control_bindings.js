@@ -50,6 +50,8 @@ export const MAX_TARGETS = 64;
 export const MAX_GROUPS = 256;
 export const MAX_PRESETS = 32;
 export const MAX_PRESET_TARGETS = 64;
+// Other choices one choice applies with its own (Phase 6A).
+export const MAX_PRESET_INCLUDES = 16;
 // Controls Modes: categories of exclusive choices (presets).
 export const MAX_PRESET_CATEGORIES = 16;
 export const CATEGORY_DESCRIPTION_MAX = 300;
@@ -260,6 +262,7 @@ export function editManifest(text, mutate) {
         for (const key of EXECUTION_EXPORT_KEYS) delete entry[key];
     }
     if (ours) delete manifest.execution.routing; // export-only, like each switch's facts
+    delete manifest.subgraph_names; // export-only: derived from the live graph
     if (isOurViewsSection(manifest.views) && isPlainObject(manifest.views.items)) {
         for (const entry of Object.values(manifest.views.items)) {
             if (isPlainObject(entry)) for (const key of VIEW_EXPORT_KEYS) delete entry[key];
@@ -400,11 +403,30 @@ export function readPresets(raw) {
         }
         const effects = executionEffects(execution);
         const entries = Object.values(members);
-        // Distinct node effects count beside value and seed-mode targets.
+        // Distinct node effects count beside value and seed-mode targets;
+        // `includes` never counts: a choice keeps one member of its own.
         if ((!entries.length && !Object.keys(execution).length) || !effects
             || entries.reduce((n, m) => n + 1 + Number(Object.hasOwn(m, "seed_mode")), 0) + Object.keys(effects).length > MAX_PRESET_TARGETS) continue;
+        const includes = readIncludes(entry);
+        if (!includes) continue;
         if (Object.keys(result).length >= MAX_PRESETS) break;
-        result[id] = {name, description, order, members, ...(Object.keys(execution).length ? {execution} : {})};
+        result[id] = {name, description, order, members, ...(Object.keys(execution).length ? {execution} : {}),
+            ...(includes.length ? {includes} : {})};
+    }
+    return result;
+}
+
+// A choice's `includes` (control_manifest.read_includes): absent reads as
+// none; anything but a list of at most 16 entries, counted before anything is
+// dropped, is null and skips the choice. A non-id entry is dropped alone, a
+// repeat keeps the first; whether an id names a choice is the server's to say.
+export function readIncludes(entry) {
+    if (!Object.hasOwn(entry, "includes")) return [];
+    const raw = entry.includes;
+    if (!Array.isArray(raw) || raw.length > MAX_PRESET_INCLUDES) return null;
+    const result = [];
+    for (const item of raw) {
+        if (typeof item === "string" && ID_RE.test(item) && !FORBIDDEN_KEYS.has(item) && !result.includes(item)) result.push(item);
     }
     return result;
 }
@@ -427,6 +449,11 @@ export function applyPresetEdit(manifest, id, field, value) {
     else if (field === "name" || field === "description") {
         if (!Object.hasOwn(readPresets(presets), id)) throw new Error("This choice no longer exists.");
         presets[id][field] = value;
+    } else if (field === "includes") {
+        // One manifest write, like a rename; an empty list removes the key.
+        if (!Object.hasOwn(readPresets(presets), id)) throw new Error("This choice no longer exists.");
+        if (Array.isArray(value) && value.length) presets[id].includes = [...value];
+        else delete presets[id].includes;
     } else if (field === "move") {
         const valid = readPresets(presets);
         const ordered = Object.keys(valid).sort((a, b) => valid[a].order - valid[b].order).filter(key => key !== id);
@@ -892,7 +919,19 @@ export function applyCleanupPlan(manifest, plan) {
         if (!Object.keys(preset[table]).length && !(isPlainObject(left) && Object.keys(left).length)) {
             delete manifest.presets[row.preset_id];
             dropChoiceFromCategories(manifest, row.preset_id);
+            dropChoiceFromIncludes(manifest, row.preset_id);
         }
+    }
+}
+
+// Takes a deleted choice out of every `includes` (control_cleanup.drop_included):
+// it applied nothing, so a choice that included it loses nothing.
+export function dropChoiceFromIncludes(manifest, id) {
+    if (!isPlainObject(manifest.presets)) return;
+    for (const entry of Object.values(manifest.presets)) {
+        if (!isPlainObject(entry) || !Array.isArray(entry.includes) || !entry.includes.includes(id)) continue;
+        entry.includes = entry.includes.filter(item => item !== id);
+        if (!entry.includes.length) delete entry.includes;
     }
 }
 
@@ -1615,6 +1654,47 @@ function exportExecution(saved, root, manifest) {
     return out;
 }
 
+// ── Subgraph names (Phase 6B) ───────────────────────────────────────────────
+
+export const MAX_SUBGRAPH_NAMES = 128;
+// C0/C1 controls, bidi embeddings, overrides and isolates, and U+FEFF (which
+// JS trim strips and Python's strip does not): a name is one line of text.
+const NAME_CONTROLS = /[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩﻿]/g;
+
+// A subgraph's display name (control_manifest.clean_subgraph_name): controls
+// removed, trimmed, at most 120 code points; null when nothing is left.
+export function subgraphName(value) {
+    if (typeof value !== "string") return null;
+    const name = [...value.replace(NAME_CONTROLS, "").trim()].slice(0, LABEL_MAX).join("").trim();
+    return name || null;
+}
+
+// `{host execution path: name}` for every subgraph instance at every depth,
+// muted and bypassed ones included (the canvas lists candidates inside muted
+// bodies too): the instance's title, else its definition's name. Keys are
+// flattened paths, as an expanded inner node's id (`outer:inner`).
+export function exportSubgraphNames(root) {
+    const names = {};
+    let count = 0;
+    const visit = (graph, prefix, depth) => {
+        if (depth >= MAX_NESTING) return;
+        for (const node of nodesOf(graph)) {
+            // Past the cap nothing more is kept, so nothing more is walked.
+            if (count >= MAX_SUBGRAPH_NAMES) return;
+            if (!isHost(node)) continue;
+            const path = prefix ? `${prefix}:${node.id}` : String(node.id);
+            const name = subgraphName(node.title) ?? subgraphName(node.subgraph?.name);
+            if (name && cleanPath(path) && count < MAX_SUBGRAPH_NAMES) {
+                names[path] = name;
+                count++;
+            }
+            visit(node.subgraph, path, depth + 1);
+        }
+    };
+    visit(root, "", 0);
+    return names;
+}
+
 // The API export of a manifest: saved presentation plus each binding's
 // targets, status and seed mode. Pure: never writes the widget or the graph,
 // and never throws, because a throw here would stop every Run of the workflow
@@ -1656,7 +1736,17 @@ export function exportManifest(text, root) {
         out.suggestions = suggestions.map(s => ({ binding_id: s.binding_id, targets: publicTargets(s.targets) }));
         if (manifest.execution !== undefined) out.execution = exportExecution(manifest.execution, root, manifest);
         if (manifest.views !== undefined) out.views = exportViews(manifest.views, root, manifest);
+        // Derived on every export, never passed through: a stale map that an
+        // older pack kept in saved text is replaced or deleted here.
+        const names = exportSubgraphNames(root);
+        if (Object.keys(names).length) out.subgraph_names = names;
+        else delete out.subgraph_names;
         let exported = JSON.stringify(out);
+        // The names are display only: past the cap they go first.
+        if (utf8Bytes(exported) > MAX_MANIFEST_BYTES && out.subgraph_names) {
+            delete out.subgraph_names;
+            exported = JSON.stringify(out);
+        }
         // The capsule shares the server's 128 KiB cap with everything else, and
         // a graph edit alone can grow it: past the cap it gives way, never the
         // Relay (its switches then read "too large" in the Sonder App).
@@ -1666,7 +1756,9 @@ export function exportManifest(text, root) {
         }
         return exported;
     } catch (error) {
-        return JSON.stringify({ ...manifest, error: String(error?.message || error || "Controls export failed.") });
+        const failed = { ...manifest, error: String(error?.message || error || "Controls export failed.") };
+        delete failed.subgraph_names; // never a stale saved map, even here
+        return JSON.stringify(failed);
     }
 }
 

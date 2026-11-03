@@ -9,6 +9,7 @@ import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
 import { EDITOR_COLORS as COLORS, SPACE, TYPE, chromeInputCss, chromeSelectCss, setButtonDisabled, setButtonVariant } from "./editor_theme.js";
 import { normalizeTiming } from "./view_timing.js";
 import { VIEW_FEED_SAMPLING, viewFeed } from "./control_targets.js";
+import { subgraphChain } from "./views_model.js";
 
 let serial = 0;
 const make = (tag, text) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; return el; };
@@ -171,7 +172,7 @@ export function mountViewsManage(host, { track = work => work, notify = () => {}
     // on every focus change, and a rebuild between a press and its click loses it.
     const listKey = value => JSON.stringify([value.views_error || null, (value.views || []).map(d =>
         [d.view_id, d.label, d.default_label, d.order, d.origin, d.status, d.reason, d.participation, d.title, d.class_type,
-            timingKey(d.timing), d.feed || "output"])]);
+            timingKey(d.timing), d.feed || "output", subgraphChain(d.path, value.subgraph_names)])]);
 
     function render(next = host.getView()) {
         view = next || {};
@@ -226,7 +227,10 @@ export function mountViewsManage(host, { track = work => work, notify = () => {}
                 top.append(reset);
             }
             const sampling = viewFeed(descriptor) === VIEW_FEED_SAMPLING;
-            const detail = make("div", [descriptor.title || descriptor.class_type, sampling ? "Sampling preview" : "",
+            // The node, named with the subgraphs it sits in when the export names them.
+            const chain = subgraphChain(descriptor.path, view.subgraph_names);
+            const node = descriptor.title || descriptor.class_type;
+            const detail = make("div", [chain && node ? `${chain} › ${node}` : node, sampling ? "Sampling preview" : "",
                 ORIGINS[descriptor.origin] || "",
                 descriptor.status !== "ok" ? descriptor.reason : descriptor.participation === "inactive" ? "Switched off" : ""]
                 .filter(Boolean).join(" · "));

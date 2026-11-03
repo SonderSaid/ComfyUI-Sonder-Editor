@@ -65,6 +65,14 @@ export function mountModesManage(host, { track, notify, success = () => {}, flus
     categorySelect.style.cssText = chromeInputCss({minWidth: "0"}) + "flex:1;";
     categorySelect.setAttribute("aria-label", "Category");
     categoryLabel.append(make("span", "Category"), categorySelect);
+    // Choices from other categories this one applies with its own (Phase 6A).
+    const also = make("div"), alsoTitle = make("div", "Also applies"), alsoNote = make("div"), alsoList = make("div");
+    also.dataset.controlsModesIncludes = "true";
+    also.style.cssText = `display:none;flex-direction:column;gap:2px;`;
+    alsoTitle.style.cssText = `${smallText}font-weight:${TYPE.fwBold};`;
+    alsoNote.style.cssText = smallText;
+    alsoList.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;`;
+    also.append(alsoTitle, alsoNote, alsoList);
     // The other choices of the edited one's category, to move between them.
     siblings.dataset.controlsModesSiblings = "true";
     siblings.style.cssText = `display:none;flex-direction:column;gap:2px;`;
@@ -73,7 +81,7 @@ export function mountModesManage(host, { track, notify, success = () => {}, flus
     siblings.append(siblingsTitle, siblingsList);
     actions.style.cssText = `display:flex;flex-wrap:wrap;gap:${SPACE.s1}px;`;
     actions.append(save, remove, reset);
-    editor.append(editorTitle, loadLine, name, description, counter, categoryLabel, siblings, missing, actions);
+    editor.append(editorTitle, loadLine, name, description, counter, categoryLabel, also, siblings, missing, actions);
     el.append(heading, list, loose, addCategory, editor);
 
     // `sel`: what the editor holds. {kind: "category"|"choice", id, draft, category?}
@@ -93,6 +101,10 @@ export function mountModesManage(host, { track, notify, success = () => {}, flus
     let lastLoaded = null;
     const loads = new Set(); // loads still running, superseded ones included
     const pendingText = new Map(), blocks = new Map(), looseRows = new Map(), siblingButtons = new Map();
+    // Also applies: a queued select's value until its write lands, keyed by
+    // choice and category (`pendingIncludes`), a draft's selections
+    // (`draftIncludes`, by category), kept lines.
+    const pendingIncludes = new Map(), draftIncludes = new Map(), alsoLines = new Map();
     const categories = () => Array.isArray(view.preset_categories) ? view.preset_categories : [];
     const presets = () => Array.isArray(view.presets) ? view.presets : [];
     const choiceRow = id => presets().find(p => p.id === id);
@@ -120,13 +132,21 @@ export function mountModesManage(host, { track, notify, success = () => {}, flus
         if (isChoice() && membershipDirty && !globalThis.confirm(`Discard the unsaved setting changes to “${current}”?`)) return false;
         const loading = next?.kind === "choice" && !next.draft;
         if (loading && diverged() && !globalThis.confirm(`Your Controls changed since loading “${choiceRow(lastLoaded.id)?.name || lastLoaded.id}” `
-            + `and aren't saved to it. Load “${choiceRow(next.id)?.name || next.id}” anyway?`)) return false;
+            + `and aren't saved to it${ownRowsText(lastLoaded.id)}. Load “${choiceRow(next.id)?.name || next.id}” anyway?`)) return false;
         return true;
+    }
+    // Update never saves an included choice's Controls: they belong to its own row.
+    function ownRowsText(id) {
+        const names = (choiceRow(id)?.includes || []).filter(item => item.status !== "missing")
+            .map(item => item.name || choiceRow(item.id)?.name).filter(Boolean);
+        if (!names.length) return "";
+        const text = names.length === 1 ? names[0] : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+        return ` (${text} ${names.length === 1 ? "is" : "are"} set in ${names.length === 1 ? "its" : "their"} own row${names.length === 1 ? "" : "s"})`;
     }
 
     function select(next) {
         if (!canLeave(next)) return false;
-        sel = next; membershipDirty = false; creating = null;
+        sel = next; membershipDirty = false; creating = null; draftIncludes.clear();
         const row = next?.kind === "choice" ? choiceRow(next.id) : next ? categoryRow(next.id) : null;
         name.value = next?.draft ? "" : row?.name || "";
         description.value = next?.draft ? "" : row?.description || "";
@@ -193,7 +213,8 @@ export function mountModesManage(host, { track, notify, success = () => {}, flus
     // two quick edits of one list never build on the same stale list.
     // `done`: the success message (or a function giving it) for a write
     // accepted by the canvas or stored by the app, announced once.
-    function enqueue(what, build, { flush = false, text = null, after = null, done = null } = {}) {
+    // `settle`: runs when the write is over, accepted or not, before the repaint.
+    function enqueue(what, build, { flush = false, text = null, after = null, done = null, settle = null } = {}) {
         if (destroyed) return Promise.resolve(false);
         if (text) pendingText.set(text.target, text.value);
         // Snapshot saves before this edit joins the panel's gate.
@@ -220,6 +241,7 @@ export function mountModesManage(host, { track, notify, success = () => {}, flus
             } catch (error) { notify(`The ${what} could not be saved.`, error?.message); return false; }
             finally {
                 if (text && pendingText.get(text.target) === text.value) pendingText.delete(text.target);
+                settle?.();
                 queued--;
                 if (!destroyed) { render(host.getView()); changed(); }
             }
@@ -292,7 +314,9 @@ export function mountModesManage(host, { track, notify, success = () => {}, flus
             return;
         }
         const capture = {members: [...members], ...(switches.size ? {execution: [...switches]} : {})};
-        const fields = draft ? {...capture, name: name.value, description: description.value} : capture;
+        // A draft's Also applies selections, except one in the category it goes into.
+        const includes = [...draftIncludes].filter(([cid, pid]) => pid && cid !== into).map(([, pid]) => pid);
+        const fields = draft ? {...capture, name: name.value, description: description.value, ...(includes.length ? {includes} : {})} : capture;
         const label = name.value;
         const message = () => {
             if (!draft) return `Choice “${label}” ${renamed ? "renamed and updated" : "updated"} from current values.`;
@@ -534,6 +558,7 @@ export function mountModesManage(host, { track, notify, success = () => {}, flus
             categorySelect.disabled = twice;
             categorySelect.title = twice ? "Listed in two categories. Remove it from one first." : "";
         }
+        paintAlso(choice);
         paintSiblings(choice ? categoryRow(sel.draft ? sel.category : homeOf(sel.id)?.id) : null);
         paintLoad(choice && !sel.draft);
 
@@ -550,6 +575,116 @@ export function mountModesManage(host, { track, notify, success = () => {}, flus
         missingLines = new Map(lines.filter(line => line !== missingTitle).map(line => [line.dataset.controlsMember, line]));
         for (const child of [...missing.children]) if (!lines.includes(child)) child.remove();
         placeInOrder(missing, lines);
+    }
+
+    // Also applies: one select per other category (Nothing or one of its
+    // choices) and a line with Remove for each inclusion no select shows (a
+    // choice in no category, or one that no longer exists). The server owns
+    // the rules; a select disables only what the rows show for certain.
+    const includesOf = (current, id) => ((current.presets || []).find(p => p.id === id)?.includes || []).map(item => item.id);
+    const homeIn = (current, pid) => (current.preset_categories || []).find(c => (c.choices || []).includes(pid))?.id || null;
+    function writeIncludes(id, edit, options) {
+        return enqueue("choice", current => {
+            if (staleView && current === staleView) { notify("Controls are still updating. Try again."); return null; }
+            if (!(current.presets || []).some(p => p.id === id)) { notify("This choice no longer exists. Open Manage again."); return null; }
+            const before = includesOf(current, id), next = edit(before, current);
+            return next.join("\u0000") === before.join("\u0000") ? null : {[`preset:${id}:includes`]: next};
+        }, options);
+    }
+    function chooseIncluded(cid, pid) {
+        if (!isChoice()) return;
+        if (sel.draft) { draftIncludes.set(cid, pid); return; }
+        const id = sel.id, owner = choiceRow(id)?.name || id, chosen = choiceRow(pid)?.name, key = `${id}\u0000${cid}`;
+        pendingIncludes.set(key, pid);
+        void writeIncludes(id, (before, current) => {
+            // Only this category's entry changes, in its place; an earlier
+            // write is already in `before`.
+            const mine = item => homeIn(current, item) === cid;
+            const rest = before.filter(item => !mine(item));
+            if (!pid) return rest;
+            const at = before.findIndex(mine);
+            const index = at < 0 ? rest.length : before.slice(0, at).filter(item => !mine(item)).length;
+            return [...rest.slice(0, index), pid, ...rest.slice(index)];
+        }, {done: pid ? `“${owner}” now also applies “${chosen}”.` : `“${owner}” no longer applies a choice from “${categoryRow(cid)?.name || cid}”.`,
+            settle: () => { if (pendingIncludes.get(key) === pid) pendingIncludes.delete(key); }});
+    }
+    function removeIncluded(pid) {
+        if (!isChoice() || sel.draft) return;
+        const id = sel.id, owner = choiceRow(id)?.name || id;
+        void writeIncludes(id, before => before.filter(item => item !== pid), {done: `“${owner}” no longer includes that choice.`});
+    }
+    function alsoSelect(cid) {
+        const label = make("label"), text = make("span"), select = make("select");
+        label.style.cssText = `display:flex;align-items:center;gap:${SPACE.s1}px;${smallText}`;
+        select.style.cssText = chromeInputCss({minWidth: "0"}) + "flex:1;";
+        select.addEventListener("change", () => chooseIncluded(cid, select.value || null));
+        label.append(text, select);
+        return {el: label, text, select};
+    }
+    function alsoRemoveLine(pid) {
+        const line = make("div"), text = make("span"), fix = button("Remove");
+        line.style.cssText = `display:flex;flex-wrap:wrap;align-items:center;gap:${SPACE.s1}px;${smallText}`;
+        fix.addEventListener("click", () => removeIncluded(pid));
+        line.append(text, fix);
+        return {el: line, text, fix};
+    }
+    function paintAlso(choice) {
+        const home = !choice ? null : sel.draft ? sel.category || null : homeOf(sel.id)?.id || null;
+        const others = choice ? categories().filter(c => c.id !== home) : [];
+        const stored = choice && !sel.draft ? choiceRow(sel.id)?.includes || [] : [];
+        const parents = choice && !sel.draft ? presets().filter(p => (p.includes || []).some(item => item.id === sel.id)) : [];
+        const lines = [], represented = new Set();
+        if (!parents.length) {
+            for (const category of others) {
+                const key = `category:${category.id}`;
+                let line = alsoLines.get(key);
+                if (!line) alsoLines.set(key, line = alsoSelect(category.id));
+                setText(line.text, `“${category.name}”:`);
+                const options = [["", "Nothing", ""], ...(category.choices || []).filter(pid => choiceRow(pid)).map(pid => [pid, choiceRow(pid).name,
+                    // A choice that includes others can't be included (one level).
+                    (choiceRow(pid).includes || []).length ? "It includes other choices itself, so it can't be included." : ""])];
+                const optionsKey = JSON.stringify(options);
+                if (line.select.dataset.key !== optionsKey) {
+                    line.select.dataset.key = optionsKey;
+                    line.select.replaceChildren(...options.map(([value, label, why]) => {
+                        const option = new Option(label, value);
+                        option.disabled = !!why;
+                        option.title = why;
+                        return option;
+                    }));
+                }
+                line.select.setAttribute("aria-label", `Also applies from ${category.name}`);
+                const saved = stored.find(item => item.status !== "missing" && (category.choices || []).includes(item.id))?.id || "";
+                if (saved) represented.add(saved);
+                const pending = `${sel.id}\u0000${category.id}`;
+                const value = sel.draft ? draftIncludes.get(category.id) || ""
+                    : pendingIncludes.has(pending) ? pendingIncludes.get(pending) || "" : saved;
+                if (line.select.value !== value) line.select.value = value;
+                lines.push(line.el);
+            }
+        }
+        // What no select shows: an included choice in no other category, a
+        // second one from one category, or one that is gone.
+        for (const item of stored) {
+            if (represented.has(item.id)) continue;
+            const key = `include:${item.id}`;
+            let line = alsoLines.get(key);
+            if (!line) alsoLines.set(key, line = alsoRemoveLine(item.id));
+            const label = item.name || choiceRow(item.id)?.name || item.id;
+            setText(line.text, item.status === "missing" ? "An included choice no longer exists"
+                : homeIn(view, item.id) === home && home ? `“${label}” (in this choice's own category)`
+                    : homeIn(view, item.id) ? `“${label}”` : `“${label}” (not in a category)`);
+            line.fix.setAttribute("aria-label", item.status === "missing" ? "Remove the missing choice" : `Remove ${label}`);
+            lines.push(line.el);
+        }
+        const live = new Set(lines);
+        for (const [key, line] of alsoLines) if (!live.has(line.el)) { line.el.remove(); alsoLines.delete(key); }
+        placeInOrder(alsoList, lines);
+        const note = parents.length
+            ? `${parents.map(p => `“${p.name}”`).join(" and ")} ${parents.length === 1 ? "includes" : "include"} this choice, so it can't include others.` : "";
+        setText(alsoNote, note);
+        alsoNote.style.display = note ? "" : "none";
+        also.style.display = choice && (lines.length || note) ? "flex" : "none";
     }
 
     // Choices in “<category>” (N), in the category's own order (its `choices`

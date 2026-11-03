@@ -67,6 +67,150 @@ def _expand(view, preset):
     return changes, unavailable
 
 
+# ── Inclusions (Phase 6A) ────────────────────────────────────────────────────
+# A choice's ``includes`` names choices in other categories that it applies
+# with its own members, by reference: one batch, and it matches only while
+# every included choice's conditions hold too. ``resolve_inclusions`` is the
+# one authority; apply, projection and the batch check all read it.
+
+def home_categories(categories):
+    """``{choice id: the category that shows it}``: the first by order that lists it."""
+    from . import control_preset_categories as pc
+
+    homes = {}
+    for cid in pc.ordered(categories or {}):
+        for choice in categories[cid].get("choices") or []:
+            homes.setdefault(choice, cid)
+    return homes
+
+
+def _control_keys(preset):
+    """What a choice sets, for the overlap rule: settings, switches and the nodes they set."""
+    keys = {("binding", bid) for bid in preset.get("members") or {}}
+    keys |= {("switch", eid) for eid in preset.get("execution") or {}}
+    keys |= {("node", path) for path in cm.execution_effects(preset.get("execution") or {}) or {}}
+    return keys
+
+
+def _targets(preset):
+    return (sum(1 + ("seed_mode" in m) for m in (preset.get("members") or {}).values())
+            + len(cm.execution_effects(preset.get("execution") or {}) or {}))
+
+
+def _quote(definitions, identity):
+    return f"“{(definitions.get(identity) or {}).get('name') or identity}”"
+
+
+def inclusion_problems_of(definitions, categories, identity, *, homes=None):
+    """Every structural problem with choice ``identity``'s ``includes``, in
+    order, as ``{rule, other, message}``. Rules: ``missing`` (no such choice),
+    ``nested`` (it includes others itself, or is this choice: one level only),
+    ``category`` (it is in this choice's own category), ``shared_category``
+    (two included choices share a category), ``overlap`` (two parts set one
+    setting, switch or node) and ``budget`` (more than 64 targets merged).
+    Whether an included choice can apply now is a state, not a problem here."""
+    preset = definitions[identity]
+    includes = preset.get("includes") or []
+    if not includes:
+        return []
+    homes = home_categories(categories) if homes is None else homes
+    problems, parts, by_home = [], [(identity, preset)], {}
+    for other in includes:
+        included = definitions.get(other)
+        if included is None:
+            problems.append({"rule": "missing", "other": other,
+                             "message": "An included choice no longer exists. Remove it in Manage."})
+            continue
+        if other == identity:
+            problems.append({"rule": "nested", "other": other, "message": "A choice can't include itself."})
+            continue
+        if included.get("includes"):
+            problems.append({"rule": "nested", "other": other,
+                             "message": f"{_quote(definitions, other)} includes other choices itself, so it can't be included."})
+            continue
+        home = homes.get(other)
+        # A category problem still counts the choice's Controls below, so a
+        # later capture that also overlaps (or passes the budget) is its own
+        # problem, and fixing the category alone shows the next one.
+        if home is not None and home == homes.get(identity):
+            problems.append({"rule": "category", "other": other,
+                             "message": f"{_quote(definitions, other)} is in this choice's own category, so it can't be included."})
+        elif home is not None and home in by_home:
+            problems.append({"rule": "shared_category", "other": other,
+                             "message": f"{_quote(definitions, by_home[home])} and {_quote(definitions, other)} are in one "
+                                        "category, so only one of them can be included."})
+        elif home is not None:
+            by_home[home] = other
+        parts.append((other, included))
+    owners: dict = {}
+    for other, part in parts:
+        clash = next((owners[key] for key in sorted(_control_keys(part)) if key in owners), None)
+        if clash is not None:
+            problems.append({"rule": "overlap", "other": other, "message": (
+                f"{_quote(definitions, other)} sets a Control this choice sets too." if clash == identity
+                else f"{_quote(definitions, clash)} and {_quote(definitions, other)} set the same Control.")})
+            continue
+        for key in _control_keys(part):
+            owners[key] = other
+    if sum(_targets(part) for _, part in parts) > cm.MAX_PRESET_TARGETS:
+        problems.append({"rule": "budget", "other": None, "message": (
+            "With the choices it includes, this choice holds more than 64 targets; a seed with a mode counts as two, "
+            "and each node a switch sets counts as one.")})
+    return problems
+
+
+def resolve_inclusions(definitions, categories, identity, *, homes=None):
+    """``(parts, None)``: the definitions choice ``identity`` applies, its own
+    first, then each choice it includes in order; or ``(None, problem)``."""
+    problems = inclusion_problems_of(definitions, categories, identity, homes=homes)
+    if problems:
+        return None, problems[0]
+    preset = definitions[identity]
+    return [(identity, preset), *((other, definitions[other]) for other in preset.get("includes") or [])], None
+
+
+def inclusion_problems(definitions, categories):
+    """``{(parent, rule, other): message}`` over every choice: the batch check
+    compares this before and after a batch's edits."""
+    homes = home_categories(categories)
+    return {(identity, p["rule"], p["other"]): p["message"]
+            for identity, preset in definitions.items() if preset.get("includes")
+            for p in inclusion_problems_of(definitions, categories, identity, homes=homes)}
+
+
+def expand_choice(view, definitions, categories, identity, *, own_only=False, homes=None):
+    """``(changes, reason, own unavailable ids)`` to apply choice ``identity``:
+    its own members' targets and, unless ``own_only``, every included choice's,
+    as one batch. ``reason`` is non-empty when it can't apply; an included
+    part's reason names that choice."""
+    preset = definitions[identity]
+    if own_only:
+        parts = [(identity, preset)]
+    else:
+        parts, problem = resolve_inclusions(definitions, categories, identity, homes=homes)
+        if problem:
+            return {}, problem["message"], []
+    changes = {}
+    for part_id, part in parts:
+        part_changes, unavailable = _expand(view, part)
+        if unavailable:
+            text = _reason(view, unavailable, part)
+            if part_id == identity:
+                return {}, text, unavailable
+            return {}, f"Included {_quote(definitions, part_id)}: {text}", []
+        changes.update(part_changes)
+    return changes, "", []
+
+
+def _merged(parts):
+    """One definition holding every part's members and switches (no overlap)."""
+    members, execution = {}, {}
+    for _, part in parts:
+        members.update(part.get("members") or {})
+        execution.update(part.get("execution") or {})
+    return {"members": members, **({"execution": execution} if execution else {})}
+
+
 def _labels(view):
     labels = {d["binding_id"]: d.get("label") or d["binding_id"] for d in view.get("bindings", [])}
     labels.update({d["execution_id"]: d.get("label") or d["execution_id"] for d in view.get("execution", []) or []})
@@ -207,12 +351,27 @@ def preset_projection(view, presets, categories=None, *, origins=None, category_
 
     bindings = {d["binding_id"]: d for d in view.get("bindings", [])}
     switches = _switches(view)
-    rows, conditions = [], {}
-    for identity, preset in sorted(presets.items(), key=lambda item: item[1]["order"]):
-        changes, unavailable = _expand(view, preset)
+    homes = home_categories(categories)
+    built, conditions, own_conditions = {}, {}, {}
+
+    def holds(preset, cleaned):
+        """Every setting and switch of ``preset`` holds its captured state now."""
+        return (all(condition_holds(bindings.get(bid, {}), match_condition(
+                        bindings.get(bid, {}), member, cleaned.get(f"binding:{bid}:value", _UNSET)))
+                    for bid, member in preset["members"].items())
+                and all(_execution_matches(switches.get(eid, {}), member)
+                        for eid, member in (preset.get("execution") or {}).items()))
+
+    # Choices that include nothing first: an including choice reads their states.
+    for identity, preset in sorted(presets.items(), key=lambda item: bool(item[1].get("includes"))):
+        changes, reason, unavailable = expand_choice(view, presets, categories, identity, homes=homes)
+        included = [presets[other] for other in preset.get("includes") or [] if other in presets] if not reason else []
+        for other in preset.get("includes") or []:
+            if not reason and built.get(other, {}).get("state") in ("unavailable", "refused"):
+                reason = f"Included {_quote(presets, other)}: {built[other]['reason']}"
         cleaned, rejected = (cd.validate_binding_changes(view, changes, prompt=prompt, expanded=True)
-                             if not unavailable and changes else ({}, []))
-        state = "unavailable" if unavailable else "refused" if rejected else "match"
+                             if not reason and changes else ({}, []))
+        state = "unavailable" if reason else "refused" if rejected else "match"
         members = []
         for bid, member in preset["members"].items():
             descriptor = bindings.get(bid, {})
@@ -222,23 +381,32 @@ def preset_projection(view, presets, categories=None, *, origins=None, category_
                             # Two row lists can share a summary; Manage's hint needs the real comparison.
                             **({"differs": control_rows.canonical(member["value"]) != control_rows.canonical(descriptor.get("value"))}
                                if descriptor.get("kind") == control_rows.ROWS_KIND else {})})
-            if state == "match" and not condition_holds(
-                    descriptor, match_condition(descriptor, member, cleaned.get(f"binding:{bid}:value", _UNSET))):
-                state = "differs"
-        execution = []
-        for eid, member in (preset.get("execution") or {}).items():
-            status = "unavailable" if eid in unavailable else "ok"
-            execution.append({"execution_id": eid, "preview": _mode_preview(member), "status": status})
-            if state == "match" and not _execution_matches(switches.get(eid, {}), member):
-                state = "differs"
+        # Members and switches stay the choice's own (Manage's ticks and Update);
+        # matching needs every included choice's conditions too.
+        execution = [{"execution_id": eid, "preview": _mode_preview(member), "status": "unavailable" if eid in unavailable else "ok"}
+                     for eid, member in (preset.get("execution") or {}).items()]
+        if state == "match" and not all(holds(part, cleaned) for part in [preset, *included]):
+            state = "differs"
         if categories:
-            conditions[identity] = _conditions(view, preset, cleaned)
-        rows.append({"id": identity, "name": preset["name"], "description": preset["description"],
-                     "order": preset["order"], "origin": (origins or {}).get(identity, "workflow"),
-                     "state": state, "members": members, "execution": execution, "unavailable": unavailable,
-                     "reason": _reason(view, unavailable, preset) if unavailable else _refused_reason(view, rejected) if rejected else ""})
+            own_conditions[identity] = _conditions(view, preset, cleaned)
+            conditions[identity] = _conditions(view, _merged([(identity, preset), *((None, p) for p in included)]), cleaned)
+        built[identity] = {"id": identity, "name": preset["name"], "description": preset["description"],
+                           "order": preset["order"], "origin": (origins or {}).get(identity, "workflow"),
+                           "state": state, "members": members, "execution": execution, "unavailable": unavailable,
+                           "reason": reason or (_refused_reason(view, rejected) if rejected else "")}
+    for identity, preset in presets.items():
+        if preset.get("includes"):
+            built[identity]["includes"] = [{
+                "id": other, "name": presets[other]["name"] if other in presets else "",
+                "status": "missing" if other not in presets
+                else "unavailable" if built[other]["state"] in ("unavailable", "refused") else "ok"}
+                for other in preset["includes"]]
+    rows = [built[identity] for identity, _ in sorted(presets.items(), key=lambda item: item[1]["order"])]
+    # Overlap compares what matching uses (included conditions too); linked
+    # compares each choice's own, so a deliberate inclusion never links rows.
     category_rows = (control_preset_categories.category_rows(categories, presets, conditions, labels=_control_labels(view),
-                                                            origins=category_origins, dropped=set(dropped))
+                                                            origins=category_origins, dropped=set(dropped),
+                                                            linked_conditions=own_conditions)
                      if categories else [])
     return rows, category_rows
 
@@ -316,14 +484,32 @@ def _entry(base, members, switched):
     return entry
 
 
-def validate_preset_changes(view, changes, *, prompt=None, structural=None, inventory=None, execution_inventory=None):
+def _includes_value(raw):
+    """A written ``includes``: a list of at most 16 different choice ids."""
+    if (not isinstance(raw, list) or len(raw) > cm.MAX_PRESET_INCLUDES
+            or any(not isinstance(c, str) or not cm.ID_RE.fullmatch(c) or c in cm.FORBIDDEN_KEYS for c in raw)
+            or len(set(raw)) != len(raw)):
+        raise cd.ControlValueError(f"Choose at most {cm.MAX_PRESET_INCLUDES} different choices to include.")
+    return list(raw)
+
+
+def _with_includes(entry, includes):
+    entry.pop("includes", None)
+    if includes:
+        entry["includes"] = list(includes)
+    return entry
+
+
+def validate_preset_changes(view, changes, *, prompt=None, structural=None, inventory=None, execution_inventory=None,
+                            own_only=False):
     """Return canonical preset edits or an ordinary atomic value/mode batch.
 
     Category targets (``preset_category:<id>:<field>``) validate here too, in
     request order against the same ephemeral definitions, so one request can
     create a choice and list it. Mounted structural intents are shape-checked
     only and forwarded raw. The private definitions never travel in its
-    bounded publication view.
+    bounded publication view. ``own_only`` applies a choice without the
+    choices it includes (the Launcher's requirement simulations).
     """
     from . import control_preset_categories as pc
 
@@ -372,8 +558,12 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                 limit = cm.LABEL_MAX if field == "name" else cm.DESCRIPTION_MAX
                 if not isinstance(raw, str) or len(raw) > limit or (field == "name" and cm.blank_name(raw)):
                     raise cd.ControlValueError(f"A choice {field} must be text of 1–{limit} characters." if field == "name" else f"A choice description may hold at most {limit} characters.")
-            if field not in {"create", "capture", "apply", "name", "description", "move", "remove", "reset"}:
+            if field not in {"create", "capture", "apply", "name", "description", "move", "remove", "reset", "includes"}:
                 raise cd.ControlValueError("This choice target is unavailable.")
+            if field == "includes":
+                raw = _includes_value(raw)
+            if field == "create" and "includes" in raw:
+                _includes_value(raw["includes"])
             if structural == "relay":
                 cleaned[target] = copy.deepcopy(raw)
                 continue
@@ -381,9 +571,10 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
             if field == "apply":
                 if not existing:
                     raise cd.ControlValueError("This choice no longer exists. Open Manage.")
-                expanded, unavailable = _expand(view, existing)
-                if unavailable:
-                    raise cd.ControlValueError(_reason(view, unavailable, existing))
+                # Its own members and every included choice's: one batch.
+                expanded, reason, _ = expand_choice(view, definitions, categories, identity, own_only=own_only)
+                if reason:
+                    raise cd.ControlValueError(reason)
                 # Values and modes validate and land as one batch: one native
                 # history step on the canvas, one sidecar mutation in the app.
                 values, errors = cd.validate_binding_changes(view, expanded, prompt=prompt, structural=structural,
@@ -400,6 +591,7 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                 entry = _entry({"name": name.strip() if isinstance(name, str) else name, "description": raw.get("description", ""),
                                 "order": min(cm.ORDER_LIMIT, max((p["order"] for p in definitions.values()), default=-1) + 1)},
                                *_capture_preset(view, raw["members"], execution=raw.get("execution", [])))
+                _with_includes(entry, raw.get("includes"))
                 if identity not in cm.read_presets({identity: entry}):
                     raise cd.ControlValueError("A choice needs a name of 1–120 characters and a description of at most 1000 characters.")
                 definitions[identity] = entry
@@ -411,6 +603,9 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                 entry = _entry(existing, *_capture_preset(view, raw["members"], existing, raw.get("execution", [])))
                 definitions[identity] = entry
                 cleaned[target] = entry
+            elif field == "includes":
+                _with_includes(definitions[identity], raw)
+                cleaned[target] = raw
             elif field in ("name", "description"):
                 definitions[identity][field] = raw
                 # Every writer stores what this accepts; refuse what its reader would drop.
@@ -430,6 +625,8 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                     pc.drop_choice(categories, identity)
         except (cd.ControlValueError, TypeError, ValueError) as exc:
             rejected.append({"target": target, "reason": str(exc)})
+    if not rejected and structural != "relay" and any(s in cd.PRESET_SOURCES for s in sources.values()):
+        rejected.extend(_inclusion_refusals(view, changes, sources, definitions, categories, start))
     if not rejected and structural != "relay" and "preset_category" in sources.values():
         # Only a duplicate this batch makes is refused: one already there (a
         # Replace, a reset, a hand edit) is resolved by the first category and
@@ -446,6 +643,44 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                 if sources[target] == "preset_category" and parsed[1] in added and parsed[2] in ("create", "choices"):
                     rejected.append({"target": target, "reason": reason})
     return ({} if rejected else cleaned), rejected
+
+
+def _inclusion_refusals(view, changes, sources, definitions, categories, start):
+    """Inclusion problems this batch makes (``inclusion_problems`` before and
+    after): one already there (a hand edit, an older pack) never blocks an
+    unrelated edit. A ``reset`` can't be checked (what it restores isn't
+    visible here): problems naming a reset choice, and the category rules
+    after a category reset, are left to show at read; the rest of the batch
+    is still checked."""
+    parsed = {target: cd.parse_target(target) for target in changes}
+    reset = {p[1] for p in parsed.values() if p and p[0] == "preset" and p[2] == "reset"}
+    category_reset = any(p and p[0] == "preset_category" and p[2] == "reset" for p in parsed.values())
+    before = inclusion_problems(view.get("_presets", {}), start)
+    added = {(parent, rule, other): message for (parent, rule, other), message in inclusion_problems(definitions, categories).items()
+             if (parent, rule, other) not in before and parent not in reset and other not in reset
+             and not (category_reset and rule in ("category", "shared_category"))}
+    if not added:
+        return []
+    removed = {p[1] for p in parsed.values() if p and p[0] == "preset" and p[2] == "remove"}
+    refusals, seen = [], set()
+    # Deleting an included choice names the choices that include it.
+    for other in removed:
+        parents = [parent for (parent, rule, gone) in added if rule == "missing" and gone == other]
+        if parents:
+            names = " and ".join(_quote(definitions, parent) for parent in sorted(parents, key=lambda p: definitions[p]["order"]))
+            verb = "includes" if len(parents) == 1 else "include"
+            refusals.append({"target": f"preset:{other}:remove", "reason": f"{names} {verb} this choice. Take it out there first."})
+            seen.update((parent, "missing", other) for parent in parents)
+    preset_targets = [t for t in changes if sources[t] in cd.PRESET_SOURCES]
+    for (parent, rule, other), message in added.items():
+        if (parent, rule, other) in seen:
+            continue
+        # The target that names the choice, else the batch's first.
+        target = next((t for t in preset_targets if parsed[t][0] == "preset" and parsed[t][1] in (parent, other)),
+                      preset_targets[0] if preset_targets else next(iter(changes)))
+        label = (definitions.get(parent) or {}).get("name") or parent
+        refusals.append({"target": target, "reason": f"“{label}”: {message}"})
+    return refusals
 
 
 def _category_change(view, categories, definitions, identity, field, raw, structural):
@@ -516,6 +751,8 @@ def edit_definitions(definitions, identity, field, value):
         definitions.pop(identity, None)
     elif field in ("name", "description"):
         definitions[identity][field] = value
+    elif field == "includes":
+        _with_includes(definitions[identity], value)
     elif field == "move":
         ordered = sorted(definitions, key=lambda key: definitions[key]["order"])
         ordered.remove(identity)

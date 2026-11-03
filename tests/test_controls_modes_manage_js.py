@@ -453,3 +453,91 @@ panel.destroy();console.log('ok');
 
 def test_a_refused_load_never_blocks_the_next_selection_or_done(tmp_path):
     run(PRELUDE + PANEL_LOAD, tmp_path, 'modes-manage-panel-load')
+
+
+INCLUDES = r'''
+// Phase 6A: Also applies, one select per other category.
+const {mountModesManage}=await import(MANAGE_URL);
+const own=(binding_id,preview)=>({binding_id,preview,status:'ok'});
+let view={state:'ready',execution:[],bindings:[{binding_id:'pass',label:'Pass',kind:'COMBO',value:'b',status:'ok'},
+        {binding_id:'mask',label:'Mask',kind:'COMBO',value:'a',status:'ok'}],
+    presets:[P('refine','differs',{name:'Refine',members:[own('pass','a')]}),P('up','match',{name:'Upscale',members:[own('pass','b')]}),
+        P('off','match',{name:'Mask Off',members:[own('mask','a')]}),P('char','differs',{name:'Character',members:[own('mask','b')]}),
+        P('nest','differs',{name:'Nested',members:[own('mask','c')],includes:[{id:'refine',name:'Refine',status:'ok'}]}),
+        P('loose','differs',{name:'Loose',members:[own('pass','z')]})],
+    preset_categories:[C('passes','Passes',['refine','up']),C('mask','Mask',['off','char','nest'])]};
+const calls=[],notices=[],toasts=[];let refuse=null,gate=null;
+const host={getView:()=>view,freshView:async()=>({view,fresh:true}),
+    async applyChanges(changes){calls.push(changes);if(gate)await gate.promise;if(refuse)return {ok:false,rejected:[{reason:refuse}]};
+        for(const [target,value] of Object.entries(changes)){const [source,id,field]=target.split(':');
+            if(source==='preset'&&field==='includes')view={...view,presets:view.presets.map(p=>p.id!==id?p:{...p,
+                includes:value.map(pid=>({id:pid,name:view.presets.find(q=>q.id===pid)?.name||'',status:view.presets.some(q=>q.id===pid)?'ok':'missing'}))})};}
+        return {ok:true,rejected:[]};}};
+const manage=mountModesManage(host,{track:w=>w,notify:m=>notices.push(m),success:m=>toasts.push(m),flushPending:async()=>true});
+document.body.append(manage.el);manage.render(view);
+const pick=id=>walk(manage.el).find(n=>n.dataset.controlsModesChoice===id).children[0];
+const also=()=>walk(manage.el).find(n=>n.dataset.controlsModesIncludes==='true');
+const select=name=>walk(also()).find(n=>n.tagName==='SELECT'&&n.attributes['aria-label']===`Also applies from ${name}`);
+pick('up').dispatch('click');await settle();calls.length=0;
+assert.equal(also().style.display,'flex');assert.match(also().textContent,/^Also applies/);
+assert.equal(select('Passes'),undefined,'no select for its own category');
+assert.deepEqual(select('Mask').options.map(o=>[o.value,o.textContent,!!o.disabled]),
+    [['','Nothing',false],['off','Mask Off',false],['char','Character',false],['nest','Nested',true]]);
+assert.equal(select('Mask').options[3].title,"It includes other choices itself, so it can't be included.");
+assert.equal(select('Mask').value,'');
+// A pick writes the list, built from the current row; the select holds its value meanwhile.
+gate=deferred();select('Mask').value='off';select('Mask').dispatch('change');await settle();
+manage.render(view);assert.equal(select('Mask').value,'off','pending: no flicker');
+gate.resolve();gate=null;await settle();
+assert.deepEqual(calls,[{'preset:up:includes':['off']}]);assert.equal(toasts.at(-1),'“Upscale” now also applies “Mask Off”.');
+// Own-only ticks: the included choice's Control is not ticked in this choice.
+assert.equal(select('Mask').value,'off');
+// Changing the pick replaces only this category's entry.
+select('Mask').value='char';select('Mask').dispatch('change');await settle();
+assert.deepEqual(calls.at(-1),{'preset:up:includes':['char']});
+// A refused write warns and the select goes back to the stored value.
+refuse='“Upscale”: “Mask Off” sets a Control this choice sets too.';
+select('Mask').value='off';select('Mask').dispatch('change');await settle();refuse=null;
+assert.equal(notices.at(-1),'“Upscale”: “Mask Off” sets a Control this choice sets too.');assert.equal(select('Mask').value,'char');
+// Nothing removes it.
+select('Mask').value='';select('Mask').dispatch('change');await settle();
+assert.deepEqual(calls.at(-1),{'preset:up:includes':[]});
+// An inclusion no select shows: a choice in no category, and a missing one, each with Remove.
+view={...view,presets:view.presets.map(p=>p.id==='up'?{...p,includes:[{id:'loose',name:'Loose',status:'ok'},{id:'gone',name:'',status:'missing'}]}:p)};
+manage.render(view);
+assert.match(also().textContent,/“Loose” \(not in a category\)Remove/);assert.match(also().textContent,/An included choice no longer existsRemove/);
+walk(also()).find(n=>n.tagName==='BUTTON'&&n.attributes['aria-label']==='Remove the missing choice').dispatch('click');await settle();
+assert.deepEqual(calls.at(-1),{'preset:up:includes':['loose']});
+// A queued pick shows only on its own choice: another choice selected meanwhile reads its stored value.
+pick('char').dispatch('click');await settle();
+gate=deferred();select('Passes').value='up';select('Passes').dispatch('change');await settle();
+pick('off').dispatch('click');await settle();assert.equal(select('Passes').value,'','not the pending pick of another choice');
+gate.resolve();gate=null;await settle();
+// Loading another choice after a hand change asks, naming the included row
+// (its name blanked, as a cut publication leaves it).
+const asked=[];globalThis.confirm=m=>{asked.push(m);return false;};
+view={...view,presets:view.presets.map(p=>p.id==='off'?{...p,state:'differs',includes:[{id:'up',name:'',status:'ok'}]}:p)};
+manage.render(view);
+pick('refine').dispatch('click');await settle();
+assert.equal(asked.length,1);assert.match(asked[0],/aren't saved to it \(Upscale is set in its own row\)\. Load “Refine” anyway\?/);
+globalThis.confirm=()=>true;
+// A choice another one includes can't include others.
+pick('loose').dispatch('click');await settle();
+assert.match(also().textContent,/“Upscale” includes this choice, so it can't include others\./);
+assert.equal(walk(also()).some(n=>n.tagName==='SELECT'),false);
+// A draft sends its picks with Create, except one in the category it goes into.
+const add=walk(manage.el).find(n=>n.dataset.controlsModesCategory==='passes'&&n.tagName==='DIV');
+walk(add).find(n=>n.tagName==='BUTTON'&&n.textContent==='+ Choice').dispatch('click');await settle();
+walk(manage.el).find(n=>n.attributes['aria-label']==='Choice name').value='Draft';
+select('Mask').value='off';select('Mask').dispatch('change');await settle();
+const created=calls.length;
+walk(manage.el).find(n=>n.tagName==='BUTTON'&&n.textContent==='Create').dispatch('click');await settle();
+const sent=calls.slice(created).find(c=>Object.keys(c).some(k=>k.endsWith(':create')));
+const createKey=Object.keys(sent).find(k=>k.endsWith(':create'));
+assert.deepEqual(sent[createKey].includes,['off']);assert.deepEqual(sent[createKey].members,[]);
+console.log('ok');
+'''
+
+
+def test_manage_also_applies(tmp_path):
+    run(PRELUDE + INCLUDES, tmp_path, 'modes-manage-includes')

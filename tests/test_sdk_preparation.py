@@ -232,3 +232,33 @@ def test_the_launcher_check_is_reused_while_unchanged_and_survives_a_failed_attr
     monkeypatch.setattr(sdk_templates, "attribute_requirements", lambda *a, **kw: 1 / 0)
     result = sdk_templates.check_template(world.template_id, class_lookup=CLASSES.get, describe=describe, node_lookup=lookup)
     assert result["missing_nodes"] == [{"class_type": "NotInstalledNode"}] and result["missing_models"]
+
+
+def with_passes(full_includes, select_pass):
+    """The workflow plus a Passes row (Phase 6A): Plain or Full, Full including a Task choice."""
+    prompt = workflow()
+    manifest = json.loads(prompt["9"]["inputs"]["manifest"])
+    manifest["bindings"]["pass"] = _binding("t", "seed", label="Pass")
+    manifest["presets"]["plain"] = {"name": "Plain", "order": 2, "members": {"pass": {"value": 0}}}
+    manifest["presets"]["full"] = {"name": "Full", "order": 3, "members": {"pass": {"value": 1}}, "includes": [full_includes]}
+    manifest["preset_categories"]["passes"] = {"name": "Passes", "order": 1, "choices": ["plain", "full"]}
+    prompt["t"] = _node("Seeded", {"seed": select_pass})
+    prompt["9"] = _node("SonderControlRelay", {"manifest": json.dumps(manifest)})
+    return prompt
+
+
+def test_an_included_choice_needing_a_file_is_named_with_its_parent(world):
+    # Passes → Full includes Task → Edit, and both are selected: Edit's items name it, from Full.
+    sdk_templates.replace_template(world.template_id, json.dumps(with_passes("edit", 1)).encode(), validate=lambda p: {"ok": True})
+    result = check(world)
+    assert result["missing_nodes"] == [{"class_type": "NotInstalledNode", "needed_by": ["Task → Edit (from Passes → Full)"]}]
+    assert [m["needed_by"] for m in result["missing_models"]] == [["Task → Edit (from Passes → Full)"]]
+
+
+def test_a_choice_that_frees_an_item_only_through_its_inclusion_takes_no_credit(world):
+    # Passes on Plain; Full would include Task → Clean, which frees Edit's items.
+    # Simulations apply own members only, so only the Task row is credited.
+    sdk_templates.replace_template(world.template_id, json.dumps(with_passes("clean", 0)).encode(), validate=lambda p: {"ok": True})
+    result = check(world)
+    assert result["missing_nodes"] == [{"class_type": "NotInstalledNode", "needed_by": ["Task → Edit"]}]
+    assert [m["needed_by"] for m in result["missing_models"]] == [["Task → Edit"]]
