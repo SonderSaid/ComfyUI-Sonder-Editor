@@ -210,7 +210,6 @@ def test_starter_without_initial_modes_does_not_create_controls_sidecar(starter)
 
 @pytest.mark.parametrize('slug, choices', [
     ('sonder_ltx_2_5_edit_vfx', ['Make a New Video', 'Generate New Audio', 'Standard']),
-    ('sonder_ltx_2_5_edit_vfx_standard', ['Make a New Video', 'Generate New Audio']),
     ('sonder_ltx_2_5_refine_upscale', ['Refining Pass Only', 'Mask Off']),
     ('sonder_minimax_h3_references_swaps', ['Standard Generation', 'Mask Off']),
 ])
@@ -247,58 +246,36 @@ def test_shipped_starter_sources_and_initial_choices(slug, choices):
     assert {entry['seed_mode'] for entry in menu['bindings'].values() if entry.get('seed_mode')} == {'fixed'}
 
 
-def test_standard_edit_starter_removes_relay_dependency_without_changing_other_tasks():
-    from server import control_manifest as cm, control_routing
+def test_edit_starter_defaults_to_standard_and_runs_without_prompt_relay():
+    # One Edit & VFX starter: Standard needs no Prompt Relay, so a newcomer without
+    # the pack opens and generates; Timed Prompts is the Mode that asks for it.
+    from server import control_manifest as cm, control_routing, run_preparation
 
     folder = Path(st.__file__).resolve().parents[1] / 'sdk_starters'
-    full = json.loads((folder / 'sonder_ltx_2_5_edit_vfx.json').read_text(encoding='utf-8'))
-    simple = json.loads((folder / 'sonder_ltx_2_5_edit_vfx_standard.json').read_text(encoding='utf-8'))
-    assert 'promptrelay' not in json.dumps(simple).lower()
-    assert 'prompt relay' not in json.dumps(simple).lower()
-    assert 'PromptRelaySmartEncode' in {n['class_type'] for n in full.values()}
-    relay = cm.find_relay(full)['key']
-    full_menu = json.loads(full[relay]['inputs']['manifest'])
-    menu = json.loads(simple[relay]['inputs']['manifest'])
-    removed = {'3384', '3385', '3391', '3392', '3396'}
-    assert set(simple) == set(full) - removed
-    assert full['3392']['inputs']['choice'] == 'Normal Conditioning'
-    assert full['3392']['inputs']['choice_list'].splitlines()[0] == 'Normal Conditioning'
-    expected_links = {
-        ('3035', 'iclora_model'): full['3391']['inputs']['b0_l1'],
-        ('3064', 'positive'): full['3391']['inputs']['b0_l0'],
-        ('3386', 'model'): full['3391']['inputs']['b0_l1'],
-        ('3348', 'string_b'): full['3396']['inputs']['branches.item0'],
-    }
-    for key, node in simple.items():
-        if key == relay:
-            continue
-        expected = json.loads(json.dumps(full[key]))
-        for (consumer, field), value in expected_links.items():
-            if consumer == key:
-                expected['inputs'][field] = value
-        assert node == expected
-    assert menu['preset_categories'] == {k: v for k, v in full_menu['preset_categories'].items()
-                                         if k != 'edit_vfx_prompt_method'}
-    assert menu['presets'] == {k: v for k, v in full_menu['presets'].items()
-                              if k not in ('edit_vfx_prompt_standard', 'edit_vfx_prompt_timed')}
-    assert menu['bindings'] == {k: v for k, v in full_menu['bindings'].items() if k != '-a4xOoh01dto'}
-    assert menu['views'] == full_menu['views']
+    assert not list(folder.glob('*standard*'))
+    graph = json.loads((folder / 'sonder_ltx_2_5_edit_vfx.json').read_text(encoding='utf-8'))
+    meta = json.loads((folder / 'sonder_ltx_2_5_edit_vfx.meta.json').read_text(encoding='utf-8'))
+    assert meta['name'] == 'LTX 2.5 Edit & VFX'
+    relay_nodes = [key for key, node in graph.items() if node['class_type'] == 'PromptRelaySmartEncode']
+    assert relay_nodes and all(meta['initial_node_modes'][key]['mode'] == 'muted' for key in relay_nodes)
+    menu = json.loads(graph[cm.find_relay(graph)['key']]['inputs']['manifest'])
+    method = next(c for c in menu['preset_categories'].values() if c['name'] == 'Prompt Method')
+    assert [menu['presets'][cid]['name'] for cid in method['choices']] == ['Standard', 'Timed Prompts (Prompt Relay)']
+    assert not menu['description'].startswith('## LTX 2.5 Edit & VFX — ')
+    notes = json.dumps(menu['notes'])
+    assert 'before opening' not in notes and 'greyed out until' in notes
     routing, error = control_routing.read_routing(menu['execution']['routing'])
     assert error is None
-    assert not removed.intersection(routing['nodes'])
-    for preset in menu['presets'].values():
-        assert set(preset['members']) <= set(menu['bindings'])
-        assert set(preset.get('execution', {})) <= set(menu['execution']['controls'])
-    for binding in menu['bindings'].values():
-        assert all(t['path'] in simple for t in binding['targets'])
-    assert all(v['path'] in simple for v in menu['views']['items'].values())
-    assert all(m['path'] in simple for s in menu['execution']['controls'].values() for m in s['members'])
-    meta = json.loads((folder / 'sonder_ltx_2_5_edit_vfx.meta.json').read_text(encoding='utf-8'))
-    assert meta['name'].endswith('Prompt Relay')
+    modes = {key: entry['mode'] for key, entry in meta['initial_node_modes'].items()}
+    compiled = control_routing.compile_modes(graph, routing, modes)
+    outputs = {'SonderSaveVideo', 'SonderPreviewVideo'}
+    lookup = lambda name: None if name == 'PromptRelaySmartEncode' else (type('Output', (), {'OUTPUT_NODE': True}) if name in outputs else object)  # noqa: E731
+    prepared = run_preparation.prepare(compiled, class_lookup=lookup)['prompt']
+    assert not [node for node in prepared.values() if node['class_type'] == 'PromptRelaySmartEncode']
+
 
 @pytest.mark.parametrize('slug,example', [
     ('sonder_ltx_2_5_edit_vfx', 'sonder_ltx_2_5_edit_vfx'),
-    ('sonder_ltx_2_5_edit_vfx_standard', 'sonder_ltx_2_5_edit_vfx'),
     ('sonder_ltx_2_5_refine_upscale', 'sonder_ltx_2_5_refine_upscale'),
     ('sonder_minimax_h3_references_swaps', 'sonder_minimax_h3_references_swaps'),
 ])
@@ -384,7 +361,6 @@ def _choice_files(slug, choice_name):
 
 @pytest.mark.parametrize('slug,note,category', [
     ('sonder_ltx_2_5_edit_vfx', 'ltx_models_downloads', 'Task'),
-    ('sonder_ltx_2_5_edit_vfx_standard', 'ltx_models_downloads', 'Task'),
     ('sonder_minimax_h3_references_swaps', 'h3_models', 'Task'),
     ('sonder_minimax_h3_references_swaps', 'h3_models', 'Mask'),
     ('sonder_ltx_2_5_refine_upscale', 'refine_models', 'Passes'),
@@ -498,7 +474,6 @@ def _subgraph_walker():
 
 @pytest.mark.parametrize('slug,expected', [
     ('sonder_ltx_2_5_edit_vfx', {'3132': 'Sampling'}),
-    ('sonder_ltx_2_5_edit_vfx_standard', {'3132': 'Sampling'}),
     # Host 9400 ships muted; its name is listed all the same.
     ('sonder_ltx_2_5_refine_upscale', {'9400': 'Upscale'}),
     ('sonder_minimax_h3_references_swaps', None),

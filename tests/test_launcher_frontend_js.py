@@ -51,6 +51,11 @@ const missingCases = {
         run_missing_nodes: [{class_type: 'VAELoaderKJ', needed_by: ['Task → Edit With Words']}], run_problems: ['routing']},
         {}, {}, null).map(p => [p.kind, p.text]),
     checkedBadge: lw.workflowBadge({validation: {missing_nodes: ['Other']}, run_missing_nodes: [], missing_models: []}),
+    hiddenNoMore: lw.workflowBadge({validation: {missing_nodes: ['Other']}, run_missing_nodes: [], missing_models: [{}]}),
+    runProblem: lw.workflowBadge({validation: {missing_nodes: ['Other']}, run_missing_nodes: [], missing_models: [], run_problems: ['Switch a Save on.']}),
+    failedCheck: modules.launcher_open_bar.pairProblems({}, {...missingTemplate, requirements_error: 'x'}, {}, {}, mappings).map(p => [p.kind, p.text])[0],
+    helpWhenNeeded: lw.asksForInstall(lw.missingNodeLines({validation: {missing_nodes: ['X']}, run_missing_nodes: [{class_type: 'X'}]}, null)),
+    helpOtherModes: lw.asksForInstall(lw.missingNodeLines({validation: {missing_nodes: ['X']}, run_missing_nodes: []}, null)),
     neededBadge: lw.workflowBadge({validation: {missing_nodes: ['X']}, run_missing_nodes: [{class_type: 'X'}]}),
     neededModel: modules.launcher_view.modelMessage({file: 'a.safetensors', relative: 'models/loras/a.safetensors', node: 'L', needed_by: ['Passes → Upscale Pass Only']}),
     models: [
@@ -96,15 +101,25 @@ console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,exi
                                       '(Power Lora Loader (rgthree)). Install them, restart ComfyUI, then reload this page.')
     assert missing['withoutManager'] == ('Missing nodes: VAELoaderKJ. Install the node packs that provide them, '
                                          'restart ComfyUI, then reload this page.')
-    # Before the row's check answers, missing nodes warn: the Modes may not use them.
-    assert missing['badge'] == ['Missing nodes', 'warn']
-    assert missing['problems'][0] == ['warn', 'Missing node packs: KJNodes for ComfyUI (VAELoaderKJ). Install them, restart ComfyUI, then reload this page.']
+    # Before the row's check answers, nothing is said about nodes: the Modes may not
+    # use them. If the check can't answer, the list stands alone rather than being lost.
+    assert missing['badge'] == ['Select to check', '']
+    assert missing['problems'] == []
+    assert missing['failedCheck'] == ['warn', 'Missing node packs: KJNodes for ComfyUI (VAELoaderKJ). Install them, restart ComfyUI, then reload this page.']
     assert missing['checked'] == [
         ['bad', 'Missing nodes: VAELoaderKJ. Install the node packs that provide them, restart ComfyUI, then reload this page.'
                 ' Needed by Task → Edit With Words.'],
         ['dim', 'Some Modes of this workflow use nodes that aren’t installed: Other. The current Modes don’t need them.'],
         ['bad', 'routing']]
-    assert missing['checkedBadge'] == ['Missing nodes', 'warn'] and missing['neededBadge'] == ['Missing nodes', 'bad']
+    # Only what the current Modes need sets the badge, and it no longer hides models.
+    assert missing['checkedBadge'] == ['Ready', 'good'] and missing['neededBadge'] == ['Missing nodes', 'bad']
+    assert missing['hiddenNoMore'] == ['1 models missing', 'warn']
+    # Never Ready in green above a line saying it can't generate.
+    assert missing['runProblem'] == ['Can’t generate', 'bad']
+    # Help installing comes only with a line that asks for an install, at both call sites.
+    assert missing['helpWhenNeeded'] is True and missing['helpOtherModes'] is False
+    for name in ('launcher_open_bar', 'launcher_workflows'):
+        assert 'asksForInstall(' in (JS / f'{name}.js').read_text(encoding='utf-8')
     assert missing['neededModel'] == 'a.safetensors → models/loras/a.safetensors (L) Needed by Passes → Upscale Pass Only.'
     # Missing nodes never disable Open: the workflow's Modes may not use them.
     bar = (JS / 'launcher_open_bar.js').read_text(encoding='utf-8')
@@ -119,7 +134,8 @@ console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,exi
     gate = landing.split('async function loadNodePacks()', 1)[1].split('\n}', 1)[0]
     # Fetched once, and only when a listed workflow has missing nodes.
     assert "state.nodePacks !== undefined || !state.templates.some(t => missingNodes(t).length)" in gate
-    assert "'/v2/customnode/getmappings?mode=cache'" in gate
+    assert "fetchNodePackMappings(api.apiURL(NODE_PACKS_PATH))" in gate
+    assert '"/v2/customnode/getmappings?mode=cache"' in (JS / 'node_pack_mappings.js').read_text(encoding='utf-8')
 
 
 def _run_module_script(body):
@@ -182,8 +198,8 @@ console.log(JSON.stringify({states, badges, problems, nested, needed: m.launcher
     b = value['badges']
     assert b['notReady'] == b['unsupported'] == ['Generate unavailable', 'warn']
     assert b['ready'] == b['unknown'] == b['unreachable'] == ['Ready', 'good']
-    assert b['missingNodesWin'] == ['Missing nodes', 'warn'] and b['modelsWin'] == ['1 models missing', 'warn']
-    assert b['unchecked'] == ['Select to check models', '']
+    assert b['missingNodesWin'] == ['Select to check', ''] and b['modelsWin'] == ['1 models missing', 'warn']
+    assert b['unchecked'] == ['Select to check', '']
     # The notice says how to install; the Open bar points back to it.
     assert value['problems'] == [value['short']] and 'see the note at the top' in value['short']
     sources = ''.join((JS / f'{name}.js').read_text(encoding='utf-8') for name in ('launcher_header', 'launcher_open_bar', 'launcher_workflows', 'sdk_landing'))

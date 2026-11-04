@@ -977,6 +977,23 @@ def _requirement_keys(readiness: dict) -> tuple[set, set]:
             {(m.get("node_id"), m.get("input"), m.get("file")) for m in readiness.get("missing_models") or []})
 
 
+def _simulate_choice(authored: dict, stored: dict, view: dict, prompt: dict, choice_id: Any, *, own_only: bool,
+                     describe=None, node_lookup=None, class_lookup=None) -> dict | None:
+    """``run_readiness`` with this Mode choice applied to a copy of the Control
+    values, through the canonical path; None when the choice can't apply
+    (hidden, drifted or unavailable members). Pure."""
+    try:
+        values, rejected = control_presets.validate_preset_changes(
+            view, {f"preset:{choice_id}:apply": True}, prompt=prompt, structural="sdk", own_only=own_only)
+        if rejected:
+            return None
+        data = copy.deepcopy(stored)
+        apply_choice_values(data, values, view)
+        return _judge_stored(authored, data, describe=describe, node_lookup=node_lookup, class_lookup=class_lookup)
+    except (control_descriptors.ControlValueError, TemplateError, KeyError, TypeError, ValueError):
+        return None
+
+
 def attribute_requirements(authored: dict, stored: dict, readiness: dict, *, describe=None,
                            node_lookup=None, class_lookup=None) -> dict:
     """Which current Mode choice needs each missing item:
@@ -1019,17 +1036,11 @@ def attribute_requirements(authored: dict, stored: dict, readiness: dict, *, des
                 logger.info("Mode attribution stopped after %d simulated choices", simulations)
                 break
             simulations += 1
-            try:
-                values, rejected = control_presets.validate_preset_changes(
-                    view, {f"preset:{choice.get('id')}:apply": True}, prompt=prompt, structural="sdk", own_only=True)
-                if rejected:
-                    continue  # hidden, drifted or unavailable members: this choice can't apply
-                data = copy.deepcopy(stored)
-                apply_choice_values(data, values, view)
-                nodes, models = _requirement_keys(_judge_stored(authored, data, describe=describe,
-                                                                node_lookup=node_lookup, class_lookup=class_lookup))
-            except (control_descriptors.ControlValueError, TemplateError, KeyError, TypeError, ValueError):
+            judged = _simulate_choice(authored, stored, view, prompt, choice.get("id"), own_only=True, describe=describe,
+                                      node_lookup=node_lookup, class_lookup=class_lookup)
+            if judged is None:
                 continue
+            nodes, models = _requirement_keys(judged)
             freed |= {("node", n) for n in nodes_now - nodes} | {("model", m) for m in models_now - models}
         for kind, key in freed:
             labels = result["nodes" if kind == "node" else "models"].setdefault(key, [])
@@ -1115,6 +1126,188 @@ def _check_template(template_id: str, prompt: dict, stored: dict, *, node_lookup
         nodes.append({"class_type": name, "needed_by": labels} if labels else {"class_type": name})
     result.update(missing_models=named["missing_models"], missing_nodes=nodes, problems=readiness["problems"])
     return result
+
+
+# ── Mode availability (0.8 hardening, Phase 12A) ─────────────────────────────
+# Which Mode choices can't run on this install, for the Sonder App's Modes table.
+# Guidance from the one judge (``run_readiness``): Generate stays the only hard
+# refusal. Derived and ephemeral, never in the Controls view, whose readers
+# (``derive_modes``, Modes at run) must not see it. The canvas hosts have no
+# equivalent: there ComfyUI's Run validates the graph.
+
+def _needs_of(readiness: dict) -> dict:
+    """What a judged run lacks, by what the user would install: a class, a file."""
+    models: dict = {}
+    for item in readiness.get("missing_models") or []:
+        models.setdefault(f"{item.get('folder') or ''}|{item.get('file') or ''}", item)
+    return {"nodes": set(readiness.get("missing_nodes") or []), "models": models}
+
+
+def _public_needs(nodes, models: dict) -> dict:
+    return {"missing_nodes": sorted(nodes), "missing_models": [models[key] for key in sorted(models)]}
+
+
+def _could_anything_be_missing(prompt: dict, view: dict, node_lookup, class_lookup) -> bool:
+    """False only when no choice of this workflow could need something absent, so
+    simulating them can't grey anything. Off LoRA rows don't count; a member
+    naming a file or a row list might point anywhere, so it always counts."""
+    if missing_node_classes(prompt, node_lookup or class_lookup):
+        return True
+    if any(not model_requirements.names_an_off_row(prompt, item)
+           for item in model_requirements.missing_models(prompt, class_lookup)):
+        return True
+    for preset in (view.get("_presets") or {}).values():
+        for member in (preset.get("members") or {}).values():
+            value = member.get("value")
+            if isinstance(value, list) or model_requirements._is_model_value("", "", value):
+                return True
+    return False
+
+
+def _unusable_choice_needs(choice_id: Any, view: dict, prompt: dict, node_lookup, class_lookup) -> dict | None:
+    """What an ``unavailable`` or ``refused`` choice lacks, from its members: its
+    own reason says to repair it in Manage even when the answer is an install.
+    None when its members don't show one; its reason then stands alone."""
+    definitions = view.get("_presets") or {}
+    preset = definitions.get(choice_id)
+    if not preset:
+        return None
+    parts, problem = control_presets.resolve_inclusions(definitions, view.get("_preset_categories") or {}, choice_id)
+    parts = [(choice_id, preset)] if problem else parts
+    bindings = {d.get("binding_id"): d for d in view.get("bindings", [])}
+    lookup = node_lookup or class_lookup or control_descriptors.comfy_class_lookup
+    nodes, models = set(), {}
+    for _, part in parts:
+        for identity, member in (part.get("members") or {}).items():
+            for target in (bindings.get(identity) or {}).get("targets") or []:
+                path, field = target.get("path"), target.get("input")
+                node = prompt.get(path) if isinstance(prompt.get(path), dict) else None
+                if node is None:
+                    continue
+                if lookup(node.get("class_type")) is None:
+                    nodes.add(node.get("class_type"))
+                    continue
+                if not isinstance(member.get("value"), str):
+                    continue
+                alone = {path: {**node, "inputs": {**(node.get("inputs") or {}), field: member["value"]}}}
+                for item in model_requirements.missing_models(alone, class_lookup):
+                    if item.get("input") == field and item.get("file") == member["value"]:
+                        models.setdefault(f"{item.get('folder') or ''}|{item['file']}", item)
+    return _public_needs(nodes, models) if nodes or models else None
+
+
+def mode_availability(authored: dict, stored: dict, *, describe=None, node_lookup=None, class_lookup=None) -> dict:
+    """``{run, choices}``: what the current state lacks, and each greyed choice's own needs.
+
+    ``run`` is what Generate would refuse on. A choice C is greyed when M(C), what's
+    missing with C selected and the other rows as they stand, holds something the
+    rest of its row doesn't: Base(row) intersects ``run`` and every M(C) judged in
+    the row, and a choice names only M(C) − Base(row). The rest belongs to the run,
+    and greying it on every button would teach nothing. Fails open: a choice that
+    can't be judged has no entry and stays out of the intersection, and fewer sets
+    only make Base larger. A simulation applies included choices too. Pure.
+    """
+    from . import control_preset_categories as pc
+
+    lookup = class_lookup or control_descriptors.comfy_class_lookup
+    prompt = copy.deepcopy(authored)
+    view = apply_stored_values(prompt, describe_stored(prompt, stored, describe), stored, describe=describe)
+    problems = list(generate_refusals(view))
+    now = {"nodes": set(), "models": {}}
+    judged_run = True
+    try:
+        prepared = prepare_compiled(run_prompt(copy.deepcopy(prompt), view), view, node_lookup=node_lookup, class_lookup=class_lookup)
+        editors = prompt_graph.editor_keys(prepared["prompt"])
+        readiness = run_readiness(prepared["prompt"], editor_key=editors[0] if editors else "",
+                                  node_lookup=node_lookup, class_lookup=class_lookup)
+        now = _needs_of(readiness)
+        problems.extend(readiness["problems"])
+    except TemplateError as exc:
+        problems.append(str(exc))
+        judged_run = False
+    result = {"run": {**_public_needs(now["nodes"], now["models"]), "problems": problems}, "choices": {}}
+    rows = pc.derive_modes(view)["rows"]
+    choices: dict = {}
+    try:
+        for row in rows:
+            for choice in row["choices"]:
+                if choice.get("state") in pc._UNUSABLE_STATES:
+                    needs = _unusable_choice_needs(choice.get("id"), view, prompt, node_lookup, class_lookup)
+                    if needs:
+                        choices[choice.get("id")] = needs
+        # With no judged run there is no Base, and every choice would grey for what
+        # the whole row needs.
+        if not judged_run or not _could_anything_be_missing(prompt, view, node_lookup, lookup):
+            result["choices"] = choices
+            return result
+        simulations = 0
+        for row in rows:
+            selected = (row.get("selected") or {}).get("id")
+            judged: dict = {}
+            for choice in row["choices"]:
+                identity = choice.get("id")
+                if choice.get("state") in pc._UNUSABLE_STATES:
+                    continue
+                if identity == selected:
+                    judged[identity] = now
+                    continue
+                if simulations >= MAX_ATTRIBUTIONS:
+                    logger.info("Mode availability stopped after %d simulated choices", simulations)
+                    break
+                simulations += 1
+                try:
+                    outcome = _simulate_choice(authored, stored, view, prompt, identity, own_only=False, describe=describe,
+                                               node_lookup=node_lookup, class_lookup=class_lookup)
+                except Exception:  # noqa: BLE001 - this choice only: it can't be judged
+                    logger.warning("Judging the Mode choice %s failed", identity, exc_info=True)
+                    continue
+                if outcome is not None:
+                    judged[identity] = _needs_of(outcome)
+            base_nodes, base_models = set(now["nodes"]), set(now["models"])
+            for needs in judged.values():
+                base_nodes &= needs["nodes"]
+                base_models &= set(needs["models"])
+            for identity, needs in judged.items():
+                nodes = needs["nodes"] - base_nodes
+                models = {key: item for key, item in needs["models"].items() if key not in base_models}
+                if nodes or models:
+                    choices[identity] = _public_needs(nodes, models)
+    except Exception:  # noqa: BLE001 - the run and what's judged so far stand
+        logger.warning("Judging the Mode choices failed", exc_info=True)
+    result["choices"] = choices
+    return result
+
+
+_availability_cache: dict[str, tuple] = {}
+
+
+def check_availability(template_id: str, *, fresh: bool = False, node_lookup: Callable[[str], Any] | None = None,
+                       class_lookup: Callable[[str], Any] | None = None, describe=None) -> dict:
+    """``mode_availability`` of a workflow's current values, shaped like
+    ``check_template``: read under the template lock, judged outside it, one
+    computation per workflow, an answer reused for a few seconds while the
+    workflow and its values are unchanged. ``fresh`` (a file may have just been
+    installed) takes only an answer whose computation began after this request
+    arrived, so reads waiting behind a running one share the next."""
+    arrived = time.monotonic()
+    with _check_guard:
+        lock = _check_locks.setdefault(template_id, threading.Lock())
+    with lock:
+        with template_lock(template_id):
+            prompt, meta = load_template(template_id)
+            stored = copy.deepcopy(read_control_values(template_id))
+        key = (stored.get("seq"), stored.get("presentation_hash"), _meta_identity(meta),
+               id(node_lookup), id(class_lookup), id(describe))
+        cached = _availability_cache.get(template_id)
+        if cached and cached[0] == key:
+            age_ok = time.monotonic() - cached[1] < CHECK_FRESH_SECONDS
+            if cached[3] > arrived or (age_ok and not fresh):
+                return copy.deepcopy(cached[2])
+        started = time.monotonic()
+        result = {"template_id": template_id, "seq": stored.get("seq"),
+                  **mode_availability(prompt, stored, describe=describe, node_lookup=node_lookup, class_lookup=class_lookup)}
+        _availability_cache[template_id] = (key, time.monotonic(), copy.deepcopy(result), started)
+        return result
 
 
 def describe_stored(prompt: dict, stored: dict, describe=None) -> dict:

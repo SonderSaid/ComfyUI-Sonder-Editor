@@ -8,8 +8,7 @@ Launcher, then prepare your media, choose what to do and generate from the app.
 - **[LTX 2.5 Edit & VFX](#ltx-25-edit--vfx)** — generate new video, edit with
   words or a picture, follow a source video's layout, movement or outlines,
   remove people, and create masks. Keep existing audio or generate new sound.
-  **LTX 2.5 Edit & VFX — Prompt Relay** is the same workflow with
-  [timed prompts](#try-timed-prompts).
+  Its **Prompt Method** row adds [timed prompts](#try-timed-prompts).
 - **[LTX 2.5 Refine & Upscale](#ltx-25-refine--upscale)** — refine existing
   footage, double its width and height, or do both. Optionally focus refinement
   on a character or the environment.
@@ -26,7 +25,9 @@ setup notes and instructions inside **Controls**.
 [Open your project and workflow](sonder-app.md#generate) from the Launcher.
 In the editor's left sidebar, open **Controls** and read the workflow's setup
 and **Models and downloads** notes. ComfyUI needs the required custom nodes
-and model files installed before you generate.
+and model files installed before you generate. A choice that needs something
+missing is [greyed out under Modes](controls.md#in-the-sonder-app): hover over it
+to see what.
 
 If your models are saved in different folders, click the **advanced hidden**
 line below Modes if it appears, then select your installed files in the
@@ -76,11 +77,11 @@ We recommend [Prompt Relay](prompts.md#prompt-relay) when you want closer
 control over when actions change. It lets different timeline **Prompt**
 sections guide different parts of the same generation.
 
-Choose **LTX 2.5 Edit & VFX — Prompt Relay** in the Launcher instead. It needs
-[ComfyUI-PromptRelay](https://github.com/kijai/ComfyUI-PromptRelay): install
-it, restart ComfyUI and refresh the page before opening the workflow. In
-**Controls → Modes → Prompt Method**, choose **Timed Prompts (Prompt Relay)**
-to use it, or **Standard** for normal LTX prompting.
+In **Controls → Modes → Prompt Method**, choose **Timed Prompts (Prompt Relay)**
+to use it, or **Standard** for normal LTX prompting. **Timed Prompts** is greyed
+out until you install
+[ComfyUI-PromptRelay](https://github.com/kijai/ComfyUI-PromptRelay): follow its
+repository's instructions, restart ComfyUI and refresh the page.
 
 ## LTX 2.5 Refine & Upscale
 

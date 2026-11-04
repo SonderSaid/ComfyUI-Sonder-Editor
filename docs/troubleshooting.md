@@ -164,12 +164,12 @@ this same ComfyUI.
 
 ### The Launcher says *Missing node packs*
 
-The workflow uses nodes this ComfyUI doesn't have. The Launcher still imports
-it, marks it **Missing nodes**, and lists the node packs that provide them.
-Without ComfyUI-Manager it lists the node names instead. **Open** still works:
-if the Modes you choose don't use those nodes, **Generate** works too.
-When the selected workflow's current Modes need a missing node, the bar at the
-bottom of the Launcher says so in red and names the Mode choice that needs it.
+The workflow's current Modes use nodes this ComfyUI doesn't have. The Launcher
+marks it **Missing nodes**, and the bar at the bottom says so in red, lists the
+node packs that provide them and names the Mode choice that needs them. Without
+ComfyUI-Manager it lists the node names instead. **Open** still works: under
+**Modes**, the choices that need a missing node are
+[greyed out](controls.md#in-the-sonder-app), and you can choose the others.
 To use those Modes, install the packs:
 
 1. Find the workflow's canvas file: the `.json` shipped next to the API file
@@ -180,12 +180,13 @@ To use those Modes, install the packs:
    tab.
 4. Click **Install All**, or **Install** beside each pack. Pack names there
    can differ slightly from the Launcher's.
-5. Restart ComfyUI when asked, then reload the Launcher page. The workflow
-   loses its **Missing nodes** mark.
+5. Restart ComfyUI when asked, then reload the Launcher page. The choices that
+   needed them are no longer greyed out.
 
 A pack the list names as **no known pack** isn't in ComfyUI-Manager's index.
 Search its node name on [registry.comfy.org](https://registry.comfy.org) or
-ask the workflow's author.
+ask the workflow's author. ComfyUI-PromptRelay, for **Timed Prompts**, installs by
+following [its repository's instructions](https://github.com/kijai/ComfyUI-PromptRelay).
 
 If you have only the API file, or your ComfyUI runs without ComfyUI-Manager
 (no **Install** buttons appear), install each listed pack by hand, following

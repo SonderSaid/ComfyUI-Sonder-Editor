@@ -24,7 +24,6 @@ from server import control_manifest as cm  # noqa: E402
 # Each starter and the canvas example it was exported from.
 STARTERS = {
     "sonder_ltx_2_5_edit_vfx": "sonder_ltx_2_5_edit_vfx",
-    "sonder_ltx_2_5_edit_vfx_standard": "sonder_ltx_2_5_edit_vfx",
     "sonder_ltx_2_5_refine_upscale": "sonder_ltx_2_5_refine_upscale",
     "sonder_minimax_h3_references_swaps": "sonder_minimax_h3_references_swaps",
 }

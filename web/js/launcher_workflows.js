@@ -1,6 +1,7 @@
 import { renderPanelMarkdown } from './panel_markdown.js';
 import { el, button, component, badge, date, input, modelMessage, listState, listNotice } from './launcher_view.js';
 import { isUnfinishedRun } from './sdk_host.js';
+import { missingNodePacks } from './node_pack_mappings.js';
 export const SAMPLE_PROJECTS_URL = 'https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects';
 export const MISSING_NODES_HELP_URL = 'https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/troubleshooting.md#the-launcher-says-missing-node-packs';
 export function missingNodes(template) { return template?.validation?.missing_nodes || []; }
@@ -15,17 +16,16 @@ export function neededBy(item) {
 }
 // A row's badge. The workflow's own problems come first; a workflow with none is
 // Ready only while this ComfyUI can generate (the header pill's install state).
-// Missing nodes don't stop an Open: they are bad when the current run needs them,
-// else a warning (other Modes use them).
+// A missing node counts only when the current run needs it: what only other Modes
+// use is greyed out in the editor, and never stops an Open.
 export function workflowBadge(template, status = null) {
     const v = template.validation || {};
     if (runMissingNodes(template)?.length) return ['Missing nodes', 'bad'];
-    if (missingNodes(template).length) return ['Missing nodes', 'warn'];
-    if (v.errors?.length || v.blocking?.length) return ['Can’t generate', 'bad'];
+    if (v.errors?.length || v.blocking?.length || template.run_problems?.length) return ['Can’t generate', 'bad'];
     if (template.missing_models?.length) return [`${template.missing_models.length} models missing`, 'warn'];
     if (template.requirements_error) return ['Check failed', 'warn'];
     if (v.warnings?.length) return [`${v.warnings.length} notes`, 'warn'];
-    if (!Array.isArray(template.missing_models)) return ['Select to check models', ''];
+    if (!Array.isArray(template.missing_models)) return ['Select to check', ''];
     if (status?.install && !status.install.ready) return ['Generate unavailable', 'warn'];
     return ['Ready', 'good'];
 }
@@ -52,43 +52,7 @@ export function generatingWorkflows(runs, fallback = 'the workflow') {
     const names = [...new Set((runs || []).map(run => run?.template_name).filter(Boolean))];
     return names.length ? names.join(' and ') : fallback;
 }
-// Missing node classes grouped by the node pack that provides them, from the
-// Manager's mappings ({pack: [[classes], {title, title_aux, nodename_pattern}]}).
-// Exact class lists first, then a pack's name pattern; a class several packs
-// list names them all. Without mappings (no Manager) each class stands alone.
-const packIndexes = new WeakMap();
-function packIndex(mappings) {
-    let index = packIndexes.get(mappings);
-    if (index) return index;
-    index = { byClass: new Map(), patterns: [] };
-    for (const [key, entry] of Object.entries(mappings)) {
-        if (!Array.isArray(entry)) continue;
-        const info = entry[1] && typeof entry[1] === 'object' ? entry[1] : {};
-        const title = String(info.title || info.title_aux || key);
-        for (const name of Array.isArray(entry[0]) ? entry[0] : []) {
-            const titles = index.byClass.get(name) || [];
-            if (!titles.includes(title)) titles.push(title);
-            index.byClass.set(name, titles);
-        }
-        if (info.nodename_pattern) {
-            try { index.patterns.push([new RegExp(String(info.nodename_pattern)), title]); } catch { /* a Python-only pattern */ }
-        }
-    }
-    packIndexes.set(mappings, index);
-    return index;
-}
-export function missingNodePacks(classes, mappings) {
-    const groups = new Map();
-    const index = mappings && typeof mappings === 'object' ? packIndex(mappings) : null;
-    for (const name of classes || []) {
-        let titles = index?.byClass.get(name) || [];
-        if (!titles.length && index) titles = [...new Set(index.patterns.filter(([re]) => re.test(name)).map(([, title]) => title))];
-        const pack = titles.length ? titles.slice(0, 3).join(' or ') : '';
-        if (!groups.has(pack)) groups.set(pack, []);
-        groups.get(pack).push(name);
-    }
-    return [...groups].map(([pack, names]) => ({ pack, classes: names }));
-}
+export { missingNodePacks };
 export function missingNodesMessage(classes, mappings) {
     const groups = missingNodePacks(classes, mappings);
     if (!groups.some(group => group.pack)) {
@@ -98,16 +62,20 @@ export function missingNodesMessage(classes, mappings) {
     return `Missing node packs: ${named.join(', ')}. Install them, restart ComfyUI, then reload this page.`;
 }
 // The lines about missing nodes, for the row's details and the Open bar: what the
-// current run needs (it can't generate), and what only other Modes use.
+// current run needs (it can't generate), and what only other Modes use. Nothing
+// until the row's check answers, so nothing flashes; if it couldn't answer, the
+// list stands alone rather than being lost.
 export function missingNodeLines(template, mappings) {
     const all = missingNodes(template), run = runMissingNodes(template);
-    if (run === null) return all.length ? [{ kind: 'warn', text: missingNodesMessage(all, mappings) }] : [];
+    if (run === null) return all.length && template?.requirements_error ? [{ kind: 'warn', text: missingNodesMessage(all, mappings) }] : [];
     const needed = run.map(item => item.class_type), lines = [];
     if (needed.length) lines.push({ kind: 'bad', text: missingNodesMessage(needed, mappings) + run.map(neededBy).join('') });
     const others = all.filter(name => !needed.includes(name));
     if (others.length) lines.push({ kind: 'dim', text: `Some Modes of this workflow use nodes that aren’t installed: ${others.join(', ')}. The current Modes don’t need them.` });
     return lines;
 }
+// Only a line that asks for an install offers help installing.
+export function asksForInstall(lines) { return lines.some(line => line.kind !== 'dim'); }
 export function missingNodesHelp() {
     const link = el('a', '', 'How to install missing node packs ↗');
     link.href = MISSING_NODES_HELP_URL; link.target = '_blank'; link.rel = 'noopener noreferrer';
@@ -163,7 +131,7 @@ export function mountWorkflows(state, actions) {
                 const details = el('div', 'sl-workflow-details');
                 const nodeLines = missingNodeLines(t, state.nodePacks);
                 for (const line of nodeLines) details.append(el('p', `sl-${line.kind}`, line.text));
-                if (nodeLines.length) details.append(missingNodesHelp());
+                if (asksForInstall(nodeLines)) details.append(missingNodesHelp());
                 for (const problem of t.run_problems || []) details.append(el('p', 'sl-bad', problem));
                 for (const problem of [...(t.validation?.errors || []), ...(t.validation?.blocking || [])]) details.append(el('p', 'sl-bad', problem));
                 for (const item of t.missing_models || []) details.append(el('p', 'sl-warn', modelMessage(item)));

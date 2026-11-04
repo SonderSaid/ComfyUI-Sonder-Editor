@@ -190,21 +190,20 @@ def record_open(folder: Any, template_id: Any, *, clock: Callable[[], float] = t
     return _update(mutate)
 
 
-def preferred_workflow(state: dict, folder: str, available: list[str], incomplete=()) -> str:
+def preferred_workflow(state: dict, folder: str, available: list[str]) -> str:
     """The workflow to preselect for ``folder``: its last one, else the last used anywhere,
     else the first available. Hidden and deleted workflows are skipped; "" when none fits.
-    An ``incomplete`` workflow (nodes missing) still opens, so the project's own last one
-    stays preselected; otherwise one with nothing missing is preferred."""
+    A missing node doesn't count against a workflow: it opens, and its current Modes may
+    not use the node (its row says so if they do)."""
     visible = [template_id for template_id in available if template_id not in set(state["hidden"]["workflows"])]
-    complete = [template_id for template_id in visible if template_id not in set(incomplete)]
     last = state["last_workflow"]
     own = last["by_project"].get(folder, {}).get("template_id", "")
     if own and own in visible:
         return own
     anywhere = last["any"].get("template_id", "")
-    if anywhere and anywhere in complete:
+    if anywhere and anywhere in visible:
         return anywhere
-    return (complete or visible or [""])[0]
+    return (visible or [""])[0]
 
 
 def public_state(state: dict) -> dict:

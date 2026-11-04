@@ -183,11 +183,10 @@ mask preparation, and saving results with sound.
 https://github.com/user-attachments/assets/38af328d-0596-4ed1-8a14-4ab9e9cb79dd
 
 The last three also ship with the [Sonder App](docs/sonder-app.md)
-(experimental, optional) as its starter workflows, exported for the API.
-Edit & VFX comes in two versions there: **LTX 2.5 Edit & VFX**, which needs no
-Prompt Relay, and **LTX 2.5 Edit & VFX — Prompt Relay**, which adds timed
-prompts. [Sonder App Workflows](docs/sonder-app-workflows.md) has the steps for
-each of their tasks in the app.
+(experimental, optional) as its starter workflows, exported for the API. There,
+Edit & VFX needs Prompt Relay only for its timed prompts.
+[Sonder App Workflows](docs/sonder-app-workflows.md) has the steps for each of
+their tasks in the app.
 
 Every sample project, with its matching workflow, showcase video, tested editor
 version and opening instructions, is on

@@ -55,8 +55,7 @@ Do this once, in a browser on the ComfyUI machine.
 
 Choose a supplied workflow under **Starters** in the Launcher, or import your
 own. See **[Sonder App Workflows](sonder-app-workflows.md)** for an introduction
-to **LTX 2.5 Edit & VFX** (also as **LTX 2.5 Edit & VFX — Prompt Relay**),
-**LTX 2.5 Refine & Upscale**, and **MiniMax H3 — References & Swaps**.
+to **LTX 2.5 Edit & VFX**, **LTX 2.5 Refine & Upscale**, and **MiniMax H3 — References & Swaps**.
 
 <a id="import-a-workflow"></a>
 
@@ -98,10 +97,11 @@ You can add or edit settings, Modes, notes and Views in the app afterward.
 The underlying nodes and the switches that control branches must be prepared
 on the canvas.
 
-A workflow that needs node packs you don't have is still imported, marked
-**Missing nodes** with the packs to install, and still opens. **Generate**
-refuses only when the Modes you chose use one of those nodes, and names the
-choice that needs it. To install them, see
+A workflow that needs node packs or model files you don't have is still
+imported and still opens. A choice that needs them is
+[greyed out under Modes](controls.md#in-the-sonder-app). **Generate** refuses
+only when the Modes you chose need them, and names the choice. To install node
+packs, see
 [The Launcher says *Missing node packs*](troubleshooting.md#the-launcher-says-missing-node-packs).
 
 ## Generate

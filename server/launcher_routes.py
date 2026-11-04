@@ -63,8 +63,6 @@ def launcher_projects(base_dir: str) -> dict:
     by_project = state["last_workflow"]["by_project"]
     templates = _templates()
     order = workflow_order(state, templates)
-    # Preferred less: it opens, but its Modes may need nodes that aren't installed.
-    missing_nodes = {t["template_id"] for t in templates if (t.get("validation") or {}).get("missing_nodes")}
     projects = []
     for entry in entries:
         folder = entry["folder"]
@@ -88,9 +86,8 @@ def launcher_projects(base_dir: str) -> dict:
             "hidden": folder in hidden,
             "last_workflow": by_project.get(folder, {}).get("template_id", ""),
             # What to preselect: its last workflow, else the last used anywhere, else
-            # the top of the sidebar, skipping hidden, deleted and missing-node ones
-            # ("" when none).
-            "workflow": launcher_state.preferred_workflow(state, folder, order, missing_nodes),
+            # the top of the sidebar, skipping hidden and deleted ones ("" when none).
+            "workflow": launcher_state.preferred_workflow(state, folder, order),
         })
     return {
         "ok": True,

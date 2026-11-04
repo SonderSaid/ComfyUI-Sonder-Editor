@@ -126,6 +126,19 @@ def missing_models(prompt: dict, class_lookup=None, *, input_cache=None, executa
     return missing
 
 
+def names_an_off_row(prompt: dict, item: dict) -> bool:
+    """Whether a ``missing_models`` item is a native LoRA row that's off, so no
+    run ever loads it: a starter's switched-off "None" row (``control_rows.row_is_noop``)."""
+    node = prompt.get(item.get("node_id")) or {}
+    match = _NATIVE_ROW_FILE.match(str(item.get("input") or ""))
+    if node.get("class_type") not in NATIVE_LORA_STACKS or not match:
+        return False
+    from . import control_rows
+    prefix = f"loras.{match.group(1)}."
+    inputs = node.get("inputs") or {}
+    return control_rows.row_is_noop({key[len(prefix):]: value for key, value in inputs.items() if key.startswith(prefix)})
+
+
 def missing_model_message(item: dict) -> str:
     name = os.path.basename(_normal(item["file"]))
     if os.path.splitext(name)[1].lower() not in MODEL_EXTENSIONS:

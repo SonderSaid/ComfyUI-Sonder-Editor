@@ -111,6 +111,15 @@ def _session_workflows(current: str) -> dict:
     return {"ok": True, "current": current, "workflows": workflows}
 
 
+def _add_local_paths(request: web.Request, items: list[dict]) -> None:
+    """Where each missing file goes on disk, shown only to a browser on the ComfyUI
+    machine, on a same-origin page; others see the models/... form."""
+    from .routes import _same_origin_request
+    if is_loopback_request(request) and _same_origin_request(request):
+        for item in items:
+            item["path"] = model_requirements.target_path(item)
+
+
 def register_sdk_routes(
     routes,
     *,
@@ -250,12 +259,7 @@ def register_sdk_routes(
     async def api_sdk_template_requirements(request: web.Request) -> web.Response:
         template_id = sdk_templates.check_template_id(request.match_info.get("template_id"))
         result = await asyncio.to_thread(sdk_templates.check_template, template_id)
-        # Where each file goes on disk is shown only to a browser on the ComfyUI
-        # machine, on a same-origin page; others see the models/... form.
-        from .routes import _same_origin_request
-        if is_loopback_request(request) and _same_origin_request(request):
-            for item in result.get("missing_models", []):
-                item["path"] = model_requirements.target_path(item)
+        _add_local_paths(request, result.get("missing_models", []))
         return web.json_response(result)
 
     @routes.get("/sonder-editor/sdk/templates/{template_id}/export")
@@ -373,6 +377,17 @@ def register_sdk_routes(
         snapshot = await runner.controls_view(session, manage=manage, query=query)
         view = await asyncio.to_thread(control_descriptors.json_safe, snapshot["view"])
         return web.json_response({"ok": True, "view": view, "seq": snapshot["seq"], "template_id": snapshot["template_id"]})
+
+    @routes.get("/sonder-editor/sdk/session/{session_id}/availability")
+    @handle
+    async def api_sdk_availability(request: web.Request) -> web.Response:
+        """Which Mode choices can't run on this install: guidance for the Modes
+        table, kept out of the Controls view. Generate stays the refusal."""
+        session = runner.session_for(request.match_info.get("session_id", ""), _secret(request))
+        result = await runner.mode_availability(session, fresh=request.query.get("fresh") == "1")
+        _add_local_paths(request, [item for needs in (result["run"], *result["choices"].values())
+                                   for item in needs["missing_models"]])
+        return web.json_response({"ok": True, **await asyncio.to_thread(control_descriptors.json_safe, result)})
 
     @routes.put("/sonder-editor/sdk/session/{session_id}/controls")
     @handle

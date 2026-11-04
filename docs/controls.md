@@ -251,6 +251,14 @@ other settings:
 Controls work the same way in the [Sonder App](sonder-app.md), with these
 differences:
 
+- **A choice that can't run is greyed out.** If a choice under **Modes** needs
+  a node or model file this ComfyUI doesn't have, hover over it to see what. Put
+  the file in place and come back to the tab: the choice is available again. If
+  you saved the file somewhere else, click **advanced hidden** below **Modes** if
+  it appears, then select your file in the matching Control. **Manage** still
+  edits the choice itself.
+- **When the current Modes can't run,** a line under the **Modes** heading says
+  how much is missing. Click **Show** beside it for the list.
 - **Switch workflows:** the **Workflow** menu at the top of the Controls tab
   opens another imported workflow on the same project. The project, scene and
   timeline stay; takes already generating finish with the workflow they

@@ -8,6 +8,7 @@
 import { ambiguityText, deriveModes, followNotice, includesText, rowOf } from "./controls_modes_model.js";
 import { CHOICE_FAILURES, applyChoice } from "./controls_choice_apply.js";
 import { createHoverTip } from "./controls_hover_tip.js";
+import { needsOf, needsText, runSummary } from "./controls_modes_availability.js";
 import { VISUALLY_HIDDEN_CSS, describedBy, placeInOrder, setText } from "./controls_dom_order.js";
 import { panelMarkdownPlainText, renderPanelMarkdown } from "./panel_markdown.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
@@ -22,6 +23,8 @@ const make = (tag, text) => {
 };
 const unusable = choice => choice.state === "unavailable" || choice.state === "refused";
 const UNAVAILABLE = "This choice is unavailable. Open Manage.";
+// How long a click on a grey choice waits to learn whether it still is.
+const AVAILABILITY_CLICK_TIMEOUT_MS = 3000;
 const headingCss = `font-size:${TYPE.t11}px;font-weight:${TYPE.fwBold};color:${COLORS.textSecondary};letter-spacing:0.02em;`;
 // Tooltip text by description: every render repaints every button.
 const PLAIN_CACHE_MAX = 256;
@@ -46,10 +49,21 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
     const panel = ++serial;
     let nextId = 0;
     const domId = () => `cm${panel}.${++nextId}`;
-    const el = make("section"), heading = make("div", "Modes"), table = make("div"),
+    const el = make("section"), heading = make("div", "Modes"), table = make("div"), runLine = make("div"),
+        runTitle = make("span"), runToggle = make("button"), runList = make("div"),
         uncategorized = make("button"), individual = make("div", "Individual Controls");
     el.dataset.controlsModes = "true";
     el.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;`;
+    // What the current run lacks (Sonder App): a status, so warningText.
+    runLine.dataset.controlsModesRun = "true";
+    runLine.style.cssText = `color:${COLORS.warningText};font-size:${TYPE.t11}px;overflow-wrap:anywhere;display:none;`;
+    runToggle.type = "button";
+    runToggle.dataset.controlsModesRunToggle = "true";
+    runToggle.style.cssText = `${S.quietLineCss}margin-left:${SPACE.s1}px;color:inherit;text-decoration:underline;`;
+    runToggle.addEventListener("click", () => { runOpen = !runOpen; repaint(); });
+    runList.dataset.controlsModesRunList = "true";
+    runList.style.whiteSpace = "pre-line";
+    runLine.append(runTitle, runToggle, runList);
     asHeading(heading);
     asHeading(individual);
     heading.style.cssText = headingCss;
@@ -60,15 +74,19 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
     uncategorized.addEventListener("click", () => openManage());
     individual.dataset.controlsIndividualHeading = "true";
     individual.style.cssText = `${headingCss}margin-top:${SPACE.s1}px;`;
-    el.append(heading, table, uncategorized, individual);
+    el.append(heading, runLine, table, uncategorized, individual);
 
     const rows = new Map(); // category id -> row parts
     const open = new Set(); // category ids whose ? block is open
-    let view = {}, options = {}, busy = false, destroyed = false;
+    let view = {}, options = {}, busy = false, destroyed = false, runOpen = false;
     // A choice's short description on hover and focus (controls_hover_tip.js).
     const tips = createHoverTip(el, { register, mark: "controlsModeTip" });
+    // What a choice lacks on this install (Sonder App; no host answer elsewhere).
+    const availability = host.availability || null;
+    const needsTextOf = id => needsText(needsOf(availability?.get(), id), availability?.packs());
+    const unsubscribeAvailability = availability?.subscribe(() => render(view, options)) || (() => {});
 
-    function paintChoice(button, { selected, outlined, dim }) {
+    function paintChoice(button, { selected, outlined, dim, grey }) {
         setButtonVariant(button, selected ? "active" : "secondary", { padding: `2px ${SPACE.s2}px`, fontSize: `${TYPE.t11}px` });
         // setButtonVariant rewrites the whole style; these follow it.
         Object.assign(button.style, {
@@ -76,11 +94,11 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
             // width and the tallest one's height (grid-auto-rows:1fr).
             whiteSpace: "normal", overflowWrap: "anywhere", width: "100%", height: "100%", minWidth: "0",
             outline: outlined ? `1px solid ${COLORS.accent}` : "", outlineOffset: outlined ? "1px" : "",
-            opacity: dim || busy ? "0.42" : "", cursor: busy ? "progress" : "pointer",
+            opacity: dim || grey || busy ? "0.42" : "", cursor: busy ? "progress" : grey ? "not-allowed" : "pointer",
         });
         button.setAttribute("aria-pressed", String(!!selected));
         // Never `disabled`: disabling the focused button would blur it.
-        if (busy) button.setAttribute("aria-disabled", "true");
+        if (busy || grey) button.setAttribute("aria-disabled", "true");
         else button.removeAttribute("aria-disabled");
     }
 
@@ -177,17 +195,18 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         for (const choice of mode.choices) {
             const parts = row.buttons.get(choice.id);
             setText(parts.label, choice.name);
-            // A choice that includes others says so on its own line.
-            parts.text = unusable(choice) ? choice.reason || UNAVAILABLE
-                : [plainText(choice.description), includesText(modes, choice)].filter(Boolean).join("\n");
+            const needs = needsTextOf(choice.id);
+            // What it lacks first. A choice that includes others says so on its own line.
+            parts.text = [needs, ...(unusable(choice) ? [choice.reason || UNAVAILABLE]
+                : [plainText(choice.description), includesText(modes, choice)])].filter(Boolean).join("\n");
             setText(parts.description, parts.text);
             describedBy(parts.button, parts.description.id, !!parts.text);
             paintChoice(parts.button, { selected: mode.selected?.id === choice.id,
-                outlined: mode.status === "ambiguous" && matching.has(choice.id), dim: unusable(choice) });
+                outlined: mode.status === "ambiguous" && matching.has(choice.id), dim: unusable(choice), grey: !!needs });
         }
         row.block.style.display = isOpen ? "flex" : "none";
         const blockKey = isOpen ? JSON.stringify([mode.description, mode.selected?.id || null,
-            mode.choices.map(choice => [choice.id, choice.name, choice.description, choice.state, choice.reason])]) : null;
+            mode.choices.map(choice => [choice.id, choice.name, choice.description, choice.state, choice.reason, needsTextOf(choice.id)])]) : null;
         if (blockKey === row.blockKey) return;
         row.blockKey = blockKey;
         row.block.replaceChildren();
@@ -199,6 +218,12 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
             const suffix = mode.selected?.id === choice.id ? " (selected)" : "";
             item.append(title);
             if (suffix) title.append(document.createTextNode(suffix));
+            const needs = needsTextOf(choice.id);
+            if (needs) {
+                const line = make("div", needs);
+                line.style.whiteSpace = "pre-line";
+                item.append(line);
+            }
             if (choice.description) item.append(renderPanelMarkdown(choice.description));
             if (unusable(choice)) item.append(make("div", choice.reason || UNAVAILABLE));
             row.block.append(item);
@@ -236,19 +261,32 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         const drawn = modes.rows.length > 0;
         heading.style.display = table.style.display = individual.style.display = drawn ? "" : "none";
         if (drawn) table.style.display = "flex";
-        el.style.display = drawn || count ? "flex" : "none";
-        if (!drawn && !count) tips.hide();
+        // Shown with no Modes too: a workflow without them can still lack a file.
+        const lacking = hidden ? null : runSummary(availability?.get(), availability?.packs(), { hasModes: drawn });
+        const needsListed = !!lacking?.needs.length;
+        setText(runTitle, lacking?.title || "");
+        setText(runToggle, runOpen ? "Hide" : "Show");
+        runToggle.setAttribute("aria-expanded", String(runOpen));
+        runToggle.style.display = needsListed ? "" : "none";
+        setText(runList, lacking ? [...(runOpen ? lacking.needs : []), ...lacking.problems].join("\n") : "");
+        runList.style.display = runList.textContent ? "" : "none";
+        runLine.style.display = lacking ? "" : "none";
+        el.style.display = drawn || count || lacking ? "flex" : "none";
+        if (!drawn && !count && !lacking) tips.hide();
         // Once per render: the open tip's text or place may have changed.
         else tips.refresh();
     }
     const repaint = () => render(view, options);
+
+    const notifyUnusable = choice => notify(
+        [needsTextOf(choice.id).replaceAll("\n", " "), choice.reason || UNAVAILABLE].filter(Boolean).join(" "));
 
     async function choose(presetId) {
         if (busy || destroyed) return;
         const clickRow = rowOf(deriveModes(host.getView()), presetId);
         const clicked = clickRow?.choices.find(choice => choice.id === presetId);
         if (!clicked) return;
-        if (unusable(clicked)) { notify(clicked.reason || UNAVAILABLE); return; }
+        if (unusable(clicked)) { notifyUnusable(clicked); return; }
         const workflow = () => host.workflows?.current?.().template_id;
         const startedOn = workflow();
         busy = true;
@@ -266,16 +304,29 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
                 const row = fresh ? rowOf(modes, presetId) : clickRow;
                 if (!row) { notify("This choice is no longer in a category. Open Manage."); return { status: "gone" }; }
                 const choice = row.choices.find(item => item.id === presetId) || clicked;
-                if (fresh && unusable(choice)) { notify(choice.reason || UNAVAILABLE); return { status: "gone" }; }
-                // Already the row's only match: applying again would only
-                // rewrite an advancing seed's number.
-                if (fresh && row.status === "selected" && row.selected.id === presetId) return { status: "already" };
-                if (fresh && row.status === "ambiguous" && row.matches.some(item => item.id === presetId)) {
-                    notify(ambiguityText(row));
-                    return { status: "already" };
-                }
-                before = modes;
-                return true;
+                if (fresh && unusable(choice)) { notifyUnusable(choice); return { status: "gone" }; }
+                const proceed = () => {
+                    // Already the row's only match: applying again would only
+                    // rewrite an advancing seed's number.
+                    if (fresh && row.status === "selected" && row.selected.id === presetId) return { status: "already" };
+                    if (fresh && row.status === "ambiguous" && row.matches.some(item => item.id === presetId)) {
+                        notify(ambiguityText(row));
+                        return { status: "already" };
+                    }
+                    before = modes;
+                    return true;
+                };
+                if (!needsTextOf(presetId)) return proceed();
+                // A grey choice: read again, since the file may have just arrived.
+                // After the flush, so an edit made just before this click counts.
+                // Only an answer that still names it stops the click: Generate
+                // remains the refusal when the read fails or runs out of time.
+                return availability.refresh({ fresh: true, timeoutMs: AVAILABILITY_CLICK_TIMEOUT_MS }).then(adopted => {
+                    const still = adopted ? needsTextOf(presetId) : "";
+                    if (!still) return proceed();
+                    notify(still.replaceAll("\n", " "));
+                    return { status: "needs_install" };
+                });
             },
         });
         busy = false;
@@ -312,6 +363,7 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         get busy() { return busy; },
         destroy() {
             destroyed = true;
+            unsubscribeAvailability();
             tips.destroy();
             unregister();
             rows.clear();

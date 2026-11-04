@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- In the Sonder App, a Mode choice that needs a node or model file this ComfyUI doesn't have is greyed out, and hovering over it says what's missing. Installing the file and returning to the tab makes it available again, and **Manage** can still edit it. When the current Modes can't run, a line under the **Modes** heading says how much is missing, and **Show** lists it.
 - When the Sonder App refuses **Generate** over a missing model file or node, it names the Mode choice that needs it (for example "Needed by Task → Edit With Words"). The Launcher shows the same names for the selected workflow.
 - Seed Controls have up and down arrows (and ↑/↓ in the field) that step exactly, even past 2^53. In fullscreen and Mount in Tab they stop at the largest number a canvas widget holds.
 - A resized multiline text box in Controls keeps its height in this browser, across renders and when you leave and reopen the editor.
@@ -23,6 +24,8 @@ a fresh `[Unreleased]` block.
 - A take records the Mode choice each category was on when the run was queued, under **Modes at run** in the Asset Gallery. A choice changed by hand afterwards reads **Custom**.
 
 ### Changed
+- The Launcher marks a workflow **Missing nodes** only when its current Modes need them. It no longer warns about a pack that only other Modes use, or passes over such a workflow when preselecting one.
+- **LTX 2.5 Edit & VFX** is one starter now. It starts on **Prompt Method → Standard**, which needs no Prompt Relay; **Timed Prompts** is greyed out until the pack is installed. The separate version without Prompt Relay is gone, so any app-only settings you added to it no longer show.
 - Sonder App runs no longer need the model files or node packs of Modes that are switched off: a Task needs only its own LoRA, and **MiniMax H3 References & Swaps** needs the SAM3 checkpoint only with **Mask On**. A canvas Run still checks every loader.
 - A workflow with node packs this ComfyUI lacks now opens in the Sonder App; **Generate** refuses only when the chosen Modes use them.
 - The bundled starters' **Models and downloads** notes list each Task's files again, and their switched-off **Additional LoRAs** row reads **None**. Labels, notes and layout you customized on a bundled starter reset once with this update.

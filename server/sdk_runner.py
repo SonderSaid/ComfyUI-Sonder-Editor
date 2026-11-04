@@ -763,6 +763,13 @@ class SdkRunner:
             # can drop it.
             return await asyncio.to_thread(self._controls_snapshot, session, manage, query, template_id)
 
+    async def mode_availability(self, session: SdkSession, *, fresh: bool = False) -> dict:
+        """Which Mode choices can't run on this install. Takes no runner lock: a
+        long Generate must not stall guidance, and the read is of a snapshot."""
+        return await asyncio.to_thread(
+            sdk_templates.check_availability, session.template_id, fresh=fresh, node_lookup=self._node_lookup,
+            class_lookup=self._class_lookup, describe=self._describe)
+
     @staticmethod
     def _check_workflow(session: SdkSession, template_id: str, expected: Any = None) -> None:
         """One workflow per request: the id read when the request arrived, which the

@@ -1,5 +1,7 @@
 // Standalone host adapters; callers own identity and connection lifecycle.
+import { AVAILABILITY_WRITE_DEBOUNCE_MS, createAvailabilityReader } from "./controls_availability_reader.js";
 import { freshWithin } from "./controls_fresh_view.js";
+import { NODE_PACKS_PATH, nodePackMappingsOnce } from "./node_pack_mappings.js";
 
 const idle = () => ({ state: "idle", bindings: [], notes: [], error: null });
 // The Sonder App has no graph to add a Relay to: Manage adds app-only Controls.
@@ -11,6 +13,7 @@ const failure = (changes, reason) => ({
 // No answer arrived, so the change may have landed: a caller reports it as
 // not confirmed, never as not applied (controls_choice_apply.js).
 const unconfirmed = (changes, reason) => ({ ...failure(changes, reason), unconfirmed: true });
+const AVAILABILITY_TIMEOUT_MS = 15000;
 // Why a mounted tab can't write: what `writeBlock` says, and the server's same answers.
 const WRITE_REFUSALS = {
     canvas: "The canvas is not connected. Nothing was changed.",
@@ -45,12 +48,42 @@ export function createSdkControlsHost(owner) {
         // A view of a workflow this page has switched away from.
         if (payload.template_id && owner.templateId && payload.template_id !== owner.templateId) return;
         if (Number(payload.seq) >= seq) {
+            const moved = Number(payload.seq) > seq;
             seq = Number(payload.seq);
             view = { ...payload.view, state: "ready", error: payload.view?.error || null };
             adoptions++;
             emit();
+            if (moved) availability.schedule(false, AVAILABILITY_WRITE_DEBOUNCE_MS);
         }
     };
+    // Which Mode choices can't run here: only while the Modes table can show.
+    const availability = createAvailabilityReader({
+        active: () => visible && !manage.on,
+        viewSeq: () => seq,
+        templateId: () => owner.templateId,
+        request: async fresh => {
+            const response = await owner._fetch(owner._sessionPath(`availability${fresh ? "?fresh=1" : ""}`), {
+                headers: owner.headers(false),
+                // A dead connection must not hold the one read in flight.
+                signal: globalThis.AbortSignal?.timeout?.(AVAILABILITY_TIMEOUT_MS),
+            });
+            if (response.ok) return response.json();
+            // A session that ended says so here too: tabs return with nothing else to read.
+            owner._noteRefusal?.({ ok: false, status: response.status, payload: await response.json().catch(() => ({})) });
+            return null;
+        },
+        loadPacks: () => (owner._apiURL ? nodePackMappingsOnce(owner._apiURL(NODE_PACKS_PATH), owner._fetch) : null),
+    });
+    // Back at the tab: a file may have been installed meanwhile. An unusable
+    // choice's state lives in the view, so that is read too when anything is lacking.
+    const onReturn = () => {
+        if (destroyed || !visible || manage.on || globalThis.document?.hidden) return;
+        availability.schedule(true);
+        const unusable = view.presets?.some(row => row.state === "unavailable" || row.state === "refused");
+        if (availability.hasEntries() || unusable) void refresh();
+    };
+    globalThis.window?.addEventListener?.("focus", onReturn);
+    globalThis.document?.addEventListener?.("visibilitychange", onReturn);
     // Manage's candidates are fetched only while it is open (amendment A1).
     const controlsPath = () =>
         owner._sessionPath("controls") +
@@ -103,6 +136,7 @@ export function createSdkControlsHost(owner) {
     }
     return {
         getView: () => view,
+        availability,
         emptyMessage: SDK_EMPTY,
         // Sonder App curation (A1): hide the workflow's own items, remove only app-only ones.
         // serverRows: the server builds this prompt, so row lists edit without canvas row widgets.
@@ -113,7 +147,10 @@ export function createSdkControlsHost(owner) {
             if (next.on === manage.on && next.filter === manage.filter) return;
             manage = next;
             epoch++;
-            if (visible) void refresh();
+            if (visible) {
+                void refresh();
+                availability.schedule();
+            }
         },
         subscribe(cb) {
             listeners.add(cb);
@@ -121,7 +158,10 @@ export function createSdkControlsHost(owner) {
         },
         setVisible(value) {
             visible = !!value;
-            if (visible) void refresh();
+            if (visible) {
+                void refresh();
+                availability.schedule();
+            }
         },
         setViewsDemand(value) {
             if (viewsDemand === !!value) return;
@@ -186,6 +226,9 @@ export function createSdkControlsHost(owner) {
             destroyed = true;
             epoch++;
             listeners.clear();
+            availability.destroy();
+            globalThis.window?.removeEventListener?.("focus", onReturn);
+            globalThis.document?.removeEventListener?.("visibilitychange", onReturn);
         },
     };
 }

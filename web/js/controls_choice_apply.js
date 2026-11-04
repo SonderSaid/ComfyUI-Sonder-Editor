@@ -6,11 +6,12 @@
 // module owns only the order: flush, read, check, decide, write.
 
 // Outcomes that leave the Controls short of what the caller asked for.
-export const CHOICE_FAILURES = new Set(["refused", "not_confirmed", "flush_failed"]);
+export const CHOICE_FAILURES = new Set(["refused", "not_confirmed", "flush_failed", "needs_install"]);
 
 // Resolves to {status, reason?, detail?, fresh}; never rejects. `status` is one
-// of applied, already, refused, not_confirmed, flush_failed, gone, superseded.
-// `decide(view, fresh)` returns true to write, or the outcome to stop with.
+// of applied, already, refused, not_confirmed, flush_failed, gone, superseded,
+// needs_install. `decide(view, fresh)` returns (or resolves to) true to write, or
+// the outcome to stop with.
 export function applyChoice(host, presetId, { flushPending, track, decide = () => true, isCurrent = () => true }) {
     // Before tracking: the panel's flush waits for tracked work, so tracking
     // first would make this apply wait for itself.
@@ -25,7 +26,13 @@ export function applyChoice(host, presetId, { flushPending, track, decide = () =
             // A newer selection or a closed panel: nothing is written, so no
             // Undo step and no flip of the values.
             if (!isCurrent()) return { status: "superseded", fresh };
-            const decision = decide(read.view, fresh);
+            let decision = decide(read.view, fresh);
+            // Only a decide that had to read waits, so any other keeps its exact
+            // order; while it read, the panel may have closed.
+            if (typeof decision?.then === "function") {
+                decision = await decision;
+                if (decision === true && !isCurrent()) return { status: "superseded", fresh };
+            }
             if (decision !== true) return { ...decision, fresh };
             const result = await host.applyChanges({ [`preset:${presetId}:apply`]: true });
             if (result?.ok) return { status: "applied", fresh };

@@ -15,6 +15,7 @@ import { downloadCuratedWorkflow } from './launcher_export.js';
 import { missingNodes, mountWorkflows, nextExitNotice } from './launcher_workflows.js';
 import { mountProjects, thumbnailMode } from './launcher_projects.js';
 import { mountOpenBar } from './launcher_open_bar.js';
+import { NODE_PACKS_PATH, fetchNodePackMappings } from './node_pack_mappings.js';
 import { mountDialog, mountPopup, mountProjectDialog } from './launcher_dialog.js';
 import { mountProjectFormatControls } from './project_format_controls.js';
 
@@ -81,13 +82,7 @@ async function checkRequirements() {
 async function loadNodePacks() {
     if (state.nodePacks !== undefined || !state.templates.some(t => missingNodes(t).length)) return;
     state.nodePacks = null;
-    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 15000);
-    try {
-        const resp = await fetch(api.apiURL('/v2/customnode/getmappings?mode=cache'), { signal: controller.signal });
-        const payload = resp.ok ? await resp.json() : null;
-        if (payload && typeof payload === 'object' && !Array.isArray(payload)) state.nodePacks = payload;
-    } catch { /* no Manager, or it did not answer: class names stand alone */ }
-    finally { clearTimeout(timer); }
+    state.nodePacks = await fetchNodePackMappings(api.apiURL(NODE_PACKS_PATH));
     if (active && state.nodePacks) render(true);
 }
 function selectProject(folder, focus = false) {
@@ -129,10 +124,10 @@ function preselect(state) {
     }
     const hidden = state.memory.hidden?.workflows || [];
     if (previous !== state.selectedProject || !state.templates.some(t => t.template_id === state.selectedTemplateId && (state.prefs.showHidden || !hidden.includes(t.template_id)))) {
-        // As the server's preferred_workflow: one with nothing missing first, else any shown one.
-        const incomplete = new Set(state.templates.filter(t => missingNodes(t).length).map(t => t.template_id));
+        // As the server's preferred_workflow. A missing node doesn't count against
+        // a workflow: its current Modes may not use it, and its row says so if they do.
         const shown = state.projectData.workflow_order.filter(id => !hidden.includes(id));
-        state.selectedTemplateId = project()?.workflow || shown.find(id => !incomplete.has(id)) || shown[0] || '';
+        state.selectedTemplateId = project()?.workflow || shown[0] || '';
     }
 }
 // One status call at a time. Overlapping refreshes share the one in flight, so a
