@@ -2331,6 +2331,15 @@ class ClipReference:
     active_take: int = 0
     take_metadata: dict = field(default_factory=dict)  # {scene_id, selection_start/end, prompt, context_frames}
 
+    def __post_init__(self):
+        # The one gate for every clip, however it was built: provenance only the
+        # asset keeps (the Controls' full text, Modes at run) never enters these
+        # inline copies (Hardening Phase 10). No clip on disk holds either, so
+        # this rewrites nothing at rest.
+        from .project_storage import take_copy_params
+        self.generation_params = take_copy_params(self.generation_params)
+        self.take_metadata = take_copy_params(self.take_metadata)
+
     @property
     def duration_frames(self) -> int:
         return self.timeline_end_frame - self.timeline_start_frame

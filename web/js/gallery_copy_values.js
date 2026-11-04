@@ -2,11 +2,60 @@
 // search/filter authority; these optional sources only supply complete clipboard text.
 
 export const TRUNCATED_MARKER = "... [truncated, full in raw_widget_text]";
-// Controls at run (server/controls_snapshot.py) caps long text values. The full
-// value exists only in the run's source prompt, never in this section.
+// Controls at run (server/controls_snapshot.py) caps long text values with this
+// marker. Since Hardening Phase 10 the asset keeps the complete text beside the
+// section (`generation_params.controls_text`), never inside it; older takes have
+// only the preview. The stored marker never changes: older packs detect it.
 export const CONTROLS_TRUNCATED_MARKER = "… [truncated, full value in the source prompt]";
+// Mirrors controls_snapshot.FULL_TEXT_KEY (parity-tested).
+export const CONTROLS_FULL_TEXT_KEY = "controls_text";
 
 const hasOwn = (value, key) => !!value && Object.prototype.hasOwnProperty.call(value, key);
+
+// Section entry -> its asset's full-text record. Filled where entries are made
+// from an asset's detail params (`shared_asset_gallery.js`), so every Copy and
+// cell of that section resolves the same way without new call-site arguments.
+const controlsFullTextBySection = new WeakMap();
+
+export function rememberControlsFullText(entries, params) {
+    const record = params && typeof params === "object" ? params[CONTROLS_FULL_TEXT_KEY] : undefined;
+    for (const entry of Array.isArray(entries) ? entries : []) {
+        if (entry?.display_type !== "controls" || typeof entry !== "object") continue;
+        if (record && typeof record === "object") controlsFullTextBySection.set(entry, record);
+        else controlsFullTextBySection.delete(entry);
+    }
+}
+
+// The one reader of a full-text record (server: controls_snapshot.controls_full_text).
+export function controlsFullText(record, bindingId) {
+    const values = record && typeof record === "object" ? record.values : null;
+    const value = values && typeof values === "object" && typeof bindingId === "string" && hasOwn(values, bindingId)
+        ? values[bindingId] : undefined;
+    return typeof value === "string" ? value : null;
+}
+
+// The complete text behind a capped Controls preview, or null. It must extend the
+// preview (minus the marker) and be longer, so a stale or foreign record is ignored.
+function controlsKeptText(entry, key, preview) {
+    if (typeof preview !== "string" || !preview.endsWith(CONTROLS_TRUNCATED_MARKER)) return null;
+    const control = Array.isArray(entry?.controls) ? entry.controls.find((item) => item?.field === key) : null;
+    const text = controlsFullText(controlsFullTextBySection.get(entry), control?.binding_id);
+    const head = preview.slice(0, -CONTROLS_TRUNCATED_MARKER.length);
+    return text !== null && text.length > head.length && text.startsWith(head) ? text : null;
+}
+
+// The cell text for a tracked field. A capped Controls preview whose full text
+// is kept says so instead of pointing at the source prompt; everything else is
+// shown as rendered. Display only: filters and search read the stored value.
+export function trackedFieldDisplayText(entry, fieldKey, rendered) {
+    if (entry?.display_type !== "controls" || typeof rendered !== "string") return rendered;
+    const key = String(fieldKey);
+    const text = controlsKeptText(entry, key, entry?.fields?.[key]);
+    if (text === null || !rendered.endsWith(CONTROLS_TRUNCATED_MARKER)) return rendered;
+    const count = Array.from(text).length;
+    return rendered.slice(0, -CONTROLS_TRUNCATED_MARKER.length)
+        + `… (Copy value copies all ${count.toLocaleString("en-US")} characters)`;
+}
 const full = (text, label = "Copy value") => ({ kind: "value", label, text });
 const unavailable = () => ({ kind: "unavailable", label: "Full value unavailable", text: "" });
 
@@ -84,9 +133,16 @@ export function resolveTrackedFieldCopy(entry, fieldKey) {
         if (preview == null) return unavailable();
         const control = Array.isArray(entry.controls) ? entry.controls.find((item) => item?.field === key) : null;
         if (control?.rows_omitted === true) return full(copyTextForValue(preview), "Copy summary");
-        return typeof preview === "string" && preview.endsWith(CONTROLS_TRUNCATED_MARKER)
-            ? { kind: "unavailable", label: "Full value is only in the run's source prompt", text: "" }
-            : full(copyTextForValue(preview));
+        const sourceOnly = { kind: "unavailable", label: "Full value is only in the run's source prompt", text: "" };
+        // A row list's text was cut with "…", which can't be told from a value
+        // ending in one: new captures mark it (`capped`), so Copy never offers it
+        // as complete. Older takes can't be told apart and keep copying the text.
+        if (control?.capped === true) return sourceOnly;
+        if (typeof preview === "string" && preview.endsWith(CONTROLS_TRUNCATED_MARKER)) {
+            const text = controlsKeptText(entry, key, preview);
+            return text === null ? sourceOnly : full(text);
+        }
+        return full(copyTextForValue(preview));
     }
     if (hasOwn(entry?.full_fields, key) && entry.full_fields[key] !== undefined) {
         return full(copyTextForValue(entry.full_fields[key]));

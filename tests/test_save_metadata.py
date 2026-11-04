@@ -423,7 +423,7 @@ def test_a_failing_snapshot_never_fails_the_save(tmp_path, monkeypatch):
     def boom(*_args, **_kwargs):
         raise RuntimeError("describe failed")
 
-    monkeypatch.setattr(io_nodes, "controls_snapshot", boom)
+    monkeypatch.setattr(io_nodes, "controls_capture", boom)
     project = _project(tmp_path)
     io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), embed_metadata=False,
                                          prompt=_controls_prompt(), unique_id="S")
@@ -453,6 +453,266 @@ def test_take_copies_and_png_sequence_carry_controls(tmp_path, monkeypatch):
     assert len(sequence.assets) == 2
     for asset in sequence.assets:
         assert _controls_section(asset.generation_params["editor_export"]["tracked_metadata"])["fields"]["Seed"]
+
+
+class _FakeTextNode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"text": ("STRING", {"multiline": True})}}
+
+
+LYRICS = ("[Verse 1]\r\nThree in the morning, rain on the pavement\r\n차가운 밤이 날 삼켜 👩‍👩‍👧\n" * 40)
+
+
+def _long_text_prompt(consumer="S", consumer_class="SonderSaveVideo", categories=None):
+    """``_controls_prompt`` plus a long STRING Control upstream of the save, and
+    optionally Mode categories in the manifest."""
+    prompt = _controls_prompt(consumer, consumer_class)
+    manifest = json.loads(prompt["R"]["inputs"]["manifest"])
+    manifest["bindings"]["lyricsB"] = {"label": "Lyrics", "status": "ok", "targets": [{"path": "T", "input": "text"}]}
+    if categories is not None:
+        manifest["presets"] = {"pa": {"name": "A", "order": 0, "members": {}}}
+        manifest["preset_categories"] = categories
+    prompt["R"]["inputs"]["manifest"] = json.dumps(manifest)
+    prompt["T"] = {"class_type": "FakeText", "inputs": {"text": LYRICS}}
+    prompt["K"]["inputs"]["positive"] = ["T", 0]
+    return prompt
+
+
+def _fake_text_classes(monkeypatch):
+    descriptors = importlib.import_module(f"{TEST_PACKAGE}.server.control_descriptors")
+    monkeypatch.setattr(descriptors, "_comfy_class_lookup", {"FakeSampler": _FakeSampler, "FakeText": _FakeTextNode}.get)
+
+
+MODES_ROWS = [{"id": "t", "name": "Task", "status": "selected", "choice": "Edit With Words", "matches": ["Edit With Words"]}]
+
+
+def _types(params):
+    return [s.get("display_type") for s in params["editor_export"]["tracked_metadata"]]
+
+
+def test_a_take_keeps_full_text_and_modes_on_the_asset_only(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _fake_text_classes(monkeypatch)
+    torch = importlib.import_module("torch")
+    _patch_save_deps(io_nodes, monkeypatch, [])
+    run_feedback = importlib.import_module(f"{TEST_PACKAGE}.server.run_feedback")
+    monkeypatch.setattr(run_feedback, "modes_for_save", lambda prompt, timeout=2.0: [dict(r) for r in MODES_ROWS])
+    seen = {}
+    real_payload = io_nodes._file_metadata_payload
+    monkeypatch.setattr(io_nodes, "_file_metadata_payload",
+                        lambda prompt, workflow, export: seen.setdefault("payload", real_payload(prompt, workflow, export)))
+    project = _project(tmp_path, with_scene=True)
+    project._execution_context = {"scene_id": "scene-1", "scene_name": "Scene 1", "selection_start": 0, "selection_end": 1}
+
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), mode="Take", embed_metadata=True,
+                                         prompt=_long_text_prompt(), unique_id="S", extra_pnginfo={"workflow": {}})
+
+    asset = project.assets[0].generation_params
+    assert asset["controls_text"] == {"v": 1, "values": {"lyricsB": LYRICS}}
+    assert _types(asset)[-2:] == ["controls", "modes"]
+    modes = asset["editor_export"]["tracked_metadata"][-1]
+    assert modes["fields"] == {"Task": "Edit With Words"}
+    clip = project.scenes[0].clips[0]
+    for params in (clip.generation_params, clip.take_metadata):
+        assert "controls_text" not in params and "modes" not in _types(params)
+        assert _controls_section(params["editor_export"]["tracked_metadata"])["fields"]["Lyrics"].endswith("source prompt]")
+    # The asset kept both after its clip copies were built.
+    assert "controls_text" in project.assets[0].generation_params and "modes" in _types(project.assets[0].generation_params)
+    # The file's embedded metadata has neither (it was built before the encode).
+    export = json.loads(seen["payload"]["editor_export"])
+    assert "controls_text" not in export and "modes" not in [s.get("display_type") for s in export["tracked_metadata"]]
+
+
+def test_a_png_sequence_keeps_full_text_and_modes_on_frame_one(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _fake_text_classes(monkeypatch)
+    torch = importlib.import_module("torch")
+    _patch_save_deps(io_nodes, monkeypatch, [])
+    run_feedback = importlib.import_module(f"{TEST_PACKAGE}.server.run_feedback")
+    monkeypatch.setattr(run_feedback, "modes_for_save", lambda prompt, timeout=2.0: [dict(r) for r in MODES_ROWS])
+    sequence = _project(tmp_path / "seq")
+    io_nodes.SonderSaveVideo().save_video(
+        sequence, torch.zeros(3, 2, 2, 3), embed_metadata=False,
+        save_preset=io_nodes.CUSTOM_SAVE_VIDEO_PRESET, custom_output_kind=io_nodes.CUSTOM_OUTPUT_KIND_PNG_SEQUENCE,
+        prompt=_long_text_prompt(), unique_id="S")
+    first, *rest = sorted(sequence.assets, key=lambda a: a.generation_params["sequence_index"])
+    assert first.generation_params["controls_text"]["values"]["lyricsB"] == LYRICS
+    assert "modes" in _types(first.generation_params)
+    for asset in rest:
+        assert "controls_text" not in asset.generation_params and "modes" not in _types(asset.generation_params)
+        assert "controls" in _types(asset.generation_params)  # previews stay on every frame
+
+
+def test_modes_not_recorded_when_the_run_has_no_record(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _fake_text_classes(monkeypatch)
+    torch = importlib.import_module("torch")
+    _patch_save_deps(io_nodes, monkeypatch, [])
+    project = _project(tmp_path)
+    project._execution_context = {}
+    prompt = _long_text_prompt(categories={"c": {"name": "Task", "order": 0, "choices": ["pa"]}})
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), embed_metadata=False,
+                                         prompt=prompt, unique_id="S")
+    modes = project.assets[0].generation_params["editor_export"]["tracked_metadata"][-1]
+    assert modes["display_type"] == "modes" and modes["status"] == "not_recorded" and modes["fields"] == {}
+    plain = _project(tmp_path / "plain")
+    plain._execution_context = {}
+    io_nodes.SonderSaveVideo().save_video(plain, torch.zeros(1, 2, 2, 3), embed_metadata=False,
+                                         prompt=_long_text_prompt(), unique_id="S")
+    assert "modes" not in _types(plain.assets[0].generation_params)
+
+
+def test_a_failing_modes_read_never_fails_the_save(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    _patch_save_deps(io_nodes, monkeypatch, [])
+    run_feedback = importlib.import_module(f"{TEST_PACKAGE}.server.run_feedback")
+
+    def boom(*_a, **_k):
+        raise RuntimeError("feedback broke")
+
+    monkeypatch.setattr(run_feedback, "modes_for_save", boom)
+    project = _project(tmp_path)
+    project._execution_context = {}
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), embed_metadata=False,
+                                         prompt=_controls_prompt(), unique_id="S")
+    assert len(project.assets) == 1
+
+
+def test_embedded_metadata_survives_a_lone_surrogate_and_keeps_ordinary_bytes(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    media_helpers = importlib.import_module(f"{TEST_PACKAGE}.server.media_helpers")
+    bad = {"N": {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "before \ud800 after"}}}
+    payload = io_nodes._file_metadata_payload(bad, {"nodes": []}, {"tracked_metadata": []})
+    for value in payload.values():
+        value.encode("utf-8")
+    assert json.loads(payload["prompt"]) == bad
+    path = media_helpers._write_ffmetadata_file(payload)
+    Path(path).unlink()
+    ordinary = {"N": {"class_type": "X", "inputs": {"value": "夜明け 👩‍👩‍👧"}}}
+    assert io_nodes._file_metadata_payload(ordinary, None, {})["prompt"] == json.dumps(
+        ordinary, ensure_ascii=False, separators=(",", ":"))
+
+
+def test_a_lone_surrogate_anywhere_in_a_run_saves_and_the_project_still_opens(tmp_path, monkeypatch):
+    """Embedding on, a lone surrogate in a bound Control, an unconnected node, the
+    canvas workflow and a collector field: the take saves, the project is written
+    by the real (strict) writer, loads, and serializes for its text routes."""
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _fake_text_classes(monkeypatch)
+    torch = importlib.import_module("torch")
+    calls = []
+    monkeypatch.setattr(io_nodes, "encode_video", _fake_encode(io_nodes, calls))
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+    project_manager = importlib.import_module(f"{TEST_PACKAGE}.server.project_manager")
+    timeline_state = _timeline_state()
+    project = project_manager.create_project("Surrogate", base_dir=str(tmp_path / "projects"))
+    project.scenes = [timeline_state.Scene(scene_id="scene-1", name="Scene 1", duration_frames=24)]
+    project_manager.save_project(project)
+    project = project_manager.load_project(project.project_dir)
+    project._execution_context = {
+        "scene_id": "scene-1", "scene_name": "Scene 1", "selection_start": 0, "selection_end": 1,
+        io_nodes.TRACKED_METADATA_CONTEXT_KEY: {"C": [{"label": "Notes", "source_node_id": "K", "display_type": None,
+                                                       "fields": {"note": "x\ud800y"}, "raw_widget_text": "note: x\ud800y"}]}}
+    prompt = _long_text_prompt()
+    prompt["T"]["inputs"]["text"] = "lyric \ud800 " + "z" * 600
+    prompt["N"] = {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "before \ud800 after"}}
+    workflow = {"nodes": [{"id": 1, "widgets_values": ["before \ud800 after"]}]}
+    seen = {}
+    real_payload = io_nodes._file_metadata_payload
+    monkeypatch.setattr(io_nodes, "_file_metadata_payload",
+                        lambda p, w, e: seen.setdefault("payload", real_payload(p, w, e)))
+
+    io_nodes.SonderSaveVideo().save_video(project, torch.zeros(1, 2, 2, 3), mode="Take", embed_metadata=True,
+                                         prompt=prompt, unique_id="S", extra_pnginfo={"workflow": workflow})
+
+    reloaded = project_manager.load_project(project.project_dir)
+    text = json.dumps(reloaded.to_dict(), ensure_ascii=False)  # what GET /project/{id} serializes
+    text.encode("utf-8")
+    assert "�" in json.dumps(reloaded.scenes[0].clips[0].generation_params, ensure_ascii=False)
+    asset = reloaded.assets[0]
+    storage = importlib.import_module(f"{TEST_PACKAGE}.server.project_storage")
+    storage.hydrate_asset(asset)
+    params = asset.generation_params
+    json.dumps(params, ensure_ascii=False).encode("utf-8")
+    assert params["controls_text"] == {"v": 1, "values": {}, "omitted": 1}
+    assert params["editor_export"]["workflow_sha256"]
+    # The embedded metadata kept the exact text, escaped only where it had to be.
+    for value in seen["payload"].values():
+        value.encode("utf-8")
+    assert json.loads(seen["payload"]["prompt"])["N"]["inputs"]["value"] == "before \ud800 after"
+
+
+def test_the_workflow_digest_survives_a_lone_surrogate_and_is_unchanged_otherwise(tmp_path, monkeypatch):
+    import hashlib
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    normal = {"nodes": [{"widgets_values": ["夜明け 👩‍👩‍👧"]}]}
+    expected = hashlib.sha256(json.dumps(normal, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    assert io_nodes._workflow_digest(normal) == expected
+    assert len(io_nodes._workflow_digest({"nodes": [{"widgets_values": ["a\ud800b"]}]})) == 64
+
+
+def test_a_bridge_keeps_full_text_on_its_first_file_and_scrubs_every_file(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    params = {"controls_text": {"v": 1, "values": {"b": "x" * 600}},
+              "editor_export": {"tracked_metadata": [{"display_type": "controls", "fields": {"a": "b\ud800"}}]}}
+    modes = {"label": "Modes at run", "display_type": "modes", "fields": {"T": "E"}, "modes": []}
+    first = io_nodes._bridge_asset_params(params, modes, keep_full_text=True)
+    later = io_nodes._bridge_asset_params(params, modes, keep_full_text=False)
+    assert first["controls_text"] == params["controls_text"] and "controls_text" not in later
+    for out in (first, later):
+        assert [s["display_type"] for s in out["editor_export"]["tracked_metadata"]] == ["controls", "modes"]
+        assert out["editor_export"]["tracked_metadata"][0]["fields"]["a"] == "b�"
+    assert params["editor_export"]["tracked_metadata"][0]["fields"]["a"] == "b\ud800"  # input untouched
+
+
+def test_modes_are_awaited_only_when_the_workflow_declares_categories(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    run_feedback = importlib.import_module(f"{TEST_PACKAGE}.server.run_feedback")
+    timeouts = []
+    monkeypatch.setattr(run_feedback, "modes_for_save", lambda prompt, timeout=2.0: timeouts.append(timeout))
+    io_nodes._modes_section_for_save(_long_text_prompt())
+    io_nodes._modes_section_for_save(_long_text_prompt(categories={"c": {"name": "T", "order": 0, "choices": ["pa"]}}))
+    assert timeouts == [0, run_feedback.MODES_SAVE_WAIT_SEC]
+
+
+def test_save_bridge_reads_modes_at_finalization(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    run_feedback = importlib.import_module(f"{TEST_PACKAGE}.server.run_feedback")
+    monkeypatch.setattr(run_feedback, "prompt_id_for", lambda prompt: "pid-1")
+    monkeypatch.setattr(run_feedback, "modes_of", lambda pid: [dict(r) for r in MODES_ROWS] if pid == "pid-1" else None)
+    prompt = _long_text_prompt(categories={"c": {"name": "Task", "order": 0, "choices": ["pa"]}})
+    run = io_nodes._bridge_modes_run(prompt)
+    assert run == {"prompt_id": "pid-1", "declared": True, "rows": MODES_ROWS}
+    section = io_nodes._bridge_modes_section({"modes_run": run})
+    assert section["fields"] == {"Task": "Edit With Words"}
+    # Pruned by a late finalization: the record noted at prepare is the fallback.
+    monkeypatch.setattr(run_feedback, "modes_of", lambda pid: None)
+    assert io_nodes._bridge_modes_section({"modes_run": run})["fields"] == {"Task": "Edit With Words"}
+    assert io_nodes._bridge_modes_section({"modes_run": {**run, "rows": None}})["status"] == "not_recorded"
+    assert io_nodes._bridge_modes_section({}) is None  # an orphan entry
+    export = {"tracked_metadata": [{"display_type": "controls"}]}
+    out = io_nodes._with_modes_at_run(export, section)
+    assert [s["display_type"] for s in out["tracked_metadata"]] == ["controls", "modes"]
+    assert len(export["tracked_metadata"]) == 1
+
+
+def test_save_bridge_keeps_full_text_on_its_params(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    _fake_text_classes(monkeypatch)
+    _clear_bridge_state(io_nodes)
+    project = _project(tmp_path)
+    project._execution_context = {"scene_id": "scene-1", "scene_name": "Scene 1"}
+    prompt = _long_text_prompt(consumer="B", consumer_class="SonderSaveBridge")
+    prompt["B"]["inputs"] = {"project": ["C", 0]}
+    prompt["I"] = {"class_type": "SaveImage", "inputs": {"images": ["D", 0], "filename_prefix": ["B", 1]}}
+    io_nodes.SonderSaveBridge().prepare_output(project, prompt=prompt, unique_id="B")
+    entry = next(value for key, value in io_nodes._BRIDGE_REGISTRY.items() if key[1] == "B")
+    assert entry["generation_params"]["controls_text"]["values"]["lyricsB"] == LYRICS
+    assert "controls_text" not in json.dumps(entry["generation_params"]["editor_export"])
+    _clear_bridge_state(io_nodes)
 
 
 def test_save_bridge_controls_follow_its_consumers(tmp_path, monkeypatch):
@@ -487,8 +747,8 @@ def test_native_controls_rows_flow_through_video_save_without_collector(tmp_path
     descriptor={'binding_id':'stack','status':'ok','kind':'ROWS','label':'Stack','group':'','order':0,
                 'targets':[{'path':'L','input':'loras'}],
                 'value':[{'lora_name':'probe.safetensors','strength':0.75,'enabled':True}]}
-    original = io_nodes.controls_snapshot
-    monkeypatch.setattr(io_nodes,'controls_snapshot',lambda p,c,**kw:original(p,c,**kw,
+    original = io_nodes.controls_capture
+    monkeypatch.setattr(io_nodes,'controls_capture',lambda p,c,**kw:original(p,c,**kw,
                         describe=lambda *a,**k:{'bindings':[descriptor]}))
     io_nodes.SonderSaveVideo().save_video(project,torch.zeros(2,2,2,3),embed_metadata=False,prompt=prompt,unique_id='S')
     tracked=project.assets[0].generation_params['editor_export']['tracked_metadata']

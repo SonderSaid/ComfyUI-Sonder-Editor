@@ -46,7 +46,10 @@ import { attachZoomPan as attachZoomPanCore } from "./media_zoom_pan.js";
 import { openContextMenu } from "./editor_context_menu.js";
 import { cancelProjectAssetDetails, requestProjectAssetDetails } from "./asset_refresh_coordinator.js";
 import { createDetailLoader, createSearchProjection } from "./asset_provenance_details.js";
-import { resolveTrackedFieldCopy, resolvePowerLoraRowCopies, resolvePowerLoraNamesCopy } from "./gallery_copy_values.js";
+import {
+    rememberControlsFullText, resolveTrackedFieldCopy, resolvePowerLoraRowCopies, resolvePowerLoraNamesCopy,
+    trackedFieldDisplayText,
+} from "./gallery_copy_values.js";
 
 const DEFAULT_SORT_MODE = DEFAULT_EDITOR_SETTINGS.gallery.sortMode;
 const DEFAULT_GALLERY_TAB = DEFAULT_EDITOR_SETTINGS.gallery.activeTab;
@@ -585,7 +588,11 @@ function trackedEntriesFromValue(value) {
 }
 
 function trackedEntriesFromParams(params) {
-    return trackedEntriesFromValue(params?.editor_export?.tracked_metadata);
+    const entries = trackedEntriesFromValue(params?.editor_export?.tracked_metadata);
+    // Controls at run keeps its full text beside the section, on the asset:
+    // every Copy and cell of these entries resolves through it.
+    rememberControlsFullText(entries, params);
+    return entries;
 }
 
 function trackedMetadataBlob(entries) {
@@ -4102,7 +4109,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                     const rendered = formatGenerationValue(value);
                     const token = fieldSearchToken(key, rendered);
                     const cellInfo = { entry, fieldKey: key, value: rendered, displayKind: "generic" };
-                    const cell = makeMetaCell(key, rendered, {
+                    const cell = makeMetaCell(key, trackedFieldDisplayText(entry, key, rendered), {
                         copy: resolveTrackedFieldCopy(entry, key),
                         onContextMenu: (event) => handleTrackedFieldContextMenu(event, cellInfo, surface),
                     });
@@ -4218,7 +4225,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             const rendered = formatGenerationValue(value);
             const token = fieldSearchToken(key, rendered);
             const cellInfo = { entry, fieldKey: String(key), value: rendered, displayKind: "generic" };
-            const cell = makeMetaCell(key, rendered, {
+            const cell = makeMetaCell(key, trackedFieldDisplayText(entry, key, rendered), {
                 copy: resolveTrackedFieldCopy(entry, key),
                 onContextMenu: (event) => handleTrackedFieldContextMenu(event, cellInfo, surface),
             });

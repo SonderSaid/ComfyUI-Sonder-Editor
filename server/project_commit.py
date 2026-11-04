@@ -4,7 +4,7 @@ from copy import deepcopy
 from .project_manager import ProjectVersionConflict, load_project, save_project
 from .lane_registry import VARIABLE_LANE_DESCRIPTORS, allocate_take_lane
 from .timeline_state import LaneConfig, TimelineProject
-from .project_storage import has_generation_provenance, hydrate_asset
+from .project_storage import ASSET_ONLY_PARAM_KEYS, has_generation_provenance, hydrate_asset
 
 logger = logging.getLogger("sonder_editor")
 
@@ -94,6 +94,16 @@ def _remap_asset_id_values(value, asset_id_remap: dict[str, str]):
             for key, item in value.items()
         }
     return value
+
+
+def _remap_generation_params(params, asset_id_remap: dict[str, str]):
+    """``_remap_asset_id_values`` over an asset's params, except the Controls'
+    full text: it is the exact executed string, so a value that happens to equal
+    an asset id is never rewritten (Hardening Phase 10)."""
+    if not isinstance(params, dict):
+        return _remap_asset_id_values(params, asset_id_remap)
+    return {key: value if key in ASSET_ONLY_PARAM_KEYS else _remap_asset_id_values(value, asset_id_remap)
+            for key, value in params.items()}
 
 
 def snapshot_item_ids(project) -> dict:
@@ -226,7 +236,7 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
             params = getattr(asset, "generation_params", None)
             if not params:
                 continue
-            remapped = _remap_asset_id_values(params, asset_id_remap)
+            remapped = _remap_generation_params(params, asset_id_remap)
             if remapped != params:
                 asset.generation_params = remapped
                 changed = True

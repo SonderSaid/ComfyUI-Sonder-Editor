@@ -19,6 +19,8 @@ a fresh `[Unreleased]` block.
 - While only In or Out is set, the generation readout's tooltip says **Generate** still uses the full scene until you choose the other point.
 - A Mode choice can also apply a choice from another category: in Manage, open the choice and pick it under **Also applies**. One click (and one Undo on the canvas) sets both rows; changing the included row by hand makes the first row read **Custom**. An older Sonder version ignores the link and keeps it only until that choice is updated.
 - The Views pane picker and Manage's Views list name the subgraph a node sits in (for example **Sampling › SamplerCustomAdvanced**) instead of only "Inside a subgraph". Workflows exported before this version, and Sonder App workflows without a Relay, keep the old text.
+- A take keeps the full text of a long text Control, such as a song's lyrics or style, up to 24 KB per take. In the Asset Gallery its **Controls at run** cell says how many characters it holds, and **Copy value** copies all of it exactly. Search still reads the first 512 characters, and takes made before this version keep only their preview.
+- A take records the Mode choice each category was on when the run was queued, under **Modes at run** in the Asset Gallery. A choice changed by hand afterwards reads **Custom**.
 
 ### Changed
 - Sonder App runs no longer need the model files or node packs of Modes that are switched off: a Task needs only its own LoRA, and **MiniMax H3 References & Swaps** needs the SAM3 checkpoint only with **Mask On**. A canvas Run still checks every loader.
@@ -27,9 +29,10 @@ a fresh `[Unreleased]` block.
 - Reference lanes that share a recipe can be selected together whatever their prompt overrides. The Prompt Bridge's **reference_prompt** is one block in lane order where each lane's override takes that lane's part, without repeating the recipe's opening and closing lines; a lane on its own still uses its override as the whole prompt. A selection that used the same override on several lanes now includes it once per lane.
 - A refusal that changed nothing (a Reference drop that can't be staged, a split with no effect) closes on its own: it follows your warning duration setting, or 6 seconds when that is set to stay until dismissed.
 - On a narrow window the editor toolbar stacks its groups on rows instead of overlapping them.
-- In Controls, a seed's label sits above its field, arrows and mode, so the number stays readable in a narrow sidebar.
+- In Controls, a seed's label sits above its field, arrows and mode, so the number stays readable in a narrow sidebar. In the Cards layout the seed field fills its card and the mode sits under it, so the number stays readable at every panel width.
 
 ### Fixed
+- A run whose prompt holds an invalid character (a lone UTF-16 surrogate, which ComfyUI accepts) saves its take instead of failing at the save with metadata embedding on.
 - Reloading a Mount in Tab page keeps the editor open, on the same scene and selection, and a run in progress keeps reporting. It used to say the project was open in another editor host.
 - A duplicated Mount in Tab or Sonder App tab takes over, and the original stops editing and offers **Take over**. A tab that lost its session could still change the project from the keyboard.
 - A mounted edit made while the canvas page is away says the canvas isn't connected and that nothing changed, and the Controls tab says so too, instead of "This tab no longer owns the editor" and "Loading controls…".

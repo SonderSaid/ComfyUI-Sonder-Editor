@@ -52,6 +52,28 @@ Hidden settings still apply their values.
 Each take records the values it used. Open the take in **Assets** and look for
 **Controls at run** in its details.
 
+A long text setting, such as a song's lyrics or style, shows its first 512
+characters in **Controls at run**. The take keeps the whole text, up to 24 KB
+for all of a take's long settings together:
+
+1. In **Assets**, click the take. Its details open in the inspector.
+2. Find the setting under **Controls at run**. A kept text ends with *… (Copy
+   value copies all 4,235 characters)*, with the take's own count; hover over
+   the value to read more of it.
+3. Click the **Copy** button on the value, or right-click it and choose
+   **Copy value**. The clipboard holds the exact text the run used, line breaks
+   included.
+
+- Searching the gallery (for example `field:lyrics=rain`) reads only the first
+  512 characters.
+- A text the take couldn't keep (over 24 KB, or with an invalid character) and
+  every take made before this was added keep only the preview: **Copy** is
+  greyed out and reads *Full value is only in the run's source prompt*.
+- A PNG sequence keeps the whole text on its first frame only.
+- A long row-list setting keeps only its preview, and its **Copy** is greyed
+  out the same way. On takes made before this was added, **Copy** copies the
+  shortened text. The native LoRA loaders' rows are always kept whole.
+
 ## Modes
 
 A workflow can group whole setups into **Modes**. Each row of the **Modes**
@@ -89,6 +111,14 @@ https://github.com/user-attachments/assets/d63c740f-1e94-44c9-806f-bcbe36ec2516
 - Two outlined buttons with *“A” and “B” both match* need a fix in **Manage**: see
   [Fix a warning in Manage](#fix-a-warning-in-manage).
 - The table is hidden while you search, and while **Manage** is open.
+
+Each take also records the choice every row was on when the run was queued.
+In **Assets**, click the take and look for **Modes at run** in its details: a
+row reads its choice's name, **Custom**, or *Matches A, B* when two choices
+matched. *Modes weren't recorded for this run* means the run started without
+Sonder's notice of it, for example from the ComfyUI API. To find takes by
+Mode, search the gallery for the row and its choice, for example
+`field:task=edit`.
 
 To make Modes, see [Make Modes](#make-modes).
 

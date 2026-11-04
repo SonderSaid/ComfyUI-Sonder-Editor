@@ -46,6 +46,21 @@ export const inputCss = `width:100%;min-width:0;box-sizing:border-box;border:1px
 export const numberInputCss = cards => inputCss + (cards ? "" : "width:76px;flex:0 0 auto;text-align:right;");
 export const seedInputCss = inputCss + "flex:1 1 auto;";
 export const modeSelectCss = inputCss + "width:96px;flex:0 0 auto;cursor:pointer;";
+
+// A seed's field and its ▴/▾ steps form one group (Hardening Phase 10, I5). In
+// Cards the group takes the card's whole width, like every other card's field,
+// and the mode select sits under it, also full width. A fixed 96 px select beside
+// the field used to leave it about 20 px in a 160 px card, and even a select that
+// wrapped only when narrow made the field shrink as the card grew (81 px in a
+// 221 px card against 121 px in a 161 px one, measured live). In Rows the group
+// is transparent, so the Phase 5 layout is unchanged.
+export const seedFieldCss = cards => (cards
+    ? `display:flex;align-items:stretch;gap:${SPACE.s1}px;flex:1 1 100%;min-width:0;`
+    : "display:contents;");
+export const seedControlCss = cards => (cards ? `flex-wrap:wrap;row-gap:${SPACE.s1}px;` : "");
+export const seedModeSelectCss = cards => (cards
+    ? inputCss + "flex:1 1 100%;cursor:pointer;"
+    : modeSelectCss);
 // The seed's up and down buttons: a narrow pair stacked beside its field.
 export const seedStepsCss = "display:inline-flex;flex-direction:column;flex:0 0 auto;align-self:stretch;";
 export const seedStepCss = `flex:1 1 0;min-height:0;width:18px;padding:0;border:1px solid ${COLORS.border};`

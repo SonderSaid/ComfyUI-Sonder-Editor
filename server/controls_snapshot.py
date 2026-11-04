@@ -42,7 +42,7 @@ import json
 import math
 from typing import Any, Callable
 
-from . import control_descriptors, control_manifest, control_rows, prompt_graph
+from . import control_descriptors, control_manifest, control_rows, json_text, prompt_graph
 from .lora_metadata import NATIVE_LORA_STACKS, NATIVE_LORA_DISPLAY, captured_native_lora_rows
 
 SECTION_LABEL = "Controls at run"
@@ -58,6 +58,19 @@ MAX_TARGETS = 8
 MAX_LOCAL_BINDINGS = 64
 TEXT_VALUE_LIMIT = 512
 TRUNCATED_MARKER = "… [truncated, full value in the source prompt]"
+
+# The complete text of each STRING value the preview capped (Hardening Phase 10).
+# It is kept beside the section, in the asset's own cold provenance under
+# ``generation_params[FULL_TEXT_KEY]``: never inside the section, so it stays
+# out of search reads, the 16 KiB section cap, the clips' inline copies
+# (``project_storage.take_copy_params``) and the file's embedded metadata.
+# Stored previews keep TRUNCATED_MARKER, which older packs detect.
+FULL_TEXT_KEY = "controls_text"
+FULL_TEXT_VERSION = 1
+# One budget per asset, in compact-JSON UTF-8 bytes (escapes counted), filled
+# in the section's Control order. Measured in Phase 10 I1: every load and save
+# reads every cold component, and 64 KiB per asset failed the edit criterion.
+FULL_TEXT_BUDGET = 24 * 1024
 
 
 # ── Sonder App delta (written by sdk_runner, read here) ──────────────────────
@@ -288,11 +301,34 @@ def _recorded_value(descriptor: dict, prompt: dict, prepared: Any = None) -> Any
         return str(int(value)) if math.isfinite(value) and value.is_integer() else str(value)
     if isinstance(value, float) and not math.isfinite(value):
         return None
-    if isinstance(value, str) and len(value) > TEXT_VALUE_LIMIT:
-        return value[:TEXT_VALUE_LIMIT] + TRUNCATED_MARKER
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, str):
+        # A lone surrogate can't be stored as UTF-8: the preview shows U+FFFD.
+        value = json_text.scrub(value)
+        return value[:TEXT_VALUE_LIMIT] + TRUNCATED_MARKER if len(value) > TEXT_VALUE_LIMIT else value
+    if isinstance(value, (int, float, bool)) or value is None:
         return value
     return None  # describe never reports a container as ``ok``
+
+
+def _full_text(descriptor: dict, prompt: dict) -> str | None:
+    """The exact executed string when the preview caps it, else ``None``.
+    Row lists stay previews only (their text is a summary, not a literal)."""
+    if descriptor.get("kind") == control_rows.ROWS_KIND:
+        return None
+    targets = descriptor.get("targets") or []
+    first = targets[0] if targets else {}
+    value = prompt_graph.node_inputs(prompt, first.get("path")).get(first.get("input"))
+    return value if isinstance(value, str) and len(value) > TEXT_VALUE_LIMIT else None
+
+
+def _row_text_capped(descriptor: dict, recorded: Any) -> bool:
+    """A row list's text preview was cut by ``control_rows.detail`` (with ``…``,
+    which Copy can't tell from a value that ends with one)."""
+    if descriptor.get("kind") != control_rows.ROWS_KIND or not isinstance(recorded, str):
+        return False
+    if recorded.endswith(TRUNCATED_MARKER):
+        return False  # the Controls marker already says so
+    return len(control_rows.detail(descriptor.get("value"), descriptor, 1 << 62)) > TEXT_VALUE_LIMIT
 
 
 def _sort_key(entry: dict, positions: dict) -> tuple:
@@ -362,7 +398,7 @@ def _record(entry: dict, field: str) -> dict:
         record["origin"] = entry["origin"]
     if entry["advanced"]:
         record["advanced"] = True
-    for name in ("seed_mode", "targets_truncated", "display_type", "rows_omitted"):
+    for name in ("seed_mode", "targets_truncated", "display_type", "rows_omitted", "capped"):
         if name in entry:
             record[name] = entry[name]
     return record
@@ -402,23 +438,83 @@ def controls_snapshot(
     ``consumer_keys`` are the prompt keys whose upstream decides relevance: the
     Save Video node, or a Save Bridge plus the nodes consuming its outputs.
     ``tracked`` is the collector chain the section joins, for ``supplied``.
+
+    Kept for the section-only callers (the snapshot tests and the golden
+    characterization). Expiry: remove once nothing calls it, since the save
+    path uses ``controls_capture``.
     """
-    if not isinstance(prompt, dict):
+    return controls_capture(prompt, consumer_keys, tracked=tracked, describe=describe,
+                            class_lookup=class_lookup)[0]
+
+
+def full_text_record(kept: list[dict]) -> dict | None:
+    """``generation_params[FULL_TEXT_KEY]`` for the Controls the section kept.
+
+    First fit in Control order under one per-asset budget: a value too large
+    for what is left is skipped, and a later smaller one may still fit. Each
+    capped value not kept (budget, invalid text) counts in ``omitted``.
+    """
+    values, used, omitted = {}, 0, 0
+    for entry in kept:
+        if "full" not in entry:
+            continue
+        text = entry["full"]
+        size = len(json.dumps(text, ensure_ascii=False).encode("utf-8")) if isinstance(text, str) else None
+        if size is None or used + size > FULL_TEXT_BUDGET:
+            omitted += 1
+            continue
+        values[entry["binding_id"]] = text
+        used += size
+    if not values and not omitted:
         return None
+    record = {"v": FULL_TEXT_VERSION, "values": values}
+    if omitted:
+        record["omitted"] = omitted
+    return record
+
+
+
+def controls_full_text(params: Any, binding_id: Any) -> str | None:
+    """The kept full text of one Control on an asset, or ``None``.
+
+    The one reader of ``FULL_TEXT_KEY`` (JS mirror: ``gallery_copy_values.js``
+    ``controlsFullText``). A later store-once text table can turn a value into a
+    reference here without any caller changing (roadmap, Storage review).
+    Today only tests call it; the gallery reads through the JS mirror. Expiry:
+    remove if the text-interning design ends without a server reader.
+    """
+    record = params.get(FULL_TEXT_KEY) if isinstance(params, dict) else None
+    values = record.get("values") if isinstance(record, dict) else None
+    value = values.get(binding_id) if isinstance(values, dict) and isinstance(binding_id, str) else None
+    return value if isinstance(value, str) else None
+
+def controls_capture(
+    prompt: Any,
+    consumer_keys: Any,
+    *,
+    tracked: Any = None,
+    describe: Callable[..., dict] | None = None,
+    class_lookup: Callable[[str], Any] | None = None,
+) -> tuple[dict | None, dict | None]:
+    """``(section, full_text)``: the Controls section, and the complete text of
+    the values its previews capped (``FULL_TEXT_KEY``'s value, or ``None``).
+    The section is exactly ``controls_snapshot``'s."""
+    if not isinstance(prompt, dict):
+        return None, None
     delta = read_sdk_delta(prompt)
     relay = control_manifest.find_relay(prompt)
     if relay["status"] == "error" or (relay["status"] == "none" and not delta["local"]):
-        return None
+        return None, None
     reachable = prompt_graph.upstream_set(prompt, consumer_keys)
     if not reachable:
-        return None
+        return None, None
     describe = describe or control_descriptors.describe_bindings
     kwargs = {"local": delta["local"]}
     if class_lookup is not None:
         kwargs["class_lookup"] = class_lookup
     view = describe(prompt, **kwargs)
     if (view.get("relay") or {}).get("status") == "error":
-        return None
+        return None, None
     entries = []
     for descriptor in view.get("bindings", []):
         binding_id = descriptor.get("binding_id")
@@ -459,12 +555,23 @@ def controls_snapshot(
         mode = delta["seed_modes"].get(binding_id, descriptor.get("seed_mode"))
         if descriptor.get("kind") == "SEED" and mode in control_manifest.SEED_MODES:
             entry["seed_mode"] = mode
+        if _row_text_capped(descriptor, entry["value"]):
+            entry["capped"] = True
+        # Labels, groups and paths come from an untrusted manifest and prompt:
+        # one lone surrogate anywhere must not drop the section.
+        entry = json_text.scrub(entry)
+        full = _full_text(descriptor, prompt)
+        if full is not None:
+            # A value that isn't valid Unicode is never kept in full.
+            entry["full"] = None if json_text.has_lone_surrogate(full) else full
         entries.append(entry)
     if not entries:
-        return None
+        return None, None
     # The panel's group order (one authority), over the groups this run used.
     # The order itself is not recorded: it is presentation, not the run.
-    order = control_descriptors.group_order({"groups": view.get("groups"), "bindings": entries, "notes": []})
+    # Group names scrubbed as the entries' are, so a name with a lone surrogate keeps its place.
+    order = control_descriptors.group_order({"groups": json_text.scrub(view.get("groups")), "bindings": entries,
+                                             "notes": []})
     positions = {name: index for index, name in enumerate(order)}
     entries.sort(key=lambda entry: _sort_key(entry, positions))
     truncated = max(0, len(entries) - MAX_BINDINGS)
@@ -485,4 +592,75 @@ def controls_snapshot(
         kept = kept[:-cut]
         truncated += cut
         section = _assemble(kept, tracked, truncated)
-    return section if _encoded_size(section) <= MAX_SECTION_BYTES else None
+    if _encoded_size(section) > MAX_SECTION_BYTES:
+        return None, None
+    # Only the Controls the section kept: a pruned one has no preview to complete.
+    return section, full_text_record(kept)
+
+
+# ── Modes at run (Hardening Phase 10, I4) ───────────────────────────────────
+# Which choice each Mode category was on when the run was queued: the run
+# notification's own record (``run_feedback.modes_for_save``), never derived
+# again here. Asset-only, like FULL_TEXT_KEY: ``take_copy_params`` keeps it out
+# of clip copies, and it is added after the file's embedded metadata is built.
+
+MODES_SECTION_LABEL = "Modes at run"
+MODES_DISPLAY_TYPE = "modes"
+MAX_MODES_SECTION_BYTES = 4 * 1024
+MODES_NOT_RECORDED = "not_recorded"
+_MODE_STATUSES = frozenset({"selected", "ambiguous", "unavailable", "custom"})
+
+
+def declares_categories(prompt: Any) -> bool:
+    """The executed prompt's Relay manifest has at least one readable category."""
+    relay = control_manifest.find_relay(prompt)
+    if relay["status"] != "ok":
+        return False
+    return bool(control_manifest.read_preset_categories((relay["manifest"] or {}).get("preset_categories")))
+
+
+def _mode_text(row: dict) -> str:
+    status = row.get("status")
+    if status == "selected":
+        return str(row.get("choice") or "")
+    if status == "ambiguous":
+        names = [str(name) for name in row.get("matches") or [] if isinstance(name, str)]
+        return "Matches " + ", ".join(names) if names else "Ambiguous"
+    return "Unavailable" if status == "unavailable" else "Custom"
+
+
+def modes_section(prompt: Any, rows: Any, *, declared: bool | None = None) -> dict | None:
+    """The Modes at run section for a save, or ``None``.
+
+    ``rows`` is the run's record (``modes_receipt`` rows), ``[]`` for a
+    workflow without categories, or ``None`` when no record came. With no record
+    and a manifest that declares categories, the section says so
+    (``status: not_recorded``); otherwise nothing is written. ``declared``
+    overrides that check when the prompt is no longer at hand (Save Bridge).
+    """
+    if rows is None:
+        if not (declares_categories(prompt) if declared is None else declared):
+            return None
+        return {"label": MODES_SECTION_LABEL, "display_type": MODES_DISPLAY_TYPE, "fields": {}, "modes": [],
+                "status": MODES_NOT_RECORDED}
+    if not isinstance(rows, list):
+        return None
+    usable = [row for row in rows if isinstance(row, dict) and row.get("status") in _MODE_STATUSES]
+    if not usable:
+        return None
+    used: set = set()
+    fields, modes = {}, []
+    for row in usable:
+        row = json_text.scrub(row)
+        category_id = str(row.get("id") or "")
+        name = _field_name(str(row.get("name") or ""), category_id, used)
+        fields[name] = _mode_text(row)
+        modes.append({"id": category_id, "field": name, "status": row["status"]})
+    section = {"label": MODES_SECTION_LABEL, "display_type": MODES_DISPLAY_TYPE, "fields": fields, "modes": modes}
+    truncated = 0
+    while _encoded_size(section) > MAX_MODES_SECTION_BYTES and modes:
+        last = modes.pop()
+        fields.pop(last["field"], None)
+        truncated += 1
+        section["truncated"] = truncated
+    return section if modes else None

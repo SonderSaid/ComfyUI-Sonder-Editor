@@ -9,6 +9,7 @@ import stat
 import uuid
 
 from .atomic_io import atomic_replace
+from .json_text import dumps_utf8
 from .path_security import project_state_path, project_state_root
 
 FROZEN_JOB_FIELDS = (
@@ -22,6 +23,36 @@ INLINE_GENERATION_PARAM_KEYS = frozenset((
     "save_preset", "codec", "pix_fmt", "color_managed", "color_space", "color_range",
     "fps", "selection_start", "scene_id",
 ))
+
+# Provenance a generated asset keeps alone, in its cold component (Hardening
+# Phase 10): never in a clip's inline `generation_params`/`take_metadata`.
+# Mirrors controls_snapshot.FULL_TEXT_KEY and MODES_DISPLAY_TYPE (parity-tested).
+ASSET_ONLY_PARAM_KEYS = frozenset(("controls_text",))
+ASSET_ONLY_SECTION_TYPES = frozenset(("modes",))
+
+
+def take_copy_params(params):
+    """``params`` without the asset-only provenance, for a clip's inline copies.
+
+    Returns new containers where something is removed and never changes its
+    input: a take's asset and its clip share nested objects through shallow
+    copies, and the asset must keep both.
+    """
+    if not isinstance(params, dict):
+        return params
+    out = params
+    if any(key in params for key in ASSET_ONLY_PARAM_KEYS):
+        out = {key: value for key, value in params.items() if key not in ASSET_ONLY_PARAM_KEYS}
+    export = out.get("editor_export")
+    tracked = export.get("tracked_metadata") if isinstance(export, dict) else None
+    if isinstance(tracked, list) and any(isinstance(section, dict)
+                                         and section.get("display_type") in ASSET_ONLY_SECTION_TYPES
+                                         for section in tracked):
+        out = dict(out) if out is params else out
+        out["editor_export"] = {**export, "tracked_metadata": [
+            section for section in tracked
+            if not (isinstance(section, dict) and section.get("display_type") in ASSET_ONLY_SECTION_TYPES)]}
+    return out
 
 # Storage formats this version reads, and the one a split save writes. A project
 # without a ``storage`` block is the legacy single-document layout (reported as 0).
@@ -111,8 +142,8 @@ def generation_summary(params):
 
 
 def provenance_revision(params, summary, descriptor=None):
-    return hashlib.sha256(json.dumps([descriptor["sha256"] if descriptor else params, summary],
-        sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+    return hashlib.sha256(dumps_utf8([descriptor["sha256"] if descriptor else params, summary],
+        sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def attach_asset_descriptors(project, data):
@@ -358,6 +389,7 @@ def _publish_component_bytes(project_dir, name, payload, *, format_version):
 def publish_component(project_dir, name, value, *, format_version=2):
     # Legacy default supports explicit old-format fixtures/tools. Save assembly
     # always supplies the document format; remove with the legacy reader.
+    # Strict, like the project writer: durable data never holds a lone surrogate.
     payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return _publish_component_bytes(project_dir, name, payload, format_version=format_version)
 

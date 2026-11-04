@@ -56,7 +56,8 @@ def _run(script):
 
 
 def _imports():
-    return (f"import {{ CONTROLS_TRUNCATED_MARKER, resolveTrackedFieldCopy }} from {json.dumps(COPY_MODULE.as_uri())};\n"
+    return (f"import {{ CONTROLS_TRUNCATED_MARKER, resolveTrackedFieldCopy, trackedFieldDisplayText }} "
+            f"from {json.dumps(COPY_MODULE.as_uri())};\n"
             f"import {{ renderTrackedSectionBody, controlsSuppliedLookup }} "
             f"from {json.dumps(RENDERERS.as_uri())};\n")
 

@@ -523,3 +523,46 @@ registerTrackedRenderer("controls", {
     renderField: renderControlField,
     matchField: matchControlsField,
 });
+
+// ---------- Modes at run (server/controls_snapshot.py modes_section) ----------
+//
+// Which choice each Mode category was on when the run was queued: the run
+// notification's own record, kept on the asset (Hardening Phase 10). `fields`
+// maps each category to its choice, Custom, "Matches A, B" or Unavailable, so
+// search, pins and Copy stay generic; `modes` holds each row's status. An older
+// pack draws it as a plain field grid.
+
+const MODE_STATUS_TEXT = {
+    selected: "",
+    custom: "Changed after choosing, or set by hand: matches no choice.",
+    ambiguous: "Matched more than one choice.",
+    unavailable: "No choice could be used.",
+};
+
+function renderModesBody(entry, ctx) {
+    const { style, CHROME } = ctx;
+    const wrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;min-width:0;`);
+    const help = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;line-height:1.4;`);
+    if (entry?.status === "not_recorded") {
+        help.textContent = "Modes weren't recorded for this run.";
+        wrap.appendChild(help);
+        return { dom: wrap, consumedFields: [] };
+    }
+    const truncated = Number.isSafeInteger(entry?.truncated) && entry.truncated > 0 ? entry.truncated : 0;
+    help.textContent = "The Mode choices this run was queued with."
+        + (truncated ? ` ${truncated} more categor${truncated === 1 ? "y was" : "ies were"} not recorded.` : "");
+    wrap.appendChild(help);
+    const fields = entry?.fields && typeof entry.fields === "object" ? entry.fields : {};
+    const keys = Object.keys(fields);
+    if (!keys.length || typeof ctx.renderFieldGrid !== "function") return { dom: wrap, consumedFields: [] };
+    const statusByField = new Map((Array.isArray(entry?.modes) ? entry.modes : [])
+        .filter((row) => row && typeof row.field === "string").map((row) => [row.field, row.status]));
+    const grid = ctx.renderFieldGrid(entry, keys, (cell, field) => {
+        const note = MODE_STATUS_TEXT[statusByField.get(field)];
+        if (note) cell.title = [cell.title, note].filter(Boolean).join("\n");
+    });
+    if (grid) wrap.appendChild(grid);
+    return { dom: wrap, consumedFields: keys, pinnedFieldsGeneric: true };
+}
+
+registerTrackedRenderer("modes", { render: renderModesBody });

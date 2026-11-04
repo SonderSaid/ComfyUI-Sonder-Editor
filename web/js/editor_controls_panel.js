@@ -1153,7 +1153,11 @@ export function mountControlsPanel(container, host) {
                 row.seedUp = seedStepButton(row, 1);
                 row.seedDown = seedStepButton(row, -1);
                 row.seedSteps.append(row.seedUp, row.seedDown);
-                row.control.append(row.seedSteps);
+                // The field and its steps stay together; styleRow lays the pair
+                // out per Rows or Cards (`S.seedFieldCss`).
+                row.seedField = make("span");
+                row.seedField.append(row.input, row.seedSteps);
+                row.control.append(row.seedField);
                 row.input.addEventListener("input", () => {
                     cancelSeedStep(row);
                     paintSeedSteps(row);
@@ -1222,7 +1226,10 @@ export function mountControlsPanel(container, host) {
         // sidebar (the number shrank to a sliver): its label goes above them.
         row.line.style.cssText = S.lineCss({ cards: isCards, stacked: stacked || spec.kind === "SEED", inline });
         row.label.style.cssText = S.labelCss(isCards);
-        row.control.style.cssText = S.controlCss({ cards: isCards, alignEnd: true });
+        row.control.style.cssText = S.controlCss({ cards: isCards, alignEnd: true })
+            + (row.seedField ? S.seedControlCss(isCards) : "");
+        if (row.seedField) row.seedField.style.cssText = S.seedFieldCss(isCards);
+        if (row.mode) row.mode.style.cssText = S.seedModeSelectCss(isCards);
         if (!row.input) return;
         const draggedHeight = row.input.style.height;
         if (spec.kind === "BOOLEAN") row.input.style.cssText = "margin:0;cursor:pointer;";

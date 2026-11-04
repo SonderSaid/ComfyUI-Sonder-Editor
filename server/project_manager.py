@@ -325,6 +325,9 @@ def save_project(
         # One authoritative encode owns both persistence and compatibility
         # shadow normalization. Pretty printing is deliberately retained; the
         # incidents this path protects were diagnosed from readable files.
+        # Strict on purpose: a lone surrogate must fail here rather than reach
+        # disk, where the project's text routes could no longer encode it.
+        # Save nodes scrub what they record (Hardening Phase 10).
         serialized = json.dumps(data, indent=2, ensure_ascii=False)
         tmp_file = f"{project_file}.{uuid.uuid4().hex}.tmp"
         try:

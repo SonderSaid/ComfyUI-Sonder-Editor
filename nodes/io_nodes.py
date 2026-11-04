@@ -48,7 +48,8 @@ from ..server.project_commit import (
 )
 from .metadata_collector import TRACKED_METADATA_CONTEXT_KEY, collector_chain_for_consumer
 from .prompt_once import run_once_per_prompt
-from ..server.controls_snapshot import controls_snapshot
+from ..server.controls_snapshot import FULL_TEXT_KEY, MODES_DISPLAY_TYPE, controls_capture, modes_section
+from ..server.json_text import dumps_utf8, scrub as json_text_scrub
 from ..server.prompt_graph import downstream_set
 from ..server.color_correction import (
     COLOR_DRIFT_METADATA_KEY,
@@ -224,7 +225,9 @@ def _json_clone(value):
 
 
 def _json_dumps_compact(value) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    # UTF-8-safe: a lone surrogate in the prompt used to fail the whole save at
+    # the embedded-metadata write (Hardening Phase 10).
+    return dumps_utf8(value, separators=(",", ":"), default=str)
 
 
 def _public_execution_context(context: dict) -> dict:
@@ -243,7 +246,10 @@ def _produced_by_metadata() -> dict:
     }
 
 
-def _tracked_metadata_from_context(context: dict, prompt=None, consumer_unique_id=None, controls_consumers=None) -> list:
+def _tracked_metadata_from_context(context: dict, prompt=None, consumer_unique_id=None, controls_consumers=None,
+                                   asset_only=None) -> list:
+    """The collector chain plus Controls at run. ``asset_only``, a dict, receives
+    what belongs on the asset alone (``FULL_TEXT_KEY``), never in this list."""
     chain = collector_chain_for_consumer(context, prompt, consumer_unique_id)
     tracked = [_json_clone(item) for item in chain if isinstance(item, dict)]
     consumers = controls_consumers if controls_consumers is not None else (
@@ -252,14 +258,85 @@ def _tracked_metadata_from_context(context: dict, prompt=None, consumer_unique_i
         # A save created by node expansion has a UNIQUE_ID outside the submitted prompt.
         logger.debug("Controls provenance skipped: consumer %s is not in the prompt", consumers[0])
     try:
-        snapshot = controls_snapshot(prompt, consumers, tracked=tracked)
+        snapshot, full_text = controls_capture(prompt, consumers, tracked=tracked)
     except Exception:
         # Provenance must never fail a save.
         logger.warning("Could not record the run's Controls in provenance", exc_info=True)
-        snapshot = None
+        snapshot, full_text = None, None
     if snapshot is not None:
         tracked.append(snapshot)
+    if full_text is not None and isinstance(asset_only, dict):
+        asset_only[FULL_TEXT_KEY] = full_text
     return tracked
+
+
+def _modes_section_for_save(prompt):
+    """The Modes at run section for this run's saved assets, or ``None``.
+    Provenance must never fail a save."""
+    try:
+        from ..server import run_feedback
+        from ..server.controls_snapshot import declares_categories
+        # Wait for a record only when the workflow declares categories: most
+        # runs have none. A Sonder App's own categories are attached at bind,
+        # so they are read without waiting either way.
+        declared = declares_categories(prompt)
+        rows = run_feedback.modes_for_save(prompt, run_feedback.MODES_SAVE_WAIT_SEC if declared else 0)
+        return modes_section(prompt, rows, declared=declared)
+    except Exception:
+        logger.warning("Could not record the run's Modes in provenance", exc_info=True)
+        return None
+
+
+def _bridge_modes_run(prompt) -> dict:
+    """What a Save Bridge needs to record Modes at finalization: the run's id
+    and whether its manifest declares categories (the prompt is gone by then)."""
+    try:
+        from ..server import run_feedback
+        from ..server.controls_snapshot import declares_categories
+        prompt_id = run_feedback.prompt_id_for(prompt)
+        # The record as it stands now is the fallback: by a late (watcher)
+        # finalization the run's record may already be pruned.
+        return {"prompt_id": prompt_id, "declared": declares_categories(prompt),
+                "rows": run_feedback.modes_of(prompt_id) if prompt_id else None}
+    except Exception:
+        logger.warning("Could not note the run for its Modes provenance", exc_info=True)
+        return {"prompt_id": "", "declared": False, "rows": None}
+
+
+def _bridge_modes_section(entry: dict):
+    run = entry.get("modes_run") if isinstance(entry.get("modes_run"), dict) else {}
+    try:
+        from ..server import run_feedback
+        rows = run_feedback.modes_of(run.get("prompt_id")) if run.get("prompt_id") else None
+        if rows is None and isinstance(run.get("rows"), list):
+            rows = run["rows"]
+        return modes_section(None, rows, declared=run.get("declared") is True)
+    except Exception:
+        logger.warning("Could not record the run's Modes in provenance", exc_info=True)
+        return None
+
+
+def _bridge_asset_params(generation_params: dict, modes_at_run, *, keep_full_text: bool) -> dict:
+    """One registered Bridge file's params: Modes at run added, the Controls'
+    full text kept only on the entry's first file (as a PNG sequence keeps it on
+    frame 1: each file is its own cold component), and scrubbed so a lone
+    surrogate in the run's text never reaches durable data."""
+    params = dict(generation_params)
+    if isinstance(params.get("editor_export"), dict):
+        params["editor_export"] = _with_modes_at_run(params["editor_export"], modes_at_run)
+    if not keep_full_text:
+        params.pop(FULL_TEXT_KEY, None)
+    return json_text_scrub(params)
+
+
+def _with_modes_at_run(editor_export: dict, section) -> dict:
+    """A copy of ``editor_export`` with the Modes section after its other
+    sections; the input (shared with the file's metadata) is never changed."""
+    if not section or not isinstance(editor_export, dict):
+        return editor_export
+    export = dict(editor_export)
+    export["tracked_metadata"] = [*(export.get("tracked_metadata") or []), section]
+    return export
 
 
 def _workflow_from_extra_pnginfo(extra_pnginfo):
@@ -272,13 +349,18 @@ def _workflow_digest(workflow) -> str:
     if workflow is None:
         return ""
     try:
-        payload = json.dumps(workflow, ensure_ascii=False, sort_keys=True, default=str)
+        # UTF-8-safe: the canvas workflow repeats the prompt's text, so a lone
+        # surrogate there used to fail the save here (Hardening Phase 10).
+        # Every other workflow hashes to the same digest as before.
+        payload = dumps_utf8(workflow, sort_keys=True, default=str)
     except Exception:
-        payload = str(workflow)
+        payload = json_text_scrub(str(workflow))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _compact_editor_export(project, context: dict, *, has_embedded_workflow=False, workflow=None, prompt=None, consumer_unique_id=None, controls_consumers=None) -> dict:
+def _compact_editor_export(project, context: dict, *, has_embedded_workflow=False, workflow=None, prompt=None, consumer_unique_id=None, controls_consumers=None, asset_only=None) -> dict:
+    """``asset_only``, a dict, receives params that belong on the asset alone
+    (the Controls' full text), never in this export, the file or clip copies."""
     export = {
         "schema_version": EDITOR_EXPORT_SCHEMA_VERSION,
         # Additive fields stay at schema 1.0; bump only for shape-breaking changes.
@@ -287,7 +369,8 @@ def _compact_editor_export(project, context: dict, *, has_embedded_workflow=Fals
         "project_name": getattr(project, "name", ""),
         "scene_id": str(context.get("scene_id") or ""),
         "scene_name": str(context.get("scene_name") or ""),
-        "tracked_metadata": _tracked_metadata_from_context(context, prompt, consumer_unique_id, controls_consumers),
+        "tracked_metadata": _tracked_metadata_from_context(context, prompt, consumer_unique_id, controls_consumers,
+                                                           asset_only=asset_only),
         "has_embedded_workflow": bool(has_embedded_workflow),
     }
     digest = _workflow_digest(workflow) if has_embedded_workflow else ""
@@ -374,7 +457,8 @@ def _bridge_generation_params(project, context: dict, prompt=None, consumer_uniq
     scope = run_scope.for_prompt(prompt)
     downstream = sorted(key for key in downstream_set(prompt, bridge_key) if scope is None or key in scope)
     controls_consumers = [bridge_key, *downstream] if bridge_key else []
-    return {
+    asset_only = {}
+    params = {
         "scene_id": str((context or {}).get("scene_id") or ""),
         "scene_name": str((context or {}).get("scene_name") or ""),
         "editor_export": _compact_editor_export(
@@ -385,8 +469,12 @@ def _bridge_generation_params(project, context: dict, prompt=None, consumer_uniq
             prompt=prompt,
             consumer_unique_id=consumer_unique_id,
             controls_consumers=controls_consumers,
+            asset_only=asset_only,
         ),
     }
+    # Each registered file is its own asset, so each keeps the full text.
+    params.update(asset_only)
+    return params
 
 
 def _generation_params_with_detected_workflow(generation_params: dict, file_path: str) -> dict:
@@ -968,10 +1056,19 @@ def _save_custom_png_sequence(
         write_png(filepath, frame, compression=compression, metadata=file_metadata if idx == 1 else None)
         frame_metadata = dict(metadata)
         editor_export = frame_metadata.get("editor_export")
+        if idx != 1:
+            # Frame 1 alone keeps the Controls' full text and Modes at run: each
+            # frame is its own cold component, read on every load and save.
+            frame_metadata.pop(FULL_TEXT_KEY, None)
         if idx != 1 and isinstance(editor_export, dict):
             editor_export = dict(editor_export)
             editor_export["has_embedded_workflow"] = False
             editor_export.pop("workflow_sha256", None)
+            tracked = editor_export.get("tracked_metadata")
+            if isinstance(tracked, list):
+                editor_export["tracked_metadata"] = [
+                    section for section in tracked
+                    if not (isinstance(section, dict) and section.get("display_type") == MODES_DISPLAY_TYPE)]
             frame_metadata["editor_export"] = editor_export
         asset = Asset(
             name=filename,
@@ -1909,6 +2006,8 @@ def _finalize_bridge_entry(entry: dict, outcome: str = "") -> list[Asset]:
         })
 
     completed_moves = []
+    modes_at_run = _bridge_modes_section(entry)
+    full_text_kept = False
     for pending in pending_moves:
         moved_path = _publish_bridge_output_file(pending)
         if not moved_path:
@@ -1935,6 +2034,8 @@ def _finalize_bridge_entry(entry: dict, outcome: str = "") -> list[Asset]:
             dict(entry.get("generation_params") or {}),
             moved_path,
         )
+        generation_params = _bridge_asset_params(generation_params, modes_at_run, keep_full_text=not full_text_kept)
+        full_text_kept = full_text_kept or FULL_TEXT_KEY in generation_params
         asset = Asset(
             name=pending["final_name"],
             asset_type=asset_type,
@@ -2349,6 +2450,10 @@ class SonderSaveVideo:
         workflow = _workflow_from_extra_pnginfo(extra_pnginfo)
         embed_metadata_enabled = bool(embed_metadata)
 
+        # Params for the asset alone (the Controls' full text): not in the
+        # export, so never in the file's embedded metadata or clip copies.
+        asset_only = {}
+
         def build_asset_editor_export() -> dict:
             editor_export = _compact_editor_export(
                 project,
@@ -2357,6 +2462,7 @@ class SonderSaveVideo:
                 workflow=workflow,
                 prompt=prompt,
                 consumer_unique_id=unique_id,
+                asset_only=asset_only,
             )
             editor_export.update({
                 "fps": fps,
@@ -2376,9 +2482,15 @@ class SonderSaveVideo:
         if custom_spec and custom_spec["output_kind"] == CUSTOM_OUTPUT_KIND_PNG_SEQUENCE:
             encode_metadata = metadata_for_save_preset(preset_id, custom_options)
             asset_metadata = dict(encode_metadata)
-            asset_metadata["editor_export"] = asset_editor_export
             asset_metadata[COLOR_DRIFT_METADATA_KEY] = drift_record
             _note_run_stage(prompt, unique_id, "saving")
+            # Read as late as this path allows (it has no encode before the
+            # frames are written): the run's Modes record arrives with its
+            # registration, after ComfyUI's queue reply.
+            asset_metadata["editor_export"] = _with_modes_at_run(asset_editor_export, _modes_section_for_save(prompt))
+            asset_metadata.update(asset_only)
+            # A lone surrogate in the run's text never reaches durable data.
+            asset_metadata = json_text_scrub(asset_metadata)
             output_path, png_assets = _save_custom_png_sequence(
                 project,
                 rgb_frames,
@@ -2489,8 +2601,16 @@ class SonderSaveVideo:
         has_audio = bool(encode_metadata.get("has_audio", has_audio))
         audio_alerts.extend(encode_metadata.get("alerts") or [])
         asset_generation_params = dict(encode_metadata)
-        asset_generation_params["editor_export"] = asset_editor_export
+        # Modes are read after the encode: the run's record arrives with its
+        # registration, after ComfyUI's queue reply. Like the full text they are
+        # the asset's alone; `take_copy_params` keeps both out of clip copies.
+        asset_generation_params["editor_export"] = _with_modes_at_run(asset_editor_export,
+                                                                      _modes_section_for_save(prompt))
         asset_generation_params[COLOR_DRIFT_METADATA_KEY] = drift_record
+        asset_generation_params.update(asset_only)
+        # A lone surrogate in the run's text (a collector field, a label) never
+        # reaches durable data: the project writers stay strict (Phase 10).
+        asset_generation_params = json_text_scrub(asset_generation_params)
 
         # Auto-register as a project asset
         total_frames = len(rgb_frames)
@@ -2534,6 +2654,8 @@ class SonderSaveVideo:
                     "requested_mask_pre_offset": ctx.get("requested_mask_pre_offset", ctx.get("mask_pre_offset", 0)),
                     "requested_mask_post_offset": ctx.get("requested_mask_post_offset", ctx.get("mask_post_offset", 0)),
                 }
+                # The execution context joins here: scrubbed like the asset's params.
+                take_generation_params = json_text_scrub(take_generation_params)
                 asset.generation_params = dict(take_generation_params)
 
                 geometry = calculate_take_placement(take_generation_params, total_frames)
@@ -2760,6 +2882,9 @@ class SonderSaveBridge:
             "queue_job_id": str(execution_context.get("queue_job_id") or ""),
             "prompt_text": "",
             "generation_params": generation_params,
+            # Modes at run are read at finalization, after the run's nodes:
+            # the Bridge usually executes before the run's record arrives.
+            "modes_run": _bridge_modes_run(prompt),
             "naming_stem": naming_stem,
             "base_modified_at": str(execution_context.get("base_modified_at") or ""),
             "guide_bleed_check": _guide_bleed_check_from_context(

@@ -31,7 +31,10 @@ def _matcher_source():
     fmt = source.split("function formatGenerationValue(value) {", 1)[1]
     fmt = "function formatGenerationValue(value) {" + fmt.split("\nfunction ", 1)[0]
     body = source.split("const trackedEntriesMemo = new WeakMap();", 1)[1].split("function canOpenWorkflowFor", 1)[0]
-    return fmt + "\nconst trackedEntriesMemo = new WeakMap();" + body
+    # `trackedEntriesFromParams` registers Controls full text (Hardening Phase 10).
+    copy_values = (ROOT / "web" / "js" / "gallery_copy_values.js").as_uri()
+    return (f"import {{ rememberControlsFullText }} from {json.dumps(copy_values)};\n"
+            + fmt + "\nconst trackedEntriesMemo = new WeakMap();" + body)
 
 
 def test_matchers_keep_the_old_entry_filter_blob_and_field_rules():

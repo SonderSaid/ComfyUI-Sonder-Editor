@@ -285,6 +285,83 @@ def note_modes(rows: Any, prompt_id: Any = "", key: Any = "") -> None:
     _publish(prompt_id, force=True)
 
 
+def capture_started(prompt_id: Any) -> None:
+    """A canvas Modes capture for this run is scheduled (``run_output_routes``):
+    a save that finds no record yet may wait for it (``modes_for_save``)."""
+    with _LOCK:
+        data = _DATA.get(str(prompt_id or ""))
+        if data is not None:
+            data["modes_capturing"] = data.get("modes_capturing", 0) + 1
+
+
+def capture_settled(prompt_id: Any) -> None:
+    """That capture ended: recorded, skipped, or failed."""
+    with _LOCK:
+        data = _DATA.get(str(prompt_id or ""))
+        if data is not None:
+            data["modes_capturing"] = max(0, data.get("modes_capturing", 0) - 1)
+
+
+def prompt_id_for(prompt: Any) -> str:
+    """The observed run this executing prompt object belongs to, or ""."""
+    return _prompt_id_for(prompt)
+
+
+def modes_of(prompt_id: Any) -> list | None:
+    """A run's recorded Modes rows by prompt id, without waiting (a Save
+    Bridge reads them at finalization, after the run's nodes finished)."""
+    with _LOCK:
+        data = _DATA.get(str(prompt_id or ""))
+        modes = data["modes"] if data is not None else None
+        return [dict(row) for row in modes] if isinstance(modes, list) else None
+
+
+MODES_SAVE_WAIT_SEC = 2.0
+_MODES_SAVE_POLL_SEC = 0.025
+_MODES_SAVE_IDLE_GRACE_SEC = 0.15
+
+
+def modes_for_save(prompt: Any, timeout: float = MODES_SAVE_WAIT_SEC) -> list | None:
+    """The Modes rows this run was queued with, for its saved take (Hardening
+    Phase 10): the record the run notification shows, never derived again.
+
+    ``None`` when the run has no record. While one can still come, that is the
+    run is bound but its registration hasn't arrived, or a capture is in
+    flight, this waits up to ``timeout`` (measured in I1: the record lands
+    within about 25 ms of binding and saves start hundreds of ms later). Called
+    from the prompt worker before the save's project write, never under the
+    project lock; it polls and never holds this module's lock while waiting.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    idle_since = None
+    while True:
+        prompt_id = _prompt_id_for(prompt)
+        if not prompt_id:
+            return None
+        bound = sdk_runs.bound_run(prompt_id)
+        registered = bool(bound and bound.get("owners"))
+        with _LOCK:
+            data = _DATA.get(prompt_id)
+            if data is None:
+                return None
+            if isinstance(data["modes"], list):
+                return [dict(row) for row in data["modes"]]
+            capturing = data.get("modes_capturing", 0) > 0
+        now = time.monotonic()
+        if now >= deadline:
+            return None
+        if registered and not capturing:
+            # Registered with nothing in flight. Look a little longer: the canvas
+            # route marks its capture just after registering the receipt, and a
+            # mounted tab sends its Modes after the run's registration.
+            idle_since = now if idle_since is None else idle_since
+            if now - idle_since >= _MODES_SAVE_IDLE_GRACE_SEC:
+                return None
+        else:
+            idle_since = None
+        time.sleep(_MODES_SAVE_POLL_SEC)
+
+
 def _on_progress(snapshot: dict) -> None:
     """``sdk_progress`` listener (prompt-worker thread): the running node and its count."""
     prompt_id = str(snapshot.get("prompt_id") or "")

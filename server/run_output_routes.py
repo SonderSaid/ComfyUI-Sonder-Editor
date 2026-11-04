@@ -49,6 +49,8 @@ def _capture_modes(controls: Any, prompt_id: str, key: str) -> None:
     if len(_MODES_TASKS) >= MAX_MODES_BACKLOG:
         logger.info("Run Modes capture skipped: %d captures already waiting", len(_MODES_TASKS))
         return
+    # A save that finds no record yet waits for this one (``modes_for_save``).
+    run_feedback.capture_started(prompt_id)
 
     async def capture() -> None:
         loop = asyncio.get_running_loop()
@@ -59,6 +61,8 @@ def _capture_modes(controls: Any, prompt_id: str, key: str) -> None:
     task = asyncio.ensure_future(capture())
     _MODES_TASKS.add(task)
     task.add_done_callback(_MODES_TASKS.discard)
+    # Settled however the task ends, cancelled before its first step included.
+    task.add_done_callback(lambda _task: run_feedback.capture_settled(prompt_id))
 
 
 async def register_body_of(request: web.Request) -> tuple[dict, bool]:

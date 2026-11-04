@@ -16,6 +16,8 @@ from typing import Iterable, Iterator
 import cv2
 import numpy as np
 
+from .json_text import scrub
+
 logger = logging.getLogger("sonder_editor")
 
 
@@ -1499,7 +1501,8 @@ def write_png(path: str, frame_rgb: np.ndarray, *, compression: int = 0, metadat
             # ComfyUI's canvas drag workflow reader is most compatible with
             # plain text PNG chunks. Keep these uncompressed so generated PNGs
             # round-trip through the native workflow drop path.
-            pnginfo.add_text(str(key), str(value), zip=False)
+            # Scrubbed: a lone surrogate can't be encoded and would fail the save.
+            pnginfo.add_text(scrub(str(key)), scrub(str(value)), zip=False)
     Image.fromarray(np.asarray(frame_rgb, dtype=np.uint8), mode="RGB").save(
         path,
         compress_level=_clamp_int(compression, 0, 9, 0),
@@ -2083,7 +2086,11 @@ def _write_ffmetadata_file(metadata: dict[str, str]) -> str:
         for key, value in metadata.items():
             if not key:
                 continue
-            handle.write(f"{_escape_ffmetadata(str(key))}={_escape_ffmetadata(str(value))}\n")
+            # Backstop: a lone surrogate cannot be written as UTF-8 and used to
+            # fail the save. JSON payloads arrive ASCII-escaped instead
+            # (`json_text.dumps_utf8`); anything else is scrubbed here.
+            line = f"{_escape_ffmetadata(str(key))}={_escape_ffmetadata(str(value))}\n"
+            handle.write(scrub(line))
         return handle.name
     finally:
         handle.close()
