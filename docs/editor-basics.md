@@ -8,7 +8,9 @@ This guide covers editing. For selections, prompts, guides, Drivers, templates,
 and the render queue, see [Generating](generating.md). For the asset gallery,
 inspection, and export, see [Assets & Gallery](assets-and-gallery.md).
 
-![The Sonder Editor fullscreen surface](images/editor.webp)
+![The Sonder Editor in fullscreen: the Assets tab at the left with the gallery and a selected take, the viewport split into two panes showing a take of a boy as a warrior with lightning in his eyes beside the original footage on its Driver lane, and the timeline below with named video, audio and Driver lanes](images/editor.webp)
+<p align="center"><em>Assets at the left, two viewport panes (the take and the
+original footage), and the timeline below.</em></p>
 
 ## Opening the editor
 

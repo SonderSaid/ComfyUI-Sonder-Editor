@@ -63,7 +63,7 @@ notification](docs/images/editor-controls-views.webp)
 the shot, its depth map and a live sampler preview.</em></p>
 
 <p align="center">
-  <img src="docs/images/node.png" width="420" alt="The Sonder Editor node in a ComfyUI graph, showing its sockets, project card, and inline viewport preview">
+  <img src="docs/images/node.png" width="420" alt="The Sonder Editor node on the ComfyUI canvas, showing its output sockets, its project card and an inline viewport preview of a take">
 </p>
 <p align="center"><em>One native node in your graph, with outputs only.</em></p>
 
@@ -315,8 +315,10 @@ automatically.
 - **[Controls](docs/controls.md)** — workflow settings, Modes and node
   switches in the editor, Manage, and sharing Controls.
 - **[Sonder App](docs/sonder-app.md)** (experimental, optional) — setup, the
-  Launcher, preparing your own workflows, and the
-  [Sonder App Workflows](docs/sonder-app-workflows.md) instructions.
+  Launcher, preparing your own workflows, the
+  [Sonder App Workflows](docs/sonder-app-workflows.md) instructions, and
+  [the node packs and model files](docs/sonder-app-setup.md) each workflow
+  needs.
 - **[Troubleshooting](docs/troubleshooting.md)** — installation and
   environment problems, project storage and Windows path limits, the Sonder App,
   and playback.

@@ -22,16 +22,15 @@ setup notes and instructions inside **Controls**.
 
 ## Before your first generation
 
-[Open your project and workflow](sonder-app.md#generate) from the Launcher.
-In the editor's left sidebar, open **Controls** and read the workflow's setup
-and **Models and downloads** notes. ComfyUI needs the required custom nodes
-and model files installed before you generate. A choice that needs something
-missing is [greyed out under Modes](controls.md#in-the-sonder-app): hover over it
-to see what.
+Install the workflow's node packs and model files first: follow
+[Install Models and Node Packs](sonder-app-setup.md), which lists every file
+each workflow needs and where it goes.
 
-If your models are saved in different folders, click the **advanced hidden**
-line below Modes if it appears, then select your installed files in the
-matching model controls.
+Then [open your project and workflow](sonder-app.md#generate) from the
+Launcher. In the editor's left sidebar, open **Controls** and read the
+workflow's notes. A choice that needs something missing is
+[greyed out under Modes](controls.md#in-the-sonder-app): hover over it to see
+what.
 
 Choose your [Modes](controls.md#use-a-mode) before adjusting individual
 settings. Start with a short **[In / Out](generating.md#ways-to-set-in-and-out)**

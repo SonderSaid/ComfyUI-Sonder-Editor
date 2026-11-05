@@ -1,5 +1,5 @@
 import { el, button, component, modelMessage, listState } from './launcher_view.js';
-import { asksForInstall, missingNodeLines, missingNodesHelp } from './launcher_workflows.js';
+import { asksForInstall, asksForModels, missingNodeLines, missingNodesHelp, setupGuideHelp } from './launcher_workflows.js';
 // Short, since the header notice above says how to install (PACKAGES_NEEDED).
 export const PACKAGES_MISSING = 'Generate unavailable: the Sonder App packages are missing or unsupported (see the note at the top).';
 // The bar's first line: the pair it would open, or why there is none yet, naming
@@ -41,6 +41,7 @@ export function mountOpenBar(state, actions) {
     content.append(el('div', 'sl-open-summary', openSummary(state, project, template)));
     for (const p of pairProblems(project, template, state.status, state.projectData.format_first_release, state.nodePacks)) content.append(el('div', `sl-problem sl-${p.kind}`, p.text));
     if (asksForInstall(missingNodeLines(template, state.nodePacks))) content.append(missingNodesHelp());
+    if (asksForModels(template)) content.append(setupGuideHelp());
     if (state.openError) {
         content.append(el('div', 'sl-problem sl-bad', state.openError.error));
         content.append(button('Details', actions.openDetails));

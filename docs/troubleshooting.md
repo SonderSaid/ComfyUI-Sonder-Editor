@@ -173,7 +173,10 @@ ComfyUI-Manager it lists the node names instead. **Open** still works: under
 To use those Modes, install the packs:
 
 1. Find the workflow's canvas file: the `.json` shipped next to the API file
-   you imported.
+   you imported. For a supplied workflow under **Starters**, open it instead:
+   click **Templates** in ComfyUI's left bar, then **sonder-editor** under
+   **EXTENSIONS**, click the template with the workflow's name, and go on to
+   step 3.
 2. Open the ComfyUI page in your browser and drag that file onto it.
 3. A **Missing node** message appears at the top right. Click
    **View details**. The **Workflow Overview** panel opens on its **Issues**
@@ -198,12 +201,10 @@ Models are checked only for nodes that are installed. After the packs are in,
 select the workflow again: their loaders may list more missing models.
 
 **Missing models** are listed beside the workflow when you select it, each with
-the place it goes: the full path on the ComfyUI machine, or
-`models/<folder>/…` from another computer. Put each file exactly there,
-including the subfolders shown (`models/loras/LTX/IC Lora/…`), then click the
-**ComfyUI** status at the top right of the Launcher and **Check again**. A model
-whose row says **folder unknown** belongs to a loader Sonder can't place; check
-the node's own documentation.
+the place it goes. To install them, follow
+[Install Models and Node Packs](sonder-app-setup.md#the-steps). A model whose
+row says **folder unknown** belongs to a loader Sonder can't place; check the
+node's own documentation.
 
 ### The Launcher shortcut stopped working after changing the port
 

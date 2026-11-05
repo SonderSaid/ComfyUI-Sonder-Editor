@@ -205,9 +205,9 @@ Bridge**), Drivers (**Driver Selector/Bridge**) and References
 ([Reference Selector and Bridges](references.md#wiring-the-nodes)). The full
 node list is in the [README](../README.md#nodes).
 
-![The showcase workflow: the Sonder Editor node feeding conditioning, sampling, and finally Sonder Save Video](images/showcase-workflow.webp)
-<p align="center"><em>The showcase pipeline. Your graph can be as small as
-editor → sampler → Sonder Save Video.</em></p>
+![The smallest text-to-video graph: the Sonder Editor node's prompt, width, height and frame_count feeding a text encoder, an empty latent and KSampler, then VAE Decode into Sonder Save Video, which also takes the editor's project, fps and audio](images/showcase-workflow.webp)
+<p align="center"><em>The graph above, built on the canvas. Your graph can be
+as small as editor → sampler → Sonder Save Video.</em></p>
 
 ### Masking an audio-video latent
 

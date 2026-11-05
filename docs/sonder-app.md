@@ -18,7 +18,7 @@ the pair you choose, with **Generate** (1–8 takes per click) beside **+ Queue*
 
 The app is optional: the editor and every node work without it.
 
-![The Sonder App Launcher: imported workflows listed on the left with the selected one showing its description and Controls, and project cards on the right with a New project card](images/sonder-app-launcher.webp)
+![The Sonder App Launcher: the three supplied workflows under Starters on the left, with LTX 2.5 Edit & VFX selected, Ready, and showing its description and Controls, and five project cards on the right after a New project card, with Kid Warrior selected](images/sonder-app-launcher.webp)
 <p align="center"><em>The Launcher: pick a workflow on the left and a project
 on the right, then click <strong>Open</strong>.</em></p>
 
@@ -56,6 +56,8 @@ Do this once, in a browser on the ComfyUI machine.
 Choose a supplied workflow under **Starters** in the Launcher, or import your
 own. See **[Sonder App Workflows](sonder-app-workflows.md)** for an introduction
 to **LTX 2.5 Edit & VFX**, **LTX 2.5 Refine & Upscale**, and **MiniMax H3 — References & Swaps**.
+Before its first run, follow [Install Models and Node Packs](sonder-app-setup.md)
+for the node packs and model files it needs.
 
 <a id="import-a-workflow"></a>
 
@@ -100,8 +102,9 @@ on the canvas.
 A workflow that needs node packs or model files you don't have is still
 imported and still opens. A choice that needs them is
 [greyed out under Modes](controls.md#in-the-sonder-app). **Generate** refuses
-only when the Modes you chose need them, and names the choice. To install node
-packs, see
+only when the Modes you chose need them, and names the choice. To install
+them, follow [Install Models and Node Packs](sonder-app-setup.md#the-steps);
+for node packs the Launcher names, see also
 [The Launcher says *Missing node packs*](troubleshooting.md#the-launcher-says-missing-node-packs).
 
 ## Generate

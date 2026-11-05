@@ -12,6 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- A new docs page, [Install Models and Node Packs](docs/sonder-app-setup.md), takes you from nothing installed to a Sonder App workflow that reads **Ready**: the node packs, every model file the three supplied workflows need with its folder, size and which Mode choices use it, the Hugging Face agreements, and **Check again**. The Sonder App links to it with **How to install** when the current Modes or a greyed-out choice need a node pack or model file, and the Launcher does beside a workflow's missing models.
 - In the Sonder App, a Mode choice that needs a node or model file this ComfyUI doesn't have is greyed out, and hovering over it says what's missing. Installing the file and returning to the tab makes it available again, and **Manage** can still edit it. When the current Modes can't run, a line under the **Modes** heading says how much is missing, and **Show** lists it.
 - When the Sonder App refuses **Generate** over a missing model file or node, it names the Mode choice that needs it (for example "Needed by Task → Edit With Words"). The Launcher shows the same names for the selected workflow.
 - Seed Controls have up and down arrows (and ↑/↓ in the field) that step exactly, even past 2^53. In fullscreen and Mount in Tab they stop at the largest number a canvas widget holds.
@@ -29,6 +30,7 @@ a fresh `[Unreleased]` block.
 - Sonder App runs no longer need the model files or node packs of Modes that are switched off: a Task needs only its own LoRA, and **MiniMax H3 References & Swaps** needs the SAM3 checkpoint only with **Mask On**. A canvas Run still checks every loader.
 - A workflow with node packs this ComfyUI lacks now opens in the Sonder App; **Generate** refuses only when the chosen Modes use them.
 - The bundled starters' **Models and downloads** notes list each Task's files again, and their switched-off **Additional LoRAs** row reads **None**. Labels, notes and layout you customized on a bundled starter reset once with this update.
+- The supplied workflows' setup notes say to click **Extensions** at the top right of ComfyUI and install the node packs in **Nodes Manager**, as current ComfyUI labels them. LTX 2.5 Refine & Upscale's note searches **LTXVideo**, which finds ComfyUI-LTXVideo.
 - Reference lanes that share a recipe can be selected together whatever their prompt overrides. The Prompt Bridge's **reference_prompt** is one block in lane order where each lane's override takes that lane's part, without repeating the recipe's opening and closing lines; a lane on its own still uses its override as the whole prompt. A selection that used the same override on several lanes now includes it once per lane.
 - A refusal that changed nothing (a Reference drop that can't be staged, a split with no effect) closes on its own: it follows your warning duration setting, or 6 seconds when that is set to stay until dismissed.
 - On a narrow window the editor toolbar stacks its groups on rows instead of overlapping them.

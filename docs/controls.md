@@ -10,13 +10,14 @@ from the editor, without going back to the graph. The settings come from a
 In the editor, click the **Controls** tab in the sidebar at the left, beside
 **Assets** and **References**.
 
-The **Editor** group at the top holds take settings such as
-**Takes start muted**. Below it are the settings the workflow exposes, under
-the group names its author chose.
+Below the workflow's description and its [Modes](#modes), under
+**Individual Controls**, the **Editor** group comes first. It holds take
+settings such as **Takes start muted**. Below it are the workflow's notes and
+the settings it exposes, under the group names its author chose.
 
-![The Controls tab: the workflow's description, the Editor group with Takes start muted, Link take video + audio, Max frames per batch and Output preset, then a Generation group with a note, Seed set to Randomize, Steps and Scheduler](images/controls-tab.webp)
-<p align="center"><em>The Controls tab with the Editor group and one
-workflow group, Generation, which starts with an author's note.</em></p>
+![The Controls tab's Individual Controls: the Editor group with Takes start muted, Link take video + audio, Max frames per batch, Advance queue after take, File name, Save as and Output Format, then the workflow's notes and groups folded, and the Generation Settings group open with Variation Number, a seed set to Fixed, Generation Steps and Video Prompt Strength, each with its note](images/controls-tab.webp)
+<p align="center"><em>The Editor group, then the workflow's notes and groups.
+A seed shows its mode beside it.</em></p>
 
 A workflow without Controls says *No Controls yet*. Click
 [Manage](#manage) and add a setting; on the canvas, the editor adds the
@@ -252,11 +253,10 @@ Controls work the same way in the [Sonder App](sonder-app.md), with these
 differences:
 
 - **A choice that can't run is greyed out.** If a choice under **Modes** needs
-  a node or model file this ComfyUI doesn't have, hover over it to see what. Put
-  the file in place and come back to the tab: the choice is available again. If
-  you saved the file somewhere else, click **advanced hidden** below **Modes** if
-  it appears, then select your file in the matching Control. **Manage** still
-  edits the choice itself.
+  a node or model file this ComfyUI doesn't have, hover over it to see what.
+  [Install Models and Node Packs](sonder-app-setup.md) says where each file
+  goes; once it's in place, come back to the tab and the choice is available
+  again. **Manage** still edits the choice itself.
 - **When the current Modes can't run,** a line under the **Modes** heading says
   how much is missing. Click **Show** beside it for the list.
 - **Switch workflows:** the **Workflow** menu at the top of the Controls tab

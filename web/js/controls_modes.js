@@ -9,6 +9,7 @@ import { ambiguityText, deriveModes, followNotice, includesText, rowOf } from ".
 import { CHOICE_FAILURES, applyChoice } from "./controls_choice_apply.js";
 import { createHoverTip } from "./controls_hover_tip.js";
 import { needsOf, needsText, runSummary } from "./controls_modes_availability.js";
+import { SETUP_GUIDE_URL, asksForSetup } from "./docs_links.js";
 import { VISUALLY_HIDDEN_CSS, describedBy, placeInOrder, setText } from "./controls_dom_order.js";
 import { panelMarkdownPlainText, renderPanelMarkdown } from "./panel_markdown.js";
 import { register, PRIORITY, PRESERVE_DEFAULT } from "./keyboard_ownership.js";
@@ -22,6 +23,14 @@ const make = (tag, text) => {
     return el;
 };
 const unusable = choice => choice.state === "unavailable" || choice.state === "refused";
+// The setup guide, where a need is something to install (Sonder App only: only its
+// host answers availability). A link keeps Enter: the keyboard owner lets it through.
+const setupLink = () => {
+    const link = make("a", "How to install ↗");
+    link.href = SETUP_GUIDE_URL; link.target = "_blank"; link.rel = "noopener noreferrer";
+    link.style.cssText = `color:inherit;text-decoration:underline;`;
+    return link;
+};
 const UNAVAILABLE = "This choice is unavailable. Open Manage.";
 // How long a click on a grey choice waits to learn whether it still is.
 const AVAILABILITY_CLICK_TIMEOUT_MS = 3000;
@@ -50,7 +59,7 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
     let nextId = 0;
     const domId = () => `cm${panel}.${++nextId}`;
     const el = make("section"), heading = make("div", "Modes"), table = make("div"), runLine = make("div"),
-        runTitle = make("span"), runToggle = make("button"), runList = make("div"),
+        runTitle = make("span"), runToggle = make("button"), runHelp = setupLink(), runList = make("div"),
         uncategorized = make("button"), individual = make("div", "Individual Controls");
     el.dataset.controlsModes = "true";
     el.style.cssText = `display:flex;flex-direction:column;gap:${SPACE.s1}px;`;
@@ -63,7 +72,9 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
     runToggle.addEventListener("click", () => { runOpen = !runOpen; repaint(); });
     runList.dataset.controlsModesRunList = "true";
     runList.style.whiteSpace = "pre-line";
-    runLine.append(runTitle, runToggle, runList);
+    runHelp.dataset.controlsModesRunHelp = "true";
+    runHelp.style.marginLeft = `${SPACE.s1}px`;
+    runLine.append(runTitle, runToggle, runHelp, runList);
     asHeading(heading);
     asHeading(individual);
     heading.style.cssText = headingCss;
@@ -223,6 +234,11 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
                 const line = make("div", needs);
                 line.style.whiteSpace = "pre-line";
                 item.append(line);
+                if (asksForSetup(needsOf(availability?.get(), choice.id))) {
+                    const help = setupLink();
+                    help.dataset.controlsModeSetupHelp = choice.id;
+                    item.append(help);
+                }
             }
             if (choice.description) item.append(renderPanelMarkdown(choice.description));
             if (unusable(choice)) item.append(make("div", choice.reason || UNAVAILABLE));
@@ -268,6 +284,7 @@ export function mountModes(host, { flushPending, track, notify, inform = () => {
         setText(runToggle, runOpen ? "Hide" : "Show");
         runToggle.setAttribute("aria-expanded", String(runOpen));
         runToggle.style.display = needsListed ? "" : "none";
+        runHelp.style.display = lacking && asksForSetup(availability?.get()?.run) ? "" : "none";
         setText(runList, lacking ? [...(runOpen ? lacking.needs : []), ...lacking.problems].join("\n") : "");
         runList.style.display = runList.textContent ? "" : "none";
         runLine.style.display = lacking ? "" : "none";

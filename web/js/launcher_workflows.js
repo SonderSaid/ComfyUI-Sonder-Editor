@@ -2,6 +2,7 @@ import { renderPanelMarkdown } from './panel_markdown.js';
 import { el, button, component, badge, date, input, modelMessage, listState, listNotice } from './launcher_view.js';
 import { isUnfinishedRun } from './sdk_host.js';
 import { missingNodePacks } from './node_pack_mappings.js';
+import { SETUP_GUIDE_URL, namesAFile } from './docs_links.js';
 export const SAMPLE_PROJECTS_URL = 'https://huggingface.co/datasets/SonderSaid/Sonder-Editor-Projects';
 export const MISSING_NODES_HELP_URL = 'https://github.com/SonderSaid/ComfyUI-Sonder-Editor/blob/main/docs/troubleshooting.md#the-launcher-says-missing-node-packs';
 export function missingNodes(template) { return template?.validation?.missing_nodes || []; }
@@ -81,6 +82,15 @@ export function missingNodesHelp() {
     link.href = MISSING_NODES_HELP_URL; link.target = '_blank'; link.rel = 'noopener noreferrer';
     return link;
 }
+// Missing model files the current Modes need: the setup guide says where each goes.
+// A LoRA row naming no file is fixed in Controls, so it asks for no guide.
+export function asksForModels(template) { return (template?.missing_models || []).some(namesAFile); }
+export function setupGuideHelp() {
+    const link = el('a', '', 'How to install missing models ↗');
+    link.href = SETUP_GUIDE_URL; link.target = '_blank'; link.rel = 'noopener noreferrer';
+    link.dataset.setupGuide = 'true';
+    return link;
+}
 // The exit notice after a status poll of the session left behind. A null payload
 // means the session ended (ComfyUI restarted, or a later Open took its takes
 // over): nothing is left to show or cancel here.
@@ -135,6 +145,7 @@ export function mountWorkflows(state, actions) {
                 for (const problem of t.run_problems || []) details.append(el('p', 'sl-bad', problem));
                 for (const problem of [...(t.validation?.errors || []), ...(t.validation?.blocking || [])]) details.append(el('p', 'sl-bad', problem));
                 for (const item of t.missing_models || []) details.append(el('p', 'sl-warn', modelMessage(item)));
+                if (asksForModels(t)) details.append(setupGuideHelp());
                 for (const note of t.validation?.warnings || []) details.append(el('p', 'sl-dim', note));
                 if (t.description) {
                     const description = el('div', 'sl-workflow-description');
