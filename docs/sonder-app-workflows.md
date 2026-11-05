@@ -8,7 +8,7 @@ Launcher, then prepare your media, choose what to do and generate from the app.
 - **[LTX 2.5 Edit & VFX](#ltx-25-edit--vfx)** — generate new video, edit with
   words or a picture, follow a source video's layout, movement or outlines,
   remove people, and create masks. Keep existing audio or generate new sound.
-  Its **Prompt Method** row adds [timed prompts](#try-timed-prompts).
+  Its **Prompt Method** category adds [timed prompts](#try-timed-prompts).
 - **[LTX 2.5 Refine & Upscale](#ltx-25-refine--upscale)** — refine existing
   footage, double its width and height, or do both. Optionally focus refinement
   on a character or the environment.
@@ -23,14 +23,11 @@ setup notes and instructions inside **Controls**.
 ## Before your first generation
 
 Install the workflow's node packs and model files first: follow
-[Install Models and Node Packs](sonder-app-setup.md), which lists every file
-each workflow needs and where it goes.
+[Install Models and Node Packs](sonder-app-setup.md).
 
 Then [open your project and workflow](sonder-app.md#generate) from the
 Launcher. In the editor's left sidebar, open **Controls** and read the
-workflow's notes. A choice that needs something missing is
-[greyed out under Modes](controls.md#in-the-sonder-app): hover over it to see
-what.
+workflow's notes.
 
 Choose your [Modes](controls.md#use-a-mode) before adjusting individual
 settings. Start with a short **[In / Out](generating.md#ways-to-set-in-and-out)**
@@ -77,10 +74,9 @@ control over when actions change. It lets different timeline **Prompt**
 sections guide different parts of the same generation.
 
 In **Controls → Modes → Prompt Method**, choose **Timed Prompts (Prompt Relay)**
-to use it, or **Standard** for normal LTX prompting. **Timed Prompts** is greyed
-out until you install
-[ComfyUI-PromptRelay](https://github.com/kijai/ComfyUI-PromptRelay): follow its
-repository's instructions, restart ComfyUI and refresh the page.
+to use it, or **Standard** for normal LTX prompting. **Timed Prompts** needs the
+ComfyUI-PromptRelay pack: see
+[Install Models and Node Packs](sonder-app-setup.md#ltx-25-edit--vfx).
 
 ## LTX 2.5 Refine & Upscale
 

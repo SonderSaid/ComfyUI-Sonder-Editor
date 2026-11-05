@@ -164,19 +164,14 @@ this same ComfyUI.
 
 ### The Launcher says *Missing node packs*
 
-The workflow's current Modes use nodes this ComfyUI doesn't have. The Launcher
-marks it **Missing nodes**, and the bar at the bottom says so in red, lists the
-node packs that provide them and names the Mode choice that needs them. Without
-ComfyUI-Manager it lists the node names instead. **Open** still works: under
-**Modes**, the choices that need a missing node are
-[greyed out](controls.md#in-the-sonder-app), and you can choose the others.
-To use those Modes, install the packs:
+The workflow's current Modes use nodes this ComfyUI doesn't have. You can
+still click **Open** and choose other Modes. For a supplied workflow under
+**Starters**, install the packs with
+[Install Models and Node Packs](sonder-app-setup.md#the-steps). For your own
+workflow:
 
 1. Find the workflow's canvas file: the `.json` shipped next to the API file
-   you imported. For a supplied workflow under **Starters**, open it instead:
-   click **Templates** in ComfyUI's left bar, then **sonder-editor** under
-   **EXTENSIONS**, click the template with the workflow's name, and go on to
-   step 3.
+   you imported.
 2. Open the ComfyUI page in your browser and drag that file onto it.
 3. A **Missing node** message appears at the top right. Click
    **View details**. The **Workflow Overview** panel opens on its **Issues**
@@ -188,8 +183,7 @@ To use those Modes, install the packs:
 
 A pack the list names as **no known pack** isn't in ComfyUI-Manager's index.
 Search its node name on [registry.comfy.org](https://registry.comfy.org) or
-ask the workflow's author. ComfyUI-PromptRelay, for **Timed Prompts**, installs by
-following [its repository's instructions](https://github.com/kijai/ComfyUI-PromptRelay).
+ask the workflow's author.
 
 If you have only the API file, or your ComfyUI runs without ComfyUI-Manager
 (no **Install** buttons appear), install each listed pack by hand, following
@@ -200,10 +194,10 @@ Launcher.
 Models are checked only for nodes that are installed. After the packs are in,
 select the workflow again: their loaders may list more missing models.
 
-**Missing models** are listed beside the workflow when you select it, each with
-the place it goes. To install them, follow
-[Install Models and Node Packs](sonder-app-setup.md#the-steps). A model whose
-row says **folder unknown** belongs to a loader Sonder can't place; check the
+A workflow that reads, for example, **3 models missing** lists each file and
+its place when you select it. Follow
+[Install Models and Node Packs](sonder-app-setup.md#the-steps). A file listed
+with **folder unknown** belongs to a loader Sonder can't place; check the
 node's own documentation.
 
 ### The Launcher shortcut stopped working after changing the port

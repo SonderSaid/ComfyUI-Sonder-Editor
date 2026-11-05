@@ -10,14 +10,12 @@ from the editor, without going back to the graph. The settings come from a
 In the editor, click the **Controls** tab in the sidebar at the left, beside
 **Assets** and **References**.
 
-Below the workflow's description and its [Modes](#modes), under
-**Individual Controls**, the **Editor** group comes first. It holds take
-settings such as **Takes start muted**. Below it are the workflow's notes and
-the settings it exposes, under the group names its author chose.
+Under **Individual Controls**, the **Editor** group holds take settings such
+as **Takes start muted**. The workflow's notes and settings follow, in the
+groups its author chose.
 
 ![The Controls tab's Individual Controls: the Editor group with Takes start muted, Link take video + audio, Max frames per batch, Advance queue after take, File name, Save as and Output Format, then the workflow's notes and groups folded, and the Generation Settings group open with Variation Number, a seed set to Fixed, Generation Steps and Video Prompt Strength, each with its note](images/controls-tab.webp)
-<p align="center"><em>The Editor group, then the workflow's notes and groups.
-A seed shows its mode beside it.</em></p>
+<p align="center"><em>The Editor group, then the workflow's notes and groups.</em></p>
 
 A workflow without Controls says *No Controls yet*. Click
 [Manage](#manage) and add a setting; on the canvas, the editor adds the
@@ -31,11 +29,6 @@ For a workflow that already has Controls, [Modes](#modes) and notes, open
 Click a value and change it. A seed shows its mode beside it (fixed,
 increment, decrement, randomize). To read what a setting does, hold the
 pointer over its name: the node's own help appears under it.
-
-A setting whose node is muted or bypassed shows **Muted** or **Bypassed**
-beside its name. You can still change it: the value applies once the node runs
-again. A setting that can't be used — its node was removed or is linked to
-another node — is skipped, so the workflow's own value runs.
 
 A small line near the top of the Controls tab, under the search box (and
 under the **Modes** table when the workflow has one), hides what you don't
@@ -53,27 +46,10 @@ Hidden settings still apply their values.
 Each take records the values it used. Open the take in **Assets** and look for
 **Controls at run** in its details.
 
-A long text setting, such as a song's lyrics or style, shows its first 512
-characters in **Controls at run**. The take keeps the whole text, up to 24 KB
-for all of a take's long settings together:
-
-1. In **Assets**, click the take. Its details open in the inspector.
-2. Find the setting under **Controls at run**. A kept text ends with *… (Copy
-   value copies all 4,235 characters)*, with the take's own count; hover over
-   the value to read more of it.
-3. Click the **Copy** button on the value, or right-click it and choose
-   **Copy value**. The clipboard holds the exact text the run used, line breaks
-   included.
-
-- Searching the gallery (for example `field:lyrics=rain`) reads only the first
-  512 characters.
-- A text the take couldn't keep (over 24 KB, or with an invalid character) and
-  every take made before this was added keep only the preview: **Copy** is
-  greyed out and reads *Full value is only in the run's source prompt*.
-- A PNG sequence keeps the whole text on its first frame only.
-- A long row-list setting keeps only its preview, and its **Copy** is greyed
-  out the same way. On takes made before this was added, **Copy** copies the
-  shortened text. The native LoRA loaders' rows are always kept whole.
+A long text setting, such as a song's lyrics, shows only its start under
+**Controls at run**. To copy the whole text the run used, click **Copy** on the
+value, or right-click it and choose **Copy value**. Gallery search reads only
+the start of a long text.
 
 ## Modes
 
@@ -100,26 +76,16 @@ https://github.com/user-attachments/assets/d63c740f-1e94-44c9-806f-bcbe36ec2516
    choice keep their values.
 
 - The highlighted button is the choice whose values the Controls hold now. If
-  you change one of those Controls by hand, the row reads **Custom** and no
-  button is highlighted.
-- A choice can change another row too, when both set the same Control.
-- A choice can also apply a choice in another row: hover over its button, and
-  the tooltip's last line says so, for example *Also applies Refine Pass
-  Spatial Mask → Mask Off.* Clicking it highlights both rows' choices, and a
-  message names the other row. If you then click another choice in that other
-  row, the first row reads **Custom**. On the canvas, one **Ctrl+Z** undoes the
-  whole click.
+  you change one of those Controls by hand, the category reads **Custom** and
+  no button is highlighted.
+- A choice can also apply a choice from another category: one click sets both.
 - Two outlined buttons with *“A” and “B” both match* need a fix in **Manage**: see
   [Fix a warning in Manage](#fix-a-warning-in-manage).
 - The table is hidden while you search, and while **Manage** is open.
 
-Each take also records the choice every row was on when the run was queued.
-In **Assets**, click the take and look for **Modes at run** in its details: a
-row reads its choice's name, **Custom**, or *Matches A, B* when two choices
-matched. *Modes weren't recorded for this run* means the run started without
-Sonder's notice of it, for example from the ComfyUI API. To find takes by
-Mode, search the gallery for the row and its choice, for example
-`field:task=edit`.
+Each take records its Modes too: in **Assets**, click the take and look for
+**Modes at run** in its details. To find takes by Mode, search the gallery for
+a category and its choice, for example `field:task=edit`.
 
 To make Modes, see [Make Modes](#make-modes).
 
@@ -192,23 +158,11 @@ is what the choice holds. Then:
 
 - **Update from current values** saves what the ticked Controls hold now.
 - **Category** moves it to another category, or to **Not in a category**.
-- **Also applies**, under **Category**, has one list per other category.
-  Pick a choice in one of them to apply it together with this one, every time
-  this choice is clicked. Pick **Nothing** to stop. The included choice keeps
-  its own settings: **Update from current values** never saves them into this
-  choice. For example, open **Upscale Pass Only** in the **Passes** category,
-  then set **“Refine Pass Spatial Mask”:** to **Mask Off**, so that one click
-  runs the upscale pass with the mask turned off.
-  - A choice can include one choice per category, and never one from its own
-    category.
-  - The two may not set the same setting or switch the same node. Manage
-    refuses that and says why.
-  - A choice that another one includes can't include others, and can't be
-    deleted until you set the other choice's list back to **Nothing**.
-  - An included choice that is in no category shows as its own line under
-    **Also applies**, with **Remove**.
-  - Sonder 0.8.2 and earlier ignore **Also applies**: the choice then applies
-    only its own settings, and updating the choice there drops the link.
+- **Also applies**, under **Category**, has one list per other category. Pick
+  a choice there to apply it every time this choice is clicked, or **Nothing**
+  to stop. For example, open **Upscale Pass Only** and set **“Refine Pass
+  Spatial Mask”:** to **Mask Off**: one click then runs the upscale pass with
+  the mask off.
 
 Click **Edit** on a category to rename it, change its description or
 **Delete** it; its choices stay, under **Not in a category**. Choices **Not in
@@ -223,8 +177,6 @@ a category** don't show in the Controls tab.
 | *“A” and “B” can both match* | Give the two choices a shared setting with different values, so each is told apart. |
 | *Shares Steps with Look* | A choice in one category can change the other. Leave it when that is intended; otherwise remove the shared setting from one category's choices. |
 | A choice listed twice, or one that no longer exists | Click **Remove from this category**, **Remove the repeat** or **Remove missing**, or edit that category's choices. |
-| A choice's button is dimmed, and its tooltip starts *Included “Mask Off”:* | The choice it applies (here **Mask Off**) can't apply right now. Repair that choice: the rest of its tooltip says what is wrong. |
-| *An included choice no longer exists* under **Also applies** | Click **Remove** beside it. |
 
 ## Choosing lanes and folders from Controls
 
@@ -252,13 +204,8 @@ other settings:
 Controls work the same way in the [Sonder App](sonder-app.md), with these
 differences:
 
-- **A choice that can't run is greyed out.** If a choice under **Modes** needs
-  a node or model file this ComfyUI doesn't have, hover over it to see what.
-  [Install Models and Node Packs](sonder-app-setup.md) says where each file
-  goes; once it's in place, come back to the tab and the choice is available
-  again. **Manage** still edits the choice itself.
-- **When the current Modes can't run,** a line under the **Modes** heading says
-  how much is missing. Click **Show** beside it for the list.
+- **A choice that needs a missing node pack or model file is greyed out.** To
+  install it, follow [Install Models and Node Packs](sonder-app-setup.md).
 - **Switch workflows:** the **Workflow** menu at the top of the Controls tab
   opens another imported workflow on the same project. The project, scene and
   timeline stay; takes already generating finish with the workflow they

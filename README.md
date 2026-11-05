@@ -183,8 +183,7 @@ mask preparation, and saving results with sound.
 https://github.com/user-attachments/assets/38af328d-0596-4ed1-8a14-4ab9e9cb79dd
 
 The last three also ship with the [Sonder App](docs/sonder-app.md)
-(experimental, optional) as its starter workflows, exported for the API. There,
-Edit & VFX needs Prompt Relay only for its timed prompts.
+(experimental, optional) as its starter workflows, exported for the API.
 [Sonder App Workflows](docs/sonder-app-workflows.md) has the steps for each of
 their tasks in the app.
 

@@ -16,36 +16,29 @@ list every file the three supplied workflows need.
    ([Installation](../README.md#installation)) and follow
    [Set it up](sonder-app.md#set-it-up) on the Sonder App page.
 2. **Install the node packs.** Each workflow's section below lists its packs.
-   Models are checked only once their nodes are installed, so do this before
-   the model files.
    1. In ComfyUI, click **Extensions** at the top right. **Nodes Manager**
       opens.
-   2. Click the **Search** box at the top, type the search word the section
-      gives, and click **Install** on the pack with that name.
+   2. Click the **Search** box at the top, type the pack's **Search for** word
+      from the tables below, and click **Install** on the pack with that name.
    3. When every pack is installed, restart ComfyUI and reload the page in
       your browser.
 
    If there is no **Extensions** button, ComfyUI was started without its
    Manager: start it with the `--enable-manager` option, or install each pack
    by following the instructions on its GitHub page, then restart ComfyUI.
-3. **Find where each file goes on your computer.** Open the
+3. **Find where each file goes.** Open the
    [Launcher](sonder-app.md#open-the-launcher) and click the workflow under
-   **Starters**. Its row lists each model file the current Modes still need,
-   with the place it goes: the full path on the ComfyUI machine, including
-   subfolders such as `loras/LTX/`, or `models/<folder>/…` when the Launcher
-   is open on another computer. Use that place even if your models are
-   kept somewhere other than `ComfyUI/models/`, for example by Stability Matrix
-   or an `extra_model_paths.yaml` file. The tables below give the usual
-   folder inside `ComfyUI/models/`, and every file, including those that other
-   Modes need.
+   **Starters**. Its row lists each missing file as *file → place*. Save each
+   file there. If you already have a file in another models folder, or under
+   another name, keep it where it is instead: open the workflow, click
+   **advanced hidden** below **Modes** in **Controls** if it appears, and pick
+   your file in the matching model setting. The tables below list every file,
+   including those other Modes need.
 4. **Get access to the gated files.** Files whose **Access** column names a
    repository need a free Hugging Face account. Click **Sign Up** at the top
    right of [huggingface.co](https://huggingface.co) to create one, or
    **Log In**. Then open each repository named in the **Access** column and
-   click **Agree and Access**; this shares your Hugging Face account
-   information with that repository's owner. Access is granted at once. Each
-   repository is a separate agreement, and one agreement covers every file in
-   it.
+   click **Agree and Access**. Access is granted at once.
 5. **Download each file.** Click a file's name in its table to open its page.
    - On Hugging Face, click **Download** just above the file on the left, then
      **Download file**.
@@ -55,19 +48,11 @@ list every file the three supplied workflows need.
    Save it in the place from step 3, subfolders included. Create a folder if
    it doesn't exist yet. Keep the file name as it is.
 6. **Check again.** In the Launcher, click **ComfyUI** at the top right, then
-   **Check again**. No restart is needed for model files. The workflow's row
-   reads **Ready** once the current Modes have everything they need. A Mode
-   choice that still needs a file stays
-   [greyed out](controls.md#in-the-sonder-app).
+   **Check again**. No restart is needed for model files. The workflow then
+   reads **Ready**.
 
-**Already have a file in another folder, or under another name?** Instead of
-moving it, open the workflow, click **advanced hidden** below **Modes** in
-**Controls** if it appears, and select your file in the matching model
-Control.
-
-**Using the canvas version of a workflow?** A canvas **Run** checks every
-model loader before it starts, so download every file in its table, not only
-the ones your Mode choice needs.
+**Using the workflow on the canvas?** Download every file in its table except
+the optional one.
 
 ## LTX 2.5 Edit & VFX
 
@@ -82,10 +67,9 @@ the ones your Mode choice needs.
 Install RES4LYF even when the Launcher reads **Ready**: the workflow uses its
 sampling method, and the Launcher can't tell when it's missing.
 
-ComfyUI-PromptRelay is needed only for **Modes → Prompt Method → Timed Prompts
-(Prompt Relay)**, which stays greyed out until it is installed. Install it by
-following its repository's instructions, then restart ComfyUI and reload the
-page.
+ComfyUI-PromptRelay is needed only for **Controls → Modes → Prompt Method →
+Timed Prompts (Prompt Relay)**. Install it by following its repository's
+instructions, then restart ComfyUI and reload the page.
 
 The LTX, MoGe and SDPose nodes come with ComfyUI. If the Launcher lists one of
 them as missing, update ComfyUI.
@@ -125,7 +109,7 @@ Install RES4LYF even when the Launcher reads **Ready**: the workflow uses its
 sampling method, and the Launcher can't tell when it's missing.
 
 **Model files** (about 50.8 GB in all; **Refining Pass Only** needs 47.6 GB of
-them). The first five are the same files as in LTX 2.5 Edit & VFX, so download
+them). The first six are the same files as in LTX 2.5 Edit & VFX, so download
 them once:
 
 <!-- Sizes from the Hugging Face and GitHub file pages, 2026-11-04. -->
@@ -154,8 +138,8 @@ them once:
 The H3, SAM3 and LoRA-list nodes come with ComfyUI. If the Launcher lists one
 of them as missing, update ComfyUI.
 
-**Model files** (about 56.0 GB in all; **Mask Off** with **Standard
-Generation** needs 54.3 GB of them). None needs a Hugging Face agreement:
+**Model files** (about 56.0 GB without the optional one; **Mask Off** with
+**Standard Generation** needs 54.3 GB of them):
 
 <!-- Sizes from the Hugging Face file pages, 2026-11-04. -->
 

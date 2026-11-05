@@ -422,12 +422,7 @@ A **View** is one of your workflow's output nodes (**Preview Image**,
 **Sonder Preview Video**, **Sonder Save Video** and the like, including ones
 inside a subgraph) shown in a [viewport pane](editor-basics.md#panes). To add
 one, click a pane's source button, choose **Add output…** and click the node.
-A node inside a subgraph is listed with the subgraphs it sits in, for example
-**Sampling › SamplerCustomAdvanced**. A workflow exported with Sonder 0.8.2 or earlier
-(or a Sonder App workflow without a Sonder Control Relay) lists it by its own
-title, with *Inside a subgraph* under it.
-To rename, reorder or delete Views,
-see [Manage](controls.md#manage).
+To rename, reorder or delete Views, see [Manage](controls.md#manage).
 
 https://github.com/user-attachments/assets/36622192-fcac-4ed8-ad8b-bae93cbb3303
 
