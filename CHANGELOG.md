@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-11-05
+
 ### Added
 - A new docs page, [Install Models and Node Packs](docs/sonder-app-setup.md), lists the node packs and every model file the three supplied workflows need, with folders, sizes and Hugging Face agreements. The Sonder App's **How to install** links and the Launcher's **How to install missing models** open it.
 - In the Sonder App, a Mode choice that needs a missing node or model file is greyed out; hover over it to see what. When the current Modes can't run, a line under **Modes** says how much is missing, and **Show** lists it.
