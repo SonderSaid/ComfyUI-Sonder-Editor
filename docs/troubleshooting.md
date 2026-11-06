@@ -5,9 +5,12 @@ projects. For a first setup, see [Getting Started](getting-started.md).
 
 ## Installation & environment
 
-- **Controls compatibility:** ComfyUI-Custom-Scripts' **Preset Text** extension
-  (`pysssss.PresetText`) can make exposed Controls appear as disabled "Setting"
-  rows even when their nodes are still in the workflow.
+### Controls show as disabled "Setting" rows
+
+ComfyUI-Custom-Scripts' **Preset Text** extension (`pysssss.PresetText`) can
+make exposed Controls appear this way even when their nodes are still in the
+workflow. Turn that extension off, or remove ComfyUI-Custom-Scripts, then
+reload the page.
 
 ### The Editor is blank or shows raw controls after installing through Manager
 
@@ -40,11 +43,9 @@ the safe choice for ComfyUI) and reinstall it so it's the only OpenCV present.
 
 ### `ffmpeg` not found / export or decode fails
 
-Install FFmpeg **7.0 or newer** and make sure it's on your `PATH`, then restart ComfyUI.
-Audio preparation checks the selected binary; an older system installation takes
-precedence over the bundled binary and must be updated or removed from `PATH`. The
-bundled `imageio-ffmpeg` binary is used as a fallback, but a system ffmpeg is
-more capable across formats.
+Install FFmpeg **7.0 or newer** and make sure it's on your `PATH`, then restart
+ComfyUI. An older ffmpeg on `PATH` is used before the bundled one, so update it
+or remove it from `PATH`.
 
 ## Logic nodes
 
@@ -75,29 +76,26 @@ paths, and extract projects directly into `ComfyUI/output/sonder-projects/`.
 
 ### An export says the files were saved but registration could not be confirmed
 
-The exported video and audio are finished and safe — the message names their
-paths inside the project. Only the project bookkeeping failed, so press
-**Refresh** in the gallery and the files are registered as basic assets; their
-generation details and automatic take placement are not recovered. On Windows
+The message names the exported files' paths inside the project. Press
+**Refresh** in the gallery to add them as basic assets, without their
+generation details or take placement. On Windows
 this is usually the 260-character path limit, which the message calls out when
 it can detect it: move or rename the project so its folder path is shorter, or
 enable long-path support in Windows, then export again.
 
 ### I can't link a project on another drive or a UNC share
 
-Enable **Allow External Project Links** in Editor Settings first, then use
+Enable **Settings ▸ Server ▸ Allow External Project Links** first, then use
 **Link project folder…** from the project menu and paste the server-visible
 path. Local Windows drives use a junction without elevated privileges; UNC
 paths need a true symlink, which requires Windows Developer Mode or an elevated
-ComfyUI process. Do not toggle the setting while a render or Save Bridge job is
-in flight; its finalization safely remains pending until the matching path is
-trusted again. The Launcher's **New project → Link existing** does the same and
+ComfyUI process. Don't change the setting while a render or Save Bridge job is
+running. The Launcher's **New project → Link existing** does the same and
 shows the project before you link it.
 
 ### Link project folder and the external links switch are greyed out
 
-Both work only in a browser on the ComfyUI machine itself, because they let the
-server read and write folders outside its projects folder. From another
+Both work only in a browser on the ComfyUI machine itself. From another
 computer, through a reverse proxy, or on a headless server, either open the
 editor on that machine, or stop ComfyUI and set
 `"allow_external_project_links": true` in `ComfyUI/user/sonder-editor/settings.json`,
@@ -109,8 +107,7 @@ Sonder projects folder. Turning links off and unlinking work from anywhere.
 ### Install in Settings → Sonder App is refused or doesn't finish
 
 Install adds `comfy-sdk` and `comfy-api-proxy` at pinned versions to ComfyUI's
-own Python and never changes a package that is already there. What each message
-means:
+own Python. What each message means:
 
 - **"Install and Uninstall work only in a browser on the ComfyUI machine."**:
   they work only in a browser on the computer running ComfyUI, opened at `127.0.0.1` or

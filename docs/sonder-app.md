@@ -140,11 +140,9 @@ for the full instructions. The **Workflow** menu at the top of Controls
 ## The local connection
 
 When you open a workflow from the Launcher, Sonder starts a local connection to
-ComfyUI (`comfy-api-proxy`) on a free port from 8189 to 8198, or reuses one
-already serving this ComfyUI. It stops the one it started when ComfyUI exits or
-after half an hour without a Sonder App session. ComfyUI started with its own
-TLS options (`--tls-keyfile`, `--tls-certfile`) isn't supported. If Generate
-can't connect, see
+ComfyUI (`comfy-api-proxy`). ComfyUI started with its own TLS options
+(`--tls-keyfile`, `--tls-certfile`) isn't supported. If Generate can't
+connect, see
 [Troubleshooting](troubleshooting.md#generate-says-the-sonder-app-couldnt-connect-to-comfyui).
 
 ## Takes made in the app

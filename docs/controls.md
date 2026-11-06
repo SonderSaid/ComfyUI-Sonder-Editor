@@ -26,8 +26,8 @@ For a workflow that already has Controls, [Modes](#modes) and notes, open
 
 ## Change a setting
 
-Click a value and change it. A seed shows its mode beside it (fixed,
-increment, decrement, randomize). To read what a setting does, hold the
+Click a value and change it. A seed shows its mode beside it. To read what a
+setting does, hold the
 pointer over its name: the node's own help appears under it.
 
 A small line near the top of the Controls tab, under the search box (and
@@ -38,7 +38,7 @@ need:
   **2 notes hidden**: click it to bring them back.
 - Settings the workflow marks Advanced start hidden. The line reads, for
   example, **1 advanced hidden**: click it to show them.
-- Both are also checkboxes in **Settings → Controls** (**Show notes** and
+- Both are also checkboxes in **Settings ▸ Controls** (**Show notes** and
   **Show advanced settings**).
 
 Hidden settings still apply their values.
@@ -81,7 +81,6 @@ https://github.com/user-attachments/assets/d63c740f-1e94-44c9-806f-bcbe36ec2516
 - A choice can also apply a choice from another category: one click sets both.
 - Two outlined buttons with *“A” and “B” both match* need a fix in **Manage**: see
   [Fix a warning in Manage](#fix-a-warning-in-manage).
-- The table is hidden while you search, and while **Manage** is open.
 
 Each take records its Modes too: in **Assets**, click the take and look for
 **Modes at run** in its details. To find takes by Mode, search the gallery for
@@ -217,11 +216,10 @@ differences:
   subgraphs, so the app can't tell which nodes a switch would cover. A switch
   works only if every node it covers was on when the workflow was exported. To
   hide a switch you don't need, click **Manage**, then **Hide** on its row.
-- **Re-importing** a workflow keeps your values, seed modes, app-only
-  Controls, hidden settings, and the categories, choices and Views you edited.
-  It resets labels, notes, order, groups, **Advanced** flags and the
-  description to the workflow's. A saved value whose setting now points
-  somewhere else resets to the workflow's value.
+- **Re-importing** a workflow keeps what you changed in the app (values, seed
+  modes, app-only Controls, hidden settings, and the categories, choices and
+  Views you edited) and takes labels, notes, order and the description from
+  the file.
 - **Reset to workflow's version** (in a category's or choice's editor) and
   **Reset** (on a View) bring back the imported version.
 
@@ -232,11 +230,8 @@ differences:
   out nodes that are muted or bypassed, so first turn on every node a switch
   or setting needs.
 - **From the Sonder App:** in the Launcher, open the workflow's **⋮** menu and
-  click **Export as API**. The file carries current values, seed modes, labels,
-  notes, group order, **Advanced** flags, the description and active app-only
-  Controls. Hidden entries are left out. Every switch's nodes stay on in the
-  file, so your current switch choices are not in it: save them in a choice
-  first if you want to keep them.
+  click **Export as API**. Hidden entries and your switch states aren't in the
+  file: save switch states in a choice first.
 
 Loading an API file on the ComfyUI canvas flattens subgraphs and can lose some
 node settings; send the saved canvas workflow too when the recipient uses the

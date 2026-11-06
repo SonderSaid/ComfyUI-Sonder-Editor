@@ -24,7 +24,7 @@
     "class_type": "LTXVGetTilingSizes",
     "_meta": {
       "title": "Get Tiling Sizes",
-      "aux_id": "LightricksResearch/ComfyUI-LTXVideo-Internal",
+      "aux_id": "Lightricks/ComfyUI-LTXVideo",
       "ver": "65bfc50105d620a6a21675e022d229f947c6eb57"
     }
   },
@@ -1052,7 +1052,7 @@
     "class_type": "LTXVTiledFusionSampler",
     "_meta": {
       "title": "🅛🅣🅧 Tiled Fusion Sampler",
-      "aux_id": "LightricksResearch/ComfyUI-LTXVideo-Internal",
+      "aux_id": "Lightricks/ComfyUI-LTXVideo",
       "ver": "65bfc50105d620a6a21675e022d229f947c6eb57"
     }
   },
@@ -1105,7 +1105,7 @@
     "class_type": "LTXAddVideoICLoRAGuide",
     "_meta": {
       "title": "🅛🅣🅧 Add Video IC-LoRA Guide",
-      "aux_id": "LightricksResearch/ComfyUI-LTXVideo-Internal",
+      "aux_id": "Lightricks/ComfyUI-LTXVideo",
       "ver": "65bfc50105d620a6a21675e022d229f947c6eb57"
     }
   },

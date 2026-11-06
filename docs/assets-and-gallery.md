@@ -1,12 +1,10 @@
 # Assets & Gallery
 
 Every piece of media in a project — imports, generated takes, captures,
-exports — lives in the **asset gallery** under **Assets** in the editor's left sidebar. The
-same gallery powers the dormant node card's Assets module.
-
-The fullscreen and mounted sidebar also has a **References** tab. It groups
-reusable image, voice, and video assets into project-level characters, locations,
-props, and outfits; see [References](references.md).
+exports — lives in the **asset gallery** under **Assets** in the editor's left
+sidebar. The **Assets** button on the [node card](editor-basics.md#the-node-card)
+opens the same gallery. The sidebar's **References** tab is covered in
+[References](references.md).
 
 Editing with these assets is covered in [Editor Basics](editor-basics.md);
 generation in [Generating](generating.md).
@@ -21,8 +19,9 @@ generation in [Generating](generating.md).
 - **View** — *Folders* (collapsible groups, `Root` included) or *Flat*.
 - **Sort** — Newest, Oldest, Name, Type, Duration, Resolution.
 - **Search** — free text matches display names, plus token filters:
-  `kind:` and `ext:` for artifacts, and `field:<name>=<value>` /
-  `tracked:<text>` for tracked generation metadata (see below).
+  `kind:` for an artifact's kind, `ext:` for a file extension (`ext:mov`), and
+  `field:<name>=<value>` / `tracked:<text>` for tracked generation metadata
+  (see below).
 
 Rows carry badges: a **Scene** marker when the active scene uses the asset,
 a **★ favorite** star, and a **Missing** placeholder when the file is gone
@@ -36,22 +35,24 @@ rules are in [Editor Basics](editor-basics.md#dropping-assets-onto-the-timeline)
 
 ## Asset lifecycle & safety
 
-- **Rename** changes the display name only — the file on disk is never
-  renamed.
-- **Replace File…** swaps the media behind an asset while keeping the asset
-  identity and every reference to it.
+Right-click an asset in the gallery for these. **Empty Trash** is on the
+**Trash** folder's right-click menu.
+
+- **Rename** changes only the name shown.
+- **Replace File...** swaps the media behind an asset; everything that uses
+  it shows the new file.
 - **Move to Trash** is a soft delete: the asset moves to the **Trash**
   virtual folder at the bottom of the gallery, references stay recoverable,
   and **Restore** returns it to its original folder. Only **Delete
-  Permanently** and **Empty Trash** are destructive. Trash can auto-purge by
-  age/size (Settings ▸ Render).
+  Permanently** and **Empty Trash** are destructive. Trash can empty itself by
+  age or size: **Settings ▸ Asset Gallery ▸ Trash Retention Days** /
+  **Trash Max Size**.
 - After **Delete Permanently** or **Empty Trash**, an asset's uses on the
   timeline and in the queue become **Missing** placeholders, and it leaves any
   Reference it belonged to.
 - **Missing assets** (file moved or deleted on disk) keep their entry and
-  references — **Relink…** points them at the file again and everything
-  reconnects.
-- **Where Used…** answers "can I safely delete this?" — a grouped summary with
+  references — **Relink...** points them at the file again.
+- **Where Used...** answers "can I safely delete this?" — a grouped summary with
   per-reference rows for clips, guides, audio, generation jobs, and Reference
   Library members.
 - **Open Source Workflow** loads the ComfyUI workflow embedded in a
@@ -72,17 +73,15 @@ raw generation dump:
   exposing the same labels.
 - A **Raw** collapsible keeps the untouched generation dump.
 
-**Artifacts** (latents, JSON, checkpoints, other backend outputs) are
-first-class gallery entries: searchable and inspectable with a metadata
-card, but they render no media preview and can't be dropped on the timeline.
+**Artifacts** (latents, JSON, checkpoints…) appear in the gallery and can be
+searched and inspected, but have no preview and can't go on the timeline.
 
 ## Takes
 
 A **take** is one generated version, saved by **Sonder Save Video** with
 **mode** set to **Take**. It lands in **Assets** under **Takes**, in a folder
-named after the scene, and on its own Video row, with its sound on a linked
-Audio row. Takes reuse an empty row after the last occupied row when it is
-unlocked and visible; otherwise they add a row.
+named after the scene, and on its own Video lane, with its sound on a linked
+Audio lane.
 
 ![A generated take placed on its own linked video and audio lanes](images/take-placed.webp)
 
@@ -107,11 +106,11 @@ was generated. **Restore Take Placement** (**Settings** ▸ **Timeline
 Behavior**, on by default) controls this:
 
 - **In the take's own scene**, it lands at its original time with its
-  original trim, wherever along the row you drop it.
-- **On the ruler**, its sound comes back too, on a new Audio row. The two are
+  original trim, wherever along the lane you drop it.
+- **On the ruler**, its sound comes back too, on a new Audio lane. The two are
   linked when **Link Dropped Video + Audio** (**Settings** ▸ **Timeline
   Behavior**) is on.
-- **On an Audio row**, only its sound comes back, with the same trim. If the
+- **On an Audio lane**, only its sound comes back, with the same trim. If the
   take has no sound that can be recovered, nothing is placed.
 - **In another scene**, it starts where you drop it, with the same trim. If
   that scene has another frame rate, the trim is converted to keep the same
@@ -136,15 +135,15 @@ source of the next render over that range.
 For sound, keep **place_audio_on_timeline** on **Sonder Save Video** when you
 generate new sound and want later takes to continue from it. When the sound is
 frozen (**Sonder Masks Bridge** **edit_audio** on **Freeze**), turn it off, so
-the same audio isn't stacked on a new row with every take.
+the same audio isn't stacked on a new lane with every take.
 
-**Choosing the take that plays.** Higher-numbered Video rows appear in front.
+**Choosing the take that plays.** Higher-numbered Video lanes appear in front.
 To keep one take, right-click it and choose **Unmute Selected**, then mute the
-competing takes with **Mute Selected**, or hide their Video row with the eye at
-the left of the row. Click **Play** under the preview to check picture and
+competing takes with **Mute Selected**, or hide their Video lane with the eye at
+the left of the lane. Click **Play** under the preview to check picture and
 sound. A favorite star in **Assets** doesn't change what plays.
 
-To switch only the picture and keep the sound, hide the Video row, or unlink
+To switch only the picture and keep the sound, hide the Video lane, or unlink
 the take first ([Linked groups](editor-basics.md#linked-groups)).
 
 ## Manage mode & bulk actions
@@ -158,14 +157,13 @@ trashed ones.
 
 Double-click (or Space) a gallery asset for fullscreen inspection.
 
-- **Images** — wheel zoom pivots toward the cursor up to **16×** for
-  pixel-level checks; left-drag pans; `F` fits.
-- **Video** — Space plays/pauses; ←/→ steps one frame (Shift = 10,
-  Ctrl = 1 s); **right-drag anywhere on the video scrubs** from the current
-  playhead; the scrub bar handles absolute seeks.
-- **Audio** — an interactive waveform: click/drag seeks, the played portion
-  highlights.
-- ↑/↓ cycle through assets without leaving the overlay.
+- **Images** — wheel zoom pivots toward the cursor, up to **16×**; left-drag
+  pans.
+- **Video** — **right-drag anywhere on the video scrubs** from the current
+  playhead.
+- **Audio** — click or drag on the waveform to seek.
+
+The keys are listed under [Inspect overlay](#inspect-overlay).
 
 ## Compare mode
 
@@ -174,14 +172,13 @@ it, click **Assets** at the upper left, double-click a result to inspect it,
 then click **Compare** in the inspection overlay (or press **C** there). To
 make the winner the take that plays, see [Takes](#takes).
 
-- **Layouts** — a screen-fixed **divider** over one shared stage (pan/zoom
-  moves both together), or explicit **side-by-side**, where a further toggle
-  switches between **Linked Zoom** and **Independent Zoom**.
+- **Layouts** — **Divider**, one shared stage split by a divider (pan and zoom
+  move both), or **Side by Side**, where a toggle switches between **Linked
+  Zoom** and **Independent Zoom**.
 - **Pickers** — left-click assigns A, right-click assigns B, and the current
-  pair stays pinned at the top of both lists. Each side gets its own search box
-  and keeps its own scroll position; a sticky toggle chooses which side the
-  arrow keys cycle, so you can hold one take fixed and flip the other through
-  candidates.
+  pair stays pinned at the top of both lists. Each side has its own search box.
+  A toggle chooses which side ↑ / ↓ change, so you can hold one take fixed and
+  flip the other through candidates.
 - **Video** — linked transport; an **A | B | None**
   control picks which side's audio plays.
 - **Audio** — stacked waveforms; monitor **A / B / Both / Mute** on keys
@@ -192,10 +189,8 @@ make the winner the take that plays, see [Takes](#takes).
 - **Favorites** — each side carries a star in its corner of the stage, faint
   until you hover; click it to favorite that side. `S` favorites the side the
   arrow keys cycle, and the pickers mark favorites with ★. Opened from the
-  **Favorites** scope, compare becomes an elimination round: unfavorite the
-  weaker take and the next one in that side's list steps in, until the last
-  favorite of that type is left, shown in single view. Single Inspect in the
-  Favorites scope moves on to the next favorite instead of closing.
+  **Favorites** scope, unfavorite the weaker take and the next favorite in that
+  side's list steps in, until one is left.
 
 https://github.com/user-attachments/assets/38af328d-0596-4ed1-8a14-4ab9e9cb79dd
 
@@ -209,7 +204,7 @@ You don't add proxies yourself. Your browser can't play some video formats,
 such as ProRes and Lossless FFV1 (RGB), so when such a video arrives (an
 import, a take, a Save Bridge file, an export), Sonder makes a **proxy**: a
 playable copy, unless **Build Proxies** is set to **Only when I ask**. The viewport, the gallery, Inspect, Compare and **Crop, Trim &
-Preview** show the proxy; render, export, Add frame to guides and the graph
+Preview** show the proxy; render, export, **Add Frame to Guides** and the graph
 always use the original file.
 
 Until a proxy is ready, the viewport shows a notice where the clip would be,
@@ -266,20 +261,18 @@ Export saves the arranged picture and sound of one scene. For the steps, see
 [Export the timeline](getting-started.md#export-the-timeline).
 The toolbar's **Export** dialog offers:
 
-- **Save presets** — Compatible MP4, High Quality MP4, Editing Master MP4,
-  ProRes 422 HQ, Lossless FFV1 (RGB), or Custom with expert encode
-  controls.
-- **Include video / audio** checkboxes, and **Place as take** to drop the
-  result straight onto a fresh lane in the active scene (with optional
-  linked, muted take placement).
+- **Save preset** — the presets in [Audio fidelity](#audio-fidelity), or
+  **Custom**.
+- **Include video** / **Include audio**, and **Place as take** to put the
+  result on a new lane in the active scene; **Link take video + audio** and
+  **New take starts muted** set how.
 - Exports land in the gallery's `Exports` folder; place-as-take exports land
   in Root.
 
 ## Audio fidelity
 
 Saved and previewed results may be lowered in volume to leave peak headroom;
-quiet material is not boosted. Check the result in the gallery before
-delivery.
+quiet material is not boosted.
 
 A video export has no audio stream when its window has no audible tracks.
 
@@ -327,7 +320,7 @@ export in its target player or editor.
 | C | Toggle Compare |
 | S | Favorite / unfavorite (compare: the side ↑ / ↓ cycles) |
 | Delete | Move to Trash |
-| F | Fit |
+| F / 0 | Fit |
 | + / − | Zoom |
 | Wheel | Zoom (image/video) / waveform zoom (audio) |
 | Esc | Close |

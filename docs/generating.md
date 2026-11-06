@@ -43,13 +43,12 @@ either.
   grid; the ▲▼ steppers move directly along it.
 - **Context frames (Ctx Pre/Post)** extend the source window beyond the
   selection, feeding your graph already-rendered frames for generation
-  overlap — this is what makes seamless chaining possible.
+  overlap.
 - **Mask offsets (Mask −/+)** move the start and end of the region the
   Masks Bridge marks for regeneration. Check the mask against your intended
   edit before running; these values do not change In/Out.
 - **Saved Selections** (the bookmark button) capture the *full* recall state
-  — in/out, context, and mask offsets — and live in the project, so they're
-  shareable.
+  — in/out, context, and mask offsets — and live in the project.
 - **✕** in the **GEN** box clears the Selection (the **X** key does too).
 
 ### Ways to set In and Out
@@ -145,17 +144,16 @@ Guide frames condition generation with a reference image at a specific frame
 [Convert a Video clip to Driver](editor-basics.md#driver-clips) from its
 right-click menu. The original video remains an asset, but the Driver is no
 longer a visible picture layer. To exclude an old Driver from this workflow's
-guidance, hide its **Driver lane** with the eye icon at the left of that row.
-This does not hide a separate Audio lane. Collapse only folds the row; it does
-not disable guidance. A workflow's explicit Driver override can take priority
-over lane hiding, so check the selected workflow's instructions.
+guidance, hide its **Driver lane** with the eye icon at the left of that lane.
+This does not hide a separate Audio lane. Collapse only folds the lane; it does
+not disable guidance.
 
 Driver clips steer motion, composition, look, or characters without ever
 appearing in output (their editing rules are in
 [Editor Basics](editor-basics.md#driver-clips)). Each Driver has a
 **strength** (0–1). In the graph, **Sonder Driver Selector** picks a Driver
-row from its lane menu and outputs `has_driver`; **Sonder Driver Bridge**
-outputs that row's frames for the generation window. When the template's frame
+lane from its lane menu and outputs `has_driver`; **Sonder Driver Bridge**
+outputs that lane's frames for the generation window. When the template's frame
 rule adds frames to the end of the window, a Driver that runs to the window's
 end holds its last frame over them.
 
@@ -185,13 +183,17 @@ its card, its widgets are set by the editor.
 | `frame_count` · `fps` · `width` · `height` | INT · FLOAT · INT · INT | The window's geometry, for your sampler and latents. |
 | `mask_start_time` / `mask_end_time` | FLOAT | Where the regenerated span begins and ends. |
 
-A text-to-video graph needs three of them and no bridge nodes:
+A text-to-video graph needs two of them and no bridge nodes. Encode
+`rendered_frames` with your model's VAE and sample that latent at full
+denoise (an empty timeline arrives as
+[black frames](#empty-timeline-means-black-frames)), and wire `prompt` into
+your text encoder:
 
 ```
-Sonder Editor ──prompt────────> your text encoder ──> sampler ──> VAE Decode
-              ──frame_count───>                                        │
-              ──width/height──>                                        ▼
-                                                               Sonder Save Video
+Sonder Editor ──rendered_frames──> VAE Encode ──> sampler ──> VAE Decode
+              ──prompt──────────> your text encoder ──^           │
+                                                                 ▼
+                                                         Sonder Save Video
 ```
 
 End every graph with **Sonder Save Video** (or **Sonder Save Bridge**) taking
@@ -205,9 +207,24 @@ Bridge**), Drivers (**Driver Selector/Bridge**) and References
 ([Reference Selector and Bridges](references.md#wiring-the-nodes)). The full
 node list is in the [README](../README.md#nodes).
 
-![The smallest text-to-video graph: the Sonder Editor node's prompt, width, height and frame_count feeding a text encoder, an empty latent and KSampler, then VAE Decode into Sonder Save Video, which also takes the editor's project, fps and audio](images/showcase-workflow.webp)
-<p align="center"><em>The graph above, built on the canvas. Your graph can be
-as small as editor → sampler → Sonder Save Video.</em></p>
+### Skip a branch the window doesn't need
+
+**Sonder Switch** runs only one of its inputs. To skip a Driver or Reference
+branch in windows that don't have one:
+
+1. Wire **Sonder Driver Selector**'s `has_driver` (or **Sonder Reference
+   Selector**'s `has_reference`) into the Switch's `select`. It is `0` without
+   a Driver or Reference in the window, `1` with one.
+2. Connect the path without it to `item0`, and the path through the Bridge to
+   `item1`.
+3. Take the Switch's `item` output onward.
+
+The branch that isn't selected doesn't run, including its LoRA. **Sonder
+Cluster** does the same for several values that switch together.
+
+![The smallest text-to-video graph: the Sonder Editor node's rendered_frames encoded by VAE Encode into KSampler's latent_image and its prompt into a text encoder, then VAE Decode into Sonder Save Video, which also takes the editor's project, fps and audio; the LTX 2.5 model, text encoder and VAE loaders sit below](images/showcase-workflow.webp)
+<p align="center"><em>The graph above, built on the canvas with LTX 2.5's
+loaders.</em></p>
 
 ### Masking an audio-video latent
 
@@ -287,10 +304,6 @@ For a spatial edit, also follow [Edit a moving region](#edit-a-moving-region).
   such as `WanImageToVideo`, `WanAnimateToVideo`, the Cosmos image-to-video
   pair, HunyuanVideo's *v2 (replace)* mode and SCAIL continuation, all of which
   pin their reference frames that way. Those pins are silently destroyed.
-  Chaining through the Sonder timeline is unaffected, because it carries context
-  as encoded frames inside the window rather than as a producer-written pin.
-  Stock `SetLatentNoiseMask` behaves identically; this is not specific to the
-  Masks Bridge.
 - Without spatial_mask, masks are hard 0/1, so the boundary latent is fully
   regenerated and the seam is a hard cut at latent resolution — around a third of a second for LTX
   video, and much finer for audio.
@@ -364,13 +377,13 @@ The queue panel docks at the bottom of the Assets sidebar.
   section for exactly what freezes). No selection queues the full scene.
 - **+ Batch (N)** splits the selection into contiguous chunks sharing a batch
   id; chunk size follows the template's frame rule and **Max frames per
-  batch** (**Settings ▸ Render**). With zero context the chunks are independent; with context, later
+  batch** (**Settings ▸ Render**, also in the **Controls** tab's **Editor**
+  group). With zero context the chunks are independent; with context, later
   chunks read earlier chunks' placed takes.
-- **Queue Active** decides what a ComfyUI run renders: **ON** → the first
-  pending queued job (FIFO, one per run); **OFF** → the live editor
-  selection.
-- Job completion is owned by the terminal save node (**Sonder Save Video**
-  or **Save Bridge** with `mark_queue_complete` on). If a batch chunk fails,
+- **Queue Active** decides what a ComfyUI run renders: **ON** → the oldest
+  pending job, one per run; **OFF** → the live editor selection.
+- A job completes when **Sonder Save Video** or **Save Bridge** saves with
+  `mark_queue_complete` on. If a batch chunk fails,
   later chunks in that batch are auto-skipped so a progressive batch can't
   continue over a gap.
 - New takes land on the timeline as described in
@@ -403,7 +416,7 @@ edits affect a queued job and which don't.
 |---|---|
 | **Render clips & audio tracks** | trims, moves, mutes, and lane hides apply as they are when the job runs — the timeline state at execution is what renders |
 | **Newly placed takes** | with context, later batch chunks read earlier chunks' takes through the normal compositor |
-| **Guides-Bridge per-guide overrides** | the bridge node's override map is read at execution, not from the snapshot |
+| **Guides Bridge per-guide settings** | read when the job runs, not when it was queued |
 | **Take link/mute settings** | resolved from live Settings when the take is placed |
 | **Asset gallery state** | folders, favorites, renames never affect queued jobs |
 

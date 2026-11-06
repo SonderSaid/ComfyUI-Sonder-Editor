@@ -45,7 +45,7 @@ editor steps, then what your graph needs for it. First
 5. Double-click the **Global** bar in the timeline and type what holds for the
    whole scene (style, place, light). Press Enter or click elsewhere to keep it;
    **Esc** discards what you typed.
-6. Double-click empty space on the **Prompt** row, the last row of the
+6. Double-click empty space on the **Prompt** lane, the last lane of the
    timeline. Type what happens, then click **Create**.
 7. In the **GEN** box of the toolbar, type `0` in **In** and press Enter, then
    about five seconds of frames in **Out** (for example `121` at 24 fps) and
@@ -56,10 +56,8 @@ editor steps, then what your graph needs for it. First
 
 **In the graph:**
 1. Encode **Sonder Editor**'s `rendered_frames` (and `audio`, for a model that
-   generates sound) with your model's VAE, and sample that latent instead of an
-   empty one. Wire `prompt` into your text encoder. If your graph can only start
-   from an empty latent, wire `frame_count`, `width` and `height` into it
-   instead.
+   generates sound) with your model's VAE, and sample that latent. Wire
+   `prompt` into your text encoder.
 2. Sample at full denoise: an empty timeline reaches the graph as
    [black frames](generating.md#empty-timeline-means-black-frames).
 3. End the graph with **Sonder Save Video**, with `project` wired from the
@@ -69,8 +67,8 @@ editor steps, then what your graph needs for it. First
 4. Click **Run** at the top right of the canvas. In the
    [Sonder App](sonder-app.md#generate), click **Generate** instead.
 
-**You'll see:** a new [take](assets-and-gallery.md#takes) on its own Video row,
-with any sound on a linked Audio row, covering **In** to **Out**. Click **Play**
+**You'll see:** a new [take](assets-and-gallery.md#takes) on its own Video lane,
+with any sound on a linked Audio lane, covering **In** to **Out**. Click **Play**
 under the preview to watch it.
 
 **Learn more:** [The generation window](generating.md#the-generation-window) ·
@@ -90,7 +88,7 @@ so it keeps the frames it is given and generates the rest.
 **In the editor:**
 1. Put the clip on the timeline. For a file: drag it from your file manager
    into the **Assets** sidebar, then from **Assets** onto the ruler (the strip
-   of frame numbers at the top of the timeline). It lands on a new Video row.
+   of frame numbers at the top of the timeline). It lands on a new Video lane.
 2. Click the ruler near the clip's end. Use **←** / **→** to land on the first
    frame after the clip, where the preview turns empty, and press **I**.
 3. If the scene ends there too, type a longer length in **Frames** (toolbar,
@@ -100,7 +98,7 @@ so it keeps the frames it is given and generates the rest.
    for example `24`. Set **Post** to `0`. These are the
    [context frames](generating.md#the-generation-window).
 6. Write a **Prompt** section over the new range (double-click the **Prompt**
-   row, type, **Create**).
+   lane, type, **Create**).
 7. In **Render Queue**, untick **Queue Active**.
 
 **In the graph:**
@@ -156,13 +154,11 @@ as in [Extend a video](#extend-a-video).
 3. Type the number of jobs in the box beside **Run**, then click **Run**.
 
 **You'll see:** each run renders the next job and marks it **Completed** in
-**Render Queue**; **Clear Completed Renders** removes finished jobs. The takes
-line up one after another across the range.
+**Render Queue**. The takes line up one after another across the range.
 
-To queue several takes of one selection instead, click **+ Queue** once per
-take, and set your seed to change on each run.
-
-**Learn more:** [What's frozen vs. what stays live](generating.md#whats-frozen-vs-what-stays-live)
+**Learn more:** [The render queue](generating.md#the-render-queue), including
+several takes of one selection with **+ Queue** ·
+[What's frozen vs. what stays live](generating.md#whats-frozen-vs-what-stays-live)
 
 ## Redo a part of a clip
 
@@ -189,11 +185,11 @@ take, and set your seed to change on each run.
 2. Set denoise to match step 3: below 1 for a subtle fix, 1 for a new action.
 3. To keep the clip's sound, set **edit_audio** to **Freeze** and turn
    **Sonder Save Video**'s **place_audio_on_timeline** off. To regenerate it
-   too, leave both on.
+   too, set **edit_audio** to **Edit** and leave **place_audio_on_timeline** on.
 4. **Sonder Save Video**: **mode** **Take**. Change the seed before each new
    attempt, then click **Run**.
 
-**You'll see:** a take covering only **In** to **Out**, on a new Video row in
+**You'll see:** a take covering only **In** to **Out**, on a new Video lane in
 front of the original. If it starts muted, right-click it and choose **Unmute
 Selected** to see it in place.
 
@@ -212,10 +208,10 @@ passes through at the frames you choose.
 
 **In the editor:**
 1. Drag the images from your file manager into the **Assets** sidebar.
-2. Drag each image from **Assets** onto the **Guides** row, at the frame where
+2. Drag each image from **Assets** onto the **Guides** lane, at the frame where
    it should appear. Each one is a keyframe, called a
    [guide](generating.md#guides) in the editor.
-3. To set an exact frame or a strength, click **☰** on the **Guides** row
+3. To set an exact frame or a strength, click **☰** on the **Guides** lane
    header to open **Guide Management**, and edit that guide's row.
 4. Set **In** and **Out** to the range to generate. The guides inside it are
    used at their frames. If your model takes only a first and a last frame,
@@ -229,8 +225,10 @@ passes through at the frames you choose.
 - **One guide per pass:** place your model's per-guide node (for example
   `LTXVAddGuide`) between **Sonder Guides Bridge Start** and **Sonder Guides
   Bridge End**, both with `project` from the editor. Feed it Start's `image`,
-  `frame_index` and `strength`, carry your latent through the loop's `value`
-  sockets, and connect Start's `flow_control` to End.
+  `frame_index` and `strength`. Connect your latent to Start's `value_0`,
+  Start's `value_0` output to the guide node's latent input, and that node's
+  latent output to End's `value_0`. Connect Start's `flow_control` to End's,
+  and take End's `value_0` onward to the sampler.
 
 Then save with **Sonder Save Video**, **mode** **Take**, and click **Run**.
 
@@ -252,9 +250,9 @@ for that kind of signal, such as an IC-LoRA.
 
 **In the editor:**
 1. Drag the control video into **Assets**, then from **Assets** onto the ruler.
-   It lands on a new Video row.
+   It lands on a new Video lane.
 2. Right-click the clip and choose **Convert to Driver**. It becomes a
-   [Driver](generating.md#drivers): it moves to a **Driver** row and leaves the
+   [Driver](generating.md#drivers): it moves to a **Driver** lane and leaves the
    preview.
 3. Write a **Prompt** section over the Driver's range.
 4. Set **In** and **Out** inside the Driver's range. Keep the range short:
@@ -263,18 +261,20 @@ for that kind of signal, such as an IC-LoRA.
 
 **In the graph:**
 1. Add **Sonder Driver Selector** with `project` from the editor, and choose
-   your Driver row by name in its lane menu.
+   your Driver lane by name in its lane menu.
 2. Wire its `driver_ref` into **Sonder Driver Bridge**, and the Bridge's
    `driver_images` (with `driver_idx` and `driver_strength` if your node takes
    them) into your model's control input.
-3. If the Driver covers only part of the timeline, route the driver branch
-   through **Sonder Switch** or **Sonder Cluster** on the Selector's
-   `has_driver`, so ranges without a Driver skip it, including its LoRA.
+3. If the Driver covers only part of the timeline, wire the Selector's
+   `has_driver` into a [Sonder Switch](generating.md#skip-a-branch-the-window-doesnt-need)'s `select`. Connect the path
+   without the Driver to `item0` and the path through the Driver Bridge to
+   `item1`, then take `item` onward. Ranges without a Driver then skip it,
+   including its LoRA.
 4. **Sonder Save Video**: **mode** **Take**. Click **Run**.
 
 **You'll see:** a take that follows the control video.
 
-![Two viewport panes side by side: a stick-figure pose from the Driver and a robot on the Moon raising its sword in step with it, while the playhead crosses the Driver row on the timeline](images/driver-loop.webp)
+![Two viewport panes side by side: a stick-figure pose from the Driver and a robot on the Moon raising its sword in step with it, while the playhead crosses the Driver lane on the timeline](images/driver-loop.webp)
 
 **Learn more:** [Driver clips](editor-basics.md#driver-clips) ·
 Worked example: the [LTX 2.3 Playground](../README.md#examples) drives an LTX
@@ -306,7 +306,7 @@ matches what that input accepts.
    Check that the item reads [In window](references.md#what-a-generation-window-resolves-to).
 6. Write the action in a **Prompt** section. To include the Reference's text,
    [attach a Context chip](references.md#attaching-a-context-chip).
-   In **Render Queue**, untick **Queue Active**.
+7. In **Render Queue**, untick **Queue Active**.
 
 **In the graph:**
 1. Add **Sonder Reference Selector** and connect **Sonder Editor**'s `project`
@@ -321,10 +321,10 @@ matches what that input accepts.
    recipe text separately, use **Sonder Reference Prompt Bridge** from the
    same `reference_set` and wire `reference_prompt` to the matching text input
    instead of also attaching that text as a chip.
-5. For windows without a Reference, use `has_reference` to select the
-   conditioned or unconditioned branch with **Sonder Switch** or
-   **Sonder Cluster**. Keep the Bridges on the conditional branch so they
-   are skipped when `has_reference` is `0`.
+5. For windows without a Reference, wire the Selector's `has_reference` into a
+   [Sonder Switch](generating.md#skip-a-branch-the-window-doesnt-need)'s `select`. Connect the path without the
+   Reference to `item0` and the path through the Bridges to `item1`, then take
+   `item` onward. The Bridges then run only when a Reference is in the window.
 6. Save the decoded result with **Sonder Save Video**, `project` from the
    editor and **mode** **Take**, then click **Run**.
 
@@ -333,8 +333,6 @@ Reference input. How strongly it follows the media depends on your model.
 
 **Learn more:** [Wiring the Reference nodes](references.md#wiring-the-nodes) ·
 [Reference prompting](references.md#reference-prompting).
-There is no shipped generic Reference example; add these nodes to your
-model's working graph.
 
 ## Use References with separate inputs
 
@@ -347,9 +345,9 @@ For MiniMax H3, use its reference-to-video model mode.
 
 **In the editor:**
 1. Add your Library members and stage the first as in
-   [Use a Reference](#use-a-reference). In **Reference Lane Setup**, expand
-   that item's options and click **+ Add member** to include another Library
-   member in the same item. Use [separate lanes](references.md#use-cases)
+   [Use a Reference](#use-a-reference). In **Reference Lane Setup**, click
+   **+ Add member** on that item to include another Library member in the
+   same item. Use [separate lanes](references.md#use-cases)
    for different timing or recipes.
 2. In each lane's **Reference Lane Setup → Recipe → Template**, select the
    matching slot recipe. For H3 images, choose **MiniMax H3 Pictures**.
@@ -373,9 +371,8 @@ For MiniMax H3, use its reference-to-video model mode.
    reference inputs use `nothing`. Gate empty Reference branches with
    `has_reference`, as in
    [Use a Reference](#use-a-reference).
-4. Connect the editor's `prompt` to the text encoder. For H3, set the
-   consuming node's **ref_image_size** to `max`, and use the `ref2va`
-   model choice.
+4. Connect the editor's `prompt` to the text encoder. For H3, on the H3 node
+   that takes the pictures, set **ref_image_size** to `max`.
 5. Save with **Sonder Save Video**, **mode** **Take**, then click **Run**.
 
 ![A ComfyUI graph: Sonder Editor feeding Sonder Reference Selector with reference_lanes set to two lanes, Sonder Reference Image Bridge with outputs labelled r01 · Picture 1 and r02 · Picture 2, two Preview Image nodes showing the staged pictures, and Preview as Text showing the compiled MiniMax H3 prompt](images/reference-graph.webp)
@@ -403,9 +400,9 @@ sampler works.
 2. At the right of the bar above the viewport, click **2**. A second
    [pane](editor-basics.md#panes) appears; the first keeps the scene preview.
 3. Click the second pane's source button at its top left (**Guides ▾**).
-4. Under **Sampling previews**, click your sampler. For a video model, first
-   add the Override (In the graph, step 3) and click it instead. It becomes a
-   [View](generating.md#output-views), and the pane keeps showing it.
+4. Under **Sampling previews**, click your sampler, or, for a video model,
+   **Model Preview Override** (add it first: In the graph, step 3). It becomes
+   a [View](generating.md#output-views), and the pane keeps showing it.
 
 **In the graph:**
 1. Make ComfyUI draw previews: open ComfyUI's **Settings** (the gear icon),
@@ -450,7 +447,6 @@ last.</em></p>
    **Place as take** unless you want the file back on the timeline.
 7. Click **Export**.
 
-**You'll see:** a progress bar, then the file in the **Exports** folder of
-**Assets**. Double-click it to play it.
+**You'll see:** the file in the **Exports** folder of **Assets**. Double-click it to play it.
 
 **Learn more:** [Export timeline](assets-and-gallery.md#export-timeline)

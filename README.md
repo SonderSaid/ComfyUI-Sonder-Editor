@@ -81,7 +81,7 @@ What you can do from the editor:
 | You want to… | Use… |
 |---|---|
 | Organize your work | [Projects and scenes](docs/editor-basics.md#creating-a-project), with [folders, favorites and media recovery](docs/assets-and-gallery.md) |
-| Arrange picture and sound | [Video and Audio rows](docs/editor-basics.md#the-timeline): move, trim, split, layer and play media |
+| Arrange picture and sound | [Video and Audio lanes](docs/editor-basics.md#the-timeline): move, trim, split, layer and play media |
 | Describe what happens | [Global text and timed Prompt sections](docs/prompts.md), from a plain text field to structured instructions |
 | Guide the result | [Guides and Drivers](docs/generating.md#guides), or [reusable References](docs/references.md) staged where they apply |
 | Choose what to generate or change | [In/Out, surrounding context and picture/sound masks](docs/generating.md#the-generation-window) |
@@ -104,7 +104,7 @@ setup.
 ### Redo just one part
 
 Keep the take you like and redo a stretch of it: set **In** and **Out**, keep the
-frames before as context, and the new take lands on its own row, ready to play
+frames before as context, and the new take lands on its own lane, ready to play
 beside the first. See [Redo a part of a clip](docs/getting-started.md#redo-a-part-of-a-clip).
 
 https://github.com/user-attachments/assets/3b87d262-5496-4870-aff0-2990dfc3ef5a
@@ -328,13 +328,13 @@ automatically.
   area. Do not expose a ComfyUI instance running this pack to untrusted networks
   unless you have put ComfyUI behind your own authentication and network
   controls.
-- Generated files can embed ComfyUI prompt/workflow metadata when **Embed
-  Metadata** is enabled on **Sonder Save Video**. Turn that off before sharing
+- Generated files can embed ComfyUI prompt/workflow metadata when
+  `embed_metadata` is on in **Sonder Save Video**. Turn that off before sharing
   files if your graph, prompts, paths, model names, or node settings are private.
 - Project `media/`, `cache/`, and generated output folders are user data, not
   source distribution files. Do not commit them to a public repository.
-- **External Project Links** is off by default. Enabling it in Editor Settings
-  makes this ComfyUI installation follow project and media symlinks/junctions
+- **Allow External Project Links** (**Settings ▸ Server**) is off by default.
+  Enabling it makes this ComfyUI installation follow project and media symlinks/junctions
   wherever the editor resolves files. Treat every linked folder as readable by
   anyone who can reach your ComfyUI server.
 

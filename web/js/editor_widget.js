@@ -23058,6 +23058,7 @@ export class EditorWidget {
                 ["M", "Mute / Hide selected asset(s)"],
                 ["S", "Toggle snapping"],
                 ["T", "Toggle timecode display"],
+                ["A", "Toggle animatic mode (hide all video)"],
                 ["F", "Fit timeline to view"],
                 ["Shift+F", "Zoom to selection"],
             ]) +

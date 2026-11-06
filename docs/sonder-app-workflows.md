@@ -111,7 +111,7 @@ Above the timeline, choose **Model → MiniMax H3** and **Channels → MiniMax H
 (full reference)**.
 
 Under **Controls → Modes**, choose one of the five **Task** choices, then choose
-**Mask On** or **Mask Off** in the separate **Mask** row. Masking affects video;
+**Mask On** or **Mask Off** in the separate **Mask** category. Masking affects video;
 the Task decides whether audio is generated or kept. For generation with your
 own media, follow the workflow's **Use References** note. References must be
 placed in time to participate.
@@ -126,7 +126,7 @@ For a masked character swap:
    Reference lane. Describe the replacement in that Library member's
    **Prompt**. See [H3 Subject or Picture setup](references.md#minimax-h3-full-reference).
    Under **Controls → Swap Sources**, set **Replacement Picture Lane** to that
-   lane; show advanced settings if the section is hidden.
+   lane; click **advanced hidden** below **Modes** if the section isn't shown.
 3. **Choose the swap and mask.** Select **Modes → Task → Character Swap**, then
    **Modes → Mask → Mask On**. In **Who do you want to mask?** below Modes,
    describe the person to replace, such as `the woman on the left`.
@@ -136,8 +136,9 @@ For a masked character swap:
    **Mask Settings** if needed, then run the preview again.
 5. **Set the strength and generate.** Under **Generation Settings**, start with
    **Swap Strength** at **1**. Increase it if the swap is failing; lower it if
-   unintended details change. Turn **Queue Active** off in **Render Queue**
-   below the sidebar to use the live selection, then click **Generate**.
+   unintended details change. Turn **Queue Active** off in **Render Queue**,
+   at the bottom of the **Assets** sidebar, to use the live selection, then
+   click **Generate**.
 
 For a head replacement, choose **Head Swap** and describe the head when you
 want the mask limited to that area. **Mask Off** runs the same Task without a
@@ -165,4 +166,4 @@ finished video.
 
 For comparing versions and exporting the assembled timeline, see
 [Compare](assets-and-gallery.md#compare-mode) and
-[Export the timeline](assets-and-gallery.md#export-timeline).
+[Export the timeline](getting-started.md#export-the-timeline).

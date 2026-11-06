@@ -82,11 +82,9 @@ Switch the fullscreen or mounted left sidebar from **Assets** to
   whether it is a **subject** or **context**, and give it a one-line
   description. Locations begin as context; the other kinds begin as subjects,
   and either can be changed.
-- Cards show their kind, class, description, member count, and unresolved
-  state. **Manage** reveals entity Edit and Delete.
+- **Manage** shows each card's Edit and Delete.
 - Add one image, audio, or video asset at a time. The picker can **Inspect** a
-  source without selecting it. After selection, only compatible built-in tags
-  are offered; custom tags remain unrestricted.
+  source without selecting it.
 - Members can carry tags, prompt text, an image/video crop, and an
   audio/video start/end trim. A blank end uses the rest of the source.
 - **Crop & Preview**, **Trim & Preview**, or **Crop, Trim & Preview** opens the
@@ -99,14 +97,11 @@ Switch the fullscreen or mounted left sidebar from **Assets** to
   width/height ratio such as `3 × 10`. Trim handles resize the interval;
   dragging its middle moves it without changing its duration.
 - **Space** plays or pauses the active view, and focused crop and trim controls
-  take Arrow-key nudges — the full list is in the editor's **?** shortcut
-  atlas. **Apply to Draft** returns your edit to the member; nothing reaches
+  take Arrow-key nudges — the full list is in the editor's **Keyboard
+  Shortcuts** overlay (**?**). **Apply to Draft** returns your edit to the member; nothing reaches
   the project until you Save.
 - **Edit**, **Remove**, and **Up/Down** act on individual members, with explicit
   Save and Cancel. Swapping a member's source asset happens inside its editor.
-- Search matches reference names, kinds, descriptions, current asset names, and
-  both the stored id and displayed label of member tags. Missing, Trashed, and
-  unresolved members stay visible.
 
 ## Tags
 
@@ -124,11 +119,8 @@ Pictures asks for identity, environment, style, motion, storyboard, or
 composition-anchor inputs. These are suggestions, not requirements — nothing
 is blocked, and the only hard limit is the recipe's member cap.
 
-A tag describing content is universal. A tag naming a provider input slot
-carries its family: **Motion Reference** is universal, while
-**MiniMax H3 · Motion** names an H3 slot. The picker groups tags by family;
-compact timeline labels use shorter names, such as **H3·Motion**.
-Custom tags keep the text you entered.
+Tags that name an H3 input start with **MiniMax H3 ·** (shown as **H3·…** on
+the timeline); the picker groups them. Custom tags keep the text you entered.
 
 Built-in tags are media-aware, so once you pick an asset only the tags that fit
 it are offered: Voice Identity takes standalone audio, and video only when the
@@ -140,8 +132,9 @@ staging; what the model receives is its media and its prompt text.
 ## Reference lanes
 
 Adding media to the **Reference Library** alone does not send it to a model.
-In the **References** sidebar at the upper left, drag the intended member
-onto a **Reference** timeline row over the range where it applies. The lane's
+In the **References** sidebar at the upper left, drag the member onto the
+timeline ruler to make a new Reference lane, or onto an existing Reference
+lane, over the range where it applies. The lane's
 recipe and connected workflow decide how that staged input is used. A
 Reference guides a generation; it is not a visible Video layer.
 
@@ -166,12 +159,12 @@ with **Add to timeline** on an expanded Library card; the rules are in
 
 A Reference lane header's **☰** (also on its right-click menu) opens **Reference Lane Setup**.
 It also opens after the first item is added to a new or empty lane. To turn
-that off, open **Settings → References** and untick
+that off, open **Settings ▸ References** and untick
 **Open Lane Setup on First Item (browser)**.
 
 ## Reference image fitting
 
-**Settings → References** sets how individual reference images and video
+**Settings ▸ References** sets how individual reference images and video
 frames fill their recipe's output dimensions, across all built-in and custom
 recipes in the project. New and existing projects default to **Fill (crop),
 Center** until you choose a setting.
@@ -183,18 +176,12 @@ Center** until you choose a setting.
 | **Fill (crop)** | Fills the output while keeping aspect ratio, cropping what extends past it. |
 | **Stretch** | Fills the output by resizing to its width and height. |
 
-Fill also offers a **Crop Anchor**: Center, Top, Bottom, Left or Right. The
-anchor stays saved when another mode hides the control. These settings travel
-with the project; the clip and guide creation defaults are separate browser
-preferences. A choice shows at once while it saves; if the save fails, the
-control returns to the saved setting.
+Fill also offers a **Crop Anchor**: Center, Top, Bottom, Left or Right. These
+settings travel with the project.
 
 Fitting happens after the Library member's own crop and after the recipe
 chooses output dimensions. It applies to **Batch**, **Temporal** and **Slots**.
 **Sheet** grids and strips keep their recipe's fitting, layout and background.
-
-Queued jobs keep the fit mode and anchor captured when they were added, even
-if Settings changes before they run.
 
 <a id="recipes-and-lane-setup"></a>
 ## Recipes and Reference Lane Setup
@@ -231,26 +218,19 @@ Recipes that ship built in:
 Choose a recipe in **Reference Lane Setup → Recipe → Template**.
 Recipes for a different media kind are greyed out while the lane holds items,
 with the reason beside the name. Stage that kind on another lane instead.
-A mouse selection applies immediately. When browsing with the keyboard, press
-Enter or leave the selector to apply; Esc restores the previous choice.
 
 **Edit as custom** makes an editable project recipe from the selected values.
 To reset it to the built-in recipe, select that built-in again in **Template**.
 
 Several model contracts need one extra setup detail outside the recipe:
 
-- **LTX Best Face ID** uses a single-reference frame of `460×406`
-  (`1.133:1`). A portrait face crop is therefore pillarboxed to roughly 59–66%
-  frame fill unless the Library member's crop box matches that aspect.
-- **LTX IC-LoRA Ingredients** needs both `Reference sheet: [...]` and
-  `Generated video: [...]`. The recipe supplies both labels — `Reference
-  sheet:` as its prefix and `Generated video:` as its suffix — so the derived
-  prompt arrives already closed. What is still yours is the generated-video
-  description that follows the label, written on the prompt track.
-- **MiniMax H3 Pictures** assumes the consuming node's `ref_image_size` is
-  `max`. The node defaults to `match`, which rescales to the generation's pixel
-  area and discards the recipe's 2048-short-edge preparation. The recipe mirrors
-  the node's nearest-`/32` image rounding; set the node to `max` when using it.
+- **LTX Best Face ID:** crop the member to `460×406` (`1.133:1`) to fill the
+  frame; other crops are pillarboxed.
+- **LTX IC-LoRA Ingredients:** the recipe writes `Reference sheet:` before
+  the members and `Generated video:` after them. Write the generated video's
+  description in a Prompt section; it follows that label.
+- **MiniMax H3 Pictures:** set the H3 node's `ref_image_size` to `max`. Its
+  default, `match`, discards the recipe's preparation.
 
 **Reference Lane Setup** shows each staged item's frame range, strength,
 **Active** state, members and advisories. Tabs along the top switch lanes.
@@ -265,15 +245,6 @@ The prompt preview is read-only. Click it to open
 <p align="center"><em>An item with two members on a MiniMax H3 Pictures lane.
 Each member row has its role and preservation; the prompt preview above them
 is read-only.</em></p>
-
-Some values are **pegged** rather than typed — the frame grid and snap multiple
-follow the scene's model template, a sheet's loop length follows the render
-window. A pegged value names the source it follows, and falls back to its
-authored number when that source is unset.
-
-Grid sheets choose the column count that gives their actual members the most
-fitted image area. Four square members form a `2×2`; four portrait members form
-the accepted `4×1` layout rather than reserving empty cells.
 
 ## What a generation window resolves to
 
@@ -292,8 +263,8 @@ Reference Lane Setup:
 ![Four Reference lanes across a generation window: solid bars are in window, while a Superseded item and a Below threshold item are dimmed and hatched](images/reference-verdicts.webp)
 <p align="center"><em>Only the solid bars reach the model. <strong>Superseded</strong> lost to an item covering the window more tightly; <strong>Below threshold</strong> was dropped because its overlap is too small relative to the shorter item/window span.</em></p>
 
-**Reference Threshold %** (Settings, project-wide) measures overlap divided by
-the shorter of the item span and render-window span. An item containing the
+**Reference Threshold %** (**Settings ▸ Prompts**, project-wide) compares the
+overlap with the shorter of the item and the generation window. An item containing the
 window, or fully inside it, scores 100% and stays even at threshold 100.
 Crossing an edge reduces coverage smoothly; a short neighbor mostly inside a
 long window can still stay. Unlike prompts, filtering can leave a lane with
@@ -301,12 +272,7 @@ long window can still stay. Unlike prompts, filtering can leave a lane with
 If several items pass, the item with the greatest overlap relative to its own
 span wins on that lane.
 
-With no selection nothing is marked, since the marks answer "what will this
-render use".
-
-Queueing a **batch** predicts all of this per chunk before anything runs, and
-says whether a lane drops because of the threshold or because that chunk falls
-outside the staged range. A lane that resolves in no chunk always warns.
+Set **In** and **Out** to see the verdicts.
 
 ### Use cases
 
@@ -476,16 +442,7 @@ Empty optional fields can stay empty; address the fields named by advisories.
 A chip can name a Reference that doesn't win the current window — its lane is
 muted or hidden, its item is superseded, below threshold, or simply outside.
 The render still goes ahead, and the chip raises an advisory instead of
-blocking the job.
-
-That is what makes a deliberate reference-free pass possible: for a final
-low-denoise upscale you mute the Reference lane so nothing influences detail,
-and every chip bound to that lane follows the mute. The node path reads the
-same fact the same way — a muted lane yields `has_reference = 0`, so the gate
-skips the Bridges.
-
-A **deleted** source is a different matter and does block. That is broken
-authoring rather than a fact about this window.
+blocking the job. A **deleted** source blocks the job.
 
 What becomes of the chip's own authored text is a policy you choose:
 
@@ -501,24 +458,13 @@ overrides the project shows a small `KEEP` or `DROP` badge. The override is
 local to that chip **including linked copies**, so splitting a section leaves
 the two halves free to differ.
 
-Keep preserves what *you* wrote, not what the compiler would have claimed for
-you. A derived appearance clause such as `(appears in [Shot 3])` follows the
-conditioning rather than the prose, so it is not added for a chip that isn't
-conditioning the window under either policy.
-
-Advisories aggregate per lane and cause, so muting a lane on a dense timeline
-reads as one advisory naming every affected chip. When text is kept a second
-advisory says so. Either way every affected chip is still marked individually in the
-Prompt Management.
-
 ### Mentions
 
 Reference members and prompt identities share one set of **handles**. Typing
 `@Anna` in any prompt field compiles to whatever label your prompt format uses,
 and the editor marks it so you can see it is live.
 
-Mentions are ordinary text, which is what lets them survive copy, cut, and
-paste. Prose can name a handle that doesn't exist yet and wire itself up when
+Prose can name a handle that doesn't exist yet and wire itself up when
 you create it. An unrecognized `@handle` stays as typed and raises a warning: correct its
 spelling or create the intended identity/member handle.
 
@@ -543,23 +489,20 @@ example workflow has all four wired against MiniMax H3, alongside first- and
 last-frame guides and latent noise masks.
 
 **Sonder Reference Selector** takes the editor's `project` output, and its own
-panel is where you choose **one or more Reference lanes** to send on. `+` lists
-the lanes available, each chosen lane becomes a removable row, and several
-lanes combine into one ordered set. A lane that no longer exists is skipped
-rather than quietly substituting another.
+panel is where you choose **one or more Reference lanes** to send on: click
+**+** to add a lane. Several lanes combine into one ordered set.
 
 It emits:
 
 - `reference_set` — fan out to whichever Bridges you need.
 - `has_reference` — `0` when no selected lane has an item effective for this
-  window, `1` when any does. Gate the branch holding the Bridges on this so it
-  genuinely does not execute.
+  window, `1` when any does. Wire it into a
+  [Sonder Switch](generating.md#skip-a-branch-the-window-doesnt-need) so the
+  branch holding the Bridges doesn't run without one.
 - `reference_strength` — the authored strength of the first effective lane in
   lane order, or `0.0`.
 
-Co-selected lanes must agree. A candidate whose media kind or recipe
-settings differ from the lanes already selected is listed but disabled, with
-the reason shown; a blank or detached recipe can only be selected alone.
+Lanes selected together must use the same media kind and recipe settings.
 
 With several lanes selected, the Prompt Bridge's `reference_prompt` combines
 them in lane order. A lane with an override sends the override in place of its

@@ -6,7 +6,7 @@
 # requirements), it can overwrite that build with a mismatched, often
 # CPU-only wheel and break GPU acceleration. Audio decode, mixing and export
 # use FFmpeg; torchaudio is only an optional waveform-thumbnail fallback.
-# See the "Troubleshooting" section of README.md.
+# See docs/troubleshooting.md.
 
 # Image / array — ships with ComfyUI; listed for standalone environments
 numpy
@@ -15,8 +15,8 @@ Pillow>=9.1
 
 # Video I/O
 # NOTE: opencv-python-headless is used deliberately (no GUI deps). Some other
-# custom nodes install full `opencv-python`; the two conflict. See README
-# "Troubleshooting" if cv2 imports break after installing another node pack.
+# custom nodes install full `opencv-python`; the two conflict. See
+# docs/troubleshooting.md if cv2 imports break after installing another node pack.
 opencv-python-headless
 # 0.6.0 bundles ffmpeg 7.1, satisfying the FFmpeg 7.0 audio floor enforced by
 # server/media_helpers.require_audio_ffmpeg. Pinned because a bare requirement

@@ -5,7 +5,7 @@ timeline. Three things decide what that prompt looks like:
 
 | Surface | What it decides |
 |---|---|
-| **Channel Template** — Settings | Which fields a prompt section has. |
+| **Channel Template** — the toolbar's **Channels** selector | Which fields a prompt section has. |
 | **Prompt format** — Prompt Management | How those fields are labelled, separated, and validated. |
 | **Prompt sections and the Global document** — timeline | What the fields say, and when. |
 
@@ -20,8 +20,8 @@ References that feed prompts are in [References](references.md).
 place, choose the prompt format, and name References and identities. Open it in
 any of these ways:
 
-- Click **☰** on the **Prompt** or **Global** row header of the timeline.
-- Right-click a Prompt section, or the Prompt row, and choose **Open Prompt
+- Click **☰** on the **Prompt** or **Global** lane header of the timeline.
+- Right-click a Prompt section, or the Prompt lane, and choose **Open Prompt
   Management**.
 - In **Reference Lane Setup**, click an item's prompt preview.
 
@@ -33,82 +33,53 @@ any of these ways:
 
 ## How the output prompt is composed
 
-To write one part of a scene, double-click empty **Prompt** space near the
-bottom of the timeline, enter the text and click **Create**. Double-click an
-existing section to edit it. **Global**, just above Prompt, supplies scene-wide
-text. The **Channels** selector above the timeline changes the project's
-prompt fields; **Standard** offers one plain field. A timed section scopes
-which text reaches a generation window. How closely a model follows those
-times depends on the workflow and prompt format.
+The **Global** text and every Prompt section in the generation window compile
+into one prompt. The **Channels** selector above the timeline sets which fields
+a section has. How closely a model follows the sections' times depends on the
+workflow and prompt format.
 
 ![The Global lane holding a scene-wide description, with per-moment prompt sections beneath it](images/prompt-lanes.webp)
 
-The **Global** document plus every prompt section in the generation window compile
-into one provider-ready prompt. The project's Channel Template defines the
-fields—Standard, Visual/Speech/Sound, MiniMax H3, or a custom set—and its
-**prompt format** (technical: Prompt Context Profile) owns labels, separators,
-dynamic syntax, writing aids, and validation.
+While you edit a section on the timeline, the **Channel** list above its
+fields shows **All channels**; choose one to edit only that field. The other
+fields keep their text.
 
-Context chips update their text for the selected generation window: shot
-numbers, Reference labels, timestamps and links to earlier sections. Hover a
-chip to preview its contribution. Fix any blocking diagnostic before queueing.
-For fixed phrases such as camera motion or dialogue wrappers, use a
-[Writing aid](#writing-aids).
-
-Timeline prompt bars show **All channels** by default. Choose a channel to
-focus on its field; other fields keep their text and still contribute to the
-prompt. The choice is remembered for each Channel Template.
-
-- **Boundary Prompt Threshold** (project-wide) drops a section from a window
-  when its clipped coverage is below that percentage of the shorter of its
-  authored span and the generation window. Containment in either direction stays;
-  lower-coverage ends drop first (trailing first on ties), with at least one
-  section kept. The default is 10%. The timeline shows
-  affected slivers with a dim "Ignored" hatch, and sections that *will*
-  compose get a strong accent.
-- **Out-of-window Reference text** (project-wide) decides whether a Reference
-  Context chip still contributes its authored text when its Reference is not
-  conditioning the window. Drop is the default; any chip can override it. See
+- **Boundary Prompt Threshold %** (**Settings ▸ Prompts**, default 10%) leaves
+  out a section that only grazes the generation window. Those sections show a
+  dim **Ignored** hatch on the timeline. At least one section is always kept.
+- **Out-of-window Reference text** (**Settings ▸ Prompts**): see
   [References](references.md#when-the-reference-isnt-in-the-window).
 - Lane hiding is part of composition: Prompt lane hidden → global-only
   output; Global hidden → sections only; both hidden → empty prompt.
-- **Takes global** on a section decides, per channel, whether that field picks
-  up the scene's Global text. Only channels whose Global actually carries text
-  are offered. Untick one and the global text is dropped from any render that
-  covers only sections which opted out.
+- **Takes global** (on each section in Structured mode) chooses, per field,
+  whether that field adds the Global text.
 
 ## Channel Templates
 
 A Channel Template decides which fields a prompt section has. It is
 **project-wide**: every section in the project authors the same set.
 
-Set it in **Settings ▸ Prompts ▸ Channel Template**. A new project starts on
-**Standard** — one plain field, no field names — unless you change the default
-under **Settings ▸ Channel Templates**.
+Choose it in the toolbar's **Channels** selector, or in **Settings ▸ Prompts ▸
+Channel Template**. A new project starts on **Standard** (one plain field)
+unless you change **Default for new projects** under **Settings ▸ Channel
+Templates**.
 
 Built-ins cover the common cases: one plain field, the editor's Visual / Speech
-/ Sound split, and MiniMax H3's own field sets. You can also create your own.
+/ Sound split, and MiniMax H3's own field sets. To make your own, open
+**Settings ▸ Channel Templates** and click **New Channel Template**. It sets:
 
-A custom template declares:
+- its channels, each with a key, the header written into the prompt, and the
+  guidance shown while you write that field;
+- **Field names**: **Always write field names** (every channel then needs a
+  header) or **Never write field names**;
+- **Between fields** and **After a header**: the separators;
+- **Shot markers in**: the field that carries shot markers;
+- **Unlabelled writing goes to**: where Writing-mode text without a heading lands;
+- **Default prompt format**.
 
-- **Channels** — each with a key, the header written into output, and the
-  authoring guidance shown while writing that field.
-- **Field names** — always written, or never. A template that writes them needs
-  a header on every channel.
-- **Separators** — between fields (space, newline, blank line), and between a
-  header and its text (space, colon, colon + newline).
-- **Shot marker channel** — which field carries shot markers.
-- **Default draft channel** — where unheadered Writing-mode prose lands.
-- **Global merge** — whether the scene-global prompt leads the whole prompt, or
-  is authored per channel.
-
-**Where each half lives matters.** Your custom definitions are **browser-local**
-— they belong to the editor, not the project. The *active choice* is saved into
-the project, which keeps its own copy of the definition. So a project opened on
-another machine still has its fields, but the definition won't be in the catalog
-there, and editing a catalog template never reaches a project that is closed.
-When a project holds an older copy of a template you have since edited, its
-settings card says so, and **Use** replaces it.
+Custom templates are saved in this browser. A project keeps a copy of the one
+it uses, so it opens elsewhere with its fields. When that copy is older than
+your edited template, the template's settings card offers **Use** to update it.
 
 ## Prompt formats
 
@@ -116,14 +87,10 @@ Where a Channel Template says what the fields *are*, a **prompt format** says
 how they are written: labels, separators, dynamic syntax, writing aids, and what
 counts as valid. Error messages call it a "prompt context profile".
 
-A format is chosen **per scene**, in the Prompt Management panel's
-**Prompt Context** section — though you rarely have to. Each Channel Template names the format it
-expects, and a scene follows that automatically; picking one explicitly is what
-unpegs it, and from then on that scene keeps your choice.
-
-Formats target a particular template, so one built for a different template
-appears **disabled rather than hidden**, and an existing mismatched pairing
-stays visible instead of vanishing.
+Choose a format per scene in Prompt Management's **Prompt Context** section.
+Until you choose, a scene uses the format its Channel Template names; once you
+choose, the scene keeps your choice. A format built for another template is
+listed but disabled.
 
 To change a built-in format, click **Save as custom…** and edit the copy.
 Saving an edited custom format creates a new version; select that version
@@ -135,36 +102,23 @@ and its speaker labels.
 
 ## Context chips
 
-A chip stores *intent* rather than words — which Reference, which shot, which
-earlier section — and resolves to the right wording when the prompt compiles for
-the selected window. That is what lets a prompt survive restaging and
-renumbering without being rewritten.
-
-It also means you can name the same thing wherever it belongs without repeating
-it in the output. Chips resolving to equivalent text in one channel emit
-**once**; the rest report *deduplicated* instead of writing the line again. When
-the same text would be emitted for a *different* subject or slot, that is
-flagged. Switch off that capability on the chip whose contribution you do
-not want.
+A chip's text follows the generation window: shot numbers, timestamps,
+Reference labels and links renumber when you move things. Two chips that would
+write the same line write it once. To leave out one part of a chip's text,
+open the chip and untick that part.
 
 **+ Attach** adds one. Chips sit either inline in a field or in the section's own context row, depending on
 where the format places them. To change a chip later, click an inline chip
 (marked `✎`), or click a context-row chip and choose **Configure…**.
-
-A chip can also be switched off for a single field without being removed. That
-field then says the capability is disabled and contributes no text.
-
-Because a chip resolves against a window, editing a section that falls **outside
-the current generation window** shows scene-wide numbering instead.
 
 | Chip | What it contributes |
 |---|---|
 | **Shot** | Shot numbering, with an optional relative time. |
 | **Time** | A timestamp on its own. |
 | **Reference** | Context for a staged Reference or a prompt identity. |
-| **Vocal Event** | A managed piece of speech or song. |
-| **Prompt Link** | A link to an earlier prompt section. |
-| **Custom** | Your own text. |
+| **Vocal event** | A managed piece of speech or song. |
+| **Prompt link** | A link to an earlier prompt section. |
+| **Context** | Your own text. |
 
 ![A prompt section in Structured mode: chips inline inside a channel and in the section's own context row, with @mentions written directly into the prose](images/prompt-structured-chips.webp)
 
@@ -173,8 +127,8 @@ Click **Override…** on that row to show and change them. Fields you have
 overridden stay visible.
 
 Leave optional fields empty when you have nothing to add. A field following
-a source can still contribute that source's text; switch off that capability
-for the field if you want no contribution. If an advisory names a missing
+a source can still contribute that source's text; untick that part in the
+chip if you want none. If an advisory names a missing
 field, use its **Fix** to open the field and supply the requested detail.
 
 ![The top of Prompt Management: a warning that a Subject needs authored detail in "Preservation detail", with a Fix button beside it](images/prompt-management-fix.webp)
@@ -186,11 +140,9 @@ opens the chip on the field the warning names.</em></p>
 Some provider syntax is fixed — a dialogue wrapper, a scene-transition marker, a
 camera phrase from a set vocabulary.
 
-A **Writing aid** inserts that syntax for you. Which aids exist, and which
-channels offer them, is declared by your **prompt format**, so you are shown
-only the ones valid where you are writing — and the same aid can insert
-different text under a different format. MiniMax H3, for example, carries the
-generic set bound to its description channel but writes voiceover its own way.
+A **Writing aid** inserts that syntax for you: right-click in a prompt box (or
+press **Shift+F10**) and choose it. Your prompt format decides which aids a
+field offers.
 
 Generic formats offer dialogue, voiceover, group speech, singing, scene
 transition, cutoff, visible text, camera motion and framing. Some take fields —
@@ -200,9 +152,9 @@ they insert is ordinary text you can edit afterwards.
 ## Prompt Relay
 
 Prompt Relay lets a supported model use different prompts during one
-generation. Install [kijai's ComfyUI-PromptRelay](https://github.com/kijai/ComfyUI-PromptRelay)
-and use its workflow for your model. Add **Sonder Prompt Relay Bridge**,
-with `project` wired from **Sonder Editor**.
+generation. [Install ComfyUI-PromptRelay](sonder-app-setup.md#ltx-25-edit--vfx),
+then add **Sonder Prompt Relay Bridge**, with `project` wired from
+**Sonder Editor**.
 
 ![One take in the editor moving from tears to manic laughter to a cold grin, as the playhead crosses four Prompt sections that light up in turn, with a white card quoting the prompt in play](images/prompt-relay-loop.webp)
 
@@ -213,17 +165,16 @@ with `project` wired from **Sonder Editor**.
 | `local_prompts` | **Prompt Relay Encode**'s `local_prompts`, for the manual route |
 | `segment_lengths` | **Prompt Relay Encode**'s `segment_lengths`, alongside `local_prompts` |
 
-Choose the Smart route or the manual pair. If Global is empty, the Smart
-encoder also uses the first local segment as its global prompt. Feed the
-Relay encoder your model, CLIP and sampled latent, then connect both its
-`model` and `positive` outputs onward to the sampler. Follow the dependency's
-model-specific example and avoid combining it with other attention patchers.
+Choose the Smart route or the manual pair. Feed the Relay encoder your model,
+CLIP and sampled latent, then connect both its `model` and `positive` outputs
+onward to the sampler. Follow ComfyUI-PromptRelay's example for your model, and
+don't combine it with other nodes that patch the model's attention.
 
 ## Prompt identities
 
 An **identity** is a provider-neutral record of who or what a prompt is talking
-about. You create one explicitly in Prompt Management; the Reference Library never
-mints one for you.
+about. To create one, open Prompt Management and click **+** beside
+**Identity Prompting**. Adding a Library Reference doesn't create one.
 
 An identity may combine several Library members, each with its own contribution,
 or exist from a description alone with no media at all. When an audio member is
@@ -231,8 +182,7 @@ attributed to one, it declares that identity's voice: that member's prose feeds
 the audio definition rather than the appearance.
 
 Identities and Reference members share one set of handles, so `@Anna` reaches
-whichever you named. Deleting a Reference or member removes the source
-relationship but leaves the identity visible for repair.
+whichever you named.
 
 Identities live under **Identity Prompting**, beside **Reference Prompting** in
 Prompt Management. Which identity kinds exist is declared by your prompt format.
@@ -250,10 +200,9 @@ that matters most is whether they write to your prompts as you type.
 
 ### Structured mode — live
 
-Global and per-section document editors, carrying the same inline and scope
-Context chips as the timeline bars, plus range and channel controls, per-row
-**Select** and **Queue**, reusable prompt **templates**, and an enqueue-captured
-**history** you can re-apply in one click.
+Editors for Global and every section, with the same chips as the timeline,
+**Select** and **Queue** on each row, **Save Current as Template**, and
+**Load History** (the prompts of earlier queued jobs) to re-apply one.
 
 Edits here are edits to the prompts themselves. There is nothing to commit.
 
@@ -266,19 +215,17 @@ frames per block.
 
 Two views share one draft. **Source** is where you write — channel headings,
 break lines and chip contributions all editable, with each chip's contribution
-shown as prose beneath the text it attaches to. **Compiled** is read-only output
-from the same compiler the render uses, for checking what the draft becomes.
+shown as prose beneath the text it attaches to. **Compiled** shows, read-only,
+the prompt the draft becomes.
 
 ![Writing mode in Source view: channel heading lines, a --- break between blocks, and each chip's contribution shown as prose beneath the text it attaches to](images/writing-mode-source.webp)
 
 **Nothing here reaches your prompts until you Apply** — and nothing your prompts
 do reaches the draft on its own either.
 
-- **Apply** replaces the lane's sections with the draft blocks, in one undoable
-  step. It means *make the lane match this draft*, so it also replaces any
-  section edits made elsewhere since you started writing. It can extend the
-  scene if the draft runs past the end, and is refused only by a locked Prompt
-  or Global lane, or an empty draft.
+- **Apply** replaces the lane's sections with the draft blocks. It means *make
+  the lane match this draft*, so it also replaces any section edits made
+  elsewhere since you started writing.
 - **Reset from sections** pulls the other way, rebuilding the draft and its
   lengths from the lane's current sections. The draft you had is kept, and
   **Restore draft** brings it back.
@@ -287,7 +234,7 @@ Alongside those, **Split here** breaks the draft at the caret and **Equalize**
 resets every block to an equal share of the scene.
 
 ![The Writing mode tool row above the allocation strip, with seven blocks showing their frame lengths, timecodes and per-block context rows](images/writing-mode-allocation.webp)
-<p align="center"><em><strong>Restore draft</strong> appears only while a draft is stashed, which is what makes <strong>Reset from sections</strong> safe to press.</em></p>
+<p align="center"><em><strong>Restore draft</strong> brings back the draft that <strong>Reset from sections</strong> replaced.</em></p>
 
 Drafts are saved in your browser, per project and scene — not in the project.
 They don't travel to another machine, and clearing site data loses them.

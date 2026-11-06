@@ -4,8 +4,9 @@ How the Sonder Editor surface is organized and how you edit on it: the layout,
 the timeline, every item type you can place, the viewport and its panes, and
 the gestures and shortcuts that move them around.
 
-This guide covers editing. For selections, prompts, guides, Drivers, templates,
-and the render queue, see [Generating](generating.md). For the asset gallery,
+This guide covers editing. For selections, guides, Drivers, templates and the
+render queue, see [Generating](generating.md); for prompts,
+[Prompts](prompts.md). For the asset gallery,
 inspection, and export, see [Assets & Gallery](assets-and-gallery.md).
 
 ![The Sonder Editor in fullscreen: the Assets tab at the left with the gallery and a selected take, the viewport split into two panes showing a take of a boy as a warrior with lightning in his eyes beside the original footage on its Driver lane, and the timeline below with named video, audio and Driver lanes](images/editor.webp)
@@ -73,11 +74,7 @@ The sidebar width and timeline height are drag-resizable and remembered
 between sessions (**Settings ▸ Layout & UI Scale ▸ Reset Layout Section**
 clears them).
 
-**References** is the project-level authoring Library for reusable character,
-location, prop, outfit, voice, and video media. The Library holds the media
-itself; **Reference lanes** on the timeline are what scope its members over a
-range of frames. See
-[References](references.md).
+The **References** tab is covered in [References](references.md).
 
 ## The timeline
 
@@ -85,13 +82,13 @@ range of frames. See
 
 1. **Video lanes** (V1, V2, …) — stack for compositing; the higher-numbered
    lane renders in front.
-2. **Audio lanes** (A1, A2, …) — independent rows.
+2. **Audio lanes** (A1, A2, …) — independent of each other.
 3. **Driver lanes** — one Driver clip per lane (conditioning, not output).
 4. **Reference lanes** (R1, R2, …) — scope Library members over a range
    (conditioning, not output).
 5. **Guides** — a fixed track of guide-frame markers.
 6. **Global** — the always-on scene-wide prompt.
-7. **Prompt** — the segment prompt-section lane.
+7. **Prompt** — timed prompt sections.
 
 ### Lane headers
 
@@ -138,7 +135,7 @@ the source edge), *Fill (crop)* with a crop anchor, or *Stretch*.
 
 ### Audio tracks
 
-An audio asset, or the sound of a video, on an Audio row, drawn with its
+An audio asset, or the sound of a video, on an Audio lane, drawn with its
 waveform. Move, trim, split and mute work as for video clips; double-click
 opens its start, volume and mute.
 
@@ -205,16 +202,17 @@ discards what you typed.
 
 ### Linked groups
 
-Any mix of items can be linked into a **symmetric edit group** (badge letter
-A…Z): move, delete, split, and mute act on the whole group. Single-click selects the whole group;
+Any mix of items can be **linked** (badge A…Z): move, delete, split, and mute
+act on the whole group. Single-click selects the whole group;
 **double-click isolates one member** for properties such as volume or
 opacity, while mute still affects the group. Video+audio drops and generated
-takes auto-link (configurable in Settings). Right-click **Unlink Linked Items**
+takes link automatically (**Link Dropped Video + Audio** under **Settings ▸
+Timeline Behavior**, **Link Take Video + Audio** under **Settings ▸ Render**). Right-click **Unlink Linked Items**
 before muting only one member.
 
 ## Editing gestures
 
-![Three takes on a Video row: the middle one is dragged left and snaps to the first with a dashed guide, its right edge is trimmed out and snaps to the third, then the C key and a click split it in two](images/editing-gestures-loop.webp)
+![Three takes on a Video lane: the middle one is dragged left and snaps to the first with a dashed guide, its right edge is trimmed out and snaps to the third, then the C key and a click split it in two](images/editing-gestures-loop.webp)
 
 - **Snapping** (`S` to toggle, or the **Snap** button above the timeline)
   pulls a dragged item's start **or end**, and a trimmed edge, to nearby
@@ -227,7 +225,7 @@ before muting only one member.
   the Ruler** pulls the playhead to those targets when you click or drag on
   the ruler, and **Snap Razor Cuts** moves a Razor cut to a target inside
   the item you click.
-- **Razor mode** (`C`): click a clip, audio track, prompt section or Reference
+- **Razor mode** (`C`, or **✂ Cut** above the timeline): click a clip, audio track, prompt section or Reference
   item to split it at that point (with **Snap Razor Cuts** on, at the snap
   guide shown while you hover, when a target is close). **⌇ Split Here** does
   the same to everything selected, at the playhead; it acts only on the
@@ -243,11 +241,11 @@ before muting only one member.
 
 Where you drop a gallery asset decides what happens:
 
-- **The ruler strip** (the frame numbers at the top) → always a **new row**.
-  A video → a Video row; audio → an Audio row; a video with sound → both,
+- **The ruler strip** (the frame numbers at the top) → always a **new lane**.
+  A video → a Video lane; audio → an Audio lane; a video with sound → both,
   linked. This is the only drop that places picture and sound together.
-- **An existing row** → that row only. A video with sound on a **Video** row
-  places the picture; on an **Audio** row, the sound. Audio on a Video row is
+- **An existing lane** → that lane only. A video with sound on a **Video** lane
+  places the picture; on an **Audio** lane, the sound. Audio on a Video lane is
   refused.
 - **The Guides track** → an image dropped there becomes a guide frame.
 - A take keeps the trim it was generated with, and in its own scene its
@@ -304,11 +302,9 @@ open.</em></p>
 
 Each workflow remembers its own panes.
 
-## Safety & recovery
-
-- Deleted assets go to the **Trash** first.
-- **Missing files** show placeholders; **Relink** restores them (see
-  [Assets & Gallery](assets-and-gallery.md)).
+<a id="safety--recovery"></a>
+Deleted assets go to the **Trash**, and missing files can be relinked: see
+[Asset lifecycle & safety](assets-and-gallery.md#asset-lifecycle--safety).
 
 ## Keyboard shortcuts
 
@@ -348,5 +344,6 @@ you're typing in a text field.
 | ? | Shortcut overlay |
 | Esc | Exit fullscreen / dismiss overlay / clear selection |
 
-Gallery, inspect-overlay, and focused Reference-media shortcuts are listed in
-[Assets & Gallery](assets-and-gallery.md).
+Gallery and inspect-overlay shortcuts are in
+[Assets & Gallery](assets-and-gallery.md#gallery--overlay-shortcuts). The
+Reference media editor's are in the **?** overlay.

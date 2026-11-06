@@ -76,8 +76,9 @@ ComfyUI-PromptRelay is needed only for **Controls → Modes → Prompt Method �
 Timed Prompts (Prompt Relay)**. It isn't in Nodes Manager, so install it with
 [Git](https://git-scm.com/downloads):
 
-1. In File Explorer, open ComfyUI's `custom_nodes` folder. Click the address
-   bar, type `cmd` and press Enter. A terminal opens in that folder.
+1. Open a terminal in ComfyUI's `custom_nodes` folder. On Windows: open that
+   folder in File Explorer, click the address bar, type `cmd` and press
+   Enter.
 2. Type `git clone https://github.com/kijai/ComfyUI-PromptRelay` and press
    Enter.
 3. Restart ComfyUI and reload the page in your browser.

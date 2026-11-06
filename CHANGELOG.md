@@ -12,26 +12,27 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
-- A new docs page, [Install Models and Node Packs](docs/sonder-app-setup.md), takes you from nothing installed to a Sonder App workflow that reads **Ready**: the node packs, every model file the three supplied workflows need with its folder, size and which Mode choices use it, the Hugging Face agreements, and **Check again**. The Sonder App links to it with **How to install** when the current Modes or a greyed-out choice need a node pack or model file, and the Launcher does beside a workflow's missing models.
-- In the Sonder App, a Mode choice that needs a node or model file this ComfyUI doesn't have is greyed out, and hovering over it says what's missing. Installing the file and returning to the tab makes it available again, and **Manage** can still edit it. When the current Modes can't run, a line under the **Modes** heading says how much is missing, and **Show** lists it.
+- A new docs page, [Install Models and Node Packs](docs/sonder-app-setup.md), lists the node packs and every model file the three supplied workflows need, with folders, sizes and Hugging Face agreements. The Sonder App's **How to install** links and the Launcher's **How to install missing models** open it.
+- In the Sonder App, a Mode choice that needs a missing node or model file is greyed out; hover over it to see what. When the current Modes can't run, a line under **Modes** says how much is missing, and **Show** lists it.
 - When the Sonder App refuses **Generate** over a missing model file or node, it names the Mode choice that needs it (for example "Needed by Task → Edit With Words"). The Launcher shows the same names for the selected workflow.
 - Seed Controls have up and down arrows (and ↑/↓ in the field) that step exactly, even past 2^53. In fullscreen and Mount in Tab they stop at the largest number a canvas widget holds.
 - A resized multiline text box in Controls keeps its height in this browser, across renders and when you leave and reopen the editor.
 - The Views pane picker and pane titles show a Driver lane's own name, as the timeline header does.
 - While only In or Out is set, the generation readout's tooltip says **Generate** still uses the full scene until you choose the other point.
-- A Mode choice can also apply a choice from another category: in Manage, open the choice and pick it under **Also applies**. One click (and one Undo on the canvas) sets both rows; changing the included row by hand makes the first row read **Custom**. An older Sonder version ignores the link and keeps it only until that choice is updated.
+- A Mode choice can also apply a choice from another category: in Manage, open the choice and pick it under **Also applies**. One click (and one Undo on the canvas) sets both; changing the included category by hand makes the first read **Custom**. An older Sonder version ignores the link and drops it when that choice is updated.
 - The Views pane picker and Manage's Views list name the subgraph a node sits in (for example **Sampling › SamplerCustomAdvanced**) instead of only "Inside a subgraph". Workflows exported before this version, and Sonder App workflows without a Relay, keep the old text.
 - A take keeps the full text of a long text Control, such as a song's lyrics or style, up to 24 KB per take. In the Asset Gallery its **Controls at run** cell says how many characters it holds, and **Copy value** copies all of it exactly. Search still reads the first 512 characters, and takes made before this version keep only their preview.
-- A take records the Mode choice each category was on when the run was queued, under **Modes at run** in the Asset Gallery. A choice changed by hand afterwards reads **Custom**.
+- A take records the Mode choice each category was on when the run was queued, under **Modes at run** in the Asset Gallery. A category whose settings you changed by hand reads **Custom**. Search finds takes by Mode, for example `field:task=edit`.
 
 ### Changed
-- The Launcher marks a workflow **Missing nodes** only when its current Modes need them. It no longer warns about a pack that only other Modes use, or passes over such a workflow when preselecting one.
-- **LTX 2.5 Edit & VFX** is one starter now. It starts on **Prompt Method → Standard**, which needs no Prompt Relay; **Timed Prompts** is greyed out until the pack is installed. The separate version without Prompt Relay is gone, so any app-only settings you added to it no longer show.
-- Sonder App runs no longer need the model files or node packs of Modes that are switched off: a Task needs only its own LoRA, and **MiniMax H3 References & Swaps** needs the SAM3 checkpoint only with **Mask On**. On the canvas, every loader that isn't muted still needs its file.
+- The Launcher marks a workflow **Missing nodes** only when its current Modes need them. It no longer warns about a pack that only other Modes use, or passes over such a workflow when preselecting one. A workflow whose current run has another problem, such as a switched-off Save, reads **Can’t generate**.
+- **LTX 2.5 Edit & VFX** is one starter now (formerly **LTX 2.5 Edit & VFX — Prompt Relay**). It starts on **Prompt Method → Standard**, which needs no Prompt Relay; **Timed Prompts** is greyed out until the pack is installed.
+- Sonder App runs no longer need the model files or node packs of Modes that are switched off: a Task needs only its own LoRA and model files, and **MiniMax H3 References & Swaps** needs the SAM3 checkpoint only with **Mask On**. On the canvas, every loader that isn't muted still needs its file.
 - A workflow with node packs this ComfyUI lacks now opens in the Sonder App; **Generate** refuses only when the chosen Modes use them.
-- The bundled starters' **Models and downloads** notes list each Task's files again, and their switched-off **Additional LoRAs** row reads **None**. Labels, notes and layout you customized on a bundled starter reset once with this update.
-- The supplied workflows' setup notes say to click **Extensions** at the top right of ComfyUI and install the node packs in **Nodes Manager**, as current ComfyUI labels them. LTX 2.5 Refine & Upscale's note searches **LTXVideo**, which finds ComfyUI-LTXVideo.
-- Reference lanes that share a recipe can be selected together whatever their prompt overrides. The Prompt Bridge's **reference_prompt** is one block in lane order where each lane's override takes that lane's part, without repeating the recipe's opening and closing lines; a lane on its own still uses its override as the whole prompt. A selection that used the same override on several lanes now includes it once per lane.
+- The bundled starters' **Models and downloads** notes list each Task's files again, and their switched-off **Additional LoRAs** row reads **None**.
+- Labels, notes, layout and the description you customized on a bundled starter reset once with this update; values, Modes and app-only Controls are kept.
+- The supplied workflows' setup notes say to click **Extensions** at the top right of ComfyUI, install the node packs in **Nodes Manager**, then click **Apply Changes**. LTX 2.5 Refine & Upscale's note searches **LTXVideo**, which finds ComfyUI-LTXVideo. The Edit & VFX notes link the install steps for ComfyUI-PromptRelay, which isn't in Nodes Manager, and no longer say to restart ComfyUI after adding model files.
+- Reference lanes that share a recipe can be selected together whatever their prompt overrides. The Prompt Bridge's **reference_prompt** combines them in lane order, each override in place of its lane's part, with the recipe's **Prompt prefix** and **Prompt suffix** once. A lone lane still uses its override as the whole prompt. The same override on several lanes now appears once per lane.
 - A refusal that changed nothing (a Reference drop that can't be staged, a split with no effect) closes on its own: it follows your warning duration setting, or 6 seconds when that is set to stay until dismissed.
 - On a narrow window the editor toolbar stacks its groups on rows instead of overlapping them.
 - In Controls, a seed's label sits above its field, arrows and mode, so the number stays readable in a narrow sidebar. In the Cards layout the seed field fills its card and the mode sits under it, so the number stays readable at every panel width.
@@ -39,12 +40,16 @@ a fresh `[Unreleased]` block.
 ### Fixed
 - A run whose prompt holds an invalid character (a lone UTF-16 surrogate, which ComfyUI accepts) saves its take instead of failing at the save with metadata embedding on.
 - Reloading a Mount in Tab page keeps the editor open, on the same scene and selection, and a run in progress keeps reporting. It used to say the project was open in another editor host.
-- A duplicated Mount in Tab or Sonder App tab takes over, and the original stops editing and offers **Take over**. A tab that lost its session could still change the project from the keyboard.
+- A duplicated Mount in Tab or Sonder App tab takes over, and the original stops editing and offers **Take over**. Before, a tab that lost its session could still change the project from the keyboard.
 - A mounted edit made while the canvas page is away says the canvas isn't connected and that nothing changed, and the Controls tab says so too, instead of "This tab no longer owns the editor" and "Loading controls…".
 - The Render Queue in a mounted tab and the Sonder App follows retried jobs through to Completed instead of sometimes stopping on Running or Pending.
 - Editor session ids are no longer shared with other pages on the same ComfyUI, and session diagnostics answer only on the ComfyUI machine.
 - A switched-off LoRA row whose file isn't installed can be edited from Controls in fullscreen, Mount in Tab and the Sonder App.
 - Integer Controls step by the node's declared step (tile size by 32, not 1).
+- A View pane's **Run** in Mount in Tab works when the browser reaches ComfyUI over plain HTTP from another computer.
+- The editor's **?** shortcut overlay lists **A** (animatic mode).
+- When LTX 2.5 Refine & Upscale's LTXVideo nodes are missing, ComfyUI's missing-node help points to the public ComfyUI-LTXVideo repository instead of one that doesn't exist.
+- In **Controls at run**, **Copy** is greyed out on a long list setting the take had to shorten, instead of copying the shortened list as if it were complete.
 - A Control note's **More** works on the first click after you leave a field.
 - Switching workflows in the Sonder App while a Mode choice is loading is refused with a message, instead of switching on its own once the load ends.
 - Clicking the pane-count or arrangement buttons no longer leaves the keyboard focus ring on them.
@@ -52,9 +57,11 @@ a fresh `[Unreleased]` block.
 - Clicking the viewport's progress bar while playing keeps playing from there instead of jumping back; ←/→/Home while playing do the same, and End stops at the end.
 - **Render Queue** shows its real count as soon as the editor opens, also while collapsed, instead of **(0)** until the first take (Mount in Tab and the Sonder App).
 - The Launcher names the folder for the LTX sampling preview file (**vae_approx/**) on an install that has none yet.
-- The Launcher's **ComfyUI** status reads **Generate unavailable** when the Sonder App packages are missing, including after a failed Generate, instead of **Connection problem**.
-- Workflow rows in the Launcher say **Generate unavailable** instead of **Ready** while the Sonder App packages are missing or unsupported.
+- The Launcher's **ComfyUI** status and workflow rows read **Generate unavailable** while the Sonder App packages are missing or unsupported (also after a failed Generate), instead of **Connection problem** and **Ready**.
 - While ComfyUI is still starting, the Launcher shows **Checking…** and loading lines instead of **Unreachable** and an empty project list. If ComfyUI stays slow it says so, and a project or workflow list that can't load says so with a **Check again** button.
+
+### Removed
+- The separate **LTX 2.5 Edit & VFX** starter without Prompt Relay. Values, Mode edits and app-only Controls you set in it don't carry over: the remaining starter keeps those of the former **— Prompt Relay** version.
 
 ## [0.8.2] - 2026-11-02
 
