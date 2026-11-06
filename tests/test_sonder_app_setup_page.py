@@ -176,3 +176,43 @@ def test_pack_links_match_the_notes(slug):
     assert named <= set(REPO_LINK.findall(canvas_notes))
     res4lyf = 'Install RES4LYF even when the Launcher reads **Ready**' in page_section(slug)
     assert res4lyf == (slug in LTX)
+
+
+KJ, LTXV = 'https://github.com/kijai/ComfyUI-KJNodes', 'https://github.com/Lightricks/ComfyUI-LTXVideo'
+RES4LYF, RELAY = 'https://github.com/ClownsharkBatwing/RES4LYF', 'https://github.com/kijai/ComfyUI-PromptRelay'
+# Which pack defines each non-ComfyUI node the starters use, read from the packs'
+# sources on the release-check install (2026-11-05). Every other class there was
+# found in ComfyUI itself; Sonder's own start with "Sonder".
+PACK_OF_CLASS = {
+    'GrowMaskWithBlur': KJ, 'LTXVAudioVideoMask': KJ, 'ModelPreviewOverrideKJ': KJ, 'VAELoaderKJ': KJ,
+    'LTXAddVideoICLoRAGuide': LTXV, 'LTXVGetTilingSizes': LTXV, 'LTXVSetVideoLatentNoiseMasks': LTXV,
+    'LTXVTiledFusionSampler': LTXV,
+    'SeedGenerator': RES4LYF, 'PromptRelaySmartEncode': RELAY,
+}
+CORE_CLASSES = {
+    'BasicGuider', 'BasicScheduler', 'CLIPLoader', 'CLIPTextEncode', 'Canny', 'CheckpointLoaderSimple',
+    'ComfyMathExpression', 'GetICLoRAParameters', 'ImageCompositeMasked', 'ImageScale', 'ImageToMask',
+    'InvertMask', 'KSamplerSelect', 'LTXVAddGuide', 'LTXVAudioVAEDecode', 'LTXVAudioVAEEncode',
+    'LTXVConcatAVLatent', 'LTXVConditioning', 'LTXVCropGuides', 'LTXVDualCFGGuider', 'LTXVLatentUpsampler',
+    'LTXVPreprocess', 'LTXVScheduler', 'LTXVSeparateAVLatent', 'LatentUpscaleModelLoader', 'LoadLoraModel',
+    'LoadMoGeModel', 'LoraLoaderModelOnly', 'ManualSigmas', 'MaskToImage', 'MiniMaxH3AddGuide',
+    'MiniMaxH3ReferenceToVideo', 'MiniMaxH3SigmaShift', 'MoGeInference', 'MoGeRender', 'PrimitiveFloat',
+    'PrimitiveString', 'RandomNoise', 'SAM3_Detect', 'SDPoseDrawKeypoints', 'SDPoseKeypointExtractor',
+    'SamplerCustomAdvanced', 'SeedNode', 'SetLatentNoiseMask', 'StringConcatenate', 'UNETLoader',
+    'VAEDecodeAudio', 'VAEDecodeTiled', 'VAEEncodeAudio', 'VAEEncodeTiled', 'VAELoader',
+}
+# A pack used only through a setting's value, never a node class: the Launcher
+# can't see it missing, which is why the page says so for RES4LYF.
+PACK_OF_VALUE = {'res_2s': RES4LYF, 'bong_tangent': RES4LYF}
+
+
+@pytest.mark.parametrize('slug', sorted(STARTERS))
+def test_pack_tables_follow_the_graph(slug):
+    api, _, _ = starter_menu(slug)
+    classes = {node['class_type'] for node in api.values() if not node['class_type'].startswith('Sonder')}
+    unknown = classes - CORE_CLASSES - set(PACK_OF_CLASS)
+    assert not unknown, f'say which pack provides {sorted(unknown)} (PACK_OF_CLASS or CORE_CLASSES)'
+    values = {v for node in api.values() for v in node.get('inputs', {}).values() if isinstance(v, str)}
+    needed = {PACK_OF_CLASS[c] for c in classes & set(PACK_OF_CLASS)} | {PACK_OF_VALUE[v] for v in values & set(PACK_OF_VALUE)}
+    packs = {LINK.match(row[0]).group(2) for row in table(page_section(slug), 'Pack')}
+    assert packs == needed

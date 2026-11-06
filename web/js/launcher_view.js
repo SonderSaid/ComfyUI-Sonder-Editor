@@ -1,5 +1,6 @@
 // Launcher DOM primitives and theme. No import-time DOM or listeners.
 import { THEME as T, FONT, TYPE, SPACE, RADIUS, EDITOR_COLORS as C, chromeButtonCss, chromeInputCss, setButtonDisabled } from './editor_theme.js';
+import { namesAFile } from './docs_links.js';
 export { setButtonDisabled };
 export function el(tag, cls = '', text = '') {
     const node = document.createElement(tag);
@@ -36,7 +37,7 @@ export function date(value) {
 export function modelMessage(item) {
     const name = String(item.file || '').split(/[\\/]/).pop();
     // A native LoRA row naming no file (a starter's switched-off "None" turned on).
-    if (!/\.[A-Za-z0-9]+$/.test(name)) return `A LoRA row in ${item.node} reads “${name}”, not an installed file. Choose a LoRA file for it in Controls, or switch the row off.`;
+    if (!namesAFile(item)) return `A LoRA row in ${item.node} reads “${name}”, not an installed file. Choose a LoRA file for it in Controls, or switch the row off.`;
     const target = item.path || item.relative;
     const needed = item.needed_by?.length ? ` Needed by ${item.needed_by.join('; ')}.` : '';
     return (target ? `${name} → ${target} (${item.node})` : `${name} → folder unknown (${item.node} · ${item.input || ''})`) + needed;

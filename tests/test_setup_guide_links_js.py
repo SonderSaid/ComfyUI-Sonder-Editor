@@ -125,3 +125,21 @@ def test_the_canvas_host_still_has_no_availability():
     # The Modes links hang off `host.availability`, which only the Sonder App host has.
     for name in ('controls_host_canvas.js', 'editor_node_controller.js'):
         assert 'availability' not in (ROOT / 'web/js' / name).read_text(encoding='utf-8'), name
+
+
+MOUNTED = r'''
+const {createMountedControlsHost}=await import(REMOTE_URL);
+const never=()=>new Promise(()=>{});
+const host=createMountedControlsHost({projectId:'p',hostId:'h',sessionId:'s',apiURL:p=>p,fetchImpl:never});
+assert.equal('availability' in host,false,'Mount in Tab draws no setup links');
+host.destroy?.();
+console.log('ok');
+process.exit(0);
+'''
+
+
+def test_the_mounted_host_has_no_availability(tmp_path):
+    # controls_host_remote.js also builds the Sonder App host, which does have
+    # availability, so a text search can't cover Mount in Tab: build its host.
+    script = MOUNTED.replace('REMOTE_URL', json.dumps((ROOT / 'web/js/controls_host_remote.js').as_uri()))
+    run(PRELUDE + script, tmp_path, 'setup-guide-mounted')

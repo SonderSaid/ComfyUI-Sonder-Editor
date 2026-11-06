@@ -162,6 +162,18 @@ To use a proxy you run yourself, set `SONDER_SDK_PROXY_URL` (and
 this machine unless you also set `SONDER_SDK_ALLOW_REMOTE=1`, and it must serve
 this same ComfyUI.
 
+### Generate says "ComfyUI didn't accept the run"
+
+ComfyUI refused the workflow before running it, usually because a setting
+names a sampler or scheduler this ComfyUI doesn't have.
+
+- **LTX 2.5 Edit & VFX or Refine & Upscale:** install RES4LYF, even if the
+  Launcher reads **Ready**
+  ([Install Models and Node Packs](sonder-app-setup.md#ltx-25-edit--vfx)).
+- **Any other workflow:** look in the window where ComfyUI runs. A line with
+  `Value not in list` names the node and setting. Install the pack that
+  provides that value, or choose another value in **Controls**.
+
 ### The Launcher says *Missing node packs*
 
 The workflow's current Modes use nodes this ComfyUI doesn't have. You can
@@ -173,7 +185,7 @@ workflow:
 1. Find the workflow's canvas file: the `.json` shipped next to the API file
    you imported.
 2. Open the ComfyUI page in your browser and drag that file onto it.
-3. A **Missing node** message appears at the top right. Click
+3. A message such as **2 issues found** appears at the top right. Click
    **View details**. The **Workflow Overview** panel opens on its **Issues**
    tab.
 4. Click **Install All**, or **Install** beside each pack. Pack names there
@@ -181,7 +193,9 @@ workflow:
 5. Restart ComfyUI when asked, then reload the Launcher page. The choices that
    needed them are no longer greyed out.
 
-A pack the list names as **no known pack** isn't in ComfyUI-Manager's index.
+A pack the Launcher names as **no known pack**, or the **Issues** tab lists
+as **Unknown pack** with no **Install** button, is one ComfyUI-Manager can't
+match to that node.
 Search its node name on [registry.comfy.org](https://registry.comfy.org) or
 ask the workflow's author.
 

@@ -16,19 +16,23 @@ list every file the three supplied workflows need.
    ([Installation](../README.md#installation)) and follow
    [Set it up](sonder-app.md#set-it-up) on the Sonder App page.
 2. **Install the node packs.** Each workflow's section below lists its packs.
+   For your own workflow, use the pack names the Launcher lists.
    1. In ComfyUI, click **Extensions** at the top right. **Nodes Manager**
       opens.
-   2. Click the **Search** box at the top, type the pack's **Search for** word
-      from the tables below, and click **Install** on the pack with that name.
-   3. When every pack is installed, restart ComfyUI and reload the page in
-      your browser.
+   2. Click the **Search** box at the top and type the pack's **Search for**
+      word from the tables below. Wait a moment for the list to settle, then
+      click **Install** on the pack with that name.
+   3. When every pack is installed, click **Apply Changes** in the bar that
+      asks you to restart ComfyUI. When ComfyUI is back, reload the page in
+      your browser. If ComfyUI doesn't come back, start it again the way you
+      usually do.
 
    If there is no **Extensions** button, ComfyUI was started without its
    Manager: start it with the `--enable-manager` option, or install each pack
    by following the instructions on its GitHub page, then restart ComfyUI.
 3. **Find where each file goes.** Open the
-   [Launcher](sonder-app.md#open-the-launcher) and click the workflow under
-   **Starters**. Its row lists each missing file as *file → place*. Save each
+   [Launcher](sonder-app.md#open-the-launcher) and click the workflow (the
+   supplied ones are under **Starters**). Its row lists each missing file as *file → place*. Save each
    file there. If you already have a file in another models folder, or under
    another name, keep it where it is instead: open the workflow, click
    **advanced hidden** below **Modes** in **Controls** if it appears, and pick
@@ -65,11 +69,18 @@ the optional one.
 | [ComfyUI-PromptRelay](https://github.com/kijai/ComfyUI-PromptRelay), optional | Not in Nodes Manager |
 
 Install RES4LYF even when the Launcher reads **Ready**: the workflow uses its
-sampling method, and the Launcher can't tell when it's missing.
+sampling method, and the Launcher can't tell when it's missing. Without it,
+**Generate** stops with *ComfyUI didn't accept the run*.
 
 ComfyUI-PromptRelay is needed only for **Controls → Modes → Prompt Method →
-Timed Prompts (Prompt Relay)**. Install it by following its repository's
-instructions, then restart ComfyUI and reload the page.
+Timed Prompts (Prompt Relay)**. It isn't in Nodes Manager, so install it with
+[Git](https://git-scm.com/downloads):
+
+1. In File Explorer, open ComfyUI's `custom_nodes` folder. Click the address
+   bar, type `cmd` and press Enter. A terminal opens in that folder.
+2. Type `git clone https://github.com/kijai/ComfyUI-PromptRelay` and press
+   Enter.
+3. Restart ComfyUI and reload the page in your browser.
 
 The LTX, MoGe and SDPose nodes come with ComfyUI. If the Launcher lists one of
 them as missing, update ComfyUI.
@@ -102,11 +113,12 @@ Existing Video** need 47.6 GB of them):
 | Pack | Search for |
 |---|---|
 | [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) | `KJNodes` |
-| [ComfyUI-LTXVideo](https://github.com/Lightricks/ComfyUI-LTXVideo) | `LTXVideo` |
+| [ComfyUI-LTXVideo](https://github.com/Lightricks/ComfyUI-LTXVideo) | `LTXVideo`, the one by LTX.io |
 | [RES4LYF](https://github.com/ClownsharkBatwing/RES4LYF) | `RES4LYF` |
 
 Install RES4LYF even when the Launcher reads **Ready**: the workflow uses its
-sampling method, and the Launcher can't tell when it's missing.
+sampling method, and the Launcher can't tell when it's missing. Without it,
+**Generate** stops with *ComfyUI didn't accept the run*.
 
 **Model files** (about 50.8 GB in all; **Refining Pass Only** needs 47.6 GB of
 them). The first six are the same files as in LTX 2.5 Edit & VFX, so download

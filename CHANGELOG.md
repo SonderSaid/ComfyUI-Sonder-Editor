@@ -27,7 +27,7 @@ a fresh `[Unreleased]` block.
 ### Changed
 - The Launcher marks a workflow **Missing nodes** only when its current Modes need them. It no longer warns about a pack that only other Modes use, or passes over such a workflow when preselecting one.
 - **LTX 2.5 Edit & VFX** is one starter now. It starts on **Prompt Method → Standard**, which needs no Prompt Relay; **Timed Prompts** is greyed out until the pack is installed. The separate version without Prompt Relay is gone, so any app-only settings you added to it no longer show.
-- Sonder App runs no longer need the model files or node packs of Modes that are switched off: a Task needs only its own LoRA, and **MiniMax H3 References & Swaps** needs the SAM3 checkpoint only with **Mask On**. A canvas Run still checks every loader.
+- Sonder App runs no longer need the model files or node packs of Modes that are switched off: a Task needs only its own LoRA, and **MiniMax H3 References & Swaps** needs the SAM3 checkpoint only with **Mask On**. On the canvas, every loader that isn't muted still needs its file.
 - A workflow with node packs this ComfyUI lacks now opens in the Sonder App; **Generate** refuses only when the chosen Modes use them.
 - The bundled starters' **Models and downloads** notes list each Task's files again, and their switched-off **Additional LoRAs** row reads **None**. Labels, notes and layout you customized on a bundled starter reset once with this update.
 - The supplied workflows' setup notes say to click **Extensions** at the top right of ComfyUI and install the node packs in **Nodes Manager**, as current ComfyUI labels them. LTX 2.5 Refine & Upscale's note searches **LTXVideo**, which finds ComfyUI-LTXVideo.
