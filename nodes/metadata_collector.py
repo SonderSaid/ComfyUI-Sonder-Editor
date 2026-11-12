@@ -8,6 +8,7 @@ import re
 from typing import Any
 
 from ..server.lora_metadata import NATIVE_LORA_STACKS, native_lora_fields
+from .cache_policy import ALWAYS_RUNS, PER_RUN, TAKES_PROJECT
 
 from .subgraph_provenance import (
     checked_workflow_node,
@@ -560,6 +561,9 @@ class SonderMetadataCollector:
     FUNCTION = "collect"
     RETURN_TYPES = ("SONDER_PROJECT",)
     RETURN_NAMES = ("project",)
+    # nodes/cache_policy.py: runs whenever scheduled; its project output is per-run.
+    SONDER_CACHE_POLICY = {"project": PER_RUN}
+    SONDER_CACHE_EXECUTION = ALWAYS_RUNS(TAKES_PROJECT)
     DESCRIPTION = "Collects explicitly wired upstream widget values into Sonder asset metadata."
 
     @classmethod

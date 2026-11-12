@@ -58,6 +58,32 @@ If it reports `Selected branch 'itemN' is not available (None)`, update
 Sonder Editor too and restart ComfyUI. Keep the existing connections.
 If a branch still runs, check whether another active node also consumes it.
 
+### Nodes after the Sonder Editor run again on every take
+
+Nodes that use only the Editor's text and number outputs, such as text
+encoding, are reused while those values don't change. They run every time when:
+
+- ComfyUI was started with `--cache-none`. Remove it.
+- The workflow has more than one **Sonder Editor**. Keep one.
+- An input of the **Sonder Editor** is wired to another node. Set the value
+  on the Editor instead.
+- The value passes through a **Sonder Switch**, **Sonder Cluster** or
+  **Sonder Gate** whose other branch comes from a Sonder bridge or from the
+  Editor's `project`, `rendered_frames`, `guide_images` or `audio`. The LTX 2.5
+  Edit & VFX workflow's prompt does this, so its text encoding runs every take.
+- The value reaches the node through an input that accepts any type.
+- The ComfyUI console shows `Sonder cache pipeline is unavailable on this
+  ComfyUI`. Update ComfyUI and Sonder Editor; the reason in brackets names what
+  differs.
+
+The console names any other reason once, in a line starting
+`Sonder cache pipeline: nodes after the Sonder Editor rerun`. A line starting
+`Sonder cache pipeline failed` means that run fell back to running everything;
+report it with the lines that follow.
+
+Nodes fed by the Editor's `rendered_frames`, `guide_images`, `audio` or
+`project` outputs always run.
+
 ## Projects & storage
 
 ### An older Sonder version refuses a project saved by a newer one

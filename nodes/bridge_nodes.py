@@ -36,6 +36,7 @@ from ..server.media_helpers import (
 )
 from ..server.path_security import resolve_existing_project_path
 from ..server.timeline_state import GuideFrame
+from .cache_policy import ALWAYS_RUNS, INHERITS, TAKES_PROJECT
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +317,14 @@ class SonderGuidesBridgeStart:
         ("flow_control", "image", "frame_index", "strength")
         + tuple(f"value_{i}" for i in range(MAX_PASSTHROUGH))
     )
+    # nodes/cache_policy.py: guide media identity is Execution Cache Pipeline Phase 3.
+    SONDER_CACHE_POLICY = {
+        "flow_control": INHERITS("Guides loop: Execution Cache Pipeline Phase 3"),
+        "image": INHERITS("Guides loop: Execution Cache Pipeline Phase 3"),
+        "frame_index": INHERITS("Guides loop: Execution Cache Pipeline Phase 3"),
+        "strength": INHERITS("Guides loop: Execution Cache Pipeline Phase 3"),
+        "value_*": INHERITS("Guides loop: Execution Cache Pipeline Phase 3"),
+    }
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -391,6 +400,9 @@ class SonderGuidesBridgeEnd:
 
     RETURN_TYPES = tuple(_ANY for _ in range(MAX_PASSTHROUGH))
     RETURN_NAMES = tuple(f"value_{i}" for i in range(MAX_PASSTHROUGH))
+    # nodes/cache_policy.py: expands the loop on every run it is scheduled in.
+    SONDER_CACHE_POLICY = {"value_*": INHERITS("Guides loop: Execution Cache Pipeline Phase 3")}
+    SONDER_CACHE_EXECUTION = ALWAYS_RUNS(TAKES_PROJECT)
 
     @classmethod
     def INPUT_TYPES(cls):

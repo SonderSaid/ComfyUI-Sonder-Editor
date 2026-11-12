@@ -11,6 +11,14 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Changed
+- A workflow whose only save node is not a Sonder node, and that doesn't take the Editor's frames or audio, now does nothing when you run it again unchanged, like any ComfyUI workflow.
+- A node that takes only the Editor's text and numbers and a fixed seed now returns its previous result when nothing changed, as ComfyUI does for any unchanged node. To get a new result each take, set its seed to change after each run.
+- The Editor's `fps` output is always a decimal number, so an integer project frame rate shows as `24.0` in previews and saved metadata.
+
+### Fixed
+- Nodes after the Sonder Editor no longer run again on every take. Nodes that use only its text and number outputs (prompt, guide and mask values, frame count, fps, width, height) are reused from ComfyUI's cache while those values don't change. In a workflow whose text encoder takes the Editor's prompt directly, a second take with the same prompt skips text encoding, and changing only the seed reruns sampling but not encoding. There is nothing to set up; `--cache-none` turns it off. [Troubleshooting](docs/troubleshooting.md#nodes-after-the-sonder-editor-run-again-on-every-take) lists what still makes them run.
+
 ## [0.8.4] - 2026-11-10
 
 ### Added

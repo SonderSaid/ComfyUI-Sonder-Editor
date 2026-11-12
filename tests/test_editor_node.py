@@ -1211,6 +1211,78 @@ def test_project_only_no_scene_or_zero_duration_uses_bounded_empty_outputs(
     assert tuple(result[10]["waveform"].shape) == (1, 2, 1)
 
 
+def test_editor_outputs_are_normalised_to_their_exact_socket_types(tmp_path, monkeypatch):
+    # The cache pipeline substitutes only exact str/int/float values, and ComfyUI
+    # keys 24 == 24.0 and 0.0 == -0.0 alike, so the Editor canonicalises them.
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    np = importlib.import_module("numpy")
+    normalise = editor_node._normalise_outputs
+    # The slots come from RETURN_TYPES and the EXACT declarations, never a copy.
+    assert editor_node._exact_slots("STRING") == (3, 4, 5)
+    assert editor_node._exact_slots("INT") == (6, 8, 9)
+    assert editor_node._exact_slots("FLOAT") == (7, 11, 12)
+
+    class Text(str):
+        def __str__(self):
+            return "overridden"
+
+    base = ["project", "frames", "guides", Text("0,8"), "1.0", "prompt", 9.0, 24, np.int64(1280), 720.0,
+            "audio", -0.0, np.float32(1.5)]
+    out = normalise(tuple(base))
+    assert type(out[3]) is str and out[3] == "0,8"
+    assert (type(out[6]), out[6]) == (int, 9)
+    assert (type(out[7]), out[7]) == (float, 24.0)
+    assert (type(out[8]), out[8]) == (int, 1280)
+    assert (type(out[9]), out[9]) == (int, 720)
+    assert type(out[11]) is float and str(out[11]) == "0.0"
+    assert (type(out[12]), out[12]) == (float, 1.5)
+    assert out[:3] == ("project", "frames", "guides") and out[10] == "audio"
+
+    # Never invents a value: inexact, absent, NaN, bool or foreign shapes stay as they are.
+    odd = list(base)
+    odd[6], odd[7], odd[8], odd[9], odd[11] = None, float("nan"), 1280.5, True, 2 ** 60 + 1
+    out = normalise(tuple(odd))
+    assert out[6] is None and out[7] != out[7] and out[8] == 1280.5 and out[9] is True
+    assert type(out[11]) is int
+    mocked = ("project", 24)
+    assert normalise(mocked) is mocked
+    assert normalise(None) is None
+
+
+def test_editor_normalises_an_integer_project_fps_on_the_empty_and_main_paths(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    torch = importlib.import_module("torch")
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+
+    empty = timeline_state.TimelineProject(project_dir=str(tmp_path), resolution=(64, 48), scenes=[])
+    empty.fps = 24  # project.json can hold an integer
+    monkeypatch.setattr(editor_node, "load_project", lambda _dir: empty)
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project", project_name="Ignored", fps=24.0, width=64, height=48,
+        prompt=_prompt_graph({"e": _prompt_node("SonderEditor")}), unique_id="e")
+    assert (type(result[7]), result[7]) == (float, 24.0)
+    assert (type(result[8]), type(result[9])) == (int, int)
+
+    scene = timeline_state.Scene(scene_id="scene-1", name="Scene", duration_frames=4)
+    project = timeline_state.TimelineProject(project_dir=str(tmp_path), name="Main", resolution=(64, 48),
+                                             scenes=[scene])
+    project.fps = 24
+    monkeypatch.setattr(editor_node, "load_project", lambda _dir: project)
+    monkeypatch.setattr(editor_node.SonderEditor, "_render_scene_frames",
+                        lambda self, proj, scene, start, end, **_kw: torch.zeros(max(1, end - start), 2, 2, 3))
+    monkeypatch.setattr(editor_node.SonderEditor, "_load_scene_audio",
+                        lambda self, proj, scene, start, end, **_kw: editor_node._make_silent_audio(1.0))
+    result = editor_node.SonderEditor().execute(
+        project="Existing Project", project_name="Ignored", fps=24.0, width=64, height=48,
+        scene_id="scene-1", selection_start=0, selection_end=4,
+        prompt=_prompt_graph({"e": _prompt_node("SonderEditor")}), unique_id="e")
+    assert len(result) == 13
+    assert (type(result[7]), result[7]) == (float, 24.0)
+    assert all(type(result[slot]) is float for slot in (11, 12))
+    assert all(type(result[slot]) is int for slot in (6, 8, 9))
+    assert all(type(result[slot]) is str for slot in (3, 4, 5))
+
+
 def test_project_only_execution_skips_media_and_preserves_context(
     tmp_path, monkeypatch, caplog
 ):
@@ -4551,6 +4623,60 @@ def test_execute_is_not_remembered_without_a_queue_run_or_after_a_failure(tmp_pa
         node.execute("p", "n", 24, 64, 64, prompt=trusted, unique_id="1")
     assert node.execute("p", "n", 24, 64, 64, prompt=trusted, unique_id="1") == ("second",)
     assert calls == [False, False, True, True]
+    runs.reset_for_tests()
+
+
+def test_a_stored_early_run_failure_is_replayed_before_the_token_claim_or_body(tmp_path, monkeypatch):
+    # The cache pipeline ran the Editor early and it raised: the scheduled Editor
+    # raises the same failure and never checks its token, claims or renders again.
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(editor_node)
+    prompt = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    prompt["1"]["_meta"] = {"title": "Sonder Editor", "sonder_run": "tok-1"}
+    runs.register_token("tok-1", ["proj-id"])
+    runs.open_release("33", "prompt-33", prompt)
+    calls = []
+
+    def fake_execute_once(self, *args, **kwargs):
+        calls.append(kwargs["unique_id"])
+        return ("ran",)
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_execute_once", fake_execute_once)
+    stored = RuntimeError("claim conflict exhausted")
+    assert runs.remember_failure("33", importlib.import_module(f"{TEST_PACKAGE}.nodes.prompt_once").call_key("1"), stored)
+
+    with pytest.raises(RuntimeError) as raised:
+        editor_node.SonderEditor().execute("p", "n", 24, 64, 64, prompt=prompt, unique_id="1")
+    assert raised.value is stored
+    assert calls == []
+    assert runs.token_state("tok-1")["state"] == "registered"
+    # A stored cancellation replays as a fresh interrupt, never the body.
+    runs.remember_failure("33", "2#0", runs.CANCELLED)
+    with pytest.raises(BaseException) as cancelled:
+        editor_node.SonderEditor().execute("p", "n", 24, 64, 64, prompt=prompt, unique_id="2")
+    assert type(cancelled.value).__name__ in {"InterruptProcessingException", "RuntimeError"}
+    assert calls == []
+    runs.reset_for_tests()
+
+
+def test_a_stored_failure_is_not_replayed_for_another_call_or_an_untrusted_prompt(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(editor_node)
+    trusted = _prompt_graph({"1": _prompt_node("SonderEditor"), "2": _prompt_node("SonderEditor")})
+    untrusted = _prompt_graph({"1": _prompt_node("SonderEditor")})
+    runs.open_release("34", "prompt-34", trusted)
+    runs.remember_failure("34", "1#0", RuntimeError("stored"))
+    calls = []
+
+    def fake_execute_once(self, *args, **kwargs):
+        calls.append((kwargs["prompt"] is trusted, kwargs["unique_id"]))
+        return ("ran", kwargs["unique_id"])
+
+    monkeypatch.setattr(editor_node.SonderEditor, "_execute_once", fake_execute_once)
+    node = editor_node.SonderEditor()
+    assert node.execute("p", "n", 24, 64, 64, prompt=trusted, unique_id="2") == ("ran", "2")
+    assert node.execute("p", "n", 24, 64, 64, prompt=untrusted, unique_id="1") == ("ran", "1")
+    assert calls == [(True, "2"), (False, "1")]
     runs.reset_for_tests()
 
 

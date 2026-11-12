@@ -166,3 +166,48 @@ def test_run_finished_listeners_are_isolated_and_removable():
     remove_seen()
     sdk_runs.notify_run_finished({"prompt_id": "q"})
     assert seen == [{"prompt_id": "p"}]
+
+
+def test_a_stored_failure_lives_on_its_open_run_and_the_first_wins():
+    first, later = RuntimeError("first"), RuntimeError("later")
+    assert not sdk_runs.remember_failure("7", "1#0", first)
+    assert sdk_runs.first_failure("7", "1#0") is None
+
+    sdk_runs.open_release("7", "prompt-7")
+    assert sdk_runs.first_failure("7", "1#0") is None
+    assert sdk_runs.remember_failure("7", "1#0", first)
+    assert sdk_runs.remember_failure("7", "1#0", later)
+    assert sdk_runs.first_failure("7", "1#0") is first
+    assert sdk_runs.remember_failure("7", "1#1", sdk_runs.CANCELLED)
+    assert sdk_runs.first_failure("7", "1#1") is sdk_runs.CANCELLED
+    # Another call key, another run, and an empty call key are untouched.
+    assert sdk_runs.first_failure("7", "2#0") is None
+    assert sdk_runs.first_failure("8", "1#0") is None
+    assert not sdk_runs.remember_failure("7", "", first)
+
+    record = sdk_runs.close_release("7")
+    assert "failures" not in record and "preparation" not in record
+    assert sdk_runs.first_failure("7", "1#0") is None
+    sdk_runs.open_release("7", "prompt-7b")
+    assert sdk_runs.first_failure("7", "1#0") is None
+
+
+def test_the_preparation_record_and_roots_are_read_from_the_open_run():
+    assert not sdk_runs.note_preparation("9", {"outcome": "prepared"})
+    assert sdk_runs.preparation("9") is None
+    assert sdk_runs.release_roots("9") is None
+
+    sdk_runs.open_release("9", "prompt-9", {"1": {}}, roots=["3", 2])
+    assert sdk_runs.release_roots("9") == ("2", "3")
+    assert sdk_runs.preparation("9") is None
+    assert sdk_runs.note_preparation("9", {"outcome": "prepared", "substituted": 2})
+    copy = sdk_runs.preparation("9")
+    copy["outcome"] = "changed"
+    assert sdk_runs.preparation("9") == {"outcome": "prepared", "substituted": 2}
+    snapshot = sdk_runs.record_snapshot("9")
+    assert "preparation" not in snapshot and "failures" not in snapshot
+    sdk_runs.close_release("9")
+    assert sdk_runs.preparation("9") is None
+
+    sdk_runs.open_release("10", "prompt-10")
+    assert sdk_runs.release_roots("10") is None

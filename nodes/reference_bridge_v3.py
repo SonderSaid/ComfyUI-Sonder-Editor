@@ -9,6 +9,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on ComfyUI vers
         raise
     from comfy_api.latest import io
 
+from .cache_policy import HANDLE, INHERITS
 from .reference_core import (
     MAX_REFERENCE_SLOTS,
     decode_reference_audios,
@@ -29,6 +30,13 @@ ReferenceSetType = io.Custom("SONDER_REFERENCE_SET")
 
 class SonderReferenceSelector(io.ComfyNode):
     """Resolve effective-in-window Reference presence without decoding media."""
+
+    # nodes/cache_policy.py
+    SONDER_CACHE_POLICY = {
+        "reference_set": HANDLE,
+        "has_reference": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
+        "reference_strength": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
+    }
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -98,6 +106,9 @@ def _numbered_outputs(output_type, prefix: str, noun: str):
 
 
 class SonderReferenceImageBridge(io.ComfyNode):
+    # nodes/cache_policy.py
+    SONDER_CACHE_POLICY = {"r??": INHERITS("bridge media: Execution Cache Pipeline Phase 3")}
+
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
@@ -132,6 +143,9 @@ class SonderReferenceImageBridge(io.ComfyNode):
 
 
 class SonderReferenceAudioBridge(io.ComfyNode):
+    # nodes/cache_policy.py
+    SONDER_CACHE_POLICY = {"a??": INHERITS("bridge media: Execution Cache Pipeline Phase 3")}
+
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
@@ -166,6 +180,13 @@ class SonderReferenceAudioBridge(io.ComfyNode):
 
 
 class SonderReferencePromptBridge(io.ComfyNode):
+    # nodes/cache_policy.py
+    SONDER_CACHE_POLICY = {
+        "reference_prompt": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
+        "reference_names": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
+        "p??": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
+    }
+
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(

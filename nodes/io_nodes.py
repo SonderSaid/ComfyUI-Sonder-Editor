@@ -48,6 +48,7 @@ from ..server.project_commit import (
 )
 from .metadata_collector import TRACKED_METADATA_CONTEXT_KEY, collector_chain_for_consumer
 from .prompt_once import run_once_per_prompt
+from .cache_policy import ALWAYS_RUNS, CACHEABLE, PER_RUN, TAKES_PROJECT
 from ..server.controls_snapshot import FULL_TEXT_KEY, MODES_DISPLAY_TYPE, controls_capture, modes_section
 from ..server.json_text import dumps_utf8, scrub as json_text_scrub
 from ..server.prompt_graph import downstream_set
@@ -1678,6 +1679,15 @@ def _install_bridge_prompt_queue_hooks() -> bool:
         except Exception:
             logger.exception("Sampling preview observation unavailable")
 
+        try:
+            # Execution cache pipeline: Editor values follow ComfyUI's native
+            # cache. Fail-open; retried at startup if the executor was not loaded.
+            from ..server import executor_hook
+            executor_hook.install(prompt_server=prompt_server)
+            executor_hook.install_on_startup(prompt_server)
+        except Exception:
+            logger.exception("Sonder cache pipeline hook unavailable")
+
         _BRIDGE_HOOKED_PROMPT_QUEUE_ID = current_queue_id
         return (
             callable(getattr(prompt_queue, "get", None))
@@ -2312,6 +2322,9 @@ class SonderSaveVideo:
     OUTPUT_NODE = True
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("output_path",)
+    # nodes/cache_policy.py: saves a take on every run it is scheduled in.
+    SONDER_CACHE_POLICY = {"output_path": PER_RUN}
+    SONDER_CACHE_EXECUTION = ALWAYS_RUNS(TAKES_PROJECT)
     OUTPUT_TOOLTIPS = ("Absolute path to the saved video file.",)
     FUNCTION = "save_video"
     DESCRIPTION = "Encodes an IMAGE tensor to a project video asset. Optionally muxes audio. Shows a thumbnail preview of the first frame. Optionally auto-corrects VAE color drift using the render's protected context frames."
@@ -2842,6 +2855,9 @@ class SonderSaveBridge:
     CATEGORY = "Sonder/IO"
     RETURN_TYPES = ("STRING", "STRING")
     RETURN_NAMES = ("output_dir", "filename_prefix")
+    # nodes/cache_policy.py: a prompt-isolated directory per run.
+    SONDER_CACHE_POLICY = {"output_dir": PER_RUN, "filename_prefix": PER_RUN}
+    SONDER_CACHE_EXECUTION = ALWAYS_RUNS(TAKES_PROJECT)
     OUTPUT_TOOLTIPS = (
         "Absolute prompt-isolated directory for save nodes that expect a folder path. Files written here are renamed to the configured stem on registration.",
         "ComfyUI-relative filename prefix encoding the configured stem. Native save nodes that honor filename_prefix (SaveImage et al.) produce filenames like <stem>_00001_.ext directly.",
@@ -2924,6 +2940,11 @@ class SonderPreviewVideo:
     OUTPUT_NODE = True
     RETURN_TYPES = ()
     FUNCTION = "preview"
+    # nodes/cache_policy.py. A preview of its inputs with no run-output side
+    # effects (maintainer decision 2026-11-12, replacing PER_RUN).
+    SONDER_CACHE_POLICY = {}
+    SONDER_CACHE_EXECUTION = CACHEABLE(
+        "a preview of its inputs; a hit replays the previous preview, which Output Views reads as From cache")
     DESCRIPTION = "Encodes frames to a temporary video for in-UI preview playback."
 
     @classmethod

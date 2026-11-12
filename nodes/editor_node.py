@@ -26,6 +26,7 @@ from ..server import run_scope
 from ..server import sdk_runs
 from ..server import view_timing
 from .prompt_once import run_once_per_prompt
+from .cache_policy import ALWAYS_RUNS, EXACT, INHERITS, NAN_FINGERPRINT, PER_RUN, output_policy
 from ..server.editor_inputs import editor_optional_inputs
 from ..server.session_registry import project_event_aliases
 from ..server.timeline_state import (
@@ -180,6 +181,61 @@ def _note_run_feedback(method: str, prompt, unique_id, *args) -> None:
             logger.warning("Run feedback note %s failed; run notifications may lack it", method, exc_info=True)
 
 
+def _exact_slots(kind: str) -> tuple:
+    """The EXACT output slots of socket type ``kind``, from the Editor's own declarations."""
+    return tuple(slot for slot, name in enumerate(SonderEditor.RETURN_NAMES)
+                 if SonderEditor.RETURN_TYPES[slot] == kind and output_policy(SonderEditor, name) == EXACT)
+
+
+def _normalise_outputs(result):
+    """The Editor's outputs with exact-equivalent canonical types; never raises.
+
+    ComfyUI keys ``24`` and ``24.0`` alike, and ``0.0`` and ``-0.0`` alike, so the
+    cache pipeline only hands a consumer a literal whose type is exactly its
+    socket's. ``fps``, ``width`` and ``height`` can arrive from ``project.json``
+    as the other numeric type. Only lossless conversions happen: an integral
+    float or numpy integer on an INT slot, an int or numpy float on a FLOAT slot
+    (``-0.0`` becomes ``0.0``), a ``str`` subclass on a STRING slot. Anything else
+    (None, NaN, ``1280.5``, a bool, an unexpected shape) is left as it is.
+    """
+    try:
+        if not isinstance(result, tuple) or len(result) != len(SonderEditor.RETURN_TYPES):
+            return result
+        values = list(result)
+        for slot in _exact_slots("INT"):
+            value = values[slot]
+            if type(value) is int or isinstance(value, bool):
+                continue
+            if isinstance(value, np.integer):
+                values[slot] = int(value)
+            elif isinstance(value, (float, np.floating)) and math.isfinite(value) and float(value).is_integer():
+                values[slot] = int(value)
+        for slot in _exact_slots("FLOAT"):
+            value = values[slot]
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, np.integer)):
+                converted = float(value)
+                if converted != value:
+                    continue  # beyond float precision: not exact
+                value = converted
+            elif isinstance(value, (float, np.floating)):
+                if not math.isfinite(value):
+                    continue
+                value = float(value)
+            else:
+                continue
+            values[slot] = 0.0 if value == 0.0 else value
+        for slot in _exact_slots("STRING"):
+            value = values[slot]
+            if isinstance(value, str) and type(value) is not str:
+                values[slot] = str.__str__(value)
+        return tuple(values)
+    except Exception:
+        logger.debug("Editor output normalisation skipped", exc_info=True)
+        return result
+
+
 def _coerce_int(value, default: int = 0) -> int:
     try:
         return int(value)
@@ -244,6 +300,24 @@ class SonderEditor:
         "mask_start_time", "mask_end_time",
     )
     OUTPUT_SLOTS = {name: index for index, name in enumerate(RETURN_NAMES)}
+    # How each output meets ComfyUI's cache (nodes/cache_policy.py). EXACT values
+    # reach their consumers as literals; media waits for a later phase.
+    SONDER_CACHE_POLICY = {
+        "project": PER_RUN,
+        "rendered_frames": INHERITS("Editor media: Execution Cache Pipeline Phase 4"),
+        "guide_images": INHERITS("Editor media: Execution Cache Pipeline Phase 4"),
+        "guide_idx": EXACT,
+        "guide_strengths": EXACT,
+        "prompt": EXACT,
+        "frame_count": EXACT,
+        "fps": EXACT,
+        "width": EXACT,
+        "height": EXACT,
+        "audio": INHERITS("Editor media: Execution Cache Pipeline Phase 4"),
+        "mask_start_time": EXACT,
+        "mask_end_time": EXACT,
+    }
+    SONDER_CACHE_EXECUTION = ALWAYS_RUNS(NAN_FINGERPRINT)
     OUTPUT_TOOLTIPS = (
         "The project object. Connect to Sonder Save Video.",
         "Composited video frames from the timeline (all visible clips layered with opacity).",
@@ -816,8 +890,9 @@ class SonderEditor:
                 take_fit_mode=DEFAULT_FIT_MODE, take_crop_position=DEFAULT_CROP_POSITION,
                 take_keep_padding=False):
         # A repeat within one prompt must not claim the run token or a queue job
-        # again, or hand downstream nodes a second project object.
-        return run_once_per_prompt(prompt, unique_id, "SonderEditor", lambda: self._execute_once(
+        # again, or hand downstream nodes a second project object. Outputs are
+        # normalised once here, so every return path and the memo carry them.
+        return run_once_per_prompt(prompt, unique_id, "SonderEditor", lambda: _normalise_outputs(self._execute_once(
             project, project_name, fps, width, height,
             scene_id=scene_id, selection_start=selection_start, selection_end=selection_end,
             pre_context_frames=pre_context_frames, post_context_frames=post_context_frames,
@@ -827,7 +902,7 @@ class SonderEditor:
             render_cache_max_bytes=render_cache_max_bytes, render_queue_active=render_queue_active,
             take_fit_mode=take_fit_mode, take_crop_position=take_crop_position,
             take_keep_padding=take_keep_padding,
-        ))
+        )))
 
     def _execute_once(self, project, project_name, fps, width, height,
                       scene_id="", selection_start=0, selection_end=0,

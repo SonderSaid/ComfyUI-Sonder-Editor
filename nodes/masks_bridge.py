@@ -49,6 +49,8 @@ except ImportError:  # pragma: no cover - ComfyUI always ships torch
     # version guards does not apply here.
     torch = None
 
+from .cache_policy import ALWAYS_RUNS, INHERITS, TAKES_PROJECT
+
 logger = logging.getLogger(__name__)
 
 # Audio axis detection tolerance, in latent steps. A real encode ceils through
@@ -414,6 +416,16 @@ class SonderMasksBridge:
         "video_mask",
         "audio_mask",
     )
+    # nodes/cache_policy.py
+    SONDER_CACHE_POLICY = {
+        "video_mask_start_time": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
+        "video_mask_end_time": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
+        "audio_mask_start_time": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
+        "audio_mask_end_time": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
+        "video_mask": INHERITS("mask provenance needs the linked latents; revisit in Phase 3"),
+        "audio_mask": INHERITS("mask provenance needs the linked latents; revisit in Phase 3"),
+    }
+    SONDER_CACHE_EXECUTION = ALWAYS_RUNS(TAKES_PROJECT)
     OUTPUT_TOOLTIPS = (
         "Video generation-mask start time (seconds). Equals the editor's mask "
         "start when Edit Video is on; equals the end (zero width) when frozen.",

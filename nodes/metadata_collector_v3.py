@@ -11,6 +11,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on ComfyUI vers
         raise
     from comfy_api.latest import ComfyAPI, ComfyExtension, io
 
+from .cache_policy import ALWAYS_RUNS, PER_RUN, TAKES_PROJECT
 from .metadata_collector import (
     MAX_V3_COLLECTOR_INPUTS,
     collect_metadata,
@@ -45,6 +46,10 @@ def _hidden_value(cls, name: str):
 
 class SonderMetadataCollectorV3(io.ComfyNode):
     """Native V3/autogrow adapter over the shared metadata collector core."""
+
+    # nodes/cache_policy.py: runs whenever scheduled; its project output is per-run.
+    SONDER_CACHE_POLICY = {"project": PER_RUN}
+    SONDER_CACHE_EXECUTION = ALWAYS_RUNS(TAKES_PROJECT)
 
     @classmethod
     def define_schema(cls) -> io.Schema:

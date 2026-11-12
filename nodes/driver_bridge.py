@@ -21,6 +21,7 @@ from ..server.media_helpers import decode_video_range, fit_frame_to_canvas, reso
 from ..server import external_links
 from ..server.path_security import path_within, resolve_existing_project_path, resolve_project_path
 from ..server.timeline_state import ClipReference, GuideFrame, LaneConfig, effective_scene_fps
+from .cache_policy import HANDLE, INHERITS
 
 logger = logging.getLogger(__name__)
 
@@ -623,6 +624,8 @@ class SonderDriverSelector:
     CATEGORY = "Sonder"
     RETURN_TYPES = ("SONDER_DRIVER_REF", "INT")
     RETURN_NAMES = ("driver_ref", "has_driver")
+    # nodes/cache_policy.py
+    SONDER_CACHE_POLICY = {"driver_ref": HANDLE, "has_driver": INHERITS("bridge values: Execution Cache Pipeline Phase 2")}
     OUTPUT_TOOLTIPS = (
         "Resolved Driver reference for the selected lane. Wire to Sonder Driver Bridge.",
         "0 when no effective driver is present, 1 when the selected lane contributes media.",
@@ -684,6 +687,9 @@ class SonderDriverBridge:
     CATEGORY = "Sonder"
     RETURN_TYPES = ("IMAGE", "INT", "FLOAT")
     RETURN_NAMES = ("driver_images", "driver_idx", "driver_strength")
+    # nodes/cache_policy.py
+    SONDER_CACHE_POLICY = {name: INHERITS("bridge media: Execution Cache Pipeline Phase 3")
+                           for name in ("driver_images", "driver_idx", "driver_strength")}
     OUTPUT_TOOLTIPS = (
         "Driver frames for the selected driver lane, window-rebased to the editor output. "
         "A Driver reaching the window's end holds its last frame over the editor's grid padding.",

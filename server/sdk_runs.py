@@ -21,6 +21,11 @@ stand in for it.
   or RAM-pressure eviction, when a lazy input or a node expansion links to it late);
   the repeat gets the first result instead of claiming, saving or writing again.
   They live on the open record, so they go with it.
+- **Stored failures and the preparation record** belong to the cache pipeline
+  (``server/cache_pipeline.py``), which runs the Editor before ComfyUI builds cache
+  keys. A failure raised inside that early run is stored so the scheduled Editor
+  replays it rather than claiming again; the preparation record says what the
+  pipeline did. Both live on the open record and go with it.
 - **Registrations** say who owns a run before it is submitted: an SDK token (above)
   or a canvas *receipt* the browser stamps on its Editor nodes. Both carry a
   process-wide ``seq``, the order "latest" means, never arrival order. The queue's
@@ -136,6 +141,10 @@ def open_release(key: Any, prompt_id: Any = "", prompt: Any = None, roots: Any =
             "hinted_token": "",
             "token_project_ids": [],
             "results": {},
+            # The cache pipeline's early Editor run: a failure the scheduled
+            # Editor replays, and what the preparation did (cache_pipeline).
+            "failures": {},
+            "preparation": None,
             # O(1) here: a cancel can race the interval between get and ComfyUI
             # resetting its interrupt flag, so nothing heavy runs in this hook.
             "roots": _clean_roots(roots),
@@ -239,6 +248,8 @@ def close_release(key: Any) -> dict[str, Any] | None:
             return None
         # First results can hold the run's frames; nothing reads them after close.
         record.pop("results", None)
+        record.pop("failures", None)
+        record.pop("preparation", None)
         record.pop("prompt_ref", None)
         if record.get("scope") is _SCOPE_UNSET:
             record["scope"] = None
@@ -274,6 +285,64 @@ def remember_result(key: Any, node_id: Any, value: Any) -> bool:
             return False
         results.setdefault(node_id, value)
         return True
+
+
+# A stored failure that stands for a cancellation: replay raises a fresh
+# interrupt rather than the original object.
+CANCELLED = object()
+
+
+def remember_failure(key: Any, call_key: Any, failure: Any) -> bool:
+    """Record the first failure of ``call_key``'s early run on its open run.
+
+    ``failure`` is an exception or ``CANCELLED``. Only the cache pipeline writes
+    these, and only for a raise from inside ``SonderEditor.execute``; the scheduled
+    call replays it (``prompt_once``) instead of running again. First wins.
+    """
+    key, call_key = _key(key), _key(call_key)
+    with _LOCK:
+        record = _RELEASES.get(key)
+        failures = record.get("failures") if record is not None else None
+        if not call_key or failures is None:
+            return False
+        failures.setdefault(call_key, failure)
+        return True
+
+
+def first_failure(key: Any, call_key: Any) -> Any:
+    """The stored failure for ``call_key`` on this open run, or None."""
+    key, call_key = _key(key), _key(call_key)
+    with _LOCK:
+        record = _RELEASES.get(key)
+        failures = record.get("failures") if record is not None else None
+        if not call_key or not failures:
+            return None
+        return failures.get(call_key)
+
+
+def note_preparation(key: Any, preparation: dict[str, Any]) -> bool:
+    """Record what the cache pipeline's preparation did for this open run."""
+    with _LOCK:
+        record = _RELEASES.get(_key(key))
+        if record is None or not isinstance(preparation, dict):
+            return False
+        record["preparation"] = dict(preparation)
+        return True
+
+
+def preparation(key: Any) -> dict[str, Any] | None:
+    """A copy of the open run's preparation record, or None."""
+    with _LOCK:
+        record = _RELEASES.get(_key(key))
+        value = record.get("preparation") if record is not None else None
+        return dict(value) if isinstance(value, dict) else None
+
+
+def release_roots(key: Any) -> tuple[str, ...] | None:
+    """The open run's execution roots (``outputs_to_execute``), or None when unknown."""
+    with _LOCK:
+        record = _RELEASES.get(_key(key))
+        return record.get("roots") if record is not None else None
 
 
 def _clean_roots(roots: Any) -> tuple[str, ...] | None:
@@ -329,7 +398,7 @@ def record_snapshot(key: Any) -> dict[str, Any] | None:
         if record is None:
             return None
         return {name: value for name, value in record.items()
-                if name not in {"prompt_ref", "results", "leases", "projects"}
+                if name not in {"prompt_ref", "results", "leases", "projects", "failures", "preparation"}
                 and value is not _SCOPE_UNSET}
 
 
