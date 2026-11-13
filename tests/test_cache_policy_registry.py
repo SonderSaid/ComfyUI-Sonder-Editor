@@ -76,6 +76,31 @@ def test_lookup_prefers_an_exact_name_over_a_pattern_and_defaults_to_inherits():
     assert policy.execution_policy(Node) is None
 
 
+def test_prepares_and_normalise_outputs_follow_the_declarations():
+    policy = _policy_module()
+
+    class Bridge:
+        RETURN_TYPES = ("SONDER_X", "INT", "FLOAT", "STRING", "FLOAT")
+        RETURN_NAMES = ("handle", "count", "start", "text", "media")
+        SONDER_CACHE_POLICY = {"handle": policy.HANDLE, "count": policy.EXACT, "start": policy.EXACT,
+                               "text": policy.EXACT, "media": policy.INHERITS("media")}
+        SONDER_CACHE_PREPARE = policy.PREPARES(publishes=["key"])
+
+    assert policy.prepare_policy(Bridge) == policy.PREPARES(publishes=("key",))
+    assert policy.prepare_policy(object) is None
+    assert policy.exact_slots(Bridge) == (1, 2, 3) and policy.exact_slots(Bridge, "FLOAT") == (2,)
+
+    class Text(str):
+        pass
+
+    out = policy.normalise_outputs(Bridge, ({"h": 1}, 3.0, -0.0, Text("t"), -0.0))
+    assert (type(out[1]), out[1]) == (int, 3)
+    assert type(out[2]) is float and str(out[2]) == "0.0"
+    assert type(out[3]) is str
+    assert str(out[4]) == "-0.0"  # not EXACT: untouched
+    assert policy.normalise_outputs(Bridge, (1, 2)) == (1, 2)
+
+
 # --- The registry walk (real comfy_api) ---------------------------------------------
 
 SCRIPT = r'''
@@ -203,6 +228,47 @@ for node_id in sorted(selected):
         else:
             fail(node_id, f"{selected[node_id]} needs SONDER_CACHE_EXECUTION (ALWAYS_RUNS or CACHEABLE)")
 
+# Preparation: an EXACT output outside the Editor needs PREPARES (the pipeline must
+# run the node early to know the value), and PREPARES needs a shape the pipeline
+# can call exactly as the executor does.
+import inspect
+from comfy_api.internal import _ComfyNodeInternal, first_real_override
+
+out["exact"], out["prepared"] = {}, []
+for node_id in sorted(mapping):
+    cls, item = mapping[node_id], info[node_id]
+    names = item["names"] or [f"#{index}" for index in range(len(item["returns"]))]
+    exact = [slot for slot, name in enumerate(names) if policy.output_policy(cls, name) == policy.EXACT]
+    handles = [slot for slot, name in enumerate(names) if policy.output_policy(cls, name) == policy.HANDLE]
+    prepares = policy.prepare_policy(cls)
+    if exact:
+        out["exact"][node_id] = exact
+    if exact and node_id != "SonderEditor" and prepares is None:
+        fail(node_id, "has EXACT outputs but declares no SONDER_CACHE_PREPARE (PREPARES)")
+    if getattr(cls, policy.PREPARE_ATTRIBUTE, None) is not None and prepares is None:
+        fail(node_id, "SONDER_CACHE_PREPARE is not a PREPARES declaration")
+    if prepares is None:
+        continue
+    out["prepared"].append(node_id)
+    if not isinstance(prepares.publishes, tuple) or not all(isinstance(key, str) and key for key in prepares.publishes):
+        fail(node_id, "PREPARES(publishes=...) must be a tuple of context keys")
+    if not exact and not handles:
+        fail(node_id, "PREPARES on a node with neither an EXACT nor a HANDLE output")
+    v3 = isinstance(cls, type) and issubclass(cls, _ComfyNodeInternal)
+    method = getattr(cls, "execute" if v3 else str(getattr(cls, "FUNCTION", "") or ""), None)
+    if not callable(method) or inspect.iscoroutinefunction(method):
+        fail(node_id, "PREPARES needs a synchronous execute")
+    if getattr(cls, "INPUT_IS_LIST", False) or any(getattr(cls, "OUTPUT_IS_LIST", None) or ()):
+        fail(node_id, "PREPARES on a list-mapped node")
+    own_lazy = first_real_override(cls, "check_lazy_status") is not None if v3 else hasattr(cls, "check_lazy_status")
+    types_ = cls.INPUT_TYPES() or {}
+    lazy_inputs = [name for category in ("required", "optional") for name, spec in (types_.get(category) or {}).items()
+                   if isinstance(spec, (tuple, list)) and len(spec) > 1 and isinstance(spec[1], dict) and spec[1].get("lazy")]
+    if own_lazy or lazy_inputs:
+        fail(node_id, "PREPARES on a node with lazy inputs")
+    if not set(item["hidden"]) <= {"PROMPT", "UNIQUE_ID"}:
+        fail(node_id, f"PREPARES with hidden inputs the early run cannot supply: {item['hidden']}")
+
 editor = info.get("SonderEditor")
 out["editor_hidden"] = editor["hidden"] if editor else None
 out["editor_exact"] = [slot for slot, name in enumerate(editor["names"])
@@ -244,6 +310,19 @@ def test_the_selection_covers_the_editor_bridges_savers_and_previews(registry):
     assert {"SONDER_PROJECT", "SONDER_DRIVER_REF", "SONDER_REFERENCE_SET"} <= set(registry["derived"])
     # Pure value nodes are not selected: nothing per-run, nothing project-derived.
     assert "SonderSelector" not in selected and "SonderLazySwitch" not in selected
+
+
+def test_the_bridges_value_outputs_are_exact_and_prepared(registry):
+    # Phase 2: the bridges' text, number and flag outputs; media and masks stay INHERITS.
+    assert sorted(registry["prepared"]) == [
+        "SonderDriverSelector", "SonderMasksBridge", "SonderPromptRelayBridge",
+        "SonderReferencePromptBridge", "SonderReferenceSelector"]
+    assert registry["exact"]["SonderPromptRelayBridge"] == [0, 1, 2, 3]
+    assert registry["exact"]["SonderMasksBridge"] == [0, 1, 2, 3]
+    assert registry["exact"]["SonderDriverSelector"] == [1]
+    assert registry["exact"]["SonderReferenceSelector"] == [1, 2]
+    assert registry["exact"]["SonderReferencePromptBridge"] == list(range(18))
+    assert set(registry["exact"]) == set(registry["prepared"]) | {"SonderEditor"}
 
 
 def test_the_editor_has_only_the_hidden_inputs_the_early_run_supplies(registry):

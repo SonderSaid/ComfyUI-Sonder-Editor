@@ -14,10 +14,18 @@ Editor's text and number outputs without touching that guard:
    (``prompt_once``), under the context the scheduled call will have, so token
    check, claim, lease and render happen exactly once. The scheduled Editor, if
    it is still scheduled, returns the memoized result.
-4. A pure planner (``plan_substitutions``) replaces each consumer's link to an
-   ``EXACT`` Editor output with the literal value (M1), when the consumer's
-   declared input type is exactly the output's literal type.
-5. Overrides go through ``DynamicPrompt.override_node``, which feeds key
+4. **Bridges** that declare ``PREPARES`` (``nodes/cache_policy.py``) and are
+   certain to run, take only the Editor's ``project`` or a prepared handle, and
+   have a consumer to gain, run their own ``execute`` here, exactly as the
+   executor would call it. That one function publishes their provenance, so a
+   bridge whose consumers all take literals and is no longer scheduled still
+   leaves its provenance on the take. The bridge pass is isolated: a fault in it
+   drops only bridge substitutions, never the Editor's.
+5. A pure planner (``plan_substitutions``) replaces each consumer's link to an
+   ``EXACT`` output of the Editor or a prepared bridge with the literal value
+   (M1), when the consumer's declared input type is exactly the output's literal
+   type.
+6. Overrides go through ``DynamicPrompt.override_node``, which feeds key
    construction and input resolution while hidden ``PROMPT``, history and display
    ids keep the submitted graph.
 
@@ -34,6 +42,7 @@ No second queue, resolver, memo or project store: the prepared result *is* the
 from __future__ import annotations
 
 import copy
+import inspect
 import logging
 import math
 import threading
@@ -92,6 +101,26 @@ class ExecutorRuntime:
     interrupt_type: type
     rearm_interrupt: Callable[[], None]
     inference_mode: Callable[[], Any]
+    # Bridge preparation (Phase 2). None when the gate cannot vouch for the
+    # executor's V3 call sequence: V3 bridges are then never prepared.
+    is_v3: Callable[[type], bool] | None = None
+    call_v3: Callable[[type, dict, Any], Any] | None = None
+    own_lazy_status: Callable[[type], bool] | None = None
+    node_output_type: type | None = None
+
+
+@dataclass(frozen=True)
+class Producer:
+    """A prepared node's result and how to read its slots, for the planner."""
+
+    result: tuple
+    slot_policy: Callable[[int], Any]
+    slot_type: Callable[[int], str]
+
+
+def producer_for(class_def: Any, result: tuple) -> Producer:
+    return Producer(result, lambda slot: cache_policy.slot_policy(class_def, slot),
+                    lambda slot: class_def.RETURN_TYPES[slot])
 
 
 class _Skip(Exception):
@@ -185,59 +214,70 @@ def _hidden_names(class_def: Any) -> set[str]:
 # --- The pure M1 planner ---------------------------------------------------------
 
 
-def plan_substitutions(nodes_view: dict[str, dict], editor_id: str, result: tuple,
-                       slot_policy: Callable[[int], Any], slot_type: Callable[[int], str],
-                       input_type_of: Callable[[str, str], Any]) -> tuple[dict[str, dict], list[dict]]:
-    """``(overrides, skips)``: literal replacements for links to ``EXACT`` Editor outputs.
+def consumer_rejects(input_type_of: Callable[[str, str], Any], node_id: str, name: str, socket: Any) -> str | None:
+    """Why input ``name`` of ``node_id`` cannot take a literal of socket type ``socket``, or None."""
+    if cache_policy.LITERAL_TYPES.get(socket) is None:
+        return "socket_type"
+    try:
+        info = input_type_of(node_id, name)
+    except Exception:
+        info = None
+    if not info:
+        return "consumer_unknown"
+    consumer_type, extra = info
+    if isinstance(extra, dict) and extra.get("rawLink"):
+        return "raw_link"
+    # Base str equality: ComfyUI's IO.ANY ("*") overrides != to match any type,
+    # which would hand a wildcard consumer a literal.
+    if not isinstance(consumer_type, str) or str.__eq__(consumer_type, socket) is not True:
+        return "consumer_type"
+    return None
 
-    A link is replaced only when the consumer declares the input's type exactly
-    as the Editor slot's literal type (``STRING``/``INT``/``FLOAT``/``BOOLEAN``),
+
+def plan_substitutions(nodes_view: dict[str, dict], producers: dict[str, Producer],
+                       input_type_of: Callable[[str, str], Any]) -> tuple[dict[str, dict], list[dict]]:
+    """``(overrides, skips)``: literal replacements for links to ``EXACT`` outputs of ``producers``.
+
+    ``producers`` maps a prepared node (the Editor, prepared bridges) to its
+    result. A link is replaced only when the consumer declares the input's type
+    exactly as the slot's literal type (``STRING``/``INT``/``FLOAT``/``BOOLEAN``),
     the value's ``type`` is exactly that Python type, and a float is finite.
-    ``rawLink`` inputs, wildcard, COMBO and unknown consumers are skipped. All
-    substitutions for one node merge into one deep copy of its current node.
-    Pure: reads only its arguments and raises only on a broken argument.
+    ``rawLink`` inputs, wildcard, COMBO and unknown consumers are skipped;
+    ``HANDLE``, ``PER_RUN`` and ``INHERITS`` slots are never substituted. All
+    substitutions for one node, from any producer, merge into one deep copy of its
+    current node. Pure: reads only its arguments and raises only on a broken argument.
     """
     overrides: dict[str, dict] = {}
     skips: list[dict] = []
     for node_id, node in nodes_view.items():
-        if node_id == editor_id or not isinstance(node, dict):
+        if node_id in producers or not isinstance(node, dict):
             continue
         replacement = None
         for name, value in (node.get("inputs") or {}).items():
-            if not is_link(value) or str(value[0]) != editor_id:
+            if not is_link(value):
+                continue
+            producer_id = str(value[0])
+            producer = producers.get(producer_id)
+            if producer is None:
                 continue
             slot = _slot_index(value)
 
             def skip(reason: str) -> None:
-                skips.append({"node": node_id, "input": name, "slot": slot, "reason": reason})
+                skips.append({"node": node_id, "input": name, "producer": producer_id, "slot": slot,
+                              "reason": reason})
 
-            if slot is None or slot >= len(result):
+            if slot is None or slot >= len(producer.result):
                 skip("slot")
                 continue
-            if slot_policy(slot) != cache_policy.EXACT:
+            if producer.slot_policy(slot) != cache_policy.EXACT:
                 continue  # declared otherwise: nothing to substitute, nothing skipped
-            socket = slot_type(slot)
+            socket = producer.slot_type(slot)
             expected = cache_policy.LITERAL_TYPES.get(socket)
-            if expected is None:
-                skip("socket_type")
+            reason = consumer_rejects(input_type_of, node_id, name, socket)
+            if reason is not None:
+                skip(reason)
                 continue
-            try:
-                info = input_type_of(node_id, name)
-            except Exception:
-                info = None
-            if not info:
-                skip("consumer_unknown")
-                continue
-            consumer_type, extra = info
-            if isinstance(extra, dict) and extra.get("rawLink"):
-                skip("raw_link")
-                continue
-            # Base str equality: ComfyUI's IO.ANY ("*") overrides != to match any
-            # type, which would hand a wildcard consumer a literal.
-            if not isinstance(consumer_type, str) or str.__eq__(consumer_type, socket) is not True:
-                skip("consumer_type")
-                continue
-            emitted = result[slot]
+            emitted = producer.result[slot]
             if type(emitted) is not expected:
                 skip("value_type")
                 continue
@@ -250,6 +290,246 @@ def plan_substitutions(nodes_view: dict[str, dict], editor_id: str, result: tupl
         if replacement is not None:
             overrides[node_id] = replacement
     return overrides, skips
+
+
+# --- Bridges: which to prepare, and running their own execute ----------------------
+
+PREPARED_HIDDEN = frozenset({"PROMPT", "UNIQUE_ID"})
+
+
+class _BridgeSkip(Exception):
+    """One bridge is not prepared, for a reason code; the rest of the pass goes on."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def shape_reason(runtime: ExecutorRuntime, class_def: Any) -> str | None:
+    """Why the pipeline cannot call ``class_def`` as the executor would, or None.
+
+    Sync ``execute``; no list mapping in or out; no lazy input and no own
+    ``check_lazy_status`` (every V3 node inherits one, so only an override
+    counts); hidden inputs only ``PROMPT``/``UNIQUE_ID`` (``get_input_data`` runs
+    with ``extra_data={}``); a V3 class only when the gate vouched for the
+    executor's V3 call sequence.
+    """
+    if runtime.is_v3 is None:
+        return "v3_unknown"  # cannot tell V3 from V1: never guess the call
+    v3 = bool(runtime.is_v3(class_def))
+    if v3 and (runtime.call_v3 is None or runtime.own_lazy_status is None or runtime.node_output_type is None):
+        return "v3_call"
+    if getattr(class_def, "INPUT_IS_LIST", False):
+        return "input_is_list"
+    if any(bool(flag) for flag in (getattr(class_def, "OUTPUT_IS_LIST", None) or ())):
+        return "output_is_list"
+    method = getattr(class_def, "execute" if v3 else str(getattr(class_def, "FUNCTION", "") or ""), None)
+    if not callable(method) or inspect.iscoroutinefunction(method):
+        return "callable"
+    if runtime.own_lazy_status(class_def) if v3 else hasattr(class_def, "check_lazy_status"):
+        return "lazy_status"
+    types_ = class_def.INPUT_TYPES() or {}
+    for category in ("required", "optional"):
+        for spec in (types_.get(category) or {}).values():
+            if isinstance(spec, (tuple, list)) and len(spec) > 1 and isinstance(spec[1], dict) and spec[1].get("lazy"):
+                return "lazy_input"
+    hidden = {run_scope._hidden_name(value) for value in (types_.get("hidden") or {}).values()}
+    if not hidden <= PREPARED_HIDDEN:
+        return "hidden"
+    return None
+
+
+def _has_literal_consumer(nodes_view: dict[str, dict], producer_id: str, class_def: Any,
+                          input_type_of: Callable[[str, str], Any]) -> bool:
+    """Whether some consumer would take one of the producer's ``EXACT`` outputs (a dry run of the planner)."""
+    for node_id, node in nodes_view.items():
+        if node_id == producer_id or not isinstance(node, dict):
+            continue
+        for name, value in (node.get("inputs") or {}).items():
+            if not is_link(value) or str(value[0]) != producer_id:
+                continue
+            slot = _slot_index(value)
+            if (slot is None or slot >= len(class_def.RETURN_TYPES)
+                    or cache_policy.slot_policy(class_def, slot) != cache_policy.EXACT):
+                continue
+            if consumer_rejects(input_type_of, node_id, name, class_def.RETURN_TYPES[slot]) is None:
+                return True
+    return False
+
+
+def select_bridges(nodes_view: dict[str, dict], closure: set[str], editor_id: str, editor_class: Any,
+                   class_of: Callable[[str], Any], input_type_of: Callable[[str, str], Any],
+                   shape_of: Callable[[Any], str | None]) -> tuple[list[str], dict[str, set[str]], dict[str, str]]:
+    """``(order, needs, reasons)``: the bridges to prepare, producers first. Pure.
+
+    A node is selected when its class declares ``PREPARES``, it is in the
+    certain-to-execute closure (under the Editor's NaN, "stock would run it"),
+    its shape is callable, every link input is the Editor's ``PER_RUN`` project or
+    a ``HANDLE`` of another selected node, and it has a consumer to gain (a
+    literal consumer of an ``EXACT`` output, or a handle feeding a node that has
+    one). ``reasons`` names why each other ``PREPARES`` node was left alone.
+    """
+    reasons: dict[str, str] = {}
+    candidates: dict[str, Any] = {}
+    for node_id, node in nodes_view.items():
+        if node_id == editor_id or not isinstance(node, dict):
+            continue
+        class_def = class_of(node.get("class_type"))
+        if class_def is not None and cache_policy.prepare_policy(class_def) is not None:
+            candidates[node_id] = class_def
+    needs: dict[str, set[str]] = {}
+    editor_types = tuple(editor_class.RETURN_TYPES)
+    for node_id, class_def in candidates.items():
+        if node_id not in closure:
+            reasons[node_id] = "not_certain"
+            continue
+        if shape_of(class_def) is not None:
+            reasons[node_id] = "shape"
+            continue
+        wanted: set[str] = set()
+        for value in (nodes_view[node_id].get("inputs") or {}).values():
+            if not is_link(value):
+                continue
+            source, slot = str(value[0]), _slot_index(value)
+            if (source == editor_id and slot is not None and slot < len(editor_types)
+                    and editor_types[slot] == "SONDER_PROJECT"
+                    and cache_policy.slot_policy(editor_class, slot) == cache_policy.PER_RUN):
+                continue
+            if (source in candidates and source != node_id and slot is not None
+                    and cache_policy.slot_policy(candidates[source], slot) == cache_policy.HANDLE):
+                wanted.add(source)
+                continue
+            reasons[node_id] = "linked_input"
+            break
+        else:
+            needs[node_id] = wanted
+    # A producer that is not selectable takes its dependents with it.
+    changed = True
+    while changed:
+        changed = False
+        for node_id in list(needs):
+            if any(source not in needs for source in needs[node_id]):
+                del needs[node_id]
+                reasons[node_id] = "producer_failed"
+                changed = True
+    useful = {node_id for node_id in needs
+              if _has_literal_consumer(nodes_view, node_id, candidates[node_id], input_type_of)}
+    changed = True
+    while changed:
+        changed = False
+        for node_id in list(useful):
+            for source in needs[node_id] - useful:
+                useful.add(source)
+                changed = True
+    for node_id in needs:
+        if node_id not in useful:
+            reasons[node_id] = "unused"
+    order: list[str] = []
+    placed: set[str] = set()
+
+    def place(node_id: str, visiting: frozenset) -> bool:
+        if node_id in placed:
+            return True
+        if node_id in visiting:
+            return False  # a cycle cannot pass ComfyUI's validation; refuse it anyway
+        if not all(place(source, visiting | {node_id}) for source in sorted(needs[node_id])):
+            return False
+        placed.add(node_id)
+        order.append(node_id)
+        return True
+
+    for node_id in sorted(useful):
+        if not place(node_id, frozenset()):
+            reasons[node_id] = "linked_input"
+    return [node_id for node_id in order if node_id not in reasons], needs, reasons
+
+
+def _bridge_values(runtime: ExecutorRuntime, class_def: Any, out: Any) -> tuple:
+    if runtime.node_output_type is not None and isinstance(out, runtime.node_output_type):
+        # A value result only: an expansion, a block or a UI output would be lost
+        # (or wrongly kept) when the bridge goes unscheduled.
+        if any(getattr(out, name, None) is not None for name in ("expand", "block_execution", "ui")):
+            raise _BridgeSkip("result_shape")
+        out = tuple(out.args)
+    if isinstance(out, dict):
+        raise _BridgeSkip("result_shape")  # a V1 {"ui", "result"} return
+    if not isinstance(out, tuple) or len(out) != len(class_def.RETURN_TYPES):
+        raise _BridgeSkip("result_shape")
+    return out
+
+
+def _run_bridge(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, node_id: str, class_def: Any,
+                sources: dict[str, tuple]) -> tuple:
+    """Call the bridge's own ``execute`` as the executor would; its values, or ``_BridgeSkip``.
+
+    Pipeline code here (input resolution, the context, the shape of the result)
+    propagates its faults to the bridge pass. Only a raise from the bridge itself
+    becomes ``bridge_failed``; nothing is stored, because the scheduled bridge
+    raises the same error with the same inputs, or never runs at all.
+    """
+    inputs = dynprompt.get_node(node_id).get("inputs") or {}
+    resolved, missing, v3_data = runtime.get_input_data(inputs, class_def, node_id, None, dynprompt, {})
+    args: dict[str, Any] = {}
+    for name, values in resolved.items():
+        if name in missing:
+            link = inputs.get(name)
+            source = sources.get(str(link[0])) if is_link(link) else None
+            slot = _slot_index(link) if is_link(link) else None
+            if source is None or slot is None or slot >= len(source):
+                raise _BridgeSkip("linked_input")
+            args[name] = source[slot]
+            continue
+        if not isinstance(values, (list, tuple)) or len(values) != 1:
+            raise _BridgeSkip("shape")
+        args[name] = values[0]
+    if any(name not in args for name in missing):
+        raise _BridgeSkip("linked_input")
+    v3 = bool(runtime.is_v3 is not None and runtime.is_v3(class_def))
+    with runtime.node_context(prompt_id, node_id, 0):
+        runtime.before_node_execution()  # stock's cancel check; its interrupt propagates
+        with runtime.inference_mode():
+            try:
+                if v3:
+                    out = runtime.call_v3(class_def, args, v3_data)
+                else:
+                    out = getattr(class_def(), class_def.FUNCTION)(**args)
+            except runtime.interrupt_type:
+                raise
+            except Exception as exc:
+                logger.debug("Sonder cache pipeline: bridge %s (%s) failed before cache keys: %s",
+                             node_id, getattr(class_def, "__name__", class_def), type(exc).__name__)
+                raise _BridgeSkip("bridge_failed") from None
+    return _bridge_values(runtime, class_def, out)
+
+
+def _prepare_bridges(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, nodes_view: dict[str, dict],
+                     closure: set[str], editor_id: str, editor_class: Any, editor_result: tuple,
+                     mappings: dict, input_type_of: Callable[[str, str], Any],
+                     record: dict[str, Any]) -> dict[str, Producer]:
+    """Run every selected bridge, producers first; the prepared ones as planner producers."""
+    order, needs, reasons = select_bridges(
+        nodes_view, closure, editor_id, editor_class, mappings.get, input_type_of,
+        lambda class_def: shape_reason(runtime, class_def))
+    sources: dict[str, tuple] = {editor_id: editor_result}
+    producers: dict[str, Producer] = {}
+    for node_id in order:
+        if any(source not in producers for source in needs[node_id]):
+            reasons[node_id] = "producer_failed"
+            continue
+        class_def = mappings[nodes_view[node_id]["class_type"]]
+        try:
+            values = _run_bridge(runtime, prompt_id, dynprompt, node_id, class_def, sources)
+        except _BridgeSkip as skip:
+            reasons[node_id] = skip.reason
+            continue
+        sources[node_id] = values
+        producers[node_id] = producer_for(class_def, values)
+    outcomes = record["bridges"]
+    outcomes["prepared"] = len(producers)
+    for reason in reasons.values():
+        record["bridge_reasons"][reason] = record["bridge_reasons"].get(reason, 0) + 1
+    outcomes["skipped"] = len(reasons)
+    return producers
 
 
 # --- Preparation -------------------------------------------------------------------
@@ -265,7 +545,8 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any) -> dict[st
     started = time.perf_counter()
     timings: dict[str, float] = {}
     record: dict[str, Any] = {"outcome": SKIPPED, "reason": "", "editor": "", "substituted": 0,
-                              "skipped": 0, "skip_reasons": {}, "timings_ms": timings}
+                              "skipped": 0, "skip_reasons": {}, "bridges": {}, "bridge_reasons": {},
+                              "timings_ms": timings}
     key = ""
     try:
         prompt = dynprompt.get_original_prompt()
@@ -325,16 +606,30 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any) -> dict[st
             consumer_type, _category, extra = info
             return (consumer_type if isinstance(consumer_type, str) else None), (extra or {})
 
-        overrides, skips = plan_substitutions(
-            nodes_view, editor_id, result,
-            lambda slot: cache_policy.slot_policy(editor_class, slot),
-            lambda slot: editor_class.RETURN_TYPES[slot],
-            input_type_of,
-        )
+        editor_producer = {editor_id: producer_for(editor_class, result)}
+        overrides, skips = plan_substitutions(nodes_view, editor_producer, input_type_of)
+        timings["plan"] = _ms(step)
+
+        # The bridge pass is isolated: a fault in it keeps the Editor's plan, so
+        # Phase 2 can never regress Phase 1. An interrupt still propagates.
+        step = time.perf_counter()
+        try:
+            producers = _prepare_bridges(runtime, prompt_id, dynprompt, nodes_view, closure, editor_id,
+                                         editor_class, result, mappings, input_type_of, record)
+            if producers:
+                overrides, skips = plan_substitutions(nodes_view, {**editor_producer, **producers}, input_type_of)
+        except runtime.interrupt_type:
+            raise
+        except Exception as exc:
+            record["bridge_reasons"]["bridge_pass_error"] = 1
+            record["bridge_error"] = type(exc).__name__
+            logger.debug("Sonder cache pipeline: the bridge pass failed; only the Editor's values are reused",
+                         exc_info=True)
+        timings["bridges"] = _ms(step)
+
         # Applied only once the whole plan exists, so a planning fault leaves none.
         for node_id, node in overrides.items():
             dynprompt.override_node(node_id, node)
-        timings["plan"] = _ms(step)
         record.update(outcome=PREPARED, substituted=len(overrides), skipped=len(skips))
         for item in skips:
             record["skip_reasons"][item["reason"]] = record["skip_reasons"].get(item["reason"], 0) + 1

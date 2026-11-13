@@ -9,7 +9,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on ComfyUI vers
         raise
     from comfy_api.latest import io
 
-from .cache_policy import HANDLE, INHERITS
+from .cache_policy import EXACT, HANDLE, INHERITS, PREPARES, normalise_outputs
 from .reference_core import (
     MAX_REFERENCE_SLOTS,
     decode_reference_audios,
@@ -34,9 +34,11 @@ class SonderReferenceSelector(io.ComfyNode):
     # nodes/cache_policy.py
     SONDER_CACHE_POLICY = {
         "reference_set": HANDLE,
-        "has_reference": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
-        "reference_strength": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
+        "has_reference": EXACT,
+        "reference_strength": EXACT,
     }
+    # The cache pipeline may run execute before cache keys exist; it publishes nothing.
+    SONDER_CACHE_PREPARE = PREPARES(publishes=())
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -91,7 +93,8 @@ class SonderReferenceSelector(io.ComfyNode):
         if result.get("conflicts"):
             from .reference_core import _conflict_message
             raise RuntimeError(_conflict_message(result))
-        return io.NodeOutput(result, int(result["has_reference"]), float(result.get("strength", 0.0)))
+        return io.NodeOutput(*normalise_outputs(
+            cls, (result, int(result["has_reference"]), float(result.get("strength", 0.0)))))
 
 
 def _numbered_outputs(output_type, prefix: str, noun: str):
@@ -182,10 +185,12 @@ class SonderReferenceAudioBridge(io.ComfyNode):
 class SonderReferencePromptBridge(io.ComfyNode):
     # nodes/cache_policy.py
     SONDER_CACHE_POLICY = {
-        "reference_prompt": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
-        "reference_names": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
-        "p??": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
+        "reference_prompt": EXACT,
+        "reference_names": EXACT,
+        "p??": EXACT,
     }
+    # The cache pipeline may run execute before cache keys exist; it publishes nothing.
+    SONDER_CACHE_PREPARE = PREPARES(publishes=())
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -218,4 +223,4 @@ class SonderReferencePromptBridge(io.ComfyNode):
 
     @classmethod
     def execute(cls, reference_set) -> io.NodeOutput:
-        return io.NodeOutput(*decode_reference_prompts(reference_set))
+        return io.NodeOutput(*normalise_outputs(cls, tuple(decode_reference_prompts(reference_set))))

@@ -21,7 +21,7 @@ from ..server.media_helpers import decode_video_range, fit_frame_to_canvas, reso
 from ..server import external_links
 from ..server.path_security import path_within, resolve_existing_project_path, resolve_project_path
 from ..server.timeline_state import ClipReference, GuideFrame, LaneConfig, effective_scene_fps
-from .cache_policy import HANDLE, INHERITS
+from .cache_policy import EXACT, HANDLE, INHERITS, PREPARES, normalise_outputs
 
 logger = logging.getLogger(__name__)
 
@@ -625,7 +625,9 @@ class SonderDriverSelector:
     RETURN_TYPES = ("SONDER_DRIVER_REF", "INT")
     RETURN_NAMES = ("driver_ref", "has_driver")
     # nodes/cache_policy.py
-    SONDER_CACHE_POLICY = {"driver_ref": HANDLE, "has_driver": INHERITS("bridge values: Execution Cache Pipeline Phase 2")}
+    SONDER_CACHE_POLICY = {"driver_ref": HANDLE, "has_driver": EXACT}
+    # The cache pipeline may run execute before cache keys exist; it publishes only this key.
+    SONDER_CACHE_PREPARE = PREPARES(publishes=("driver_selector",))
     OUTPUT_TOOLTIPS = (
         "Resolved Driver reference for the selected lane. Wire to Sonder Driver Bridge.",
         "0 when no effective driver is present, 1 when the selected lane contributes media.",
@@ -678,7 +680,7 @@ class SonderDriverSelector:
             ref["driver_idx"],
             ref["strength"],
         )
-        return (ref, int(ref["has_driver"]))
+        return normalise_outputs(SonderDriverSelector, (ref, int(ref["has_driver"])))
 
 
 class SonderDriverBridge:

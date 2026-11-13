@@ -12,6 +12,13 @@ mode (the helper's ``BY_MODE``):
 - lru: acceptance and cancel; ram: acceptance, cancel, errors, eviction;
 - none: acceptance, which asserts the pipeline is bypassed.
 
+Phase 2 adds the bridges (``bridges*`` cases): generated acceptance for every
+bridge ``EXACT`` output with stubbed resolvers and real ``execute`` (every
+mode); real bridges on fixture projects, live and frozen, with targeted edits
+and saved-take provenance against stock (classic, ram); graph shapes, safety
+and a negative control that diverts publication (classic); eviction of a
+still-scheduled bridge (ram).
+
 Skips without a ComfyUI install (``SONDER_COMFYUI_ROOT`` or the test install's venv).
 """
 
@@ -27,10 +34,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HELPER = REPO_ROOT / "tests" / "helpers" / "cache_pipeline_executor.py"
 CASES_BY_MODE = {
-    "classic": ["acceptance", "fail_open", "tokens", "cancel", "errors", "shapes", "lazy", "misc"],
-    "lru": ["acceptance", "cancel"],
-    "ram": ["acceptance", "cancel", "errors", "ram"],
-    "none": ["acceptance"],
+    "classic": ["acceptance", "fail_open", "tokens", "cancel", "errors", "shapes", "lazy", "misc",
+                "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative"],
+    "lru": ["acceptance", "cancel", "bridges"],
+    "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram"],
+    "none": ["acceptance", "bridges"],
 }
 
 

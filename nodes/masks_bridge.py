@@ -49,7 +49,7 @@ except ImportError:  # pragma: no cover - ComfyUI always ships torch
     # version guards does not apply here.
     torch = None
 
-from .cache_policy import ALWAYS_RUNS, INHERITS, TAKES_PROJECT
+from .cache_policy import ALWAYS_RUNS, EXACT, INHERITS, PREPARES, TAKES_PROJECT, normalise_outputs
 
 logger = logging.getLogger(__name__)
 
@@ -418,14 +418,17 @@ class SonderMasksBridge:
     )
     # nodes/cache_policy.py
     SONDER_CACHE_POLICY = {
-        "video_mask_start_time": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
-        "video_mask_end_time": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
-        "audio_mask_start_time": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
-        "audio_mask_end_time": INHERITS("bridge values: Execution Cache Pipeline Phase 2"),
-        "video_mask": INHERITS("mask provenance needs the linked latents; revisit in Phase 3"),
-        "audio_mask": INHERITS("mask provenance needs the linked latents; revisit in Phase 3"),
+        "video_mask_start_time": EXACT,
+        "video_mask_end_time": EXACT,
+        "audio_mask_start_time": EXACT,
+        "audio_mask_end_time": EXACT,
+        "video_mask": INHERITS("mask provenance needs the linked latents: Phase 3"),
+        "audio_mask": INHERITS("mask provenance needs the linked latents: Phase 3"),
     }
     SONDER_CACHE_EXECUTION = ALWAYS_RUNS(TAKES_PROJECT)
+    # The cache pipeline may run execute before cache keys exist, but only when no
+    # latent, VAE or spatial mask is wired (its provenance needs them).
+    SONDER_CACHE_PREPARE = PREPARES(publishes=("masks_bridge", "masks_bridge_by_node"))
     OUTPUT_TOOLTIPS = (
         "Video generation-mask start time (seconds). Equals the editor's mask "
         "start when Edit Video is on; equals the end (zero width) when frozen.",
@@ -660,11 +663,11 @@ class SonderMasksBridge:
         if video_prov or audio_prov:
             logger.info("masks bridge latent masks: video=%s audio=%s", video_prov, audio_prov)
 
-        return (
+        return normalise_outputs(SonderMasksBridge, (
             result["video_mask_start_time"],
             result["video_mask_end_time"],
             result["audio_mask_start_time"],
             result["audio_mask_end_time"],
             video_mask,
             audio_mask,
-        )
+        ))

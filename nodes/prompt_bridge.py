@@ -25,7 +25,7 @@ from ..server import frozen_prompt, prompt_channel_templates
 from ..server import prompt_payload
 from ..server.prompt_live_context import compile_live_scene_prompt_context
 from ..server.timeline_state import effective_scene_fps
-from .cache_policy import INHERITS
+from .cache_policy import EXACT, PREPARES, normalise_outputs
 
 logger = logging.getLogger(__name__)
 
@@ -223,8 +223,9 @@ class SonderPromptRelayBridge:
     RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
     RETURN_NAMES = ("global_prompt", "smart_prompt", "local_prompts", "segment_lengths")
     # nodes/cache_policy.py
-    SONDER_CACHE_POLICY = {name: INHERITS("bridge values: Execution Cache Pipeline Phase 2")
-                           for name in ("global_prompt", "smart_prompt", "local_prompts", "segment_lengths")}
+    SONDER_CACHE_POLICY = {name: EXACT for name in ("global_prompt", "smart_prompt", "local_prompts", "segment_lengths")}
+    # The cache pipeline may run execute before cache keys exist; it publishes only this key.
+    SONDER_CACHE_PREPARE = PREPARES(publishes=("prompt_relay",))
     OUTPUT_TOOLTIPS = (
         "Scene-global prompt text (always-on identity/style). Passed through "
         "untouched. If empty, PromptRelay's Smart node auto-promotes the first "
@@ -281,9 +282,9 @@ class SonderPromptRelayBridge:
             payload["source"], payload["window_start"], payload["window_end"],
             len(payload.get("segments", [])),
         )
-        return (
+        return normalise_outputs(SonderPromptRelayBridge, (
             payload["global_prompt"],
             payload["smart_prompt"],
             payload["local_prompts"],
             payload["segment_lengths"],
-        )
+        ))

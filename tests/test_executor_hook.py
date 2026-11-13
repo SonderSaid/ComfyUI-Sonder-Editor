@@ -116,6 +116,26 @@ mutants = {
 }
 out["gate_mutants"] = {name: hook.check_shape(module) for name, module in mutants.items()}
 
+# The V3 call gate: passes on the installed source, names each mutation, and only
+# a passing gate hands bridge preparation the V3 call.
+out["v3_gate_installed"] = hook.check_v3_call(execution)
+mapper_source = textwrap.dedent(hook._source(execution._async_map_node_over_list))
+no_clone = from_source("no_clone", mapper_source.replace(
+    "class_clone = obj.PREPARE_CLASS_CLONE(v3_data)", "class_clone = obj"))
+# Stock passes an instance: a change to that branch alone must fail the gate too.
+no_instance_clone = from_source("no_instance_clone", mapper_source.replace(
+    "class_clone = type_obj.PREPARE_CLASS_CLONE(v3_data)", "class_clone = type_obj"))
+v3_mutants = {
+    "no_clone": fake(_async_map_node_over_list=no_clone._async_map_node_over_list),
+    "no_instance_clone": fake(_async_map_node_over_list=no_instance_clone._async_map_node_over_list),
+    "locked": fake(make_locked_method_func=lambda type_obj, func: None),
+    "nested": fake(_io=types.SimpleNamespace(build_nested_inputs=None)),
+    "output": fake(_NodeOutputInternal=None),
+}
+out["v3_gate_mutants"] = {name: hook.check_v3_call(module) for name, module in v3_mutants.items()}
+out["v3_runtime_fields"] = sorted(hook._v3_runtime(execution))
+out["v3_runtime_mutant"] = sorted(hook._v3_runtime(v3_mutants["output"]))
+
 # Install: idempotent, not stacked.
 first = hook.install(execution)
 hooked = execution.IsChangedCache
@@ -224,6 +244,21 @@ def test_the_gate_names_each_mutation(result):
         "context": "CurrentNodeContext signature",
         "null_cache": "NullCache",
     }
+
+
+def test_the_v3_call_gate_passes_installed_and_names_each_mutation(result):
+    assert result["v3_gate_installed"] is None
+    assert result["v3_gate_mutants"] == {
+        "no_clone": "V3 call order: class_clone = obj.PREPARE_CLASS_CLONE(v3_data)",
+        "no_instance_clone": "V3 call order: class_clone = type_obj.PREPARE_CLASS_CLONE(v3_data)",
+        "locked": "make_locked_method_func signature",
+        "nested": "build_nested_inputs signature",
+        "output": "_NodeOutputInternal",
+    }
+    # Only a passing gate gives bridge preparation the V3 call; telling V3 from V1
+    # needs only ComfyUI's V3 base, so a failed gate never makes a V3 class look V1.
+    assert result["v3_runtime_fields"] == ["call_v3", "is_v3", "node_output_type", "own_lazy_status"]
+    assert result["v3_runtime_mutant"] == ["is_v3"]
 
 
 def test_install_is_idempotent_and_subclasses_the_stock_class(result):

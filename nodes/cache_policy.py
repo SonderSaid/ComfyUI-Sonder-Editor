@@ -33,14 +33,29 @@ per-run work:
   ``IS_CHANGED`` returns NaN). The registry test checks the proof.
 - ``CACHEABLE(reason)``: safe to skip on a cache hit; the reason says why.
 
+**Preparation** (``SONDER_CACHE_PREPARE = PREPARES(publishes=(...))``): a node
+other than the Editor with an ``EXACT`` output (or a ``HANDLE`` another prepared
+node needs) opts in to being run by the cache pipeline before cache keys exist.
+The pipeline calls the node's own ``execute`` exactly as the executor would, so
+both paths publish through the same lines. The contract, which
+``tests/test_cache_pipeline_bridges.py`` enforces: ``execute`` reads the project
+and the frozen job, publishes JSON-safe values under the declared
+``_execution_context`` keys only, reads nothing a save mutates, and does nothing
+else (no file writes, claims, receipts, run-record changes).
+
 The ``SONDER_`` prefix keeps these names clear of any future ComfyUI attribute.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import logging
+import math
+import numbers
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 EXACT = "EXACT"
 DESCRIPTOR = "DESCRIPTOR"
@@ -56,6 +71,7 @@ PROOFS = (TAKES_PROJECT, NAN_FINGERPRINT)
 
 POLICY_ATTRIBUTE = "SONDER_CACHE_POLICY"
 EXECUTION_ATTRIBUTE = "SONDER_CACHE_EXECUTION"
+PREPARE_ATTRIBUTE = "SONDER_CACHE_PREPARE"
 # {output name: (case, ...)}: the invalidation cases a DESCRIPTOR output registers.
 INVALIDATION_ATTRIBUTE = "SONDER_CACHE_INVALIDATION"
 
@@ -73,6 +89,17 @@ class AlwaysRuns:
 @dataclass(frozen=True)
 class Cacheable:
     reason: str
+
+
+@dataclass(frozen=True)
+class Prepares:
+    publishes: Any
+
+
+def PREPARES(publishes=()) -> Prepares:  # noqa: N802
+    """The node may be run early by the cache pipeline; ``publishes`` names the
+    ``_execution_context`` keys its ``execute`` writes (a tuple of strings)."""
+    return Prepares(tuple(publishes) if isinstance(publishes, (tuple, list)) else publishes)
 
 
 def INHERITS(reason: str) -> Inherits:  # noqa: N802 - reads as a policy constant
@@ -125,3 +152,59 @@ def slot_policy(class_def: Any, slot: int) -> Any:
 def execution_policy(class_def: Any) -> Any:
     """The node-level declaration, or None."""
     return getattr(class_def, EXECUTION_ATTRIBUTE, None)
+
+
+def prepare_policy(class_def: Any) -> Prepares | None:
+    """The class's ``PREPARES`` declaration, or None."""
+    declared = getattr(class_def, PREPARE_ATTRIBUTE, None)
+    return declared if isinstance(declared, Prepares) else None
+
+
+def exact_slots(class_def: Any, kind: str | None = None) -> tuple[int, ...]:
+    """The ``EXACT`` output slots (of socket type ``kind``, if given), from the class's declarations."""
+    types_ = tuple(getattr(class_def, "RETURN_TYPES", None) or ())
+    names = tuple(getattr(class_def, "RETURN_NAMES", None) or ())
+    return tuple(slot for slot, name in enumerate(names)
+                 if slot < len(types_) and (kind is None or types_[slot] == kind)
+                 and output_policy(class_def, name) == EXACT)
+
+
+def normalise_outputs(class_def: Any, result: Any) -> Any:
+    """``result`` with exact-equivalent canonical types on the ``EXACT`` slots; never raises.
+
+    ComfyUI keys ``24`` and ``24.0`` alike, and ``0.0`` and ``-0.0`` alike, so the
+    cache pipeline only hands a consumer a literal whose type is exactly its
+    socket's, and every producer of an ``EXACT`` output returns through here.
+    Only lossless conversions happen: an integral float or a numpy integer on an
+    INT slot, an int or a numpy float on a FLOAT slot (``-0.0`` becomes ``0.0``),
+    a ``str`` subclass on a STRING slot. Anything else (None, NaN, ``1280.5``, a
+    bool, an unexpected shape) is left as it is.
+    """
+    try:
+        if not isinstance(result, tuple) or len(result) != len(getattr(class_def, "RETURN_TYPES", None) or ()):
+            return result
+        values = list(result)
+        for slot in exact_slots(class_def, "INT"):
+            value = values[slot]
+            if type(value) is int or isinstance(value, bool):
+                continue
+            if isinstance(value, numbers.Integral):
+                values[slot] = int(value)
+            elif isinstance(value, numbers.Real) and math.isfinite(value) and float(value).is_integer():
+                values[slot] = int(value)
+        for slot in exact_slots(class_def, "FLOAT"):
+            value = values[slot]
+            if isinstance(value, bool) or not isinstance(value, numbers.Real):
+                continue
+            converted = float(value)
+            if not math.isfinite(converted) or converted != value:
+                continue  # NaN, infinite, or beyond float precision: not exact
+            values[slot] = 0.0 if converted == 0.0 else converted
+        for slot in exact_slots(class_def, "STRING"):
+            value = values[slot]
+            if isinstance(value, str) and type(value) is not str:
+                values[slot] = str.__str__(value)
+        return tuple(values)
+    except Exception:
+        logger.debug("Output normalisation skipped for %s", getattr(class_def, "__name__", class_def), exc_info=True)
+        return result

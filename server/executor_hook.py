@@ -173,6 +173,85 @@ def check_shape(execution: Any) -> str | None:
         return f"gate error: {type(exc).__name__}"
 
 
+# The scheduler's V3 call (``_async_map_node_over_list``), in this order. Stock
+# passes a node instance (``obj = class_def()``), so it takes the instance branch;
+# the class branch must say the same. Bridge preparation repeats the sequence
+# exactly, so a prepared V3 bridge sees what a scheduled one does.
+_V3_CALL_ORDER = (
+    "obj.VALIDATE_CLASS()",
+    "class_clone = obj.PREPARE_CLASS_CLONE(v3_data)",
+    "type_obj = type(obj)",
+    "type_obj.VALIDATE_CLASS()",
+    "class_clone = type_obj.PREPARE_CLASS_CLONE(v3_data)",
+    "f = make_locked_method_func(type_obj, func, class_clone)",
+    "inputs = _io.build_nested_inputs(inputs, v3_data, input_is_list=input_is_list)",
+)
+
+
+def check_v3_call(execution: Any) -> str | None:
+    """None when the executor calls V3 nodes the way ``call_v3`` repeats it, else the reason.
+
+    Separate from ``check_shape``: a mismatch only stops V3 bridges being
+    prepared; the hook, the Editor and V1 bridges keep working.
+    """
+    try:
+        mapper = getattr(execution, "_async_map_node_over_list", None)
+        if mapper is None:
+            return "_async_map_node_over_list missing"
+        source = _source(mapper)
+        last = -1
+        for token in _V3_CALL_ORDER:
+            at = source.find(token, last + 1)
+            if at < 0:
+                return f"V3 call order: {token}"
+            last = at
+        locked = getattr(execution, "make_locked_method_func", None)
+        if not callable(locked) or _params(locked) != ["type_obj", "func", "class_clone"]:
+            return "make_locked_method_func signature"
+        nested = getattr(getattr(execution, "_io", None), "build_nested_inputs", None)
+        if not callable(nested) or _params(nested)[:2] != ["values", "v3_data"]:
+            return "build_nested_inputs signature"
+        for name in ("first_real_override", "is_class"):
+            if not callable(getattr(execution, name, None)):
+                return name
+        for name in ("_ComfyNodeInternal", "_NodeOutputInternal"):
+            if not inspect.isclass(getattr(execution, name, None)):
+                return name
+        return None
+    except Exception as exc:
+        return f"V3 gate error: {type(exc).__name__}"
+
+
+def _v3_runtime(execution: Any) -> dict[str, Any]:
+    """The V3 fields of ``ExecutorRuntime``. ``is_v3`` whenever ComfyUI names its V3
+    base, so a V3 class is never taken for V1; the call itself only when
+    ``check_v3_call`` passes (otherwise V3 bridges are not prepared)."""
+    base = getattr(execution, "_ComfyNodeInternal", None)
+    fields: dict[str, Any] = {}
+    if inspect.isclass(base):
+        fields["is_v3"] = lambda class_def: inspect.isclass(class_def) and issubclass(class_def, base)
+    reason = check_v3_call(execution)
+    if reason is not None:
+        logger.info("Sonder cache pipeline: V3 bridges are not prepared on this ComfyUI (%s); "
+                    "their consumers rerun on every run as before.", reason)
+        return fields
+
+    def own_lazy_status(class_def):
+        return execution.first_real_override(class_def, "check_lazy_status") is not None
+
+    def call_v3(class_def, args, v3_data):
+        # The executor's own sequence for a V3 class (``_V3_CALL_ORDER``).
+        class_def.VALIDATE_CLASS()
+        clone = class_def.PREPARE_CLASS_CLONE(v3_data)
+        function = execution.make_locked_method_func(class_def, class_def.FUNCTION, clone)
+        if v3_data is not None:
+            args = execution._io.build_nested_inputs(args, v3_data, input_is_list=False)
+        return function(**args)
+
+    return {**fields, "own_lazy_status": own_lazy_status, "call_v3": call_v3,
+            "node_output_type": execution._NodeOutputInternal}
+
+
 def _build_runtime(execution: Any, prompt_server: Any) -> cache_pipeline.ExecutorRuntime:
     # Every name is looked up when called, as the executor itself does, so a pack
     # that wraps one after Sonder loads is seen by the early run too.
@@ -203,6 +282,7 @@ def _build_runtime(execution: Any, prompt_server: Any) -> cache_pipeline.Executo
         interrupt_type=model_management.InterruptProcessingException,
         rearm_interrupt=lambda: model_management.interrupt_current_processing(True),
         inference_mode=inference_mode,
+        **_v3_runtime(execution),
     )
 
 

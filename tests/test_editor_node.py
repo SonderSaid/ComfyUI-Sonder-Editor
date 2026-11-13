@@ -1216,11 +1216,16 @@ def test_editor_outputs_are_normalised_to_their_exact_socket_types(tmp_path, mon
     # keys 24 == 24.0 and 0.0 == -0.0 alike, so the Editor canonicalises them.
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     np = importlib.import_module("numpy")
-    normalise = editor_node._normalise_outputs
+    cache_policy = importlib.import_module(f"{TEST_PACKAGE}.nodes.cache_policy")
+    Editor = editor_node.SonderEditor
+
+    def normalise(result):
+        return cache_policy.normalise_outputs(Editor, result)
+
     # The slots come from RETURN_TYPES and the EXACT declarations, never a copy.
-    assert editor_node._exact_slots("STRING") == (3, 4, 5)
-    assert editor_node._exact_slots("INT") == (6, 8, 9)
-    assert editor_node._exact_slots("FLOAT") == (7, 11, 12)
+    assert cache_policy.exact_slots(Editor, "STRING") == (3, 4, 5)
+    assert cache_policy.exact_slots(Editor, "INT") == (6, 8, 9)
+    assert cache_policy.exact_slots(Editor, "FLOAT") == (7, 11, 12)
 
     class Text(str):
         def __str__(self):

@@ -93,6 +93,7 @@ from comfy_extras.nodes_string import StringConcatenate  # noqa: E402
 SonderEditor = editor_node.SonderEditor
 CALLS = {}
 NOTES = []
+RESOLVER_CALLS = {}
 
 
 def count(label, node_id):
@@ -294,6 +295,25 @@ class CPGuideBody:
         return (f"{previous}|{index}:w{width}",)
 
 
+class CPAfter:
+    """Passes frames on after its anchors: a saver that depends on a bridge chain."""
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "run"
+    CATEGORY = "CPH"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"image": ("IMAGE",), "a": ("*", {})},
+                "optional": {name: ("*", {}) for name in "bcdef"}}
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, input_types=None, **kwargs):
+        return True
+
+    def run(self, image, a, **anchors):
+        return (image,)
+
+
 class CPIdV3(io.ComfyNode):
     """A V3 node that bakes its own id into its output (the id-less key bug)."""
 
@@ -315,7 +335,7 @@ nodes.NODE_CLASS_MAPPINGS.update({
     "PreviewAny": PreviewAny, "StringConcatenate": StringConcatenate,
     "CPText": CPText, "CPInt": CPInt, "CPFloat": CPFloat, "CPImage": CPImage, "CPImageTap": CPImageTap,
     "CPFail": CPFail, "CPMark": CPMark, "CPSwallow": CPSwallow, "CPEvict": CPEvict, "CPProjectTap": CPProjectTap,
-    "CPDyn": CPDyn, "CPGuideBody": CPGuideBody, "CPIdV3": CPIdV3,
+    "CPDyn": CPDyn, "CPGuideBody": CPGuideBody, "CPIdV3": CPIdV3, "CPAfter": CPAfter,
 })
 nodes.NODE_CLASS_MAPPINGS.update(lazy.LAZY_NODE_CLASS_MAPPINGS)
 StringConcatenate.GET_SCHEMA()
@@ -333,7 +353,7 @@ _real_consume = SonderEditor._consume_queue_job
 _real_render = SonderEditor._render_scene_frames
 _real_save_project = editor_node.save_project
 INJECT = {"conflicts": 0, "render_error": False, "interrupt_at": None, "ram_release_in_render": False,
-          "plan_fault": False}
+          "plan_fault": False, "resolver_fault": None, "interrupt_in": None, "bridge_pass_fault": False}
 
 
 def recording_prepare(runtime, prompt_id, dynprompt):
@@ -483,8 +503,8 @@ def fixture(label, jobs, fps=24, frames=8, guides=None, clip=False):
     project.generation_queue = [
         timeline.GenerationJob(job_id=f"{label}-{index + 1}", scene_id=scene.scene_id, selection_start=0,
                                selection_end=job.get("end", 2), prompt=job["text"],
-                               params={"snapshot_version": job.get("snapshot", 1)},
-                               scene_width=job.get("width", 64), scene_height=64)
+                               params={"snapshot_version": job.get("snapshot", 1), **job.get("params", {})},
+                               scene_width=job.get("width", 64), scene_height=64, **job.get("fields", {}))
         for index, job in enumerate(jobs)
     ]
     manager.save_project(project)
@@ -507,8 +527,9 @@ def editor(fx, **extra):
     return n("SonderEditor", **inputs)
 
 
-def save(project, frames, embed=False, mark=True):
-    return n("SonderSaveVideo", project=project, frames=frames, filename_prefix="cph", fps=24.0, mode="Video",
+def save(project, frames, embed=False, mark=True, mode="Video"):
+    # Only a Take carries the execution context (bridge provenance) into its params.
+    return n("SonderSaveVideo", project=project, frames=frames, filename_prefix="cph", fps=24.0, mode=mode,
              place_audio_on_timeline=False, mark_queue_complete=mark, embed_metadata=embed,
              color_drift_correction=False)
 
@@ -538,6 +559,7 @@ async def run(executor, graph, targets=None, client=True, trusted=True, extra=No
     for store in (PREPARATIONS, EDITOR_RUNS, CLAIMS, NOTES, PROGRESS_CALLS):
         store.clear()
     CALLS.clear()
+    RESOLVER_CALLS.clear()
     SERVER.events.clear()
     valid = await execution.validate_prompt(prompt_id, prompt, targets)
     if not valid[0]:
@@ -565,7 +587,7 @@ async def run(executor, graph, targets=None, client=True, trusted=True, extra=No
         "prompt_id": prompt_id, "success": executor.success, "error": error, "cached": sorted(cached),
         "executing": executing, "outputs": outputs, "calls": dict(CALLS), "preparations": list(PREPARATIONS),
         "editor_runs": list(EDITOR_RUNS), "claims": len(CLAIMS), "notes": list(NOTES),
-        "progress_calls": list(PROGRESS_CALLS),
+        "progress_calls": list(PROGRESS_CALLS), "resolver_calls": dict(RESOLVER_CALLS),
         "prompt_unchanged": prompt == submitted or _without_is_changed(prompt) == submitted,
         "last_node_id": SERVER.last_node_id, "events": [event for event, _, _ in SERVER.events],
         "progress_state": {node_id: str(state.get("state")) for node_id, state in
@@ -609,7 +631,8 @@ def check(case, name, ok, detail=None):
 
 
 def reset_injections():
-    INJECT.update(conflicts=0, render_error=False, interrupt_at=None, ram_release_in_render=False, plan_fault=False)
+    INJECT.update(conflicts=0, render_error=False, interrupt_at=None, ram_release_in_render=False, plan_fault=False,
+                  resolver_fault=None, interrupt_in=None, bridge_pass_fault=False)
     mm.interrupt_current_processing(False)
 
 
@@ -1113,14 +1136,794 @@ async def case_misc():
     NOTES_OUT["non_sonder_hook_ms"] = totals
 
 
+# --- Phase 2: bridges -------------------------------------------------------------------------------
+
+relay_mod = sonder("nodes.prompt_bridge")
+masks_mod = sonder("nodes.masks_bridge")
+driver_mod = sonder("nodes.driver_bridge")
+reference_mod = sonder("nodes.reference_bridge_v3")
+policy = sonder("nodes.cache_policy")
+
+BRIDGE_CLASSES = {
+    "SonderPromptRelayBridge": relay_mod.SonderPromptRelayBridge,
+    "SonderMasksBridge": masks_mod.SonderMasksBridge,
+    "SonderDriverSelector": driver_mod.SonderDriverSelector,
+    "SonderDriverBridge": driver_mod.SonderDriverBridge,
+    "SonderReferenceSelector": reference_mod.SonderReferenceSelector,
+    "SonderReferencePromptBridge": reference_mod.SonderReferencePromptBridge,
+    "SonderReferenceImageBridge": reference_mod.SonderReferenceImageBridge,
+}
+nodes.NODE_CLASS_MAPPINGS.update(BRIDGE_CLASSES)
+for _cls in BRIDGE_CLASSES.values():
+    if hasattr(_cls, "GET_SCHEMA"):
+        _cls.GET_SCHEMA()
+PREPARED_CLASSES = {name: cls for name, cls in BRIDGE_CLASSES.items() if policy.prepare_policy(cls) is not None}
+
+# The bridges' resolvers, wrapped where each bridge looks them up: counted, and
+# stubbed from value tables for the generated acceptance (execute stays real).
+RESOLVERS = {"relay": (relay_mod, "build_window_relay_payload"), "masks": (masks_mod, "resolve_mask_times"),
+             "driver": (driver_mod, "resolve_driver_ref"), "reference": (reference_mod, "resolve_reference_set"),
+             "prompts": (reference_mod, "decode_reference_prompts")}
+REAL_RESOLVERS = {key: getattr(module, name) for key, (module, name) in RESOLVERS.items()}
+BRIDGE_STUB = {"on": False, "changed": set()}
+
+BRIDGE_VALUES = {
+    ("SonderPromptRelayBridge", "global_prompt"): ("global A", "global B"),
+    ("SonderPromptRelayBridge", "smart_prompt"): ("[0-2] smart A", "[0-2] smart B"),
+    ("SonderPromptRelayBridge", "local_prompts"): ("local A", "local B"),
+    ("SonderPromptRelayBridge", "segment_lengths"): ("2", "3"),
+    ("SonderMasksBridge", "video_mask_start_time"): (0.25, 0.5),
+    ("SonderMasksBridge", "video_mask_end_time"): (0.75, 1.0),
+    ("SonderMasksBridge", "audio_mask_start_time"): (0.25, 0.125),
+    ("SonderMasksBridge", "audio_mask_end_time"): (0.75, 0.625),
+    ("SonderDriverSelector", "has_driver"): (0, 1),
+    ("SonderReferenceSelector", "has_reference"): (1, 0),
+    ("SonderReferenceSelector", "reference_strength"): (1.0, 0.5),
+    ("SonderReferencePromptBridge", "reference_prompt"): ("ref A", "ref B"),
+    ("SonderReferencePromptBridge", "reference_names"): ("Hero", "Villain"),
+    **{("SonderReferencePromptBridge", f"p{index:02d}"): (f"p{index} A", f"p{index} B") for index in range(1, 17)},
+}
+
+
+def stub_values(class_name):
+    cls = PREPARED_CLASSES[class_name]
+    return {name: BRIDGE_VALUES[(class_name, name)][1 if (class_name, name) in BRIDGE_STUB["changed"] else 0]
+            for slot, name in enumerate(cls.RETURN_NAMES) if (class_name, name) in BRIDGE_VALUES}
+
+
+def _stub_relay(project):
+    v = stub_values("SonderPromptRelayBridge")
+    return {**v, "segments": [], "labels_on": False, "source": "stub", "window_start": 0, "window_end": 2}
+
+
+def _stub_masks(project, edit_video=True, edit_audio=True):
+    v = stub_values("SonderMasksBridge")
+    return {**v, "edit_video": bool(edit_video), "edit_audio": bool(edit_audio), "video_mask_frames": (0, 1),
+            "audio_mask_frames": (0, 1), "frame_count": 2, "fps": 24.0, "frame_count_padding": 0}
+
+
+def _stub_driver(project, driver_lane_index=0, driver_selector_overrides_json="{}"):
+    return {"has_driver": stub_values("SonderDriverSelector")["has_driver"], "driver_idx": 0, "strength": 0.0,
+            "source": "stub"}
+
+
+def _stub_reference(project, reference_lanes="0"):
+    v = stub_values("SonderReferenceSelector")
+    return {"has_reference": v["has_reference"], "strength": v["reference_strength"], "conflicts": [],
+            "lanes": [], "stub": True}
+
+
+def _stub_prompts(reference_set):
+    v = stub_values("SonderReferencePromptBridge")
+    return tuple(v[name] for name in PREPARED_CLASSES["SonderReferencePromptBridge"].RETURN_NAMES)
+
+
+STUBS = {"relay": _stub_relay, "masks": _stub_masks, "driver": _stub_driver, "reference": _stub_reference,
+         "prompts": _stub_prompts}
+
+
+def _counted_resolver(key):
+    real = REAL_RESOLVERS[key]
+
+    def resolver(*args, **kwargs):
+        RESOLVER_CALLS[key] = RESOLVER_CALLS.get(key, 0) + 1
+        if INJECT.get("resolver_fault") == key:
+            raise RuntimeError(f"Injected {key} resolver failure")
+        if INJECT.get("interrupt_in") == key:
+            mm.interrupt_current_processing(True)  # a cancel arriving while this bridge resolves
+        return (STUBS[key] if BRIDGE_STUB["on"] else real)(*args, **kwargs)
+
+    return resolver
+
+
+for _key, (_module, _name) in RESOLVERS.items():
+    setattr(_module, _name, _counted_resolver(_key))
+
+_real_select_bridges = pipeline.select_bridges
+
+
+def faulty_select_bridges(*args, **kwargs):
+    if INJECT.get("bridge_pass_fault"):
+        raise ValueError("Injected bridge-pass fault")
+    return _real_select_bridges(*args, **kwargs)
+
+
+pipeline.select_bridges = faulty_select_bridges
+
+
+class StubProject:
+    """What the stubbed Editor returns as ``project``: enough context for real bridges."""
+
+    def __init__(self):
+        self._execution_context = {"scene_id": "stub", "_render_raster_hw": (16, 16)}
+        STUB_PROJECTS.append(self)
+
+
+STUB_PROJECTS = []
+
+
+def bridge_stub_execute_once(self, project, *args, **kwargs):
+    result = list(stub_execute_once(self, project, *args, **kwargs))
+    result[0] = StubProject()
+    return tuple(result)
+
+
+BRIDGE_NODES = {"SonderPromptRelayBridge": "rl", "SonderMasksBridge": "mk", "SonderDriverSelector": "ds",
+                "SonderReferenceSelector": "rs", "SonderReferencePromptBridge": "rp"}
+PROBE = {"STRING": "CPText", "INT": "CPInt", "FLOAT": "CPFloat"}
+
+
+def bridge_acceptance_graph():
+    graph = {"1": n("SonderEditor", project="+ Create New", project_name="Unused", fps=24.0, width=64, height=64),
+             "rl": n("SonderPromptRelayBridge", project=["1", 0]),
+             "mk": n("SonderMasksBridge", project=["1", 0], edit_video=True, edit_audio=True),
+             "ds": n("SonderDriverSelector", project=["1", 0], driver_lane_index=0,
+                     driver_selector_overrides_json="{}"),
+             "rs": n("SonderReferenceSelector", project=["1", 0], reference_lanes="0"),
+             "rp": n("SonderReferencePromptBridge", reference_set=["rs", 0])}
+    for class_name, node in BRIDGE_NODES.items():
+        cls = PREPARED_CLASSES[class_name]
+        for slot in policy.exact_slots(cls):
+            graph[f"{node}{slot}"] = n(PROBE[cls.RETURN_TYPES[slot]], value=[node, slot])
+            graph[f"{node}{slot}p"] = n("PreviewAny", source=[f"{node}{slot}", 0])
+    return graph
+
+
+def bridge_exact_outputs():
+    """(class, output name, consumer node) for every EXACT output of a prepared class."""
+    return [(class_name, cls.RETURN_NAMES[slot], f"{BRIDGE_NODES[class_name]}{slot}")
+            for class_name, cls in PREPARED_CLASSES.items() for slot in policy.exact_slots(cls)]
+
+
+async def bridge_acceptance_sequence(enabled):
+    set_pipeline(enabled)
+    SonderEditor._execute_once = bridge_stub_execute_once
+    BRIDGE_STUB["on"] = True
+    executor = new_executor()
+    rows = []
+    try:
+        BRIDGE_STUB["changed"] = set()
+        rows.append(("base", await run(executor, bridge_acceptance_graph()), list(STUB_PROJECTS)))
+        STUB_PROJECTS.clear()
+        rows.append(("identical", await run(executor, bridge_acceptance_graph()), list(STUB_PROJECTS)))
+        for class_name, name, _consumer in bridge_exact_outputs():
+            BRIDGE_STUB["changed"] = {(class_name, name)}
+            STUB_PROJECTS.clear()
+            rows.append((f"changed:{class_name}.{name}", await run(executor, bridge_acceptance_graph()), []))
+            BRIDGE_STUB["changed"] = set()
+            rows.append((f"reverted:{class_name}.{name}", await run(executor, bridge_acceptance_graph()), []))
+    finally:
+        SonderEditor._execute_once = instrumented_execute_once
+        BRIDGE_STUB.update(on=False, changed=set())
+        STUB_PROJECTS.clear()
+    return rows
+
+
+async def case_bridges():
+    case = "bridges"
+    outputs = bridge_exact_outputs()
+    check(case, "the value tables cover every EXACT output of every prepared bridge (from the declarations)",
+          {(class_name, name) for class_name, name, _ in outputs} == set(BRIDGE_VALUES)
+          and set(BRIDGE_NODES) == set(PREPARED_CLASSES),
+          {"missing": sorted({(c, nm) for c, nm, _ in outputs} - set(BRIDGE_VALUES)),
+           "classes": sorted(PREPARED_CLASSES)})
+    pipeline_rows = await bridge_acceptance_sequence(True)
+    stock_rows = await bridge_acceptance_sequence(False)
+    consumers = {consumer for _, _, consumer in outputs}
+    for (label, row, _), (_, stock, _) in zip(pipeline_rows, stock_rows):
+        check(case, f"{label}: pipeline run succeeds", row.get("success"), row.get("error") or row.get("invalid"))
+        check(case, f"{label}: differential oracle (every consumer equals stock)", row["outputs"] == stock["outputs"],
+              _diff(row["outputs"], stock["outputs"]))
+        check(case, f"{label}: stock reruns every bridge consumer", consumers <= executed_nodes(stock),
+              sorted(consumers - executed_nodes(stock)))
+    if MODE == "none":
+        check(case, "--cache-none bypasses bridge preparation", all(not row["preparations"] for _, row, _ in pipeline_rows))
+        check(case, "--cache-none reruns every bridge consumer",
+              all(consumers <= executed_nodes(row) for _, row, _ in pipeline_rows))
+        return
+    (_, base, _), (_, identical, projects) = pipeline_rows[0], pipeline_rows[1]
+    check(case, "the first run prepares all five bridges", prep(base).get("bridges", {}).get("prepared") == 5,
+          {"bridges": prep(base).get("bridges"), "reasons": prep(base).get("bridge_reasons")})
+    check(case, "an identical second job hits every bridge consumer", not (consumers & executed_nodes(identical)),
+          sorted(consumers & executed_nodes(identical)))
+    check(case, "bridges whose consumers all took literals are not scheduled",
+          not (set(BRIDGE_NODES.values()) & executed_nodes(identical)), identical["executing"])
+    check(case, "each bridge resolved once per prompt (prepared, unscheduled)",
+          identical["resolver_calls"] == {"relay": 1, "masks": 1, "driver": 1, "reference": 1, "prompts": 1},
+          identical["resolver_calls"])
+    ctx = projects[0]._execution_context if projects else {}
+    check(case, "provenance is published by preparation while the bridges are unscheduled",
+          ctx.get("prompt_relay", {}).get("global") == "global A" and "mk" in (ctx.get("masks_bridge_by_node") or {})
+          and ctx.get("driver_selector", {}).get("has_driver") == 0, {key: ctx.get(key) for key in
+                                                                     ("prompt_relay", "masks_bridge_by_node", "driver_selector")})
+    rows = {label: row for label, row, _ in pipeline_rows}
+    for class_name, name, consumer in outputs:
+        changed = rows[f"changed:{class_name}.{name}"]
+        others = consumers - {consumer}
+        check(case, f"{class_name}.{name}: a change misses exactly its consumer",
+              consumer in executed_nodes(changed) and not (others & executed_nodes(changed)),
+              {"ran": sorted(executed_nodes(changed) & consumers), "expected": consumer})
+        reverted = rows[f"reverted:{class_name}.{name}"]
+        check(case, f"{class_name}.{name}: reverting reruns nothing else",
+              not (others & executed_nodes(reverted)), sorted(executed_nodes(reverted) & consumers))
+
+
+# --- Real bridges on fixture projects ------------------------------------------------------------
+
+def edit_project(fx, change):
+    project = manager.load_project(fx["dir"])
+    change(project, project.scenes[0])
+    manager.save_project(project)
+
+
+def add_reference(project, scene, override=""):
+    from PIL import Image
+    media = Path(project.project_dir) / "media"
+    media.mkdir(exist_ok=True)
+    Image.new("RGB", (16, 16), (0, 0, 255)).save(media / "subject.png")
+    asset = timeline.Asset(name="subject.png", path="media/subject.png", asset_type="image", width=16, height=16)
+    project.assets.append(asset)
+    member = timeline.ReferenceMember(member_id="member", asset_id=asset.asset_id, prompt="blue subject")
+    project.references = [timeline.ReferenceEntity(reference_id="entity", name="Hero", members=[member])]
+    definition = next(row for row in timeline.REFERENCE_RECIPE_PRESETS if row["media_kind"] == "image")
+    scene.reference_lane_count = 1
+    scene.reference_lane_configs = [timeline.LaneConfig()]
+    scene.reference_lane_recipes = [timeline.ReferenceLaneRecipe(
+        media_kind="image", recipe_id=definition["id"],
+        recipe={"name": definition["name"], "hard": dict(definition["hard"]), "soft": dict(definition["soft"])})]
+    scene.reference_items = [timeline.ReferenceItem(
+        reference_item_id="item", lane_index=0, start_frame=0, end_frame=-1,
+        members=[{"entity_id": "entity", "member_id": "member"}], prompt_override=override)]
+
+
+def add_driver(project, scene):
+    media = Path(project.project_dir) / "media"
+    media.mkdir(exist_ok=True)
+    write_clip(media / "driver.mkv", 8)
+    asset = timeline.Asset(name="driver.mkv", path="media/driver.mkv", asset_type="video", width=64, height=64,
+                           frame_count=8, fps=24, color_space="rgb", color_range="pc", color_probed=True)
+    project.assets.append(asset)
+    scene.motion_driver_lane_count = 1
+    scene.motion_driver_lane_configs = [timeline.LaneConfig()]
+    scene.clips.append(timeline.ClipReference(clip_id="driver-1", source_path="media/driver.mkv",
+                                              timeline_start_frame=0, timeline_end_frame=8, source_out_frame=8,
+                                              total_source_frames=8, track_index=0, role="motion_driver",
+                                              strength=0.5))
+
+
+FROZEN_FIELDS = {"scene_prompt": "frozen global",
+                 "prompt_sections": [{"start_frame": 0, "end_frame": 4, "prompt": "frozen walks"}],
+                 "scene_fps": 30.0}
+
+
+def bridge_fixture(label, runs, reference=True, driver=False, guides=None, text="Bridge job", frozen=False,
+                   muted_driver=False):
+    # The same job text on both arms, so the oracle compares like with like. A frozen
+    # job (snapshot 1) carries its own prompt and fps: the queued-run path.
+    job = {"text": text, "snapshot": 1 if frozen else 0, "end": 4 if guides else 2}
+    if frozen:
+        job.update(fields=FROZEN_FIELDS, params={"prompt_channel_labels": False})
+    fx = fixture(label, [job] * runs, guides=guides)
+
+    def build(project, scene):
+        scene.set_global_prompt("global style")
+        scene.prompt_sections = [timeline.PromptSection(0, 4, prompt="walks"), timeline.PromptSection(4, 8, prompt="runs")]
+        if reference:
+            add_reference(project, scene)
+        if driver:
+            add_driver(project, scene)
+            if muted_driver:
+                scene.clips[-1].muted = True
+
+    edit_project(fx, build)
+    return fx
+
+
+REAL_CONSUMERS = {"g", "sm", "lo", "sg", "mvs", "mve", "mas", "mae", "hd", "hr", "st", "rpp", "rpn", "rp1"}
+
+
+def real_bridge_graph(fx, width=64, edit_audio=True):
+    graph = {
+        "1": editor(fx, width=width),
+        "rl": n("SonderPromptRelayBridge", project=["1", 0]),
+        "mk": n("SonderMasksBridge", project=["1", 0], edit_video=True, edit_audio=edit_audio),
+        "ds": n("SonderDriverSelector", project=["1", 0], driver_lane_index=0, driver_selector_overrides_json="{}"),
+        "rs": n("SonderReferenceSelector", project=["1", 0], reference_lanes="0"),
+        "rp": n("SonderReferencePromptBridge", reference_set=["rs", 0]),
+        "3": n("CPInt", value=["1", 8]),
+        "4": n("CPImage", text=["g", 0], width=["3", 0], seed=17),
+        # The saver waits for every bridge's consumer, so stock's order cannot save
+        # before a bridge has published (the parity compared here).
+        "after": n("CPAfter", image=["4", 0], a=["mae", 0], b=["hd", 0], c=["rpp", 0], d=["hr", 0], e=["st", 0]),
+        "7": save(["1", 0], ["after", 0], mode="Take"),
+    }
+    for node, (source, slot, kind) in {
+            "g": ("rl", 0, "STRING"), "sm": ("rl", 1, "STRING"), "lo": ("rl", 2, "STRING"), "sg": ("rl", 3, "STRING"),
+            "mvs": ("mk", 0, "FLOAT"), "mve": ("mk", 1, "FLOAT"), "mas": ("mk", 2, "FLOAT"), "mae": ("mk", 3, "FLOAT"),
+            "hd": ("ds", 1, "INT"), "hr": ("rs", 1, "INT"), "st": ("rs", 2, "FLOAT"),
+            "rpp": ("rp", 0, "STRING"), "rpn": ("rp", 1, "STRING"), "rp1": ("rp", 2, "STRING")}.items():
+        graph[node] = n(PROBE[kind], value=[source, slot])
+        graph[f"{node}p"] = n("PreviewAny", source=[node, 0])
+    return graph
+
+
+PROVENANCE_KEYS = ("prompt_relay", "masks_bridge", "masks_bridge_by_node", "driver_selector")
+VOLATILE = {"created_at", "exported_at", "scene_id", "prompt_id", "generated_at", "execution_seconds", "render_seconds",
+            "asset_id", "take_id", "job_id", "queue_job_id", "queue_job_ref_id", "project_id", "output_path", "seconds",
+            "base_modified_at"}
+
+
+def stable_params(value):
+    if isinstance(value, dict):
+        return {key: stable_params(item) for key, item in value.items() if key not in VOLATILE and "time" not in key}
+    if isinstance(value, list):
+        return [stable_params(item) for item in value]
+    if isinstance(value, str) and "ZZ-CachePipeline-" in value:
+        return "<fixture>"
+    return value
+
+
+def last_take_params(fx):
+    project = manager.load_project(fx["dir"])
+    takes = [asset for asset in project.assets if asset.asset_type == "video"]
+    return dict(takes[-1].generation_params or {}) if takes else {}
+
+
+async def real_bridge_sequence(enabled, label):
+    set_pipeline(enabled)
+    fx = bridge_fixture(f"{label}-{int(enabled)}", 8)
+    executor = new_executor()
+    rows = []
+
+    async def step(name, graph):
+        row = await run(executor, graph)
+        rows.append((name, row, last_take_params(fx)))
+
+    await step("base", real_bridge_graph(fx))
+    await step("identical", real_bridge_graph(fx))
+    edit_project(fx, lambda project, scene: scene.set_global_prompt("global style, edited"))
+    await step("global edit", real_bridge_graph(fx))
+    await step("width only", real_bridge_graph(fx, width=72))
+    await step("freeze audio", real_bridge_graph(fx, width=72, edit_audio=False))
+
+    def override(project, scene):
+        scene.reference_items[0].prompt_override = "custom words"
+
+    edit_project(fx, override)
+    await step("prompt override edit", real_bridge_graph(fx, width=72, edit_audio=False))
+    return rows
+
+
+async def case_bridges_snapshot():
+    """The real bridges on frozen jobs (the queued-run path): prepared equals scheduled."""
+    case = "bridges_snapshot"
+    arms = {}
+    for enabled in (True, False):
+        set_pipeline(enabled)
+        fx = bridge_fixture(f"snapshot-{int(enabled)}", 4, frozen=True)
+        executor = new_executor()
+        rows = []
+        for name, graph in (("base", real_bridge_graph(fx)), ("identical", real_bridge_graph(fx)),
+                            ("freeze audio", real_bridge_graph(fx, edit_audio=False))):
+            row = await run(executor, graph)
+            rows.append((name, row, last_take_params(fx)))
+        arms[enabled] = rows
+    for (label, row, params), (_, stock, stock_params) in zip(arms[True], arms[False]):
+        check(case, f"{label}: both arms succeed", row.get("success") and stock.get("success"),
+              {"pipeline": row.get("error") or row.get("invalid"), "stock": stock.get("error") or stock.get("invalid")})
+        check(case, f"{label}: differential oracle (every consumer equals stock)", row["outputs"] == stock["outputs"],
+              _diff(row["outputs"], stock["outputs"]))
+        check(case, f"{label}: the frozen job's provenance equals stock",
+              (params.get("prompt_relay") or {}).get("source") == "snapshot"
+              and (params.get("prompt_relay") or {}).get("global") == "frozen global"
+              and stable_params({key: params.get(key) for key in PROVENANCE_KEYS})
+              == stable_params({key: stock_params.get(key) for key in PROVENANCE_KEYS}),
+              _diff(stable_params({key: params.get(key) for key in PROVENANCE_KEYS}),
+                    stable_params({key: stock_params.get(key) for key in PROVENANCE_KEYS})))
+        check(case, f"{label}: every bridge is prepared and none is scheduled",
+              prep(row).get("bridges", {}).get("prepared") == 5
+              and not ({"rl", "mk", "ds", "rs", "rp"} & executed_nodes(row)), prep(row).get("bridge_reasons"))
+    identical = arms[True][1][1]
+    check(case, "identical frozen job: no bridge consumer reruns", not (executed_nodes(identical) & REAL_CONSUMERS),
+          sorted(executed_nodes(identical) & REAL_CONSUMERS))
+    check(case, "frozen fps reaches the mask times (30 fps job)",
+          arms[True][0][1]["outputs"].get("mvep") == arms[False][0][1]["outputs"].get("mvep")
+          and (arms[True][0][2].get("masks_bridge") or {}).get("video_mask") is not None,
+          [arms[True][0][1]["outputs"].get("mvep"), (arms[True][0][2].get("masks_bridge") or {}).get("video_mask")])
+
+
+async def case_bridges_negative():
+    """Negative control: if preparation published into another project object, the
+    provenance checks must fail. Proves they can."""
+    case = "bridges_negative"
+    original = pipeline._run_bridge
+
+    def publish_elsewhere(runtime, prompt_id, dynprompt, node_id, class_def, sources):
+        sources = dict(sources)
+        for key, value in list(sources.items()):
+            if value and hasattr(value[0], "_execution_context"):
+                clone = copy.copy(value[0])
+                clone._execution_context = dict(value[0]._execution_context)
+                sources[key] = (clone,) + tuple(value[1:])
+        return original(runtime, prompt_id, dynprompt, node_id, class_def, sources)
+
+    pipeline._run_bridge = publish_elsewhere
+    try:
+        arms = await both_arms(real_bridge_graph, runs=1, label="negative")
+    finally:
+        pipeline._run_bridge = original
+    (row, params), (stock, stock_params) = arms[True][1][0], arms[False][1][0]
+    check(case, "with publication diverted, the take loses the bridges' provenance (the check can fail)",
+          row["success"] and stock["success"] and "prompt_relay" not in params and "prompt_relay" in stock_params
+          and stable_params({key: params.get(key) for key in PROVENANCE_KEYS})
+          != stable_params({key: stock_params.get(key) for key in PROVENANCE_KEYS}),
+          {"pipeline": sorted(key for key in PROVENANCE_KEYS if key in params),
+           "stock": sorted(key for key in PROVENANCE_KEYS if key in stock_params)})
+
+
+async def case_bridges_real():
+    case = "bridges_real"
+    pipeline_rows = await real_bridge_sequence(True, "real")
+    stock_rows = await real_bridge_sequence(False, "real")
+    expected = {"identical": set(), "global edit": {"g"}, "width only": set(), "freeze audio": {"mae"},
+                "prompt override edit": {"rpp"}}
+    for (label, row, params), (_, stock, stock_params) in zip(pipeline_rows, stock_rows):
+        check(case, f"{label}: both arms succeed", row.get("success") and stock.get("success"),
+              {"pipeline": row.get("error") or row.get("invalid"), "stock": stock.get("error") or stock.get("invalid")})
+        check(case, f"{label}: differential oracle (every consumer equals stock)", row["outputs"] == stock["outputs"],
+              _diff(row["outputs"], stock["outputs"]))
+        check(case, f"{label}: the saved take's bridge provenance equals stock",
+              all(key in params for key in PROVENANCE_KEYS)
+              and stable_params({key: params.get(key) for key in PROVENANCE_KEYS})
+              == stable_params({key: stock_params.get(key) for key in PROVENANCE_KEYS}),
+              _diff(stable_params({key: params.get(key) for key in PROVENANCE_KEYS}),
+                    stable_params({key: stock_params.get(key) for key in PROVENANCE_KEYS})))
+        check(case, f"{label}: generation_params equal stock (volatile fields aside)",
+              stable_params(params) == stable_params(stock_params), _diff(stable_params(params), stable_params(stock_params)))
+        check(case, f"{label}: every bridge is prepared and none is scheduled",
+              prep(row).get("bridges", {}).get("prepared") == 5
+              and not ({"rl", "mk", "ds", "rs", "rp"} & executed_nodes(row)),
+              {"bridges": prep(row).get("bridges"), "reasons": prep(row).get("bridge_reasons"),
+               "executing": row["executing"]})
+        if label in expected:
+            ran = executed_nodes(row) & REAL_CONSUMERS
+            check(case, f"{label}: exactly the changed bridge outputs' consumers rerun", ran == expected[label],
+                  {"ran": sorted(ran), "expected": sorted(expected[label])})
+
+
+# --- Graph shapes ----------------------------------------------------------------------------------
+
+async def both_arms(build, runs=2, fixture_args=None, label="shape"):
+    """Run ``build(fx)`` ``runs`` times per arm on its own fixture; rows per arm."""
+    arms = {}
+    for enabled in (True, False):
+        set_pipeline(enabled)
+        fx = bridge_fixture(f"{label}-{int(enabled)}", runs + 1, **(fixture_args or {}))
+        executor = new_executor()
+        rows = []
+        for _ in range(runs):
+            row = await run(executor, build(fx))
+            rows.append((row, last_take_params(fx)))
+        arms[enabled] = (fx, rows)
+    return arms
+
+
+async def case_bridges_shapes():
+    case = "bridges_shapes"
+
+    # H3 shape: a Selector that stays scheduled for an Image Bridge feeds a prepared,
+    # unscheduled Prompt Bridge.
+    def h3(fx):
+        return {"1": editor(fx), "rs": n("SonderReferenceSelector", project=["1", 0], reference_lanes="0"),
+                "ri": n("SonderReferenceImageBridge", reference_set=["rs", 0], unused_slots="placeholder"),
+                "rit": n("CPImageTap", frames=["ri", 0]), "ritp": n("PreviewAny", source=["rit", 0]),
+                "rp": n("SonderReferencePromptBridge", reference_set=["rs", 0]),
+                "rp1": n("CPText", value=["rp", 2]), "rp1p": n("PreviewAny", source=["rp1", 0]),
+                "7": save(["1", 0], ["ri", 0], mode="Take")}
+
+    arms = await both_arms(h3, label="h3")
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    (first, _), (second, _) = rows
+    check(case, "H3 shape: results equal stock", all(row["success"] and row["outputs"] == stock["outputs"]
+                                                     for (row, _), (stock, _) in zip(rows, stock_rows)),
+          [_diff(row["outputs"], stock["outputs"]) for (row, _), (stock, _) in zip(rows, stock_rows)])
+    check(case, "H3 shape: the Selector stays scheduled, the Prompt Bridge does not",
+          "rs" in executed_nodes(second) and "rp" not in executed_nodes(second), second["executing"])
+    check(case, "H3 shape: the per-member prompt consumer hits on an identical job", "rp1" not in executed_nodes(second),
+          second["executing"])
+    check(case, "H3 shape: the still-scheduled Selector resolves twice (prepared and scheduled)",
+          second["resolver_calls"].get("reference") == 2, second["resolver_calls"])
+
+    # H3 starter shape: only reference_set is consumed, so the Selector is unused.
+    def starter(fx):
+        return {"1": editor(fx), "rs": n("SonderReferenceSelector", project=["1", 0], reference_lanes="0"),
+                "ri": n("SonderReferenceImageBridge", reference_set=["rs", 0], unused_slots="placeholder"),
+                "7": save(["1", 0], ["ri", 0], mode="Take")}
+
+    arms = await both_arms(starter, runs=1, label="starter")
+    row, _ = arms[True][1][0]
+    check(case, "H3 starter shape: the Selector is left alone and resolves once",
+          row["success"] and prep(row).get("bridge_reasons") == {"unused": 1}
+          and row["resolver_calls"].get("reference") == 1, {"prep": prep(row), "calls": row["resolver_calls"]})
+
+    # A Driver Selector whose has_driver is a switch's select: the active branch pulls
+    # the Selector back in lazily through the Driver Bridge.
+    def lazy_driver(fx):
+        return {"1": editor(fx), "ds": n("SonderDriverSelector", project=["1", 0], driver_lane_index=0,
+                                          driver_selector_overrides_json="{}"),
+                "db": n("SonderDriverBridge", driver_ref=["ds", 0]), "dt": n("CPImageTap", frames=["db", 0]),
+                "o": n("StringConcatenate", string_a="no driver", string_b="", delimiter=""),
+                "sw": n("SonderLazySwitch", **{"select": ["ds", 1], "branches.item0": ["o", 0],
+                                               "branches.item1": ["dt", 0]}),
+                "swp": n("PreviewAny", source=["sw", 0]),
+                "after": n("CPAfter", image=["1", 1], a=["sw", 0]), "7": save(["1", 0], ["after", 0], mode="Take")}
+
+    arms = await both_arms(lazy_driver, fixture_args={"driver": True, "reference": False}, label="driver")
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    check(case, "lazy Driver branch: has_driver=1 selects the Driver branch, results equal stock",
+          all(row["success"] and row["outputs"] == stock["outputs"] for (row, _), (stock, _) in zip(rows, stock_rows))
+          and "[" in (rows[0][0]["outputs"].get("swp") or ""),
+          [(row["outputs"], stock["outputs"], row.get("error")) for (row, _), (stock, _) in zip(rows, stock_rows)])
+    check(case, "lazy Driver branch: the Selector was prepared and the switch took its literal",
+          prep(rows[0][0]).get("bridges", {}).get("prepared") == 1, prep(rows[0][0]))
+    check(case, "lazy Driver branch: driver provenance equals stock",
+          stable_params(rows[0][1].get("driver_selector")) == stable_params(stock_rows[0][1].get("driver_selector"))
+          and rows[0][1].get("driver_selector", {}).get("has_driver") == 1,
+          [rows[0][1].get("driver_selector"), stock_rows[0][1].get("driver_selector")])
+
+    # A muted Driver clip: has_driver=0 selects the other branch; results and provenance equal stock.
+    arms = await both_arms(lazy_driver, fixture_args={"driver": True, "muted_driver": True, "reference": False},
+                           label="muted")
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    check(case, "muted Driver: has_driver=0, results and provenance equal stock",
+          all(row["success"] and row["outputs"] == stock["outputs"] for (row, _), (stock, _) in zip(rows, stock_rows))
+          and rows[0][0]["outputs"].get("swp") == "no driver"
+          and stable_params(rows[0][1].get("driver_selector")) == stable_params(stock_rows[0][1].get("driver_selector"))
+          and rows[0][1].get("driver_selector", {}).get("has_driver") == 0,
+          [(row["outputs"], row.get("error"), params.get("driver_selector")) for (row, params) in rows])
+
+    # has_driver=0 with a literal consumer: the Selector is unscheduled, provenance present.
+    def no_driver(fx):
+        return {"1": editor(fx), "ds": n("SonderDriverSelector", project=["1", 0], driver_lane_index=0,
+                                          driver_selector_overrides_json="{}"),
+                "hd": n("CPInt", value=["ds", 1]), "hdp": n("PreviewAny", source=["hd", 0]),
+                "7": save(["1", 0], ["1", 1], mode="Take")}
+
+    arms = await both_arms(no_driver, label="nodriver", fixture_args={"reference": False})
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    # The saver does not depend on the Selector, so stock can save before it runs;
+    # the prepared provenance is there either way (a documented gain).
+    check(case, "has_driver=0: the Selector is unscheduled, its provenance present (stock: equal or absent)",
+          "ds" not in executed_nodes(rows[1][0]) and (rows[1][1].get("driver_selector") or {}).get("has_driver") == 0
+          and stock_rows[1][1].get("driver_selector") in (None, rows[1][1].get("driver_selector")),
+          {"executing": rows[1][0]["executing"], "pipeline": rows[1][1].get("driver_selector"),
+           "stock": stock_rows[1][1].get("driver_selector")})
+
+    # A bridge with a flattened subgraph id.
+    def subgraph(fx):
+        return {"1": editor(fx), "40:4": n("SonderPromptRelayBridge", project=["1", 0]),
+                "40:5": n("CPText", value=["40:4", 0]), "40:5p": n("PreviewAny", source=["40:5", 0]),
+                "after": n("CPAfter", image=["1", 1], a=["40:5", 0]), "7": save(["1", 0], ["after", 0], mode="Take")}
+
+    arms = await both_arms(subgraph, label="subgraph")
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    check(case, "subgraph id: prepared, hits on an identical job, equal to stock",
+          "40:5" not in executed_nodes(rows[1][0]) and rows[1][0]["outputs"] == stock_rows[1][0]["outputs"]
+          and stable_params(rows[1][1].get("prompt_relay")) == stable_params(stock_rows[1][1].get("prompt_relay")),
+          {"executing": rows[1][0]["executing"], "outputs": [rows[1][0]["outputs"], stock_rows[1][0]["outputs"]]})
+
+    # A Guides loop body consumer cloned with a bridge literal.
+    def guides(fx):
+        graph = core(fx)
+        graph["7"] = save(["1", 0], ["4", 0], mode="Take")
+        graph.update({
+            "ds": n("SonderDriverSelector", project=["1", 0], driver_lane_index=0, driver_selector_overrides_json="{}"),
+            "gs": n("SonderGuidesBridgeStart", project=["1", 0], iteration_index=0, value_0="start"),
+            "gb": n("CPGuideBody", image=["gs", 1], index=["gs", 2], width=["ds", 1], previous=["gs", 4]),
+            "ge": n("SonderGuidesBridgeEnd", project=["1", 0], flow_control=["gs", 0], value_0=["gb", 0]),
+            "gep": n("PreviewAny", source=["ge", 0]),
+        })
+        return graph
+
+    arms = await both_arms(guides, runs=1, label="guides", fixture_args={"reference": False, "guides": [0, 2]})
+    (row, _), (stock, _) = arms[True][1][0], arms[False][1][0]
+    bodies = [note for note in row["notes"] if "guide_body" in note]
+    check(case, "Guides loop: every body clone saw the bridge literal and the result equals stock",
+          row["success"] and row["outputs"].get("gep") == stock["outputs"].get("gep") and len(bodies) >= 2
+          and all(body["width_literal"] for body in bodies),
+          {"pipeline": row["outputs"].get("gep"), "stock": stock["outputs"].get("gep"), "bodies": bodies,
+           "error": row.get("error")})
+
+    # Two Masks Bridges: both prepared, both recorded by node.
+    def two_masks(fx):
+        graph = {"1": editor(fx), "after": n("CPAfter", image=["1", 1], a=["m1c", 0], b=["m2c", 0]),
+                 "7": save(["1", 0], ["after", 0], mode="Take")}
+        for node, audio in (("m1", True), ("m2", False)):
+            graph[node] = n("SonderMasksBridge", project=["1", 0], edit_video=True, edit_audio=audio)
+            graph[f"{node}c"] = n("CPFloat", value=[node, 3])
+            graph[f"{node}p"] = n("PreviewAny", source=[f"{node}c", 0])
+        return graph
+
+    arms = await both_arms(two_masks, runs=1, label="twomasks", fixture_args={"reference": False})
+    (row, params), (stock, stock_params) = arms[True][1][0], arms[False][1][0]
+    check(case, "two Masks Bridges: both recorded by node, equal to stock",
+          row["success"] and set(params.get("masks_bridge_by_node") or {}) == {"m1", "m2"}
+          and stable_params(params.get("masks_bridge_by_node")) == stable_params(stock_params.get("masks_bridge_by_node"))
+          and row["outputs"] == stock["outputs"],
+          {"pipeline": params.get("masks_bridge_by_node"), "stock": stock_params.get("masks_bridge_by_node")})
+
+
+# --- Fail-open and safety ---------------------------------------------------------------------------
+
+async def case_bridges_safety():
+    case = "bridges_safety"
+
+    def reference_graph(fx):
+        return {"1": editor(fx), "rs": n("SonderReferenceSelector", project=["1", 0], reference_lanes="0"),
+                "hr": n("CPInt", value=["rs", 1]), "hrp": n("PreviewAny", source=["hr", 0]),
+                "7": save(["1", 0], ["1", 1], mode="Take")}
+
+    # A bridge that raises: stock's error at the scheduled bridge, nothing substituted.
+    results = {}
+    for enabled in (True, False):
+        set_pipeline(enabled)
+        fx = bridge_fixture(f"refail-{int(enabled)}", 2)
+        INJECT["resolver_fault"] = "reference"
+        results[enabled] = (await run(new_executor(), reference_graph(fx)), jobs_of(fx))
+        reset_injections()
+    (row, jobs), (stock, stock_jobs) = results[True], results[False]
+    check(case, "a failing bridge: the same error at the same bridge as stock",
+          row["error"] and stock["error"] and row["error"]["node"] == stock["error"]["node"] == "rs"
+          and row["error"]["message"] == stock["error"]["message"], {"pipeline": row["error"], "stock": stock["error"]})
+    check(case, "a failing bridge: recorded as bridge_failed, nothing stored, job states equal stock",
+          prep(row).get("bridge_reasons") == {"bridge_failed": 1}
+          and [job["status"] for job in jobs.values()] == [job["status"] for job in stock_jobs.values()],
+          {"prep": prep(row), "jobs": jobs, "stock": stock_jobs})
+
+    # Masks with a linked latent: not prepared; its consumers rerun; results equal stock.
+    def linked_masks(fx):
+        return {"1": editor(fx), "lat": n("EmptyLatentImage", width=64, height=64, batch_size=1),
+                "mk": n("SonderMasksBridge", project=["1", 0], edit_video=True, edit_audio=True, video_latent=["lat", 0]),
+                "mve": n("CPFloat", value=["mk", 1]), "mvep": n("PreviewAny", source=["mve", 0]),
+                "7": save(["1", 0], ["1", 1], mode="Take")}
+
+    arms = await both_arms(linked_masks, label="linkedmasks", fixture_args={"reference": False})
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    check(case, "Masks with a linked latent: not prepared, its consumer reruns, results and provenance equal stock",
+          prep(rows[1][0]).get("bridge_reasons") == {"linked_input": 1} and "mve" in executed_nodes(rows[1][0])
+          and rows[1][0]["outputs"] == stock_rows[1][0]["outputs"]
+          and stable_params(rows[1][1].get("masks_bridge")) == stable_params(stock_rows[1][1].get("masks_bridge")),
+          {"prep": prep(rows[1][0]), "executing": rows[1][0]["executing"]})
+
+    # A bridge behind an unselected lazy branch: never prepared, publishes nothing.
+    def behind_switch(fx):
+        return {"1": editor(fx), "rl": n("SonderPromptRelayBridge", project=["1", 0]),
+                "g": n("CPText", value=["rl", 0]),
+                "o": n("StringConcatenate", string_a="other", string_b="", delimiter=""),
+                "sw": n("SonderLazySwitch", **{"select": 0, "branches.item0": ["o", 0], "branches.item1": ["g", 0]}),
+                "swp": n("PreviewAny", source=["sw", 0]), "7": save(["1", 0], ["1", 1], mode="Take")}
+
+    arms = await both_arms(behind_switch, runs=1, label="behind", fixture_args={"reference": False})
+    (row, params), (stock, stock_params) = arms[True][1][0], arms[False][1][0]
+    check(case, "a bridge on an unselected branch: not prepared, no provenance, as stock",
+          row["success"] and prep(row).get("bridge_reasons") == {"not_certain": 1}
+          and "prompt_relay" not in params and "prompt_relay" not in stock_params
+          and row["resolver_calls"].get("relay", 0) == 0 and row["outputs"] == stock["outputs"],
+          {"prep": prep(row), "calls": row["resolver_calls"], "keys": sorted(params)})
+
+    # A bridge that stays scheduled (a wildcard consumer) runs twice, identically.
+    def still_scheduled(fx):
+        return {"1": editor(fx), "rl": n("SonderPromptRelayBridge", project=["1", 0]),
+                "g": n("CPText", value=["rl", 0]), "gp": n("PreviewAny", source=["g", 0]),
+                "wp": n("PreviewAny", source=["rl", 1]),
+                "after": n("CPAfter", image=["1", 1], a=["g", 0], b=["wp", 0]),
+                "7": save(["1", 0], ["after", 0], mode="Take")}
+
+    arms = await both_arms(still_scheduled, label="still", fixture_args={"reference": False})
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    second = rows[1][0]
+    check(case, "a still-scheduled bridge: runs twice, its literal consumer hits, results and provenance equal stock",
+          "rl" in executed_nodes(second) and "g" not in executed_nodes(second)
+          and second["resolver_calls"].get("relay") == 2 and second["outputs"] == stock_rows[1][0]["outputs"]
+          and stable_params(rows[1][1].get("prompt_relay")) == stable_params(stock_rows[1][1].get("prompt_relay")),
+          {"executing": second["executing"], "calls": second["resolver_calls"]})
+
+    # An interrupt raised in bridge preparation (a cancel caught at the next bridge's
+    # check), and a cancel set after the last bridge's check.
+    for label, inject in (("raised in the bridge pass", "masks"), ("set after the last bridge", "relay")):
+        set_pipeline(True)
+        fx = bridge_fixture(f"cancel-{inject}", 3, reference=False)
+        graph = {"1": editor(fx), "mk": n("SonderMasksBridge", project=["1", 0], edit_video=True, edit_audio=True),
+                 "mve": n("CPFloat", value=["mk", 1]), "rl": n("SonderPromptRelayBridge", project=["1", 0]),
+                 "g": n("CPText", value=["rl", 0]), "gp": n("PreviewAny", source=["g", 0]),
+                 "mvep": n("PreviewAny", source=["mve", 0]), "7": save(["1", 0], ["1", 1], mode="Take")}
+        executor = new_executor()
+        INJECT["interrupt_in"] = inject
+        row = await run(executor, graph)
+        reset_injections()
+        expected_outcome = "raised" if inject == "masks" else "prepared"
+        check(case, f"cancel {label}: interrupted, no consumer ran, the job returned to pending",
+              row["error"] and row["error"]["event"] == "execution_interrupted"
+              and not any(key.split(":")[0] in ("text", "float", "int") for key in row["calls"])
+              and jobs_of(fx)[f"cancel-{inject}-1"]["status"] == "pending"
+              and prep(row).get("outcome") == expected_outcome,
+              {"error": row["error"], "calls": row["calls"], "jobs": jobs_of(fx), "prep": prep(row)})
+        following = await run(executor, graph)
+        check(case, f"cancel {label}: the executor survives and the next prompt succeeds",
+              following["success"], following.get("error"))
+
+    # A fault in the bridge pass keeps the Editor's plan.
+    results = {}
+    for enabled in (True, False):
+        set_pipeline(enabled)
+        fx = bridge_fixture(f"passfault-{int(enabled)}", 3, reference=False)
+        graph = {"1": editor(fx), "2": n("CPText", value=["1", 5]), "2p": n("PreviewAny", source=["2", 0]),
+                 "rl": n("SonderPromptRelayBridge", project=["1", 0]), "g": n("CPText", value=["rl", 0]),
+                 "gp": n("PreviewAny", source=["g", 0]), "7": save(["1", 0], ["1", 1], mode="Take")}
+        executor = new_executor()
+        INJECT["bridge_pass_fault"] = True
+        rows = [await run(executor, graph), await run(executor, graph)]
+        reset_injections()
+        results[enabled] = rows
+    rows, stock_rows = results[True], results[False]
+    check(case, "bridge-pass fault: the Editor plan still applies, bridge consumers rerun, results equal stock",
+          prep(rows[1]).get("bridge_reasons") == {"bridge_pass_error": 1} and prep(rows[1]).get("substituted", 0) >= 1
+          and "2" not in executed_nodes(rows[1]) and "g" in executed_nodes(rows[1])
+          and [row["outputs"] for row in rows] == [row["outputs"] for row in stock_rows],
+          {"prep": prep(rows[1]), "executing": rows[1]["executing"]})
+
+
+async def case_bridges_ram():
+    case = "bridges_ram"
+
+    # RAM eviction after a still-scheduled bridge: a late consumer re-stages it.
+    def evicting(fx):
+        return {"1": editor(fx), "rl": n("SonderPromptRelayBridge", project=["1", 0]),
+                "g": n("CPText", value=["rl", 0]), "ev": n("CPEvict", anchor=["g", 0]),
+                "late": n("StringConcatenate", string_a=["ev", 0], string_b=["rl", 1], delimiter="|"),
+                "latep": n("PreviewAny", source=["late", 0]),
+                "after": n("CPAfter", image=["1", 1], a=["late", 0]), "7": save(["1", 0], ["after", 0], mode="Take")}
+
+    arms = await both_arms(evicting, runs=1, label="evict", fixture_args={"reference": False})
+    (row, params), (stock, stock_params) = arms[True][1][0], arms[False][1][0]
+    check(case, "eviction re-stages a still-scheduled bridge: equal outputs and provenance",
+          row["success"] and row["outputs"] == stock["outputs"]
+          and stable_params(params.get("prompt_relay")) == stable_params(stock_params.get("prompt_relay")),
+          {"pipeline": row["outputs"], "stock": stock["outputs"], "error": row.get("error")})
+
+
 NOTES_OUT = {}
 CASES = {"acceptance": case_acceptance, "fail_open": case_fail_open, "tokens": case_tokens, "cancel": case_cancel,
-         "errors": case_errors, "shapes": case_shapes, "lazy": case_lazy, "ram": case_ram, "misc": case_misc}
+         "errors": case_errors, "shapes": case_shapes, "lazy": case_lazy, "ram": case_ram, "misc": case_misc,
+         "bridges": case_bridges, "bridges_real": case_bridges_real, "bridges_shapes": case_bridges_shapes,
+         "bridges_safety": case_bridges_safety, "bridges_ram": case_bridges_ram,
+         "bridges_snapshot": case_bridges_snapshot, "bridges_negative": case_bridges_negative}
 BY_MODE = {
-    "classic": ["acceptance", "fail_open", "tokens", "cancel", "errors", "shapes", "lazy", "misc"],
-    "lru": ["acceptance", "cancel"],
-    "ram": ["acceptance", "cancel", "errors", "ram"],
-    "none": ["acceptance"],
+    "classic": ["acceptance", "fail_open", "tokens", "cancel", "errors", "shapes", "lazy", "misc",
+                "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative"],
+    "lru": ["acceptance", "cancel", "bridges"],
+    "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram"],
+    "none": ["acceptance", "bridges"],
 }
 
 

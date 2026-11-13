@@ -37,7 +37,8 @@ def _clean():
     sdk_runs.reset_for_tests()
     pipeline.reset_for_tests()
     run_scope.reset_for_tests({name: False for name in (
-        "SonderEditor", "Encode", "Sampler", "Save", "Switch", "Combo", "Wild", "Raw", "Out")})
+        "SonderEditor", "Encode", "Sampler", "Save", "Switch", "Combo", "Wild", "Raw", "Out",
+        "Relay", "Masks", "Selector", "PromptB", "ImageB", "LazyB", "Num")})
     yield
     sdk_runs.reset_for_tests()
     run_scope.reset_for_tests()
@@ -72,6 +73,96 @@ class FakeEditor:
             kwargs.get("prompt"), kwargs.get("unique_id"), "FakeEditor", body)
 
 
+class FakeProject:
+    def __init__(self):
+        self._execution_context = {"scene_id": "s1"}
+
+
+class _Bridge:
+    """A V1 bridge in the shipped bridges' shape: project in, provenance out."""
+
+    FUNCTION = "execute"
+    calls: list = []
+    fail = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {name: (kind,) for name, (kind, _extra) in CONSUMERS[cls.__name__].items()}}
+
+    @classmethod
+    def _record(cls, kwargs):
+        _Bridge.calls.append((cls.__name__, dict(kwargs)))
+        if isinstance(cls.fail, BaseException):
+            raise cls.fail
+
+
+class Relay(_Bridge):
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("global_prompt", "smart_prompt")
+    SONDER_CACHE_POLICY = {"global_prompt": policy.EXACT, "smart_prompt": policy.EXACT}
+    SONDER_CACHE_PREPARE = policy.PREPARES(publishes=("prompt_relay",))
+
+    def execute(self, project):
+        Relay._record({"project": project})
+        project._execution_context["prompt_relay"] = {"global": "relay text"}
+        return ("relay text", "smart text")
+
+
+class Masks(_Bridge):
+    RETURN_TYPES = ("FLOAT", "MASK")
+    RETURN_NAMES = ("start", "mask")
+    SONDER_CACHE_POLICY = {"start": policy.EXACT, "mask": policy.INHERITS("needs latents")}
+    SONDER_CACHE_PREPARE = policy.PREPARES(publishes=("masks_bridge",))
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"project": ("SONDER_PROJECT",), "edit_video": ("BOOLEAN",)},
+                "optional": {"video_latent": ("LATENT",)}, "hidden": {"unique_id": "UNIQUE_ID"}}
+
+    def execute(self, project, edit_video=True, video_latent=None, unique_id=None):
+        Masks._record({"edit_video": edit_video, "unique_id": unique_id})
+        return (1.5, "MASK")
+
+
+class Selector(_Bridge):
+    RETURN_TYPES = ("SONDER_REFERENCE_SET", "INT")
+    RETURN_NAMES = ("reference_set", "has_reference")
+    SONDER_CACHE_POLICY = {"reference_set": policy.HANDLE, "has_reference": policy.EXACT}
+    SONDER_CACHE_PREPARE = policy.PREPARES(publishes=())
+
+    def execute(self, project, lanes="0"):
+        Selector._record({"lanes": lanes})
+        return ({"lanes": lanes, "project": project}, 1)
+
+
+class PromptB(_Bridge):
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("reference_prompt",)
+    SONDER_CACHE_POLICY = {"reference_prompt": policy.EXACT}
+    SONDER_CACHE_PREPARE = policy.PREPARES(publishes=())
+
+    def execute(self, reference_set):
+        PromptB._record({"reference_set": reference_set})
+        return ("prompt for " + reference_set["lanes"],)
+
+
+class ImageB(_Bridge):
+    """A media bridge: takes the handle, is never prepared (no PREPARES)."""
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("r01",)
+    SONDER_CACHE_POLICY = {"r01": policy.INHERITS("media")}
+
+
+class LazyB(Relay):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"project": ("SONDER_PROJECT", {"lazy": True})}}
+
+
+BRIDGES = {cls.__name__: cls for cls in (Relay, Masks, Selector, PromptB, ImageB, LazyB)}
+
+
 class FakeDynPrompt:
     def __init__(self, prompt):
         self.original_prompt = prompt
@@ -103,6 +194,13 @@ CONSUMERS = {
     "Wild": {"value": ("*", {})},
     "Raw": {"text": ("STRING", {"rawLink": True})},
     "Out": {"value": ("STRING", {})},
+    "Num": {"value": ("FLOAT", {}), "flag": ("INT", {})},
+    "Relay": {"project": ("SONDER_PROJECT", {})},
+    "Masks": {"project": ("SONDER_PROJECT", {}), "edit_video": ("BOOLEAN", {}), "video_latent": ("LATENT", {})},
+    "Selector": {"project": ("SONDER_PROJECT", {}), "lanes": ("STRING", {})},
+    "PromptB": {"reference_set": ("SONDER_REFERENCE_SET", {})},
+    "ImageB": {"reference_set": ("SONDER_REFERENCE_SET", {})},
+    "LazyB": {"project": ("SONDER_PROJECT", {})},
 }
 
 
@@ -141,16 +239,23 @@ class Context:
         Context.current.value = None
 
 
-def _runtime(server=None, progress=None, before=None, rearm=None, input_info=None):
+def _runtime(server=None, progress=None, before=None, rearm=None, input_info=None, input_data=None,
+             mappings=None, **v3):
     prompt_once = _module("nodes.prompt_once")
     prompt_once.get_executing_context = lambda: getattr(Context.current, "value", None)
 
     def get_input_data(inputs, class_def, unique_id, execution_list, dynprompt, extra_data):
+        # ComfyUI's shape: with no execution list every link is reported missing.
         assert execution_list is None and extra_data == {}
-        data = {name: [value] for name, value in inputs.items()}
-        data["prompt"] = [dynprompt.get_original_prompt() if dynprompt is not None else {}]
-        data["unique_id"] = [unique_id]
-        return data, {}, {}
+        data, missing = {}, {}
+        for name, value in inputs.items():
+            if pipeline.is_link(value):
+                data[name], missing[name] = (None,), True
+            else:
+                data[name] = [value]
+        for name, kind in ((class_def.INPUT_TYPES() or {}).get("hidden") or {}).items():
+            data[name] = [dynprompt.get_original_prompt() if kind == "PROMPT" else unique_id]
+        return data, missing, {"hidden_inputs": {}}
 
     def default_input_info(dynprompt, node_id, name):
         node = dynprompt.get_node(node_id)
@@ -160,16 +265,17 @@ def _runtime(server=None, progress=None, before=None, rearm=None, input_info=Non
         return spec[0], "required", spec[1]
 
     return pipeline.ExecutorRuntime(
-        get_input_data=get_input_data,
+        get_input_data=input_data or get_input_data,
         node_context=Context,
         progress_state=lambda: progress if progress is not None else Progress(),
         server=lambda: server,
         before_node_execution=before or (lambda: None),
-        class_mappings=lambda: {"SonderEditor": FakeEditor},
+        class_mappings=lambda: dict(BRIDGES, SonderEditor=FakeEditor, **(mappings or {})),
         input_info=input_info or default_input_info,
         interrupt_type=Interrupt,
         rearm_interrupt=rearm or (lambda: None),
         inference_mode=contextlib.nullcontext,
+        **{"is_v3": lambda cls: False, **v3},
     )
 
 
@@ -267,12 +373,7 @@ def _plan(nodes_view, result, consumers=CONSUMERS):
             return None
         return (spec[0] if isinstance(spec[0], str) else None), spec[1]
 
-    return pipeline.plan_substitutions(
-        nodes_view, "1", result,
-        lambda slot: policy.slot_policy(FakeEditor, slot),
-        lambda slot: FakeEditor.RETURN_TYPES[slot],
-        input_type_of,
-    )
+    return pipeline.plan_substitutions(nodes_view, {"1": pipeline.producer_for(FakeEditor, result)}, input_type_of)
 
 
 @pytest.mark.parametrize("slot, value, substituted, reason", [
@@ -469,3 +570,247 @@ def test_an_ineligibility_reason_is_logged_once_per_process(caplog):
     assert len(messages) == 1 and "untrusted" in messages[0]
     pipeline.prepare(_runtime(), "p1", FakeDynPrompt({"2": {"class_type": "Encode", "inputs": {}}}))
     assert len([r for r in caplog.records if r.levelname == "INFO"]) == 1  # no_editor is quiet
+
+
+# --- Phase 2: bridges ------------------------------------------------------------------------
+
+
+def _bridge_graph(**extra):
+    """Editor 1 with a project object; Save 3 per run; bridges and consumers from ``extra``."""
+    graph = {
+        "1": {"class_type": "SonderEditor", "inputs": {"project": "p"}},
+        "3": {"class_type": "Save", "inputs": {"project": ["1", 0], "frames": ["1", 4]}},
+    }
+    graph.update(extra)
+    return graph
+
+
+def _reset_bridges():
+    _Bridge.calls = []
+    for cls in BRIDGES.values():
+        cls.fail = None
+    project = FakeProject()
+    _reset_editor((project, "a prompt", 1280, 24.0, "IMAGE", True))
+    return project
+
+
+def _select(graph, closure=None, consumers=CONSUMERS):
+    def input_type_of(node_id, name):
+        spec = consumers.get(graph[node_id]["class_type"], {}).get(name)
+        return None if spec is None else ((spec[0] if isinstance(spec[0], str) else None), spec[1])
+
+    return pipeline.select_bridges(
+        graph, set(graph) if closure is None else closure, "1", FakeEditor, dict(BRIDGES).get, input_type_of,
+        lambda class_def: pipeline.shape_reason(_runtime(), class_def))
+
+
+def test_a_prepared_bridge_runs_once_publishes_and_feeds_its_literal_consumers():
+    project = _reset_bridges()
+    graph = _bridge_graph(**{"4": {"class_type": "Relay", "inputs": {"project": ["1", 0]}},
+                             "5": {"class_type": "Out", "inputs": {"value": ["4", 0]}}})
+    dynprompt = _open(graph, roots=("3", "5"))
+    record = pipeline.prepare(_runtime(), "p1", dynprompt)
+
+    assert record["outcome"] == "prepared" and record["bridges"]["prepared"] == 1
+    assert [name for name, _ in _Bridge.calls] == ["Relay"]
+    assert _Bridge.calls[0][1]["project"] is project  # the Editor memo's project object
+    assert project._execution_context["prompt_relay"] == {"global": "relay text"}
+    assert dynprompt.node_overrides["5"]["inputs"] == {"value": "relay text"}
+    assert "4" not in dynprompt.node_overrides and graph["5"]["inputs"]["value"] == ["4", 0]
+    assert "bridges" in record["timings_ms"]
+    # Nothing is stored for a bridge: only the Editor's call key is memoised.
+    assert sdk_runs.first_result("k1", "4#0") == (False, None)
+
+
+def test_bridge_selection_names_why_each_bridge_is_left_alone():
+    graph = _bridge_graph(**{
+        "4": {"class_type": "Relay", "inputs": {"project": ["1", 0]}},           # no consumer
+        "5": {"class_type": "Relay", "inputs": {"project": ["1", 0]}},           # not certain
+        "15": {"class_type": "Out", "inputs": {"value": ["5", 0]}},
+        "6": {"class_type": "Masks", "inputs": {"project": ["1", 0], "edit_video": True,
+                                                 "video_latent": ["90", 0]}},     # linked latent
+        "16": {"class_type": "Num", "inputs": {"value": ["6", 0]}},
+        "7": {"class_type": "Masks", "inputs": {"project": ["1", 0], "edit_video": ["91", 0]}},
+        "17": {"class_type": "Num", "inputs": {"value": ["7", 0]}},
+        "8": {"class_type": "Relay", "inputs": {"project": ["1", 1]}},           # an Editor EXACT slot
+        "18": {"class_type": "Out", "inputs": {"value": ["8", 0]}},
+        "9": {"class_type": "LazyB", "inputs": {"project": ["1", 0]}},           # lazy input
+        "19": {"class_type": "Out", "inputs": {"value": ["9", 0]}},
+        "10": {"class_type": "Selector", "inputs": {"project": ["1", 0], "lanes": ["92", 0]}},
+        "11": {"class_type": "PromptB", "inputs": {"reference_set": ["10", 0]}},  # its producer fails
+        "21": {"class_type": "Out", "inputs": {"value": ["11", 0]}},
+        "12": {"class_type": "Selector", "inputs": {"project": ["1", 0]}},        # only the handle is used
+        "13": {"class_type": "ImageB", "inputs": {"reference_set": ["12", 0]}},
+        "90": {"class_type": "Wild", "inputs": {}}, "91": {"class_type": "Wild", "inputs": {}},
+        "92": {"class_type": "Wild", "inputs": {}},
+    })
+    order, _needs, reasons = _select(graph, closure=set(graph) - {"5"})
+    assert order == []
+    assert reasons == {"4": "unused", "5": "not_certain", "6": "linked_input", "7": "linked_input",
+                       "8": "linked_input", "9": "shape", "10": "linked_input", "11": "producer_failed",
+                       "12": "unused"}
+
+
+def test_a_handle_chain_is_prepared_producer_first_and_both_are_useful():
+    graph = _bridge_graph(**{
+        "10": {"class_type": "Selector", "inputs": {"project": ["1", 0], "lanes": "0,1"}},
+        "11": {"class_type": "PromptB", "inputs": {"reference_set": ["10", 0]}},
+        "21": {"class_type": "Out", "inputs": {"value": ["11", 0]}},
+        "13": {"class_type": "ImageB", "inputs": {"reference_set": ["10", 0]}},
+    })
+    order, needs, reasons = _select(graph)
+    assert order == ["10", "11"] and needs["11"] == {"10"} and reasons == {}
+
+    _reset_bridges()
+    dynprompt = _open(graph, roots=("3", "21", "13"))
+    record = pipeline.prepare(_runtime(), "p1", dynprompt)
+    assert [name for name, _ in _Bridge.calls] == ["Selector", "PromptB"]
+    assert _Bridge.calls[1][1]["reference_set"]["lanes"] == "0,1"
+    assert dynprompt.node_overrides["21"]["inputs"] == {"value": "prompt for 0,1"}
+    assert "13" not in dynprompt.node_overrides  # media consumers keep the handle link
+    assert record["bridges"]["prepared"] == 2
+
+
+def test_a_hidden_unique_id_and_absent_optional_inputs_reach_execute_as_scheduled():
+    _reset_bridges()
+    graph = _bridge_graph(**{"6": {"class_type": "Masks", "inputs": {"project": ["1", 0], "edit_video": False}},
+                             "16": {"class_type": "Num", "inputs": {"value": ["6", 0]}}})
+    dynprompt = _open(graph, roots=("3", "16"))
+    pipeline.prepare(_runtime(), "p1", dynprompt)
+    assert _Bridge.calls == [("Masks", {"edit_video": False, "unique_id": "6"})]
+    assert dynprompt.node_overrides["16"]["inputs"] == {"value": 1.5}
+
+
+def test_a_failing_bridge_is_not_substituted_and_the_editor_plan_still_applies():
+    _reset_bridges()
+    Selector.fail = RuntimeError("Reference lane indices 0, 1 cannot be co-selected")
+    graph = _bridge_graph(**{
+        "2": {"class_type": "Encode", "inputs": {"text": ["1", 1]}},
+        "10": {"class_type": "Selector", "inputs": {"project": ["1", 0]}},
+        "11": {"class_type": "PromptB", "inputs": {"reference_set": ["10", 0]}},
+        "20": {"class_type": "Num", "inputs": {"flag": ["10", 1]}},
+        "21": {"class_type": "Out", "inputs": {"value": ["11", 0]}},
+    })
+    dynprompt = _open(graph, roots=("3", "2", "20", "21"))
+    record = pipeline.prepare(_runtime(), "p1", dynprompt)
+    assert record["bridge_reasons"] == {"bridge_failed": 1, "producer_failed": 1}
+    assert set(dynprompt.node_overrides) == {"2"}  # only the Editor's consumer
+    assert sdk_runs.first_failure("k1", "10#0") is None  # nothing stored for a bridge
+
+
+def test_a_consumer_of_editor_and_bridge_values_gets_one_merged_override():
+    _reset_bridges()
+    graph = _bridge_graph(**{"4": {"class_type": "Relay", "inputs": {"project": ["1", 0]}},
+                             "2": {"class_type": "Sampler", "inputs": {"positive": ["4", 1], "seed": ["1", 2]}}})
+    dynprompt = _open(graph, roots=("3", "2"))
+    pipeline.prepare(_runtime(), "p1", dynprompt)
+    assert dynprompt.node_overrides["2"]["inputs"] == {"positive": "smart text", "seed": 1280}
+
+
+def test_an_interrupt_in_the_bridge_pass_propagates_and_applies_nothing():
+    _reset_bridges()
+    graph = _bridge_graph(**{"2": {"class_type": "Encode", "inputs": {"text": ["1", 1]}},
+                             "4": {"class_type": "Relay", "inputs": {"project": ["1", 0]}},
+                             "5": {"class_type": "Out", "inputs": {"value": ["4", 0]}}})
+    dynprompt = _open(graph, roots=("3", "2", "5"))
+
+    def before():
+        if getattr(Context.current, "value", None).node_id == "4":
+            raise Interrupt()
+
+    with pytest.raises(Interrupt):
+        pipeline.prepare(_runtime(before=before), "p1", dynprompt)
+    assert dynprompt.node_overrides == {} and _Bridge.calls == []
+    assert sdk_runs.preparation("k1")["outcome"] == "interrupted"
+    assert sdk_runs.first_failure("k1", "1#0") is None  # the Editor itself succeeded
+
+
+def test_a_fault_in_the_bridge_pass_keeps_the_editor_plan():
+    _reset_bridges()
+    graph = _bridge_graph(**{"2": {"class_type": "Encode", "inputs": {"text": ["1", 1]}},
+                             "4": {"class_type": "Relay", "inputs": {"project": ["1", 0]}},
+                             "5": {"class_type": "Out", "inputs": {"value": ["4", 0]}}})
+    dynprompt = _open(graph, roots=("3", "2", "5"))
+    real = _runtime().get_input_data
+
+    def broken(inputs, class_def, *args):
+        if class_def is Relay:
+            raise KeyError("pipeline bug")
+        return real(inputs, class_def, *args)
+
+    record = pipeline.prepare(_runtime(input_data=broken), "p1", dynprompt)
+    assert record["outcome"] == "prepared" and record["bridge_reasons"] == {"bridge_pass_error": 1}
+    assert set(dynprompt.node_overrides) == {"2"}
+
+
+class NodeOutput:
+    def __init__(self, *args, expand=None):
+        self.args, self.expand, self.block_execution, self.ui = args, expand, None, None
+
+
+class V3Selector(Selector):
+    pass
+
+
+def test_a_v3_bridge_goes_through_the_executors_v3_call_and_is_unwrapped():
+    _reset_bridges()
+    calls = []
+
+    def call_v3(class_def, args, v3_data):
+        calls.append((class_def, args, v3_data))
+        return NodeOutput({"lanes": "0"}, 1)
+
+    v3 = dict(is_v3=lambda cls: cls is V3Selector, call_v3=call_v3, own_lazy_status=lambda cls: False,
+              node_output_type=NodeOutput)
+    CONSUMERS["V3Selector"] = CONSUMERS["Selector"]
+    run_scope.reset_for_tests({name: False for name in ("SonderEditor", "Save", "V3Selector", "Num")})
+    graph = _bridge_graph(**{"10": {"class_type": "V3Selector", "inputs": {"project": ["1", 0], "lanes": "0"}},
+                             "20": {"class_type": "Num", "inputs": {"flag": ["10", 1]}}})
+    dynprompt = _open(graph, roots=("3", "20"))
+    try:
+        record = pipeline.prepare(_runtime(mappings={"V3Selector": V3Selector}, **v3), "p1", dynprompt)
+    finally:
+        del CONSUMERS["V3Selector"]
+    assert calls and calls[0][1]["lanes"] == "0" and calls[0][2] == {"hidden_inputs": {}}
+    assert dynprompt.node_overrides["20"]["inputs"] == {"flag": 1} and record["bridges"]["prepared"] == 1
+
+    # Without the gate's V3 call, a V3 bridge is never prepared; without any way to
+    # tell V3 from V1, no bridge is.
+    assert pipeline.shape_reason(_runtime(is_v3=lambda cls: True), V3Selector) == "v3_call"
+    assert pipeline.shape_reason(_runtime(is_v3=None), Relay) == "v3_unknown"
+    # An expanding, blocking or UI-carrying NodeOutput is not a value result, nor a V1 dict.
+    with pytest.raises(pipeline._BridgeSkip, match="result_shape"):
+        pipeline._bridge_values(_runtime(**v3), V3Selector, NodeOutput({}, 1, expand={"n": {}}))
+    with_ui = NodeOutput({}, 1)
+    with_ui.ui = {"text": ["x"]}
+    with pytest.raises(pipeline._BridgeSkip, match="result_shape"):
+        pipeline._bridge_values(_runtime(**v3), V3Selector, with_ui)
+    with pytest.raises(pipeline._BridgeSkip, match="result_shape"):
+        pipeline._bridge_values(_runtime(**v3), Relay, {"ui": {}, "result": ("a", "b")})
+
+
+@pytest.mark.parametrize("change, reason", [
+    ("lazy_status", "lazy_status"),
+    ("hidden", "hidden"),
+    ("coroutine", "callable"),
+    ("input_list", "input_is_list"),
+    ("output_list", "output_is_list"),
+])
+def test_shape_rejects_what_the_pipeline_cannot_call_as_scheduled(change, reason):
+    class Odd(Relay):
+        pass
+
+    if change == "lazy_status":
+        Odd.check_lazy_status = lambda self, **kwargs: []
+    if change == "hidden":
+        Odd.INPUT_TYPES = classmethod(lambda cls: {"required": {}, "hidden": {"png": "EXTRA_PNGINFO"}})
+    if change == "coroutine":
+        async def execute(self, project):
+            return ("a", "b")
+        Odd.execute = execute
+    if change == "input_list":
+        Odd.INPUT_IS_LIST = True
+    if change == "output_list":
+        Odd.OUTPUT_IS_LIST = (False, True)
+    assert pipeline.shape_reason(_runtime(), Relay) is None
+    assert pipeline.shape_reason(_runtime(), Odd) == reason

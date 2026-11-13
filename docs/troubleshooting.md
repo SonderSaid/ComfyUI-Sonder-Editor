@@ -60,13 +60,21 @@ If a branch still runs, check whether another active node also consumes it.
 
 ### Nodes after the Sonder Editor run again on every take
 
-Nodes that use only the Editor's text and number outputs, such as text
-encoding, are reused while those values don't change. They run every time when:
+Nodes that use only text and number outputs of the Editor or of a Sonder
+bridge, such as text encoding, are reused while those values don't change.
+The bridges are the **Prompt Relay Bridge**, the **Masks Bridge** times, the
+**Driver Selector**, the **Reference Selector** and the **Reference Prompt
+Bridge**. They run every time when:
 
+- The node also takes something made from the Editor's frames or audio, such
+  as a latent encoded from them. The supplied workflows' Prompt Relay encoders
+  and mask nodes do, so they run every take.
 - ComfyUI was started with `--cache-none`. Remove it.
 - The workflow has more than one **Sonder Editor**. Keep one.
 - An input of the **Sonder Editor** is wired to another node. Set the value
   on the Editor instead.
+- A setting on the bridge, such as the **Masks Bridge** `edit_audio`, is wired
+  to another node. Set it on the bridge instead.
 - The value passes through a **Sonder Switch**, **Sonder Cluster** or
   **Sonder Gate** whose other branch comes from a Sonder bridge or from the
   Editor's `project`, `rendered_frames`, `guide_images` or `audio`. The LTX 2.5
@@ -81,8 +89,14 @@ The console names any other reason once, in a line starting
 `Sonder cache pipeline failed` means that run fell back to running everything;
 report it with the lines that follow.
 
-Nodes fed by the Editor's `rendered_frames`, `guide_images`, `audio` or
-`project` outputs always run.
+Nodes fed by the Editor's `rendered_frames`, `guide_images` or `audio`, or by
+a bridge's images, audio or masks, always run.
+
+### Memory runs higher while the Sonder Editor renders, with `--cache-classic`
+
+With `--cache-classic`, a run can briefly hold the previous take's frames and
+results while the **Sonder Editor** renders. Remove the flag to use ComfyUI's
+default cache, or start ComfyUI with `--cache-none`.
 
 ## Projects & storage
 
