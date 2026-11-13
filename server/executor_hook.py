@@ -252,6 +252,38 @@ def _v3_runtime(execution: Any) -> dict[str, Any]:
             "node_output_type": execution._NodeOutputInternal}
 
 
+def check_identity_context(execution: Any) -> str | None:
+    """None when an identified bridge can find its run from inside ``execute``, else the reason.
+
+    A media token resolves through ``get_executing_context().prompt_id``
+    (``nodes/cache_identity.py``), which only holds while the executor sets that
+    context with the same ``CurrentNodeContext`` the bridge reads. Separate from
+    ``check_shape``: a mismatch only stops media identities.
+    """
+    try:
+        from comfy_execution import utils
+
+        from ..nodes import cache_identity
+        if not callable(getattr(utils, "get_executing_context", None)):
+            return "get_executing_context missing"
+        if getattr(execution, "CurrentNodeContext", None) is not getattr(utils, "CurrentNodeContext", None):
+            return "CurrentNodeContext is not comfy_execution.utils'"
+        if cache_identity.get_executing_context is not utils.get_executing_context:
+            return "cache_identity reads another executing context"
+        return None
+    except Exception as exc:
+        return f"identity gate error: {type(exc).__name__}"
+
+
+def _identity_runtime(execution: Any) -> dict[str, Any]:
+    reason = check_identity_context(execution)
+    if reason is not None:
+        logger.info("Sonder cache pipeline: bridge media is not identified on this ComfyUI (%s); "
+                    "its consumers rerun on every run as before.", reason)
+        return {}
+    return {"identity": True}
+
+
 def _build_runtime(execution: Any, prompt_server: Any) -> cache_pipeline.ExecutorRuntime:
     # Every name is looked up when called, as the executor itself does, so a pack
     # that wraps one after Sonder loads is seen by the early run too.
@@ -283,6 +315,7 @@ def _build_runtime(execution: Any, prompt_server: Any) -> cache_pipeline.Executo
         rearm_interrupt=lambda: model_management.interrupt_current_processing(True),
         inference_mode=inference_mode,
         **_v3_runtime(execution),
+        **_identity_runtime(execution),
     )
 
 

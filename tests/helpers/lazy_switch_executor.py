@@ -1,5 +1,6 @@
 """Uncached CPU regression probe for the real ComfyUI validation/execution boundary."""
 import asyncio
+import copy
 import importlib
 import json
 from pathlib import Path
@@ -86,9 +87,30 @@ class OnceSource:
         return prompt_once.run_once_per_prompt(prompt, unique_id, "SonderTestOnce", body)
 
 
+class NanSource:
+    """A branch source that never caches: the Editor's own mechanism, a V1 NaN ``IS_CHANGED``."""
+
+    RETURN_TYPES = ("INT",)
+    FUNCTION = "run"
+    CATEGORY = "testing"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"value": ("INT", {"default": 0})}}
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def run(self, value):
+        executed.append(value)
+        return (value,)
+
+
 nodes.NODE_CLASS_MAPPINGS.update(lazy.LAZY_NODE_CLASS_MAPPINGS)
 nodes.NODE_CLASS_MAPPINGS.update({"SonderTestSource": Source, "SonderTestSelection": Selection,
-                                  "SonderTestSink": Sink, "SonderTestOnce": OnceSource})
+                                  "SonderTestSink": Sink, "SonderTestOnce": OnceSource,
+                                  "SonderTestNanSource": NanSource})
 
 
 def source(value, tuple_payload=False):
@@ -174,6 +196,62 @@ async def run_case(name, prompt, expected_sources=(), expected_outputs=None, err
     return outcome
 
 
+def prediction_states():
+    """(name, router class type, deciding literals, lazy inputs) the scheduler must agree with."""
+    for select in (0, 2):
+        yield f"predict-switch-{select}", "SonderLazySwitch", {"select": select}, \
+            [f"branches.item{i}" for i in range(3)]
+    for select, lanes in ((0, 1), (1, 2), (2, 2)):
+        yield f"predict-cluster-{select}-{lanes}", "SonderLazyCluster", \
+            {"select": select, "branches": 3, "lanes": lanes}, [f"b{b}_l{lane}" for b in range(3) for lane in range(2)]
+    for label, whens in (("open-closed", {"when_A": True, "when_B": 0}), ("closed-open", {"when_A": False, "when_B": "x"}),
+                         ("unwired", {})):
+        yield f"predict-gate-{label}", "SonderGate", whens, ["value_A", "value_B"]
+
+
+async def prediction_cases():
+    """The cache pipeline's prediction (``requested_lazy_inputs`` with every linked lazy
+    input connected) equals what the real scheduler runs, on a cold and on a warm cache.
+    Every branch source is NaN-fingerprinted, as anything downstream of the Editor is.
+    The second run also shares one source with an eager consumer, so it is evaluated
+    before the router asks; the rule still decides each input alone."""
+    results = []
+    executor = execution.PromptExecutor(
+        SimpleNamespace(client_id=None, send_sync=Mock(), last_node_id=None),
+        cache_type=execution.CacheType.CLASSIC, cache_args={"ram": 0, "ram_inactive": 0})
+    for name, class_type, deciding, names in prediction_states():
+        cls = nodes.NODE_CLASS_MAPPINGS[class_type]
+        predicted = cls.requested_lazy_inputs(deciding, frozenset(names))
+        prompt = {f"src{index}": {"class_type": "SonderTestNanSource", "inputs": {"value": index}}
+                  for index in range(len(names))}
+        prompt["subject"] = {"class_type": class_type,
+                             "inputs": dict(deciding, **{lazy_name: [f"src{index}", 0]
+                                                         for index, lazy_name in enumerate(names)})}
+        prompt["sink"] = sink()
+        prompt["eager"] = {"class_type": "SonderTestSink", "inputs": {"value": ["src0", 0], "name": "eager"}}
+        expected = sorted(names.index(lazy_name) for lazy_name in predicted)
+        outcome = {"name": name, "predicted": predicted}
+        try:
+            for attempt, with_eager in (("cold", False), ("warm", False), ("shared", True)):
+                executed.clear()
+                sunk.clear()
+                # A fresh prompt per run, as from the queue: ComfyUI writes ``is_changed``
+                # into the node dicts it evaluates (execution.py IsChangedCache.get).
+                run = copy.deepcopy({key: value for key, value in prompt.items() if with_eager or key != "eager"})
+                valid, error, outputs, node_errors = await execution.validate_prompt(f"{name}-{attempt}", run, None)
+                assert valid, (error, node_errors)
+                await executor.execute_async(run, f"{name}-{attempt}", execute_outputs=outputs)
+                assert executor.success, executor.status_messages
+                ran = sorted(set(executed))
+                wanted = sorted(set(expected) | ({0} if with_eager else set()))
+                assert ran == wanted, (attempt, ran, wanted)
+            outcome["passed"] = True
+        except AssertionError as exc:
+            outcome.update(passed=False, failure=str(exc))
+        results.append(outcome)
+    return results
+
+
 async def main():
     cases = []
     for linked in (False, True):
@@ -221,6 +299,7 @@ async def main():
                                 queue_key="77"))
     # Without a queue run (no trusted key) the guard stays out of the way.
     cases.append(await run_case("repeat-untrusted", repeat_prompt("SonderTestOnce"), [0, 0], {"result": 0}))
+    cases.extend(await prediction_cases())
     print("SONDER_LAZY_REPORT=" + json.dumps({"core": __version__, "requires_lazy": requires_lazy, "cases": cases}))
     return 0 if all(case["passed"] for case in cases) else 1
 

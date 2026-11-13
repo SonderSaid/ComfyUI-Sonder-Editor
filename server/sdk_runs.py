@@ -145,6 +145,9 @@ def open_release(key: Any, prompt_id: Any = "", prompt: Any = None, roots: Any =
             # Editor replays, and what the preparation did (cache_pipeline).
             "failures": {},
             "preparation": None,
+            # Media identities the cache pipeline handed bridges this run:
+            # token -> (class type, canonical recipe JSON, source stat snapshots).
+            "identities": {},
             # O(1) here: a cancel can race the interval between get and ComfyUI
             # resetting its interrupt flag, so nothing heavy runs in this hook.
             "roots": _clean_roots(roots),
@@ -250,6 +253,7 @@ def close_release(key: Any) -> dict[str, Any] | None:
         record.pop("results", None)
         record.pop("failures", None)
         record.pop("preparation", None)
+        record.pop("identities", None)
         record.pop("prompt_ref", None)
         if record.get("scope") is _SCOPE_UNSET:
             record["scope"] = None
@@ -338,6 +342,54 @@ def preparation(key: Any) -> dict[str, Any] | None:
         return dict(value) if isinstance(value, dict) else None
 
 
+# Bounded per run: a recipe is small JSON, but a run may not grow without limit.
+IDENTITY_LIMIT = 256
+
+
+def _only_open_record_for_prompt_id(prompt_id: str) -> dict[str, Any] | None:
+    """The one open record carrying ``prompt_id``, or None when there is none or more than one.
+
+    A client may submit its own prompt id, so two open runs could share one; the
+    identity lookup then refuses rather than guess (``nodes/cache_identity.py``).
+    """
+    matches = [record for record in _RELEASES.values() if prompt_id and record.get("prompt_id") == prompt_id]
+    return matches[0] if len(matches) == 1 else None
+
+
+def register_identity(key: Any, prompt_id: Any, token: str, class_type: str, recipe_json: str,
+                      snapshots: dict) -> str:
+    """Register a media identity the cache pipeline hands a bridge this run.
+
+    Returns "" on success, or why not: ``untrusted``, ``prompt_id_ambiguous`` (the
+    bridge could not find this record by its prompt id) or ``registry_full``. The
+    canonical JSON string is stored, never a live dict, so nothing can change a
+    recipe after its token was computed.
+    """
+    key, prompt_id = _key(key), str(prompt_id or "")
+    with _LOCK:
+        record = _RELEASES.get(key)
+        if record is None or record.get("identities") is None:
+            return "untrusted"
+        if record.get("prompt_id") != prompt_id or _only_open_record_for_prompt_id(prompt_id) is not record:
+            return "prompt_id_ambiguous"
+        identities = record["identities"]
+        if token not in identities and len(identities) >= IDENTITY_LIMIT:
+            return "registry_full"
+        identities[token] = (str(class_type), str(recipe_json), dict(snapshots))
+        return ""
+
+
+def identity_for(prompt_id: Any, token: Any) -> tuple[str, str, dict] | None:
+    """``(class type, recipe JSON, snapshots)`` registered under ``token`` by the running prompt, or None."""
+    with _LOCK:
+        record = _only_open_record_for_prompt_id(str(prompt_id or ""))
+        identities = record.get("identities") if record is not None else None
+        if not identities or not isinstance(token, str):
+            return None
+        entry = identities.get(token)
+        return (entry[0], entry[1], dict(entry[2])) if entry is not None else None
+
+
 def release_roots(key: Any) -> tuple[str, ...] | None:
     """The open run's execution roots (``outputs_to_execute``), or None when unknown."""
     with _LOCK:
@@ -398,7 +450,8 @@ def record_snapshot(key: Any) -> dict[str, Any] | None:
         if record is None:
             return None
         return {name: value for name, value in record.items()
-                if name not in {"prompt_ref", "results", "leases", "projects", "failures", "preparation"}
+                if name not in {"prompt_ref", "results", "leases", "projects", "failures", "preparation",
+                                "identities"}
                 and value is not _SCOPE_UNSET}
 
 

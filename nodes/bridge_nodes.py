@@ -36,7 +36,8 @@ from ..server.media_helpers import (
 )
 from ..server.path_security import resolve_existing_project_path
 from ..server.timeline_state import GuideFrame
-from .cache_policy import ALWAYS_RUNS, INHERITS, TAKES_PROJECT
+from . import cache_identity
+from .cache_policy import ALWAYS_RUNS, DESCRIPTOR, IDENTIFIES, IDENTITY_INVALIDATION, INHERITS, TAKES_PROJECT
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +65,18 @@ _ANY = _AnyType("*")
 
 
 # ── Guide image loading (mirrors editor_node.py:793) ──────────────────
+_RESOLVE = object()
+
+
 def _load_guide_image_bridge(path: str, asset_type: str, target_w: int, target_h: int,
-                             fit_mode: str = "pad_edge", crop_position: str = "center"):
+                             fit_mode: str = "pad_edge", crop_position: str = "center",
+                             interpretation=_RESOLVE):
+    """One guide frame, or None when it cannot be read. The recipe passes the
+    video's colour interpretation it resolved; other callers let it resolve here."""
     try:
         if asset_type == "video":
-            interpretation = resolve_source_color_interpretation(None, path)
+            if interpretation is _RESOLVE:
+                interpretation = resolve_source_color_interpretation(None, path)
             frame_rgb = decode_video_frame(path, 0, color_interpretation=interpretation)
             if frame_rgb is None:
                 cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
@@ -297,6 +305,64 @@ def _empty_image(proj_w: int, proj_h: int) -> torch.Tensor:
     return torch.zeros(1, max(1, proj_h), max(1, proj_w), 3, dtype=torch.float32)
 
 
+def guides_recipe(project, bridge_overrides_json="{}") -> dict:
+    """Every guide this loop will emit, for all iterations, as JSON (``nodes/cache_identity.py``).
+
+    Paths, frame indices, strengths, fit and the colour interpretation of video
+    guides are resolved here; the decode reads only this. A guide whose colour
+    cannot be resolved decodes as unreadable, as it always did.
+    """
+    guides = _apply_bridge_overrides(_filtered_guides(project), bridge_overrides_json)
+    scene = _resolve_active_scene(project)
+    _rs, _re, proj_w, proj_h = _resolve_render_window(project, scene)
+    items, sources = [], []
+    # Values stay raw, as the decode always read them; one JSON cannot hold exactly
+    # leaves Start without an identity (nodes/cache_identity.canonical).
+    for guide in guides:
+        path, asset_type = guide["asset_path"], guide["asset_type"]
+        interpretation, unreadable = None, False
+        if asset_type == "video":
+            try:
+                resolved = resolve_source_color_interpretation(None, path)
+                interpretation = list(resolved) if resolved else None
+            except Exception as exc:
+                logger.warning("Sonder bridge: failed to load guide %s: %s", path, exc)
+                unreadable = True
+        items.append({"path": path, "asset_type": asset_type, "interpretation": interpretation,
+                      "unreadable": unreadable,
+                      "fit_mode": guide.get("fit_mode", "pad_edge"),
+                      "crop_position": guide.get("crop_position", "center"),
+                      "local_idx": guide["local_idx"], "strength": guide["strength"]})
+        if path not in sources:
+            sources.append(path)
+    return {"width": proj_w, "height": proj_h, "guides": items, "sources": sources}
+
+
+def decode_guides_recipe(recipe: dict, iteration_index) -> tuple:
+    """``(image, frame_index, strength)`` for one iteration, from the recipe and its files only."""
+    proj_w, proj_h = int(recipe["width"]), int(recipe["height"])
+    guides = recipe["guides"]
+    try:
+        iteration_index = int(iteration_index)
+    except (TypeError, ValueError):
+        iteration_index = 0
+    if not guides or iteration_index < 0 or iteration_index >= len(guides):
+        # Empty/out-of-range placeholder: black image with strength 0.0 so downstream
+        # guide conditioning treats it as inert. Corrupt-image branch below preserves
+        # the configured guide strength (different semantic — real guide exists).
+        return _empty_image(proj_w, proj_h), 0, 0.0
+    guide = guides[iteration_index]
+    interpretation = guide.get("interpretation")
+    img = None if guide.get("unreadable") else _load_guide_image_bridge(
+        guide["path"], guide["asset_type"], proj_w, proj_h,
+        fit_mode=guide["fit_mode"], crop_position=guide["crop_position"],
+        interpretation=tuple(interpretation) if interpretation else None,
+    )
+    if img is None:
+        return _empty_image(proj_w, proj_h), int(guide["local_idx"]), float(guide["strength"])
+    return img.unsqueeze(0), int(guide["local_idx"]), float(guide["strength"])
+
+
 # ── SonderGuidesBridgeStart ───────────────────────────────────────────
 class SonderGuidesBridgeStart:
     """Loop-open node — emits one guide per iteration plus value_i passthrough."""
@@ -317,14 +383,20 @@ class SonderGuidesBridgeStart:
         ("flow_control", "image", "frame_index", "strength")
         + tuple(f"value_{i}" for i in range(MAX_PASSTHROUGH))
     )
-    # nodes/cache_policy.py: guide media identity is Execution Cache Pipeline Phase 3.
+    # nodes/cache_policy.py and nodes/cache_identity.py: one identity, the guide list
+    # for every iteration plus each guide file's bytes, covers the guide outputs.
+    # The passthroughs only forward linked inputs, which enter ComfyUI's key as they are.
     SONDER_CACHE_POLICY = {
-        "flow_control": INHERITS("Guides loop: Execution Cache Pipeline Phase 3"),
-        "image": INHERITS("Guides loop: Execution Cache Pipeline Phase 3"),
-        "frame_index": INHERITS("Guides loop: Execution Cache Pipeline Phase 3"),
-        "strength": INHERITS("Guides loop: Execution Cache Pipeline Phase 3"),
-        "value_*": INHERITS("Guides loop: Execution Cache Pipeline Phase 3"),
+        "flow_control": DESCRIPTOR,
+        "image": DESCRIPTOR,
+        "frame_index": DESCRIPTOR,
+        "strength": DESCRIPTOR,
+        "value_*": INHERITS("passthrough of linked inputs"),
     }
+    SONDER_CACHE_INVALIDATION = {name: IDENTITY_INVALIDATION
+                                 for name in ("flow_control", "image", "frame_index", "strength")}
+    SONDER_CACHE_IDENTITY = IDENTIFIES(token_input="project", recipe_inputs=("bridge_overrides_json",),
+                                       passthrough=("value_*",))
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -344,46 +416,21 @@ class SonderGuidesBridgeStart:
     def VALIDATE_INPUTS(cls, **_kwargs):
         return True
 
+    @classmethod
+    def cache_recipe(cls, project, bridge_overrides_json="{}", **_passthrough):
+        return guides_recipe(project, bridge_overrides_json)
+
     def execute(self, project, iteration_index=0, **kwargs):
-        guides = _apply_bridge_overrides(
-            _filtered_guides(project),
-            kwargs.get("bridge_overrides_json", "{}"),
-        )
-        scene = _resolve_active_scene(project)
-        _rs, _re, proj_w, proj_h = _resolve_render_window(project, scene)
+        # ``project`` is the Editor's project, or the identity the cache pipeline
+        # put in its place; loop clones copy it from this node.
+        overrides = kwargs.get("bridge_overrides_json", "{}")
+        recipe, snapshots = cache_identity.resolve(
+            project, "SonderGuidesBridgeStart", lambda value: guides_recipe(value, overrides),
+            "connect project to the Sonder Editor")
         passthrough = tuple(kwargs.get(f"value_{i}") for i in range(MAX_PASSTHROUGH))
-
-        try:
-            iteration_index = int(iteration_index)
-        except (TypeError, ValueError):
-            iteration_index = 0
-
-        if not guides or iteration_index < 0 or iteration_index >= len(guides):
-            # Empty/out-of-range placeholder: black image with strength 0.0 so downstream
-            # guide conditioning treats it as inert. Corrupt-image branch below preserves
-            # the configured guide strength (different semantic — real guide exists).
-            return (FLOW_SENTINEL, _empty_image(proj_w, proj_h), 0, 0.0) + passthrough
-
-        guide = guides[iteration_index]
-        img = _load_guide_image_bridge(
-            guide["asset_path"], guide["asset_type"], proj_w, proj_h,
-            fit_mode=guide.get("fit_mode", "pad_edge"),
-            crop_position=guide.get("crop_position", "center"),
-        )
-        if img is None:
-            return (
-                FLOW_SENTINEL,
-                _empty_image(proj_w, proj_h),
-                int(guide["local_idx"]),
-                float(guide["strength"]),
-            ) + passthrough
-
-        return (
-            FLOW_SENTINEL,
-            img.unsqueeze(0),
-            int(guide["local_idx"]),
-            float(guide["strength"]),
-        ) + passthrough
+        with cache_identity.reading(snapshots):
+            image, frame_index, strength = decode_guides_recipe(recipe, iteration_index)
+        return (FLOW_SENTINEL, image, frame_index, strength) + passthrough
 
 
 # ── SonderGuidesBridgeEnd ─────────────────────────────────────────────

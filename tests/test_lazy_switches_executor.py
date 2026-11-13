@@ -34,5 +34,7 @@ def test_lazy_nodes_through_real_executor():
     assert result.returncode == 0, result.stdout + result.stderr
     report_line = next(line for line in result.stdout.splitlines() if line.startswith("SONDER_LAZY_REPORT="))
     report = json.loads(report_line.split("=", 1)[1])
-    assert len(report["cases"]) == 26, report
+    # 26 scheduler cases plus 8 Phase 3 prediction cases (cold, warm and shared each).
+    assert len(report["cases"]) == 34, report
+    assert sum(case["name"].startswith("predict-") for case in report["cases"]) == 8
     assert all(case["passed"] for case in report["cases"]), report

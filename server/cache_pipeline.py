@@ -51,7 +51,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from . import run_scope, sdk_runs
+from . import run_preparation, run_scope, sdk_runs
 from ..nodes import cache_policy, prompt_once
 
 logger = logging.getLogger(__name__)
@@ -107,6 +107,9 @@ class ExecutorRuntime:
     call_v3: Callable[[type, dict, Any], Any] | None = None
     own_lazy_status: Callable[[type], bool] | None = None
     node_output_type: type | None = None
+    # Media identity (Phase 3): True only when the gate vouched that a bridge can
+    # find its run through the executing context (executor_hook.check_identity_context).
+    identity: bool = False
 
 
 @dataclass(frozen=True)
@@ -187,11 +190,15 @@ def _cheap_exits(prompt: dict) -> tuple[str, str, tuple[str, ...]]:
     return editor_id, key, roots
 
 
-def certain_closure(roots, get_node: Callable[[str], dict], is_lazy: Callable[[str, str], bool]) -> set[str]:
+def certain_closure(roots, get_node: Callable[[str], dict], is_lazy: Callable[[str, str], bool],
+                    requested: Callable[[str], Any] | None = None) -> set[str]:
     """Nodes reached from ``roots`` over non-lazy links: ComfyUI's ``add_node`` rule.
 
     Under the Editor's NaN every node between a root and the Editor is uncached,
-    so membership here equals "stock ComfyUI would run the Editor".
+    so membership here equals "stock ComfyUI would run the Editor". A lazy input
+    is followed only when ``requested(node_id)`` names it: a Sonder router whose
+    own rule, given values it will certainly receive, asks for that input on the
+    scheduler's first lazy check (``router_requests``).
     """
     seen: set[str] = set()
     stack = [str(root) for root in roots]
@@ -200,10 +207,48 @@ def certain_closure(roots, get_node: Callable[[str], dict], is_lazy: Callable[[s
         if node_id in seen:
             continue
         seen.add(node_id)
+        follow = frozenset(requested(node_id) or ()) if requested is not None else frozenset()
         for name, value in (get_node(node_id).get("inputs") or {}).items():
-            if is_link(value) and not is_lazy(node_id, name):
+            if is_link(value) and (name in follow or not is_lazy(node_id, name)):
                 stack.append(str(value[0]))
     return seen
+
+
+def router_requests(class_def: Any, inputs: dict, resolve: Callable[[str], Any],
+                    is_lazy_input: Callable[[str], bool]) -> list[str]:
+    """The lazy inputs a Sonder router will certainly request on its first lazy check, or ``[]``.
+
+    Each ``deciding`` input must be known: a literal in ``inputs`` (the view after
+    the M1 plan, so an Editor or bridge value the planner substituted into this
+    router counts), or a link ``resolve`` proves (``run_preparation``'s static
+    resolver: Primitives and ``SonderSelector``). An absent input is passed as
+    absent, as the scheduler does. ``connected`` is every linked lazy input:
+    under the Editor's NaN, a branch that reaches the Editor or a bridge is
+    unevaluated at that check. Anything unknown, or a raise from the rule,
+    follows nothing (today's behaviour). Only names in ``connected`` are returned.
+    """
+    declared = cache_policy.lazy_policy(class_def)
+    if declared is None:
+        return []
+    method = getattr(class_def, declared.method, None)
+    if not callable(method):
+        return []
+    deciding: dict[str, Any] = {}
+    for name in declared.deciding:
+        if name not in inputs:
+            continue
+        value = inputs[name]
+        if is_link(value):
+            value = resolve(name)
+            if value is run_preparation.UNRESOLVED:
+                return []
+        deciding[name] = value
+    connected = frozenset(name for name, value in inputs.items() if is_link(value) and is_lazy_input(name))
+    try:
+        names = method(deciding, connected)
+    except Exception:
+        return []
+    return [name for name in (names or ()) if isinstance(name, str) and name in connected]
 
 
 def _hidden_names(class_def: Any) -> set[str]:
@@ -359,15 +404,19 @@ def _has_literal_consumer(nodes_view: dict[str, dict], producer_id: str, class_d
 
 def select_bridges(nodes_view: dict[str, dict], closure: set[str], editor_id: str, editor_class: Any,
                    class_of: Callable[[str], Any], input_type_of: Callable[[str, str], Any],
-                   shape_of: Callable[[Any], str | None]) -> tuple[list[str], dict[str, set[str]], dict[str, str]]:
+                   shape_of: Callable[[Any], str | None],
+                   feeds_identity: Callable[[str], bool] | None = None,
+                   ) -> tuple[list[str], dict[str, set[str]], dict[str, str]]:
     """``(order, needs, reasons)``: the bridges to prepare, producers first. Pure.
 
     A node is selected when its class declares ``PREPARES``, it is in the
     certain-to-execute closure (under the Editor's NaN, "stock would run it"),
     its shape is callable, every link input is the Editor's ``PER_RUN`` project or
     a ``HANDLE`` of another selected node, and it has a consumer to gain (a
-    literal consumer of an ``EXACT`` output, or a handle feeding a node that has
-    one). ``reasons`` names why each other ``PREPARES`` node was left alone.
+    literal consumer of an ``EXACT`` output, a handle feeding a node that has
+    one, or a handle feeding a node the identity pass may identify:
+    ``feeds_identity(node_id)``). ``reasons`` names why each other ``PREPARES``
+    node was left alone.
     """
     reasons: dict[str, str] = {}
     candidates: dict[str, Any] = {}
@@ -413,7 +462,8 @@ def select_bridges(nodes_view: dict[str, dict], closure: set[str], editor_id: st
                 reasons[node_id] = "producer_failed"
                 changed = True
     useful = {node_id for node_id in needs
-              if _has_literal_consumer(nodes_view, node_id, candidates[node_id], input_type_of)}
+              if _has_literal_consumer(nodes_view, node_id, candidates[node_id], input_type_of)
+              or (feeds_identity is not None and feeds_identity(node_id))}
     changed = True
     while changed:
         changed = False
@@ -502,34 +552,234 @@ def _run_bridge(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, node_i
     return _bridge_values(runtime, class_def, out)
 
 
-def _prepare_bridges(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, nodes_view: dict[str, dict],
-                     closure: set[str], editor_id: str, editor_class: Any, editor_result: tuple,
-                     mappings: dict, input_type_of: Callable[[str, str], Any],
-                     record: dict[str, Any]) -> dict[str, Producer]:
-    """Run every selected bridge, producers first; the prepared ones as planner producers."""
-    order, needs, reasons = select_bridges(
-        nodes_view, closure, editor_id, editor_class, mappings.get, input_type_of,
-        lambda class_def: shape_reason(runtime, class_def))
+def _bridge_rounds(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, nodes_view: dict[str, dict],
+                   roots, editor_id: str, editor_class: Any, editor_result: tuple,
+                   mappings: dict, input_type_of: Callable[[str, str], Any], is_lazy: Callable[[str, str], bool],
+                   requested_by: Callable[[dict], Callable[[str], list[str]]], editor_overrides: dict[str, dict],
+                   record: dict[str, Any], feeds_identity: Callable[[str], bool] | None = None,
+                   ) -> tuple[dict[str, Producer], set[str]]:
+    """Prepare bridges in rounds; ``(producers, final closure)``.
+
+    Each round recomputes stock's closure with every Sonder router decided by the
+    values substituted so far (the Editor's, then each round's bridges'), so a
+    bridge behind a router whose ``select`` is ``has_driver`` becomes certain once
+    the Driver Selector is prepared. Rounds stop when no new bridge is selectable;
+    there are at most one more than the routers in view.
+    """
+    editor_producer = {editor_id: producer_for(editor_class, editor_result)}
     sources: dict[str, tuple] = {editor_id: editor_result}
     producers: dict[str, Producer] = {}
-    for node_id in order:
-        if any(source not in producers for source in needs[node_id]):
-            reasons[node_id] = "producer_failed"
+    failed: dict[str, str] = {}
+    reasons: dict[str, str] = {}
+    view_overrides = editor_overrides
+    routers = sum(1 for node in nodes_view.values() if isinstance(node, dict)
+                  and cache_policy.lazy_policy(mappings.get(node.get("class_type"))) is not None)
+    for _round in range(routers + 1):
+        closure = certain_closure(roots, dynprompt.get_node, is_lazy, requested_by(view_overrides))
+        order, needs, reasons = select_bridges(
+            nodes_view, closure, editor_id, editor_class, mappings.get, input_type_of,
+            lambda class_def: shape_reason(runtime, class_def), feeds_identity)
+        new = [node_id for node_id in order if node_id not in producers and node_id not in failed]
+        if not new:
+            break
+        for node_id in new:
+            if any(source not in producers for source in needs[node_id]):
+                failed[node_id] = "producer_failed"
+                continue
+            class_def = mappings[nodes_view[node_id]["class_type"]]
+            try:
+                values = _run_bridge(runtime, prompt_id, dynprompt, node_id, class_def, sources)
+            except _BridgeSkip as skip:
+                failed[node_id] = skip.reason
+                continue
+            sources[node_id] = values
+            producers[node_id] = producer_for(class_def, values)
+        view_overrides, _skips = plan_substitutions(nodes_view, {**editor_producer, **producers}, input_type_of)
+    # The closure the identity pass reads: every router decided by every value prepared.
+    closure = certain_closure(roots, dynprompt.get_node, is_lazy, requested_by(view_overrides))
+    final = {node_id: reason for node_id, reason in reasons.items() if node_id not in producers}
+    final.update(failed)
+    outcomes = record["bridges"]
+    outcomes["prepared"] = len(producers)
+    for reason in final.values():
+        record["bridge_reasons"][reason] = record["bridge_reasons"].get(reason, 0) + 1
+    outcomes["skipped"] = len(final)
+    return producers, closure
+
+
+# --- Media identity (M2): bridges whose outputs are a recipe plus file content --------------
+
+
+def _consumed(nodes_view: dict[str, dict], node_id: str) -> bool:
+    return any(is_link(value) and str(value[0]) == node_id
+               for other_id, node in nodes_view.items() if other_id != node_id and isinstance(node, dict)
+               for value in (node.get("inputs") or {}).values())
+
+
+def _identity_candidate(nodes_view: dict[str, dict], node_id: str, class_def: Any) -> str | None:
+    """Why ``node_id`` can never be identified, from the graph alone, or None.
+
+    Its recipe inputs must be literals (the recipe is computed before any other
+    node runs) and some node must consume it (skipping its decode is the gain).
+    """
+    declared = cache_policy.identity_policy(class_def)
+    inputs = nodes_view[node_id].get("inputs") or {}
+    if not is_link(inputs.get(declared.token_input)):
+        return "linked_input"
+    if any(is_link(inputs.get(name)) for name in declared.recipe_inputs):
+        return "linked_input"
+    if not _consumed(nodes_view, node_id):
+        return "unused"
+    return None
+
+
+def identity_feeds(nodes_view: dict[str, dict], class_of: Callable[[str], Any]) -> Callable[[str], bool]:
+    """``feeds_identity`` for ``select_bridges``: a producer whose ``HANDLE`` reaches an
+    identity candidate's token input is worth preparing even with no literal consumer."""
+    feeding: set[str] = set()
+    for node_id, node in nodes_view.items():
+        class_def = class_of(node.get("class_type")) if isinstance(node, dict) else None
+        declared = cache_policy.identity_policy(class_def) if class_def is not None else None
+        if declared is None or _identity_candidate(nodes_view, node_id, class_def) is not None:
             continue
-        class_def = mappings[nodes_view[node_id]["class_type"]]
+        link = (node.get("inputs") or {}).get(declared.token_input)
+        source_class = class_of((nodes_view.get(str(link[0])) or {}).get("class_type"))
+        slot = _slot_index(link)
+        if source_class is not None and slot is not None and \
+                cache_policy.slot_policy(source_class, slot) == cache_policy.HANDLE:
+            feeding.add(str(link[0]))
+    return feeding.__contains__
+
+
+def select_identified(nodes_view: dict[str, dict], closure: set[str], editor_id: str, editor_class: Any,
+                      producers: dict[str, Producer], prepared_candidates: set[str],
+                      class_of: Callable[[str], Any], shape_of: Callable[[Any], str | None],
+                      ) -> tuple[list[str], dict[str, str]]:
+    """``(selected, reasons)``: the bridges whose media gets an identity this prompt. Pure.
+
+    A node is selected when its class declares ``IDENTIFIES``, it is in the final
+    closure (under the Editor's NaN, "stock would run it"), its shape is callable,
+    its ``token_input`` links to the Editor's ``PER_RUN`` project or to a prepared
+    producer's ``HANDLE``, every recipe input is a literal, and something consumes it.
+    """
+    selected: list[str] = []
+    reasons: dict[str, str] = {}
+    for node_id in sorted(nodes_view):
+        node = nodes_view[node_id]
+        class_def = class_of(node.get("class_type")) if isinstance(node, dict) else None
+        declared = cache_policy.identity_policy(class_def) if class_def is not None else None
+        if declared is None:
+            continue
+        if node_id not in closure:
+            reasons[node_id] = "not_certain"
+            continue
+        if shape_of(class_def) is not None:
+            reasons[node_id] = "shape"
+            continue
+        reason = _identity_candidate(nodes_view, node_id, class_def)
+        if reason is not None:
+            reasons[node_id] = reason
+            continue
+        link = node["inputs"][declared.token_input]
+        source, slot = str(link[0]), _slot_index(link)
+        if source == editor_id:
+            ok = (slot is not None and slot < len(editor_class.RETURN_TYPES)
+                  and editor_class.RETURN_TYPES[slot] == "SONDER_PROJECT"
+                  and cache_policy.slot_policy(editor_class, slot) == cache_policy.PER_RUN)
+        elif source in producers:
+            ok = slot is not None and producers[source].slot_policy(slot) == cache_policy.HANDLE
+        else:
+            reasons[node_id] = "producer_failed" if source in prepared_candidates else "linked_input"
+            continue
+        if not ok:
+            reasons[node_id] = "linked_input"
+            continue
+        selected.append(node_id)
+    return selected, reasons
+
+
+def _identity_args(runtime: ExecutorRuntime, dynprompt: Any, node_id: str, class_def: Any,
+                   handle: Any) -> dict[str, Any]:
+    """``cache_recipe``'s arguments: the token input's value and the recipe inputs, as scheduled."""
+    declared = cache_policy.identity_policy(class_def)
+    inputs = dynprompt.get_node(node_id).get("inputs") or {}
+    resolved, missing, _v3_data = runtime.get_input_data(inputs, class_def, node_id, None, dynprompt, {})
+    args: dict[str, Any] = {declared.token_input: handle}
+    for name in declared.recipe_inputs:
+        if name not in resolved:
+            continue  # absent optional input: cache_recipe's default, as execute's
+        values = resolved[name]
+        if name in missing or not isinstance(values, (list, tuple)) or len(values) != 1:
+            raise _BridgeSkip("linked_input")
+        args[name] = values[0]
+    return args
+
+
+def _identity_pass(runtime: ExecutorRuntime, prompt_id: str, key: str, dynprompt: Any,
+                   nodes_view: dict[str, dict], closure: set[str], editor_id: str, editor_class: Any,
+                   editor_result: tuple, producers: dict[str, Producer], prepared_candidates: set[str],
+                   mappings: dict, overrides: dict[str, dict], record: dict[str, Any]) -> dict[str, dict]:
+    """Identify every selected bridge; their token overrides, merged over ``overrides``.
+
+    For each: ``cache_recipe`` (pure) under the node's context, then the full
+    content hash of every source (``cache_identity.identify``, which checks for an
+    interrupt between chunks), then registration on the run record. Any failure
+    leaves that bridge on its stock path; nothing is stored for it.
+    """
+    from ..nodes import cache_identity
+
+    selected, reasons = select_identified(
+        nodes_view, closure, editor_id, editor_class, producers, prepared_candidates, mappings.get,
+        lambda class_def: shape_reason(runtime, class_def))
+    tokens: dict[str, dict] = {}
+    memo: dict[str, tuple] = {}
+    for node_id in selected:
+        class_type = nodes_view[node_id]["class_type"]
+        class_def = mappings[class_type]
+        declared = cache_policy.identity_policy(class_def)
+        link = nodes_view[node_id]["inputs"][declared.token_input]
+        source, slot = str(link[0]), _slot_index(link)
+        handle = editor_result[slot] if source == editor_id else producers[source].result[slot]
         try:
-            values = _run_bridge(runtime, prompt_id, dynprompt, node_id, class_def, sources)
+            args = _identity_args(runtime, dynprompt, node_id, class_def, handle)
+            with runtime.node_context(prompt_id, node_id, 0):
+                runtime.before_node_execution()
+                with runtime.inference_mode():
+                    try:
+                        recipe = class_def.cache_recipe(**args)
+                    except runtime.interrupt_type:
+                        raise
+                    except Exception as exc:
+                        logger.debug("Sonder cache pipeline: %s (%s) has no media identity: %s",
+                                     node_id, class_type, type(exc).__name__)
+                        raise _BridgeSkip("recipe_failed") from None
+                try:
+                    token, recipe_json, snapshots = cache_identity.identify(
+                        class_type, recipe, runtime.before_node_execution, memo)
+                except cache_identity.RecipeNotCanonical:
+                    raise _BridgeSkip("recipe_not_json") from None
+                except cache_identity.SourceUnstable:
+                    raise _BridgeSkip("source_unstable") from None
+                except cache_identity.SourceTooLarge:
+                    raise _BridgeSkip("source_too_large") from None
+                except (cache_identity.SourceMissing, OSError):
+                    raise _BridgeSkip("source_missing") from None
         except _BridgeSkip as skip:
             reasons[node_id] = skip.reason
             continue
-        sources[node_id] = values
-        producers[node_id] = producer_for(class_def, values)
-    outcomes = record["bridges"]
-    outcomes["prepared"] = len(producers)
+        refused = sdk_runs.register_identity(key, prompt_id, token, class_type, recipe_json, snapshots)
+        if refused:
+            reasons[node_id] = refused
+            continue
+        base = overrides.get(node_id) or nodes_view[node_id]
+        replacement = copy.deepcopy(base)
+        replacement["inputs"][declared.token_input] = token
+        tokens[node_id] = replacement
+    record["identities"] = {"identified": len(tokens), "skipped": len(reasons)}
     for reason in reasons.values():
-        record["bridge_reasons"][reason] = record["bridge_reasons"].get(reason, 0) + 1
-    outcomes["skipped"] = len(reasons)
-    return producers
+        record["identity_reasons"][reason] = record["identity_reasons"].get(reason, 0) + 1
+    record["identity_bytes"] = sum(int(snapshot[0]) for _digest, snapshot in memo.values())
+    return tokens
 
 
 # --- Preparation -------------------------------------------------------------------
@@ -546,7 +796,7 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any) -> dict[st
     timings: dict[str, float] = {}
     record: dict[str, Any] = {"outcome": SKIPPED, "reason": "", "editor": "", "substituted": 0,
                               "skipped": 0, "skip_reasons": {}, "bridges": {}, "bridge_reasons": {},
-                              "timings_ms": timings}
+                              "identities": {}, "identity_reasons": {}, "timings_ms": timings}
     key = ""
     try:
         prompt = dynprompt.get_original_prompt()
@@ -573,11 +823,30 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any) -> dict[st
             extra = info[2] if isinstance(info, tuple) and len(info) == 3 else None
             return isinstance(extra, dict) and bool(extra.get("lazy"))
 
-        closure = certain_closure(roots, dynprompt.get_node, is_lazy)
+        mappings = runtime.class_mappings()
+        followed: set[tuple[str, str]] = set()
+
+        def requested_by(view: dict[str, dict]) -> Callable[[str], list[str]]:
+            """Lazy inputs each Sonder router in ``view`` (node id -> current node) will request."""
+            def requested(node_id: str) -> list[str]:
+                node = view.get(node_id) or dynprompt.get_node(node_id)
+                class_def = mappings.get(node.get("class_type")) if isinstance(node, dict) else None
+                if class_def is None or cache_policy.lazy_policy(class_def) is None:
+                    return []
+                names = router_requests(
+                    class_def, node.get("inputs") or {},
+                    lambda name: run_preparation.resolve_input_literal(prompt, node_id, name),
+                    lambda name: is_lazy(node_id, name))
+                followed.update((node_id, name) for name in names)
+                return names
+            return requested
+
+        # Stock's graph, with routers decided by literals and static values only:
+        # the Editor has not run, so none of its values is known yet.
+        closure = certain_closure(roots, dynprompt.get_node, is_lazy, requested_by({}))
         timings["closure"] = _ms(step)
         if editor_id not in closure:
             raise _Skip("not_certain")
-        mappings = runtime.class_mappings()
         editor_class = mappings[EDITOR_CLASS_TYPE]
         if not cache_policy.declared_policies(editor_class):
             # Another class registered under the Editor's id: its repeat-safety
@@ -613,24 +882,50 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any) -> dict[st
         # The bridge pass is isolated: a fault in it keeps the Editor's plan, so
         # Phase 2 can never regress Phase 1. An interrupt still propagates.
         step = time.perf_counter()
+        producers: dict[str, Producer] = {}
         try:
-            producers = _prepare_bridges(runtime, prompt_id, dynprompt, nodes_view, closure, editor_id,
-                                         editor_class, result, mappings, input_type_of, record)
+            producers, closure = _bridge_rounds(
+                runtime, prompt_id, dynprompt, nodes_view, roots, editor_id, editor_class, result,
+                mappings, input_type_of, is_lazy, requested_by, overrides, record,
+                identity_feeds(nodes_view, mappings.get) if runtime.identity else None)
             if producers:
                 overrides, skips = plan_substitutions(nodes_view, {**editor_producer, **producers}, input_type_of)
         except runtime.interrupt_type:
             raise
         except Exception as exc:
+            producers = {}
             record["bridge_reasons"]["bridge_pass_error"] = 1
             record["bridge_error"] = type(exc).__name__
             logger.debug("Sonder cache pipeline: the bridge pass failed; only the Editor's values are reused",
                          exc_info=True)
         timings["bridges"] = _ms(step)
+        record["lazy_followed"] = len(followed)
+
+        # Media identity, isolated like the bridge pass: a fault keeps every value
+        # substitution and drops only the tokens. An interrupt still propagates.
+        substituted = len(overrides)
+        step = time.perf_counter()
+        if runtime.identity:
+            try:
+                candidates = {node_id for node_id, node in nodes_view.items() if isinstance(node, dict)
+                              and cache_policy.prepare_policy(mappings.get(node.get("class_type"))) is not None}
+                tokens = _identity_pass(runtime, prompt_id, key, dynprompt, nodes_view, closure, editor_id,
+                                        editor_class, result, producers, candidates - set(producers), mappings,
+                                        overrides, record)
+                overrides = {**overrides, **tokens}
+            except runtime.interrupt_type:
+                raise
+            except Exception as exc:
+                record["identity_reasons"]["identity_pass_error"] = 1
+                record["identity_error"] = type(exc).__name__
+                logger.debug("Sonder cache pipeline: the identity pass failed; bridge media decodes as before",
+                             exc_info=True)
+        timings["identity"] = _ms(step)
 
         # Applied only once the whole plan exists, so a planning fault leaves none.
         for node_id, node in overrides.items():
             dynprompt.override_node(node_id, node)
-        record.update(outcome=PREPARED, substituted=len(overrides), skipped=len(skips))
+        record.update(outcome=PREPARED, substituted=substituted, skipped=len(skips))
         for item in skips:
             record["skip_reasons"][item["reason"]] = record["skip_reasons"].get(item["reason"], 0) + 1
         return record

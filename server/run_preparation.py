@@ -86,6 +86,16 @@ def _link(value: Any) -> tuple[str, Any] | None:
     return node_id, value[1] if len(value) > 1 else 0
 
 
+def resolve_input_literal(prompt: dict, node_id: str, name: str) -> Any:
+    """The literal ``node_id``'s input ``name`` carries when the prompt runs, or ``UNRESOLVED``.
+
+    The cache pipeline's reading of a Sonder router's deciding inputs (literals,
+    Primitives, ``SonderSelector``). Nothing is volatile by then: seed rewrites
+    happen before a prompt is queued.
+    """
+    return _resolve(prompt, node_id, name, set())
+
+
 def _resolve(prompt: dict, node_id: str, name: str, volatile: set, depth: int = 0) -> Any:
     """The literal ``node_id``'s input ``name`` carries at execution, or UNRESOLVED."""
     if depth > _LINK_DEPTH or (node_id, name) in volatile:

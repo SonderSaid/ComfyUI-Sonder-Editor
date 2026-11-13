@@ -7,6 +7,7 @@ executor names the hook hands ``prepare``.
 
 import contextlib
 import importlib
+import os
 import sys
 import threading
 import types
@@ -38,7 +39,8 @@ def _clean():
     pipeline.reset_for_tests()
     run_scope.reset_for_tests({name: False for name in (
         "SonderEditor", "Encode", "Sampler", "Save", "Switch", "Combo", "Wild", "Raw", "Out",
-        "Relay", "Masks", "Selector", "PromptB", "ImageB", "LazyB", "Num")})
+        "Relay", "Masks", "Selector", "PromptB", "ImageB", "LazyB", "Num", "Router", "AnyGate",
+        "SonderSelector", "PrimitiveInt", "MediaB", "Consumer")})
     yield
     sdk_runs.reset_for_tests()
     run_scope.reset_for_tests()
@@ -160,7 +162,52 @@ class LazyB(Relay):
         return {"required": {"project": ("SONDER_PROJECT", {"lazy": True})}}
 
 
-BRIDGES = {cls.__name__: cls for cls in (Relay, Masks, Selector, PromptB, ImageB, LazyB)}
+class Router:
+    """A Sonder router in miniature: ``select`` picks lazy input ``a`` (0) or ``b`` (1)."""
+
+    SONDER_CACHE_LAZY = policy.LAZY_REQUESTS(method="requested_lazy_inputs", deciding=("select",))
+    asked: list = []
+
+    @classmethod
+    def requested_lazy_inputs(cls, deciding, connected):
+        Router.asked.append((dict(deciding), set(connected)))
+        key = ("a", "b")[int(deciding["select"])]
+        return [key, "not_connected"] if key in connected else ["not_connected"]
+
+
+class AnyGate(Router):
+    """A Gate in miniature: an any-type ``when`` opens lazy ``value``."""
+
+    SONDER_CACHE_LAZY = policy.LAZY_REQUESTS(method="requested_lazy_inputs", deciding=("when",))
+
+    @classmethod
+    def requested_lazy_inputs(cls, deciding, connected):
+        return ["value"] if deciding.get("when") and "value" in connected else []
+
+
+class MediaB(_Bridge):
+    """An identified media bridge: a recipe from the handle plus one source file."""
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("r01",)
+    SONDER_CACHE_POLICY = {"r01": policy.DESCRIPTOR}
+    SONDER_CACHE_INVALIDATION = {"r01": policy.IDENTITY_INVALIDATION}
+    SONDER_CACHE_IDENTITY = policy.IDENTIFIES(token_input="reference_set", recipe_inputs=("unused_slots",))
+    source = ""
+    recipe_fault = None
+
+    @classmethod
+    def cache_recipe(cls, reference_set, unused_slots="placeholder"):
+        _Bridge.calls.append(("MediaB.cache_recipe", {"lanes": reference_set["lanes"], "unused_slots": unused_slots}))
+        if cls.recipe_fault is not None:
+            raise cls.recipe_fault
+        return {"lanes": reference_set["lanes"], "unused_slots": unused_slots, "sources": [cls.source]}
+
+    def execute(self, reference_set, unused_slots="placeholder"):
+        return ("IMAGE",)
+
+
+BRIDGES = {cls.__name__: cls for cls in (Relay, Masks, Selector, PromptB, ImageB, LazyB, Router, AnyGate, MediaB)}
 
 
 class FakeDynPrompt:
@@ -201,6 +248,10 @@ CONSUMERS = {
     "PromptB": {"reference_set": ("SONDER_REFERENCE_SET", {})},
     "ImageB": {"reference_set": ("SONDER_REFERENCE_SET", {})},
     "LazyB": {"project": ("SONDER_PROJECT", {})},
+    "Router": {"select": ("INT", {}), "a": ("*", {"lazy": True}), "b": ("*", {"lazy": True})},
+    "AnyGate": {"when": ("*", {}), "value": ("*", {"lazy": True})},
+    "MediaB": {"reference_set": ("SONDER_REFERENCE_SET", {}), "unused_slots": ("STRING", {})},
+    "Consumer": {"image": ("IMAGE", {})},
 }
 
 
@@ -814,3 +865,228 @@ def test_shape_rejects_what_the_pipeline_cannot_call_as_scheduled(change, reason
         Odd.OUTPUT_IS_LIST = (False, True)
     assert pipeline.shape_reason(_runtime(), Relay) is None
     assert pipeline.shape_reason(_runtime(), Odd) == reason
+
+
+# --- Phase 3, Part A: certainty through Sonder routers ------------------------------------
+
+
+def _requests(router_inputs, prompt=None, lazy=("a", "b")):
+    prompt = prompt or {"20": {"class_type": "Router", "inputs": router_inputs}}
+    run_preparation = _module("server.run_preparation")
+    return pipeline.router_requests(
+        Router, router_inputs, lambda name: run_preparation.resolve_input_literal(prompt, "20", name),
+        lambda name: name in lazy)
+
+
+def test_a_router_is_followed_only_on_values_known_before_cache_keys():
+    linked = {"a": ["5", 0], "b": ["6", 0]}
+    assert _requests({"select": 1, **linked}) == ["b"]          # a literal (or a substituted value)
+    assert _requests({"select": 0, **linked}) == ["a"]
+    assert _requests({"select": 1, "a": ["5", 0], "b": "literal"}) == []  # nothing unevaluated to request
+    primitive = {"20": {"class_type": "Router", "inputs": {"select": ["9", 0], **linked}},
+                 "9": {"class_type": "PrimitiveInt", "inputs": {"value": 1}}}
+    assert _requests(primitive["20"]["inputs"], primitive) == ["b"]
+    selector = {"20": {"class_type": "Router", "inputs": {"select": ["9", 1], **linked}},
+                "9": {"class_type": "SonderSelector", "inputs": {"choice": "two", "choice_list": "one\ntwo"}}}
+    assert _requests(selector["20"]["inputs"], selector) == ["b"]
+    unresolved = {"20": {"class_type": "Router", "inputs": {"select": ["9", 0], **linked}},
+                  "9": {"class_type": "Wild", "inputs": {}}}
+    assert _requests(unresolved["20"]["inputs"], unresolved) == []
+    assert _requests({"select": 7, **linked}) == []             # the rule raises: follow nothing
+    assert _requests({**linked}) == []                          # an absent input is absent; the rule raises
+
+
+def test_the_closure_follows_exactly_what_a_router_requests():
+    graph = {"out": {"inputs": {"v": ["sw", 0]}},
+             "sw": {"class_type": "Router", "inputs": {"select": 1, "a": ["x", 0], "b": ["y", 0]}},
+             "x": {"inputs": {}}, "y": {"inputs": {"up": ["z", 0]}}, "z": {"inputs": {}}}
+    lazy = {("sw", "a"), ("sw", "b")}
+    closure = pipeline.certain_closure(
+        ["out"], graph.__getitem__, lambda node, name: (node, name) in lazy,
+        lambda node: _requests(graph[node]["inputs"]) if node == "sw" else [])
+    assert closure == {"out", "sw", "y", "z"}
+
+
+def test_an_editor_behind_a_router_with_a_fixed_choice_is_certain():
+    for select, expected in ((0, "prepared"), (1, "skipped")):
+        _reset_editor()
+        sdk_runs.reset_for_tests()
+        graph = _graph(**{"20": {"class_type": "Router", "inputs": {"select": select, "a": ["2", 0], "b": "x"}},
+                          "30": {"class_type": "Out", "inputs": {"value": ["20", 0]}}})
+        del graph["3"]
+        dynprompt = _open(graph, roots=("30",))
+        record = pipeline.prepare(_runtime(), "p1", dynprompt)
+        assert record["outcome"] == expected, record
+        assert (record["reason"] == "not_certain") is (expected == "skipped")
+
+
+def test_a_bridge_behind_a_router_decided_by_a_prepared_value_is_prepared_in_a_later_round():
+    _reset_bridges()
+    Router.asked = []
+    graph = _bridge_graph(**{
+        "10": {"class_type": "Selector", "inputs": {"project": ["1", 0], "lanes": "0"}},
+        "20": {"class_type": "Router", "inputs": {"select": ["10", 1], "a": "off", "b": ["5", 0]}},
+        "4": {"class_type": "Relay", "inputs": {"project": ["1", 0]}},
+        "5": {"class_type": "Out", "inputs": {"value": ["4", 0]}},
+        "30": {"class_type": "Out", "inputs": {"value": ["20", 0]}},
+    })
+    dynprompt = _open(graph, roots=("3", "30"))
+    record = pipeline.prepare(_runtime(), "p1", dynprompt)
+    # Round 1 prepares the Selector (its has_reference feeds the router's INT select);
+    # round 2 knows select = 1, follows "b", and the Relay behind it becomes certain.
+    assert [name for name, _ in _Bridge.calls] == ["Selector", "Relay"]
+    assert dynprompt.node_overrides["20"]["inputs"]["select"] == 1
+    assert dynprompt.node_overrides["5"]["inputs"] == {"value": "relay text"}
+    assert record["bridges"]["prepared"] == 2 and record["lazy_followed"] == 1
+    # The rule only ever saw linked lazy inputs, and its stray name was dropped.
+    assert all(connected <= {"a", "b"} for _deciding, connected in Router.asked)
+
+
+def test_a_wildcard_deciding_input_is_never_substituted_so_it_is_never_followed():
+    _reset_bridges()
+    graph = _bridge_graph(**{
+        "10": {"class_type": "Selector", "inputs": {"project": ["1", 0], "lanes": "0"}},
+        "21": {"class_type": "Num", "inputs": {"value": 1.0, "flag": ["10", 1]}},  # makes the Selector useful
+        "20": {"class_type": "AnyGate", "inputs": {"when": ["10", 1], "value": ["5", 0]}},
+        "4": {"class_type": "Relay", "inputs": {"project": ["1", 0]}},
+        "5": {"class_type": "Out", "inputs": {"value": ["4", 0]}},
+        "30": {"class_type": "Out", "inputs": {"value": ["20", 0]}},
+    })
+    dynprompt = _open(graph, roots=("3", "30", "21"))
+    record = pipeline.prepare(_runtime(), "p1", dynprompt)
+    assert [name for name, _ in _Bridge.calls] == ["Selector"]
+    assert "20" not in dynprompt.node_overrides
+    assert record["bridge_reasons"].get("not_certain") == 1 and record["lazy_followed"] == 0
+
+
+# --- Phase 3, Part B: media identity --------------------------------------------------------
+
+
+def _media_graph(**extra):
+    graph = _bridge_graph(**{
+        "10": {"class_type": "Selector", "inputs": {"project": ["1", 0], "lanes": "0"}},
+        "13": {"class_type": "MediaB", "inputs": {"reference_set": ["10", 0], "unused_slots": "nothing"}},
+        "23": {"class_type": "Consumer", "inputs": {"image": ["13", 0]}},
+    })
+    graph.update(extra)
+    return graph
+
+
+def _reset_media(tmp_path, content=b"media bytes"):
+    project = _reset_bridges()
+    MediaB.source = str(tmp_path / "member.png")
+    Path(MediaB.source).write_bytes(content)
+    MediaB.recipe_fault = None
+    return project
+
+
+def test_a_media_bridge_gets_a_registered_token_and_its_selector_is_prepared_for_it(tmp_path):
+    _reset_media(tmp_path)
+    graph = _media_graph()
+    dynprompt = _open(graph, roots=("3", "23"))
+    record = pipeline.prepare(_runtime(identity=True), "p1", dynprompt)
+    # The Selector has no literal consumer: it is prepared because its handle feeds MediaB.
+    assert [name for name, _ in _Bridge.calls] == ["Selector", "MediaB.cache_recipe"]
+    assert _Bridge.calls[1][1] == {"lanes": "0", "unused_slots": "nothing"}
+    token = dynprompt.node_overrides["13"]["inputs"]["reference_set"]
+    assert token.startswith("sonder-identity:v1:") and dynprompt.node_overrides["13"]["inputs"]["unused_slots"] == "nothing"
+    assert graph["13"]["inputs"]["reference_set"] == ["10", 0]  # the submitted graph is untouched
+    class_type, recipe_json, snapshots = sdk_runs.identity_for("p1", token)
+    assert class_type == "MediaB" and list(snapshots) == [MediaB.source]
+    assert record["identities"] == {"identified": 1, "skipped": 0} and record["identity_bytes"] == 11
+    assert "identity" in record["timings_ms"]
+    # The same graph over the same bytes is the same token; one byte more is another.
+    sdk_runs.reset_for_tests()
+    _reset_media(tmp_path)
+    again = _open(_media_graph(), roots=("3", "23"))
+    pipeline.prepare(_runtime(identity=True), "p1", again)
+    assert again.node_overrides["13"]["inputs"]["reference_set"] == token
+    sdk_runs.reset_for_tests()
+    _reset_media(tmp_path, b"media bytez")
+    changed = _open(_media_graph(), roots=("3", "23"))
+    pipeline.prepare(_runtime(identity=True), "p1", changed)
+    assert changed.node_overrides["13"]["inputs"]["reference_set"] != token
+
+
+def test_without_the_identity_gate_nothing_is_identified_and_the_selector_stays_unused(tmp_path):
+    _reset_media(tmp_path)
+    dynprompt = _open(_media_graph(), roots=("3", "23"))
+    record = pipeline.prepare(_runtime(), "p1", dynprompt)
+    assert _Bridge.calls == [] and dynprompt.node_overrides == {}
+    assert record["identities"] == {} and record["bridge_reasons"] == {"unused": 1}
+
+
+@pytest.mark.parametrize("change, reason", [
+    ("lazy", "not_certain"),
+    ("linked_recipe_input", "linked_input"),
+    ("no_consumer", "unused"),
+    ("selector_fails", "producer_failed"),
+    ("recipe_raises", "recipe_failed"),
+    ("missing_source", "source_missing"),
+    ("not_json", "recipe_not_json"),
+])
+def test_a_media_bridge_without_an_identity_keeps_its_stock_path(tmp_path, change, reason):
+    _reset_media(tmp_path)
+    extra = {}
+    roots = ("3", "23")
+    if change == "lazy":
+        extra = {"20": {"class_type": "Router", "inputs": {"select": ["90", 0], "a": ["23", 0], "b": "x"}},
+                 "90": {"class_type": "Wild", "inputs": {}}, "30": {"class_type": "Out", "inputs": {"value": ["20", 0]}}}
+        roots = ("3", "30")
+    if change == "linked_recipe_input":
+        extra = {"13": {"class_type": "MediaB", "inputs": {"reference_set": ["10", 0], "unused_slots": ["90", 0]}},
+                 "90": {"class_type": "Wild", "inputs": {}}}
+    if change == "no_consumer":
+        # Certain (a root of its own) but consumed by nothing: no decode to skip.
+        extra = {"23": {"class_type": "Out", "inputs": {"value": "x"}}}
+        roots = ("3", "13", "23")
+    graph = _media_graph(**extra)
+    if change == "selector_fails":
+        Selector.fail = RuntimeError("conflict")
+    if change == "recipe_raises":
+        MediaB.recipe_fault = RuntimeError("member gone")
+    if change == "missing_source":
+        os.remove(MediaB.source)
+    if change == "not_json":
+        MediaB.recipe_fault = None
+        original = MediaB.cache_recipe
+        MediaB.cache_recipe = classmethod(lambda cls, **kw: {"sources": [cls.source], "bad": (1, 2)})
+    try:
+        dynprompt = _open(graph, roots=roots)
+        record = pipeline.prepare(_runtime(identity=True), "p1", dynprompt)
+    finally:
+        if change == "not_json":
+            MediaB.cache_recipe = original
+        Selector.fail = None
+    assert "13" not in dynprompt.node_overrides
+    assert record["identity_reasons"].get(reason) == 1, record
+    assert record["outcome"] == "prepared"
+
+
+def test_a_fault_in_the_identity_pass_keeps_every_value_substitution(tmp_path, monkeypatch):
+    _reset_media(tmp_path)
+    graph = _media_graph(**{"4": {"class_type": "Relay", "inputs": {"project": ["1", 0]}},
+                            "5": {"class_type": "Out", "inputs": {"value": ["4", 0]}}})
+    monkeypatch.setattr(pipeline, "select_identified", lambda *a, **k: 1 / 0)
+    dynprompt = _open(graph, roots=("3", "23", "5"))
+    record = pipeline.prepare(_runtime(identity=True), "p1", dynprompt)
+    assert record["identity_reasons"] == {"identity_pass_error": 1} and record["identity_error"] == "ZeroDivisionError"
+    assert dynprompt.node_overrides["5"]["inputs"] == {"value": "relay text"}
+    assert "13" not in dynprompt.node_overrides
+
+
+def test_an_interrupt_while_hashing_propagates_and_applies_nothing(tmp_path, monkeypatch):
+    _reset_media(tmp_path)
+    identity = _module("nodes.cache_identity")
+    monkeypatch.setattr(identity, "CHECK_EVERY", 1)
+    calls = {"n": 0}
+
+    def before():
+        calls["n"] += 1
+        if calls["n"] > 3:  # past the Editor's and the bridges' checks: inside the hash
+            raise Interrupt()
+
+    dynprompt = _open(_media_graph(), roots=("3", "23"))
+    with pytest.raises(Interrupt):
+        pipeline.prepare(_runtime(identity=True, before=before), "p1", dynprompt)
+    assert dynprompt.node_overrides == {}

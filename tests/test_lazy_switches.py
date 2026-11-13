@@ -203,3 +203,80 @@ def test_gate_execute_emits_value_or_nothing_per_lane():
     assert len(outputs) == lazy.MAX_GATE_LANES
     assert outputs[:4] == ("a", None, None, None)
     assert set(outputs[4:]) == {None}
+
+
+# --- Phase 3, Part A: one lazy rule, shared with the cache pipeline -----------------------
+
+import copy  # noqa: E402
+import itertools  # noqa: E402
+
+
+def _subsets(names):
+    names = list(names)
+    return [frozenset(combo) for size in range(len(names) + 1) for combo in itertools.combinations(names, size)]
+
+
+def _router_states(lazy):
+    """(class, deciding, all lazy names) over a grid of router states."""
+    switch = [f"branches.item{i}" for i in range(4)]
+    for select in (-1, 0, 1, 3, 5):
+        yield lazy.SonderLazySwitch, {"select": select}, switch
+    for select, branches, lanes in itertools.product((0, 1, 2, 4), (2, 3), (1, 2, 3)):
+        cluster = [f"b{b}_l{lane}" for b in range(3) for lane in range(3)]
+        yield lazy.SonderLazyCluster, {"select": select, "branches": branches, "lanes": lanes}, cluster
+    gate = ["value_A", "value_B", "value_C"]
+    for whens in itertools.product((True, False, 0, 2, None, "x", "absent"), repeat=2):
+        deciding = {f"when_{lane}": value for lane, value in zip("AB", whens) if value != "absent"}
+        yield lazy.SonderGate, deciding, gate
+
+
+def test_each_router_requests_only_connected_inputs_and_decides_each_alone():
+    lazy = _import_lazy_switches()
+    checked = 0
+    for cls, deciding, names in _router_states(lazy):
+        everything = cls.requested_lazy_inputs(deciding, frozenset(names))
+        assert set(everything) <= set(names), (cls.__name__, deciding)
+        for connected in _subsets(names) if len(names) <= 4 else (frozenset(names[::2]), frozenset(names[1::2]),
+                                                                    frozenset(names[:4]), frozenset()):
+            requested = cls.requested_lazy_inputs(deciding, connected)
+            # (a) only connected names; (b) each input decided from ``deciding`` alone.
+            assert set(requested) <= connected, (cls.__name__, deciding, connected)
+            assert requested == [name for name in everything if name in connected], (cls.__name__, deciding)
+            checked += 1
+    assert checked > 100
+
+
+def test_check_lazy_status_is_the_shared_rule_for_every_router():
+    lazy = _import_lazy_switches()
+    for cls, deciding, names in _router_states(lazy):
+        connected = frozenset(names[::2])
+        if cls is lazy.SonderLazySwitch:
+            branches = {name.split(".", 1)[1]: ((None, name) if name in connected else (object(), name))
+                        for name in names}
+            kwargs = {"select": deciding["select"], "branches": branches}
+        else:
+            kwargs = dict(deciding, **{name: (None if name in connected else object()) for name in names})
+        try:
+            scheduled = cls.check_lazy_status(**kwargs)
+        except (ValueError, TypeError):
+            continue  # the scheduler raises; the pipeline then follows nothing
+        assert scheduled == cls.requested_lazy_inputs(deciding, connected), (cls.__name__, deciding)
+
+
+def test_a_branch_the_pipeline_follows_is_never_one_the_sonder_app_cuts():
+    lazy = _import_lazy_switches()
+    run_preparation = importlib.import_module(f"{TEST_PACKAGE}.server.run_preparation")
+    cut_for = {lazy.SonderLazySwitch: run_preparation._cut_switch, lazy.SonderLazyCluster: run_preparation._cut_cluster,
+               lazy.SonderGate: run_preparation._cut_gate}
+    compared = 0
+    for cls, deciding, names in _router_states(lazy):
+        inputs = dict(deciding, **{name: [f"src_{name}", 0] for name in names})
+        prompt = {"r": {"class_type": cls.__name__, "inputs": inputs}}
+        try:
+            followed = cls.requested_lazy_inputs(deciding, frozenset(names))
+        except (ValueError, TypeError):
+            continue
+        cut = cut_for[cls](copy.deepcopy(prompt), "r", set())
+        assert not set(followed) & set(cut), (cls.__name__, deciding, followed, cut)
+        compared += 1
+    assert compared > 50

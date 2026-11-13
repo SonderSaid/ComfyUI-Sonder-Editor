@@ -1,0 +1,24 @@
+{
+  "ffmpeg": "ffmpeg version 7.1-essentials_build-www.gyan.dev Copyright (c) 2000-2024 the FFmpeg developers",
+  "cases": {
+    "driver present": "8d895bb65c9975c2d2938f71431250b96f3054a3d71f934ca6fbe68180cd0bd8",
+    "driver cover rate tail": "e582e3213d684bacf5eda3eefea8915a655de4779b1ecba35e4475c8f5247079",
+    "driver muted": "40fe31335957ef0cfa8163cb72971cf4317b75e543088f1d04be6438a0e893e7",
+    "driver absent lane": "40fe31335957ef0cfa8163cb72971cf4317b75e543088f1d04be6438a0e893e7",
+    "driver frozen from disk": "8d895bb65c9975c2d2938f71431250b96f3054a3d71f934ca6fbe68180cd0bd8",
+    "reference batch still crop": "a936c1638720230d64f2ac2495ef4f99021eedcebd98e7edc0ade63614139a47",
+    "reference slots video span": "e1571c000b636d9e1f3aad66781287bf4e478d0a2e1ef30506455e338fe03970",
+    "reference sheet": "bcf2e357e856b2b3b14bed940f21a6e7a15803dde4e1b40f1dd607461eb43bc2",
+    "reference strip": "ac43573a83eec9a23cb5e0689822fffde306d7de13aa5f8026f13f7e667ed9e0",
+    "reference temporal": "a74b253bb07494cd4187866e8009fc1056c16da4f33a6056f133d9b3f959322d",
+    "reference slots nothing": "04ca19c619272bcc74ffe38ca4fac97a088bf49b2b228da8865206750d51ea06",
+    "reference frozen from disk": "996fbe6b5129d391c5b968fea9c71177567ede475a4d94003b5f4d71bf6cfae6",
+    "reference audio": "f92013d0f1db3c8941c708603a03687a2d639dd35561777ba51c5b6ce7dd3a56",
+    "reference audio nothing": "90b0e1732713782cb7b7f9ea9c42df31340f2d9bec2755d45b52574c93af1e20",
+    "guides none": "21978bd80fa5f08807476cf453168b010027c0f9da1ca541035d60dce91dee43",
+    "guides one": "5477f395958eb7f75a2e8c38b7f241ccaaf2952bea4ac1fada44bf071da2f777",
+    "guides three": "de3f7d25d16dda7f202f0a8f42d12baf031b94b9a7cf2c720d7c96855a33b47f",
+    "guides three muted one": "fcfe8566c272ffadc0ad79c736f7d14699d523fac59a6e1f85f6e41d20769767",
+    "guides frozen from disk": "86c0a045f8bfdb2babc03a321e0700c43ce9de3cdd8df5cd58c496b918ee5a7e"
+  }
+}

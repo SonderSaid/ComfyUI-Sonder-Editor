@@ -9,13 +9,16 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on ComfyUI vers
         raise
     from comfy_api.latest import io
 
-from .cache_policy import EXACT, HANDLE, INHERITS, PREPARES, normalise_outputs
+from . import cache_identity
+from .cache_policy import DESCRIPTOR, EXACT, HANDLE, IDENTIFIES, IDENTITY_INVALIDATION, PREPARES, normalise_outputs
 from .reference_core import (
     MAX_REFERENCE_SLOTS,
-    decode_reference_audios,
-    decode_reference_images,
+    decode_reference_audio_recipe,
+    decode_reference_image_recipe,
     decode_reference_prompts,
+    reference_audio_recipe,
     reference_fingerprint,
+    reference_image_recipe,
     resolve_reference_set,
 )
 
@@ -108,9 +111,20 @@ def _numbered_outputs(output_type, prefix: str, noun: str):
     ]
 
 
+def _identity_invalidation(prefix: str) -> dict:
+    return {f"{prefix}{index:02d}": IDENTITY_INVALIDATION for index in range(1, MAX_REFERENCE_SLOTS + 1)}
+
+
 class SonderReferenceImageBridge(io.ComfyNode):
-    # nodes/cache_policy.py
-    SONDER_CACHE_POLICY = {"r??": INHERITS("bridge media: Execution Cache Pipeline Phase 3")}
+    # nodes/cache_policy.py and nodes/cache_identity.py: one identity, the decode
+    # recipe plus every member file's bytes, covers r01..r16.
+    SONDER_CACHE_POLICY = {"r??": DESCRIPTOR}
+    SONDER_CACHE_INVALIDATION = _identity_invalidation("r")
+    SONDER_CACHE_IDENTITY = IDENTIFIES(token_input="reference_set", recipe_inputs=("unused_slots",))
+
+    @classmethod
+    def cache_recipe(cls, reference_set, unused_slots="placeholder"):
+        return reference_image_recipe(reference_set, unused_slots)
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -142,12 +156,23 @@ class SonderReferenceImageBridge(io.ComfyNode):
 
     @classmethod
     def execute(cls, reference_set, unused_slots="placeholder") -> io.NodeOutput:
-        return io.NodeOutput(*decode_reference_images(reference_set, unused_slots))
+        recipe, snapshots = cache_identity.resolve(
+            reference_set, IMAGE_BRIDGE_NODE_ID, lambda value: reference_image_recipe(value, unused_slots),
+            "connect reference_set to a Sonder Reference Selector")
+        with cache_identity.reading(snapshots):
+            return io.NodeOutput(*decode_reference_image_recipe(recipe))
 
 
 class SonderReferenceAudioBridge(io.ComfyNode):
-    # nodes/cache_policy.py
-    SONDER_CACHE_POLICY = {"a??": INHERITS("bridge media: Execution Cache Pipeline Phase 3")}
+    # nodes/cache_policy.py and nodes/cache_identity.py: one identity, the decode
+    # recipe plus every member file's bytes, covers a01..a16.
+    SONDER_CACHE_POLICY = {"a??": DESCRIPTOR}
+    SONDER_CACHE_INVALIDATION = _identity_invalidation("a")
+    SONDER_CACHE_IDENTITY = IDENTIFIES(token_input="reference_set", recipe_inputs=("unused_slots",))
+
+    @classmethod
+    def cache_recipe(cls, reference_set, unused_slots="placeholder"):
+        return reference_audio_recipe(reference_set, unused_slots)
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -179,7 +204,11 @@ class SonderReferenceAudioBridge(io.ComfyNode):
 
     @classmethod
     def execute(cls, reference_set, unused_slots="placeholder") -> io.NodeOutput:
-        return io.NodeOutput(*decode_reference_audios(reference_set, unused_slots))
+        recipe, snapshots = cache_identity.resolve(
+            reference_set, AUDIO_BRIDGE_NODE_ID, lambda value: reference_audio_recipe(value, unused_slots),
+            "connect reference_set to a Sonder Reference Selector")
+        with cache_identity.reading(snapshots):
+            return io.NodeOutput(*decode_reference_audio_recipe(recipe))
 
 
 class SonderReferencePromptBridge(io.ComfyNode):

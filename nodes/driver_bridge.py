@@ -21,7 +21,9 @@ from ..server.media_helpers import decode_video_range, fit_frame_to_canvas, reso
 from ..server import external_links
 from ..server.path_security import path_within, resolve_existing_project_path, resolve_project_path
 from ..server.timeline_state import ClipReference, GuideFrame, LaneConfig, effective_scene_fps
-from .cache_policy import EXACT, HANDLE, INHERITS, PREPARES, normalise_outputs
+from . import cache_identity
+from .cache_policy import (DESCRIPTOR, EXACT, HANDLE, IDENTIFIES, IDENTITY_INVALIDATION, PREPARES,
+                           normalise_outputs)
 
 logger = logging.getLogger(__name__)
 
@@ -321,32 +323,27 @@ def _driver_path_is_contained(project_or_dir, source_path: str) -> bool:
     ))
 
 
-def _decode_driver_clip(
-    project,
-    clip,
-    overlap_start: int,
+def _decode_driver_frames(
+    abs_path: str,
+    source_path: str,
+    source_start: int,
     overlap_len: int,
     width: int,
     height: int,
     *,
-    rate_ratio: float = 1.0,
-    native_frame_count: int = 0,
-    tail_len: int = 0,
+    rate_ratio: float,
+    native_frame_count: int,
+    tail_len: int,
+    interpretation,
+    fit_mode: str,
+    crop_position: str,
+    tolerance: int,
 ) -> torch.Tensor:
+    """Decode a Driver span from resolved values only (``decode_driver_recipe``)."""
     if overlap_len <= 0:
         raise RuntimeError("Driver media produced no frames")
-    source_start = _coerce_int(getattr(clip, "source_in_frame", 0), 0) + (
-        overlap_start - _coerce_int(getattr(clip, "timeline_start_frame", 0), 0)
-    )
-    source_path = str(getattr(clip, "source_path", "") or "")
-    abs_path = _abs_driver_path(project, source_path)
-    if not os.path.isfile(abs_path):
-        raise RuntimeError(f"Driver media not found: {source_path or abs_path}")
-
-    ratio = _coerce_float(rate_ratio, 1.0)
-    if not math.isfinite(ratio) or ratio <= 0:
-        ratio = 1.0
-    native_count = max(0, _coerce_int(native_frame_count, 0))
+    ratio = rate_ratio
+    native_count = max(0, native_frame_count)
     native_indices = [
         int(math.floor((source_start + offset + 0.5) * ratio))
         for offset in range(overlap_len)
@@ -357,9 +354,6 @@ def _decode_driver_clip(
     native_end = max(native_indices) + 1
 
     frames = []
-    asset_lookup = getattr(project, "asset_for_source_path", None)
-    asset = asset_lookup(source_path) if callable(asset_lookup) else None
-    interpretation = resolve_source_color_interpretation(asset, abs_path)
     try:
         decoded_start = native_start
         decoded_frames = list(decode_video_range(
@@ -368,7 +362,7 @@ def _decode_driver_clip(
         ))
         if not decoded_frames and native_start > 0:
             # The overlap starts at or past the file's real end: look back for its last frame.
-            decoded_start = max(0, native_start - DRIVER_SHORT_MEDIA_TOLERANCE_FRAMES)
+            decoded_start = max(0, native_start - tolerance)
             decoded_frames = list(decode_video_range(
                 abs_path, decoded_start, native_start,
                 color_interpretation=interpretation,
@@ -381,7 +375,7 @@ def _decode_driver_clip(
                     f"Driver media ended before expected frame {native_start}: {source_path} "
                     f"(nothing decodes from frame {decoded_start}; {expected} frames recorded)"
                 )
-            if not decoded_frames or expected - real_end > DRIVER_SHORT_MEDIA_TOLERANCE_FRAMES:
+            if not decoded_frames or expected - real_end > tolerance:
                 raise RuntimeError(
                     f"Driver media ended before expected frame {real_end}: {source_path} "
                     f"(decoded {real_end} of {expected} recorded frames)"
@@ -396,8 +390,8 @@ def _decode_driver_clip(
                 frame_rgb,
                 width,
                 height,
-                mode=getattr(clip, "fit_mode", "pad_edge"),
-                crop_position=getattr(clip, "crop_position", "center"),
+                mode=fit_mode,
+                crop_position=crop_position,
             )
             frames.append(placed)
     except RuntimeError:
@@ -408,7 +402,7 @@ def _decode_driver_clip(
     if not frames:
         raise RuntimeError(f"Driver media produced no frames: {source_path}")
     # Hold the last frame over the render's grid padding, as the Editor pads its own tail.
-    frames.extend([frames[-1]] * max(0, _coerce_int(tail_len, 0)))
+    frames.extend([frames[-1]] * max(0, tail_len))
     return torch.from_numpy(np.stack(frames, axis=0).astype(np.float32) / 255.0)
 
 
@@ -566,19 +560,24 @@ def resolve_driver_ref(project, driver_lane_index=0, driver_selector_overrides_j
     return ref
 
 
-def decode_driver_ref(driver_ref) -> dict[str, Any]:
+def driver_recipe(driver_ref) -> dict[str, Any]:
+    """Everything the Driver decode reads except file content, as JSON (``nodes/cache_identity.py``).
+
+    The path is resolved here (project containment and the external-links
+    setting), and so is the colour interpretation, with ``asset=None`` as the
+    decode always did: the Bridge only ever had the project folder. Raises what
+    the decode raised for a broken ref, so the scheduled Bridge fails the same way.
+    """
     ref = driver_ref if isinstance(driver_ref, dict) else {}
     width = max(1, _coerce_int(ref.get("width"), 1))
     height = max(1, _coerce_int(ref.get("height"), 1))
+    # Values stay raw, as the decode always read them; one JSON cannot hold exactly
+    # leaves the Bridge without an identity (nodes/cache_identity.canonical).
+    common = {"width": width, "height": height, "lane_index": _coerce_int(ref.get("lane_index"), 0),
+              "source": ref.get("source", "live")}
     if _coerce_int(ref.get("has_driver"), 0) != 1:
-        idx = _coerce_int(ref.get("fallback_idx", ref.get("driver_idx")), 0)
-        return {
-            "images": _empty_image(width, height),
-            "idx": int(idx),
-            "strength": 0.0,
-            "has_driver": 0,
-            "source": ref.get("source", "live"),
-        }
+        return {**common, "has_driver": 0, "sources": [],
+                "idx": _coerce_int(ref.get("fallback_idx", ref.get("driver_idx")), 0)}
 
     clip_data = ref.get("clip")
     if not isinstance(clip_data, dict):
@@ -592,24 +591,58 @@ def decode_driver_ref(driver_ref) -> dict[str, Any]:
     if not project_dir:
         raise RuntimeError("Driver project directory is outside the configured project base.")
 
-    images = _decode_driver_clip(
-        project_dir,
-        clip,
-        _coerce_int(ref.get("overlap_start"), 0),
-        overlap_len,
-        width,
-        height,
-        rate_ratio=_coerce_float(ref.get("rate_ratio"), 1.0),
-        native_frame_count=_coerce_int(ref.get("native_frame_count"), 0),
-        tail_len=_coerce_int(ref.get("overlap_tail_len"), 0),
+    overlap_start = _coerce_int(ref.get("overlap_start"), 0)
+    source_start = _coerce_int(getattr(clip, "source_in_frame", 0), 0) + (
+        overlap_start - _coerce_int(getattr(clip, "timeline_start_frame", 0), 0)
     )
+    source_path = str(getattr(clip, "source_path", "") or "")
+    abs_path = _abs_driver_path(project_dir, source_path)
+    if not os.path.isfile(abs_path):
+        raise RuntimeError(f"Driver media not found: {source_path or abs_path}")
+    ratio = _coerce_float(ref.get("rate_ratio"), 1.0)
+    if not math.isfinite(ratio) or ratio <= 0:
+        ratio = 1.0
+    interpretation = resolve_source_color_interpretation(None, abs_path)
     return {
-        "images": images,
+        **common,
+        "has_driver": 1,
+        "sources": [abs_path],
+        "path": abs_path,
+        "source_path": source_path,
+        "source_start": source_start,
+        "overlap_len": overlap_len,
+        "rate_ratio": ratio,
+        "native_frame_count": max(0, _coerce_int(ref.get("native_frame_count"), 0)),
+        "tail_len": max(0, _coerce_int(ref.get("overlap_tail_len"), 0)),
+        "interpretation": list(interpretation) if interpretation else None,
+        "fit_mode": getattr(clip, "fit_mode", "pad_edge"),
+        "crop_position": getattr(clip, "crop_position", "center"),
+        "short_media_tolerance": DRIVER_SHORT_MEDIA_TOLERANCE_FRAMES,
         "idx": _coerce_int(ref.get("overlap_local_idx", ref.get("driver_idx")), 0),
         "strength": _coerce_float(ref.get("strength"), 1.0),
-        "has_driver": 1,
-        "source": ref.get("source", "live"),
     }
+
+
+def decode_driver_recipe(recipe: dict[str, Any]) -> dict[str, Any]:
+    """The Driver outputs from a recipe and the file it names; reads nothing else."""
+    width, height = int(recipe["width"]), int(recipe["height"])
+    if int(recipe["has_driver"]) != 1:
+        return {"images": _empty_image(width, height), "idx": int(recipe["idx"]), "strength": 0.0,
+                "has_driver": 0, "source": recipe["source"]}
+    interpretation = recipe.get("interpretation")
+    images = _decode_driver_frames(
+        recipe["path"], recipe["source_path"], int(recipe["source_start"]), int(recipe["overlap_len"]),
+        width, height, rate_ratio=float(recipe["rate_ratio"]),
+        native_frame_count=int(recipe["native_frame_count"]), tail_len=int(recipe["tail_len"]),
+        interpretation=tuple(interpretation) if interpretation else None,
+        fit_mode=recipe["fit_mode"], crop_position=recipe["crop_position"],
+        tolerance=int(recipe["short_media_tolerance"]))
+    return {"images": images, "idx": int(recipe["idx"]), "strength": recipe["strength"], "has_driver": 1,
+            "source": recipe["source"]}
+
+
+def decode_driver_ref(driver_ref) -> dict[str, Any]:
+    return decode_driver_recipe(driver_recipe(driver_ref))
 
 
 def resolve_driver_bridge(project, driver_lane_index=0, driver_bridge_overrides_json="{}") -> dict[str, Any]:
@@ -689,9 +722,11 @@ class SonderDriverBridge:
     CATEGORY = "Sonder"
     RETURN_TYPES = ("IMAGE", "INT", "FLOAT")
     RETURN_NAMES = ("driver_images", "driver_idx", "driver_strength")
-    # nodes/cache_policy.py
-    SONDER_CACHE_POLICY = {name: INHERITS("bridge media: Execution Cache Pipeline Phase 3")
-                           for name in ("driver_images", "driver_idx", "driver_strength")}
+    # nodes/cache_policy.py and nodes/cache_identity.py: one identity, the decode
+    # recipe plus the Driver file's bytes, covers all three outputs.
+    SONDER_CACHE_POLICY = {name: DESCRIPTOR for name in RETURN_NAMES}
+    SONDER_CACHE_INVALIDATION = {name: IDENTITY_INVALIDATION for name in RETURN_NAMES}
+    SONDER_CACHE_IDENTITY = IDENTIFIES(token_input="driver_ref")
     OUTPUT_TOOLTIPS = (
         "Driver frames for the selected driver lane, window-rebased to the editor output. "
         "A Driver reaching the window's end holds its last frame over the editor's grid padding.",
@@ -714,9 +749,16 @@ class SonderDriverBridge:
             },
         }
 
+    @classmethod
+    def cache_recipe(cls, driver_ref):
+        return driver_recipe(driver_ref)
+
     def execute(self, driver_ref):
-        result = decode_driver_ref(driver_ref)
-        lane_index = _coerce_int(driver_ref.get("lane_index"), 0) if isinstance(driver_ref, dict) else 0
+        recipe, snapshots = cache_identity.resolve(
+            driver_ref, "SonderDriverBridge", driver_recipe, "connect driver_ref to a Sonder Driver Selector")
+        with cache_identity.reading(snapshots):
+            result = decode_driver_recipe(recipe)
+        lane_index = recipe["lane_index"]
         logger.info(
             "driver bridge: lane=%s source=%s has_driver=%s idx=%s strength=%.4f",
             lane_index,

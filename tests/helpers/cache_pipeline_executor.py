@@ -165,6 +165,23 @@ class CPImageTap:
         return (f"{list(frames.shape)}",)
 
 
+class CPMediaDigest:
+    """A media consumer whose output is a digest of the exact pixels it received."""
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "run"
+    CATEGORY = "CPH"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"frames": ("IMAGE",)}, "hidden": {"unique_id": "UNIQUE_ID"}}
+
+    def run(self, frames, unique_id=None):
+        import hashlib
+        count("media", unique_id)
+        tensor = frames.detach().cpu().contiguous()
+        return (f"{list(tensor.shape)}:{hashlib.sha256(tensor.numpy().tobytes()).hexdigest()[:16]}",)
+
+
 class CPFail:
     RETURN_TYPES = ("STRING",)
     FUNCTION = "run"
@@ -336,6 +353,7 @@ nodes.NODE_CLASS_MAPPINGS.update({
     "CPText": CPText, "CPInt": CPInt, "CPFloat": CPFloat, "CPImage": CPImage, "CPImageTap": CPImageTap,
     "CPFail": CPFail, "CPMark": CPMark, "CPSwallow": CPSwallow, "CPEvict": CPEvict, "CPProjectTap": CPProjectTap,
     "CPDyn": CPDyn, "CPGuideBody": CPGuideBody, "CPIdV3": CPIdV3, "CPAfter": CPAfter,
+    "CPMediaDigest": CPMediaDigest,
 })
 nodes.NODE_CLASS_MAPPINGS.update(lazy.LAZY_NODE_CLASS_MAPPINGS)
 StringConcatenate.GET_SCHEMA()
@@ -1154,6 +1172,7 @@ BRIDGE_CLASSES = {
     "SonderReferenceImageBridge": reference_mod.SonderReferenceImageBridge,
 }
 nodes.NODE_CLASS_MAPPINGS.update(BRIDGE_CLASSES)
+nodes.NODE_CLASS_MAPPINGS["SonderSelector"] = sonder("nodes.selector").SonderSelector
 for _cls in BRIDGE_CLASSES.values():
     if hasattr(_cls, "GET_SCHEMA"):
         _cls.GET_SCHEMA()
@@ -1647,12 +1666,14 @@ async def case_bridges_shapes():
     check(case, "H3 shape: results equal stock", all(row["success"] and row["outputs"] == stock["outputs"]
                                                      for (row, _), (stock, _) in zip(rows, stock_rows)),
           [_diff(row["outputs"], stock["outputs"]) for (row, _), (stock, _) in zip(rows, stock_rows)])
-    check(case, "H3 shape: the Selector stays scheduled, the Prompt Bridge does not",
-          "rs" in executed_nodes(second) and "rp" not in executed_nodes(second), second["executing"])
+    # Phase 3: the Image Bridge takes a token, so no handle consumer keeps the Selector
+    # scheduled (Phase 2 left it scheduled, resolving twice).
+    check(case, "H3 shape: the Selector, Prompt Bridge and Image Bridge all leave the schedule",
+          not ({"rs", "rp", "ri"} & executed_nodes(second)), second["executing"])
     check(case, "H3 shape: the per-member prompt consumer hits on an identical job", "rp1" not in executed_nodes(second),
           second["executing"])
-    check(case, "H3 shape: the still-scheduled Selector resolves twice (prepared and scheduled)",
-          second["resolver_calls"].get("reference") == 2, second["resolver_calls"])
+    check(case, "H3 shape: the Selector resolves once, in preparation",
+          second["resolver_calls"].get("reference") == 1, second["resolver_calls"])
 
     # H3 starter shape: only reference_set is consumed, so the Selector is unused.
     def starter(fx):
@@ -1662,9 +1683,13 @@ async def case_bridges_shapes():
 
     arms = await both_arms(starter, runs=1, label="starter")
     row, _ = arms[True][1][0]
-    check(case, "H3 starter shape: the Selector is left alone and resolves once",
-          row["success"] and prep(row).get("bridge_reasons") == {"unused": 1}
-          and row["resolver_calls"].get("reference") == 1, {"prep": prep(row), "calls": row["resolver_calls"]})
+    # Phase 3: the Selector is prepared for the identified Image Bridge, which then
+    # takes a token, so the Selector is no longer scheduled: it still resolves once.
+    check(case, "H3 starter shape: the Selector is prepared for the Image Bridge's identity and resolves once",
+          row["success"] and prep(row).get("bridge_reasons") == {} and prep(row).get("bridges", {}).get("prepared") == 1
+          and prep(row).get("identities", {}).get("identified") == 1
+          and row["resolver_calls"].get("reference") == 1 and "rs" not in executed_nodes(row),
+          {"prep": prep(row), "calls": row["resolver_calls"], "executing": row["executing"]})
 
     # A Driver Selector whose has_driver is a switch's select: the active branch pulls
     # the Selector back in lazily through the Driver Bridge.
@@ -1912,18 +1937,340 @@ async def case_bridges_ram():
           {"pipeline": row["outputs"], "stock": stock["outputs"], "error": row.get("error")})
 
 
+# --- Phase 3: media identity -------------------------------------------------------------------
+
+identity_mod = sonder("nodes.cache_identity")
+IDENTIFIED = {"db", "ri", "gs"}
+MEDIA_CONSUMERS = {"dd", "dst", "rd", "gd"}
+
+
+def identity_graph(fx):
+    """Driver, Reference Image and Guides Start, each with consumers of its media only."""
+    return {
+        "1": editor(fx),
+        "ds": n("SonderDriverSelector", project=["1", 0], driver_lane_index=0, driver_selector_overrides_json="{}"),
+        "db": n("SonderDriverBridge", driver_ref=["ds", 0]),
+        "dd": n("CPMediaDigest", frames=["db", 0]), "ddp": n("PreviewAny", source=["dd", 0]),
+        "dst": n("CPFloat", value=["db", 2]), "dstp": n("PreviewAny", source=["dst", 0]),
+        "rs": n("SonderReferenceSelector", project=["1", 0], reference_lanes="0"),
+        "ri": n("SonderReferenceImageBridge", reference_set=["rs", 0], unused_slots="placeholder"),
+        "rd": n("CPMediaDigest", frames=["ri", 0]), "rdp": n("PreviewAny", source=["rd", 0]),
+        "gs": n("SonderGuidesBridgeStart", project=["1", 0], iteration_index=0, value_0="start"),
+        "gd": n("CPMediaDigest", frames=["gs", 1]),
+        "ge": n("SonderGuidesBridgeEnd", project=["1", 0], flow_control=["gs", 0], value_0=["gd", 0]),
+        "gep": n("PreviewAny", source=["ge", 0]),
+        # The saver depends on every chain, so both arms save after every bridge ran.
+        "after": n("CPAfter", image=["db", 0], a=["rd", 0], b=["ge", 0], c=["dst", 0]),
+        "7": save(["1", 0], ["after", 0], mode="Take"),
+    }
+
+
+def replace_reference_image(fx, color):
+    """A different image at the same path, its old modification time copied back."""
+    from PIL import Image
+    path = Path(fx["dir"]) / "media" / "subject.png"
+    stat = path.stat()
+    Image.new("RGB", (16, 16), color).save(path)
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+
+async def identity_sequence(enabled, label):
+    set_pipeline(enabled)
+    fx = bridge_fixture(f"{label}-{int(enabled)}", 8, driver=True, guides=[0])
+    executor = new_executor()
+    rows = []
+
+    async def step(name):
+        rows.append((name, await run(executor, identity_graph(fx)), last_take_params(fx)))
+
+    await step("base")
+    await step("identical")
+    replace_reference_image(fx, (0, 255, 0))
+    await step("reference replaced at the same path")
+
+    def driver_strength(project, scene):
+        next(clip for clip in scene.clips if clip.role == "motion_driver").strength = 0.75
+
+    edit_project(fx, driver_strength)
+    await step("driver strength")
+
+    def guide_strength(project, scene):
+        scene.guide_frames[0].strength = 0.3
+
+    edit_project(fx, guide_strength)
+    await step("guide strength")
+    return rows
+
+
+async def case_identity():
+    case = "identity"
+    pipeline_rows = await identity_sequence(True, "identity")
+    stock_rows = await identity_sequence(False, "identity")
+    # What each step reruns among the identified bridges and their media consumers.
+    expected = {"identical": set(), "reference replaced at the same path": {"ri", "rd"},
+                "driver strength": {"db", "dd", "dst"}, "guide strength": {"gs", "gd"}}
+    watched = IDENTIFIED | MEDIA_CONSUMERS | {"ds", "rs"}
+    for (label, row, params), (_, stock, stock_params) in zip(pipeline_rows, stock_rows):
+        check(case, f"{label}: both arms succeed", row.get("success") and stock.get("success"),
+              {"pipeline": row.get("error") or row.get("invalid"), "stock": stock.get("error") or stock.get("invalid")})
+        check(case, f"{label}: differential oracle (every consumer equals stock)", row["outputs"] == stock["outputs"],
+              _diff(row["outputs"], stock["outputs"]))
+        check(case, f"{label}: driver provenance equals stock",
+              stable_params(params.get("driver_selector")) == stable_params(stock_params.get("driver_selector"))
+              and (params.get("driver_selector") or {}).get("has_driver") == 1,
+              [params.get("driver_selector"), stock_params.get("driver_selector")])
+        check(case, f"{label}: stock runs every bridge", IDENTIFIED <= executed_nodes(stock), stock["executing"])
+        if MODE == "none":
+            check(case, f"{label}: --cache-none bypasses identity", not row["preparations"]
+                  and IDENTIFIED <= executed_nodes(row), {"prep": prep(row), "executing": row["executing"]})
+            continue
+        check(case, f"{label}: three bridges identified",
+              prep(row).get("identities") == {"identified": 3, "skipped": 0},
+              {"identities": prep(row).get("identities"), "reasons": prep(row).get("identity_reasons")})
+        if label in expected and MODE in ("classic", "ram"):
+            reran = executed_nodes(row) & watched
+            check(case, f"{label}: exactly the changed media reruns", reran == expected[label],
+                  {"ran": sorted(reran), "expected": sorted(expected[label])})
+    if MODE != "none":
+        base = pipeline_rows[0][1]
+        check(case, "base: the Selectors leave the schedule once their handles took tokens",
+              not ({"ds", "rs"} & executed_nodes(base)), base["executing"])
+        replaced = pipeline_rows[2][1]
+        check(case, "a replaced Reference image (same path, copied mtime) reaches the consumer",
+              replaced["outputs"].get("rdp") != pipeline_rows[1][1]["outputs"].get("rdp"),
+              [replaced["outputs"].get("rdp"), pipeline_rows[1][1]["outputs"].get("rdp")])
+
+
+async def case_identity_shapes():
+    """Graph shapes the identity must keep equal to stock (classic)."""
+    case = "identity_shapes"
+
+    # A three-guide loop: End clones the token-overridden Start per guide; each
+    # clone decodes its own guide from the recipe. Clones carry tensors, so they
+    # rerun; the results must equal stock.
+    def loop(fx):
+        return {"1": editor(fx, selection_end=4),
+                "gs": n("SonderGuidesBridgeStart", project=["1", 0], iteration_index=0, value_0="start"),
+                "gd": n("CPMediaDigest", frames=["gs", 1]),
+                "gb": n("StringConcatenate", string_a=["gs", 4], string_b=["gd", 0], delimiter="|"),
+                "ge": n("SonderGuidesBridgeEnd", project=["1", 0], flow_control=["gs", 0], value_0=["gb", 0]),
+                "gep": n("PreviewAny", source=["ge", 0]),
+                "after": n("CPAfter", image=["1", 1], a=["ge", 0]), "7": save(["1", 0], ["after", 0], mode="Take")}
+
+    arms = await both_arms(loop, fixture_args={"reference": False, "guides": [0, 1, 2]}, label="idloop")
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    check(case, "three-guide loop: every guide's result equals stock",
+          all(row["success"] and row["outputs"] == stock["outputs"] for (row, _), (stock, _) in zip(rows, stock_rows))
+          and (rows[0][0]["outputs"].get("gep") or "").count("|") == 3,
+          [(row["outputs"], stock["outputs"], row.get("error")) for (row, _), (stock, _) in zip(rows, stock_rows)])
+    check(case, "three-guide loop: Start is identified and its clones resolve the token",
+          prep(rows[0][0]).get("identities", {}).get("identified") == 1, prep(rows[0][0]).get("identity_reasons"))
+
+    # A loop whose value comes from the Editor's frames: Start's key folds that in, so it reruns.
+    def media_loop(fx):
+        graph = loop(fx)
+        graph["tap"] = n("CPImageTap", frames=["1", 1])
+        graph["gs"]["inputs"]["value_0"] = ["tap", 0]
+        return graph
+
+    arms = await both_arms(media_loop, fixture_args={"reference": False, "guides": [0]}, label="idmedia")
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    check(case, "a loop fed by Editor frames equals stock and its Start reruns (the accepted miss)",
+          all(row["success"] and row["outputs"] == stock["outputs"] for (row, _), (stock, _) in zip(rows, stock_rows))
+          and "gs" in executed_nodes(rows[1][0]),
+          [(row["outputs"], row.get("error"), row["executing"]) for (row, _) in rows])
+
+    # A Reference Bridge behind a Cluster whose select comes from a Sonder Selector.
+    def selected(fx):
+        return {"1": editor(fx),
+                "sel": n("SonderSelector", choice="Option 2", choice_list="Option 1\nOption 2"),
+                "rs": n("SonderReferenceSelector", project=["1", 0], reference_lanes="0"),
+                "ri": n("SonderReferenceImageBridge", reference_set=["rs", 0], unused_slots="placeholder"),
+                "rd": n("CPMediaDigest", frames=["ri", 0]),
+                "o": n("StringConcatenate", string_a="no reference", string_b="", delimiter=""),
+                "cl": n("SonderLazyCluster", select=["sel", 1], branches=2, lanes=1, b0_l0=["o", 0], b1_l0=["rd", 0]),
+                "clp": n("PreviewAny", source=["cl", 0]),
+                "after": n("CPAfter", image=["1", 1], a=["cl", 0]), "7": save(["1", 0], ["after", 0], mode="Take")}
+
+    arms = await both_arms(selected, label="idselector")
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    check(case, "Reference behind a Selector-driven Cluster: equal to stock, identified, reused on the second job",
+          all(row["success"] and row["outputs"] == stock["outputs"] for (row, _), (stock, _) in zip(rows, stock_rows))
+          and prep(rows[0][0]).get("identities", {}).get("identified") == 1
+          and not ({"ri", "rd"} & executed_nodes(rows[1][0])),
+          {"prep": prep(rows[0][0]).get("identity_reasons"), "second": rows[1][0]["executing"]})
+
+    # Setting changes miss: the Driver's fit and in point, the Image Bridge's unused_slots.
+    set_pipeline(True)
+    fx = bridge_fixture("idsettings", 6, driver=True, guides=[0])
+    executor = new_executor()
+    await run(executor, identity_graph(fx))
+
+    def fit(project, scene):
+        next(clip for clip in scene.clips if clip.role == "motion_driver").fit_mode = "cover"
+
+    def in_point(project, scene):
+        next(clip for clip in scene.clips if clip.role == "motion_driver").source_in_frame = 1
+
+    for label, change, expected in (("Driver fit", fit, {"db"}), ("Driver in point", in_point, {"db"})):
+        edit_project(fx, change)
+        row = await run(executor, identity_graph(fx))
+        check(case, f"{label}: the Driver Bridge decodes again, the others do not",
+              row["success"] and expected <= executed_nodes(row) and not ({"ri", "gs"} & executed_nodes(row)),
+              row["executing"])
+    graph = identity_graph(fx)
+    graph["ri"]["inputs"]["unused_slots"] = "nothing"
+    row = await run(executor, graph)
+    check(case, "unused_slots: the Image Bridge decodes again, the others do not",
+          row["success"] and "ri" in executed_nodes(row) and not ({"db", "gs"} & executed_nodes(row)), row["executing"])
+
+
+async def case_identity_lazy():
+    case = "identity_lazy"
+
+    def lazy_driver(fx):
+        return {"1": editor(fx), "ds": n("SonderDriverSelector", project=["1", 0], driver_lane_index=0,
+                                          driver_selector_overrides_json="{}"),
+                "db": n("SonderDriverBridge", driver_ref=["ds", 0]), "dd": n("CPMediaDigest", frames=["db", 0]),
+                "o": n("StringConcatenate", string_a="no driver", string_b="", delimiter=""),
+                "cl": n("SonderLazyCluster", select=["ds", 1], branches=2, lanes=1, b0_l0=["o", 0], b1_l0=["dd", 0]),
+                "clp": n("PreviewAny", source=["cl", 0]),
+                "after": n("CPAfter", image=["1", 1], a=["cl", 0]), "7": save(["1", 0], ["after", 0], mode="Take")}
+
+    arms = await both_arms(lazy_driver, fixture_args={"driver": True, "reference": False}, label="idlazy")
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    (first, _), (second, _) = rows
+    check(case, "Driver behind a Cluster selected by has_driver: results equal stock",
+          all(row["success"] and row["outputs"] == stock["outputs"] for (row, _), (stock, _) in zip(rows, stock_rows)),
+          [(row["outputs"], stock["outputs"], row.get("error")) for (row, _), (stock, _) in zip(rows, stock_rows)])
+    check(case, "the Cluster's requested branch is certain: the Driver Bridge is identified",
+          prep(first).get("identities", {}).get("identified") == 1 and prep(first).get("lazy_followed", 0) >= 1,
+          {"identities": prep(first).get("identities"), "reasons": prep(first).get("identity_reasons"),
+           "lazy": prep(first).get("lazy_followed")})
+    check(case, "identical second job: the Driver Bridge and its consumer are reused",
+          not ({"db", "dd"} & executed_nodes(second)), second["executing"])
+
+    arms = await both_arms(lazy_driver, fixture_args={"driver": True, "muted_driver": True, "reference": False},
+                           label="idmuted")
+    (_, rows), (_, stock_rows) = arms[True], arms[False]
+    row = rows[0][0]
+    check(case, "muted Driver: the branch is not requested, so nothing is hashed or decoded",
+          row["success"] and row["outputs"] == stock_rows[0][0]["outputs"] and "db" not in executed_nodes(row)
+          and prep(row).get("identity_reasons") == {"not_certain": 1} and not prep(row).get("identity_bytes"),
+          {"prep": prep(row), "executing": row["executing"]})
+
+
+async def case_identity_safety():
+    case = "identity_safety"
+    # A token typed into a prompt names no file: the bridge refuses it.
+    fx = bridge_fixture("forged", 2, driver=True, reference=False)
+    set_pipeline(True)
+    forged = {"1": editor(fx),
+              "db": n("SonderDriverBridge", driver_ref=identity_mod.TOKEN_PREFIX + "0" * 64),
+              "dd": n("CPMediaDigest", frames=["db", 0]), "ddp": n("PreviewAny", source=["dd", 0]),
+              "7": save(["1", 0], ["1", 1])}
+    row = await run(new_executor(), forged)
+    check(case, "a forged token fails at the bridge with the documented message",
+          not row.get("success") and (row.get("error") or {}).get("node") == "db"
+          and "did not create" in (row.get("error") or {}).get("message", ""), row.get("error") or row.get("invalid"))
+
+    # A source changed between preparation and decode fails the run; the next run works.
+    fx = bridge_fixture("changed", 3, driver=True, guides=[0])
+    original = pipeline._identity_pass
+
+    def then_touch(*args, **kwargs):
+        tokens = original(*args, **kwargs)
+        path = Path(fx["dir"]) / "media" / "subject.png"
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
+        return tokens
+
+    pipeline._identity_pass = then_touch
+    try:
+        row = await run(new_executor(), identity_graph(fx))
+    finally:
+        pipeline._identity_pass = original
+    check(case, "a source changed after hashing fails the run at its bridge",
+          not row.get("success") and (row.get("error") or {}).get("node") == "ri"
+          and "changed while this run was reading it" in (row.get("error") or {}).get("message", ""), row.get("error"))
+    row = await run(new_executor(), identity_graph(fx))
+    check(case, "the next run hashes the new state and succeeds", row.get("success"), row.get("error"))
+
+    # A cancel while hashing, at the real cadence: the Reference source is larger than
+    # one check interval, the cancel lands as its hash starts, and the hash's own
+    # interrupt check stops it. The interrupt is re-armed; no bridge or consumer runs.
+    fx = bridge_fixture("cancel", 3, driver=True, guides=[0])
+    subject = Path(fx["dir"]) / "media" / "subject.png"
+    original_png = subject.read_bytes()
+    subject.write_bytes(original_png + b"\0" * ((identity_mod.CHECK_EVERY + 4) * identity_mod.CHUNK))
+    real_digest = identity_mod.digest_file
+    checks_inside = []
+
+    def cancelled(path, check_interrupt=None):
+        if path.endswith("subject.png"):
+            mm.interrupt_current_processing(True)
+
+            def counted():
+                checks_inside.append(path)
+                check_interrupt()
+
+            return real_digest(path, counted)
+        return real_digest(path, check_interrupt)
+
+    identity_mod.digest_file = cancelled
+    try:
+        row = await run(new_executor(), identity_graph(fx))
+    finally:
+        identity_mod.digest_file = real_digest
+        mm.interrupt_current_processing(False)
+        subject.write_bytes(original_png)
+    check(case, "a cancel during a long hash stops it at the hash's own interrupt check",
+          not row.get("success") and (row.get("error") or {}).get("event") == "execution_interrupted"
+          and len(checks_inside) == 1 and not ((IDENTIFIED | MEDIA_CONSUMERS) & executed_nodes(row)),
+          {"error": row.get("error"), "checks_inside": len(checks_inside), "executing": row["executing"]})
+    check(case, "the cancelled job returns to pending", any(job["status"] == "pending" for job in jobs_of(fx).values()),
+          jobs_of(fx))
+    row = await run(new_executor(), identity_graph(fx))
+    check(case, "the next run after a cancel succeeds", row.get("success"), row.get("error"))
+
+
+async def case_identity_ram():
+    case = "identity_ram"
+
+    # RAM eviction after the Image Bridge ran with its token: a late consumer re-stages
+    # it, and it decodes again from the recipe its run registered.
+    def evicting(fx):
+        return {"1": editor(fx), "rs": n("SonderReferenceSelector", project=["1", 0], reference_lanes="0"),
+                "ri": n("SonderReferenceImageBridge", reference_set=["rs", 0], unused_slots="placeholder"),
+                "rd": n("CPMediaDigest", frames=["ri", 0]), "ev": n("CPEvict", anchor=["rd", 0]),
+                "late": n("CPMediaDigest", frames=["ri", 0]), "cat": n("StringConcatenate", string_a=["ev", 0],
+                                                                       string_b=["late", 0], delimiter="|"),
+                "catp": n("PreviewAny", source=["cat", 0]),
+                "after": n("CPAfter", image=["1", 1], a=["cat", 0]), "7": save(["1", 0], ["after", 0], mode="Take")}
+
+    arms = await both_arms(evicting, runs=1, label="idevict")
+    (row, _), (stock, _) = arms[True][1][0], arms[False][1][0]
+    check(case, "eviction re-stages an identified bridge: it decodes from its recipe, outputs equal stock",
+          row["success"] and row["outputs"] == stock["outputs"] and prep(row).get("identities", {}).get("identified") == 1,
+          {"pipeline": row["outputs"], "stock": stock["outputs"], "error": row.get("error"), "prep": prep(row)})
+
+
 NOTES_OUT = {}
 CASES = {"acceptance": case_acceptance, "fail_open": case_fail_open, "tokens": case_tokens, "cancel": case_cancel,
          "errors": case_errors, "shapes": case_shapes, "lazy": case_lazy, "ram": case_ram, "misc": case_misc,
          "bridges": case_bridges, "bridges_real": case_bridges_real, "bridges_shapes": case_bridges_shapes,
          "bridges_safety": case_bridges_safety, "bridges_ram": case_bridges_ram,
-         "bridges_snapshot": case_bridges_snapshot, "bridges_negative": case_bridges_negative}
+         "bridges_snapshot": case_bridges_snapshot, "bridges_negative": case_bridges_negative,
+         "identity": case_identity, "identity_lazy": case_identity_lazy, "identity_safety": case_identity_safety,
+         "identity_ram": case_identity_ram, "identity_shapes": case_identity_shapes}
 BY_MODE = {
     "classic": ["acceptance", "fail_open", "tokens", "cancel", "errors", "shapes", "lazy", "misc",
-                "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative"],
-    "lru": ["acceptance", "cancel", "bridges"],
-    "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram"],
-    "none": ["acceptance", "bridges"],
+                "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative",
+                "identity", "identity_lazy", "identity_safety", "identity_shapes"],
+    "lru": ["acceptance", "cancel", "bridges", "identity"],
+    "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram",
+            "identity", "identity_ram"],
+    "none": ["acceptance", "bridges", "identity"],
 }
 
 

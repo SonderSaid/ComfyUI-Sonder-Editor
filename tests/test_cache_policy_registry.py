@@ -269,6 +269,65 @@ for node_id in sorted(mapping):
     if not set(item["hidden"]) <= {"PROMPT", "UNIQUE_ID"}:
         fail(node_id, f"PREPARES with hidden inputs the early run cannot supply: {item['hidden']}")
 
+# Routers: one lazy rule, shared by check_lazy_status and the pipeline's prediction.
+def lazy_input_names(cls):
+    types_ = cls.INPUT_TYPES() or {}
+    return {name for category in ("required", "optional") for name, spec in (types_.get(category) or {}).items()
+            if isinstance(spec, (tuple, list)) and len(spec) > 1 and isinstance(spec[1], dict) and spec[1].get("lazy")}
+
+
+handle_types = {mapping[node_id].RETURN_TYPES[slot]
+                for node_id in out["prepared"]
+                for slot, name in enumerate(info[node_id]["names"])
+                if policy.output_policy(mapping[node_id], name) == policy.HANDLE}
+out["lazy"], out["identified"] = [], {}
+for node_id in sorted(mapping):
+    cls, item = mapping[node_id], info[node_id]
+    declared_inputs = {name for category in item["inputs"].values() for name in category}
+    lazy = policy.lazy_policy(cls)
+    if getattr(cls, policy.LAZY_ATTRIBUTE, None) is not None and lazy is None:
+        fail(node_id, "SONDER_CACHE_LAZY is not a LAZY_REQUESTS declaration")
+    if lazy is not None:
+        out["lazy"].append(node_id)
+        if not callable(getattr(cls, lazy.method, None)):
+            fail(node_id, f"LAZY_REQUESTS method {lazy.method!r} is not callable")
+        if not lazy.deciding or any(name not in declared_inputs for name in lazy.deciding):
+            fail(node_id, f"LAZY_REQUESTS deciding inputs are not declared inputs: {lazy.deciding}")
+        # (A Switch's lazy branches live inside its Autogrow input, which this flat
+        # walk cannot see; tests/test_lazy_switches.py covers each router's rule.)
+        if set(lazy.deciding) & lazy_input_names(cls):
+            fail(node_id, "a LAZY_REQUESTS deciding input is lazy")
+    identity = policy.identity_policy(cls)
+    if getattr(cls, policy.IDENTITY_ATTRIBUTE, None) is not None and identity is None:
+        fail(node_id, "SONDER_CACHE_IDENTITY is not an IDENTIFIES declaration")
+    names = item["names"] or [f"#{index}" for index in range(len(item["returns"]))]
+    descriptors = [name for name in names if policy.output_policy(cls, name) == policy.DESCRIPTOR]
+    if descriptors and identity is None:
+        fail(node_id, "DESCRIPTOR outputs without SONDER_CACHE_IDENTITY (IDENTIFIES)")
+    if identity is None:
+        continue
+    out["identified"][node_id] = {"token_input": identity.token_input, "descriptors": descriptors}
+    if not callable(getattr(cls, "cache_recipe", None)):
+        fail(node_id, "IDENTIFIES without a callable cache_recipe")
+    token_type = item["inputs"]["required"].get(identity.token_input)
+    if token_type not in handle_types | {"SONDER_PROJECT"}:
+        fail(node_id, f"IDENTIFIES token_input {identity.token_input!r} is not a required HANDLE or SONDER_PROJECT input")
+    if any(name not in declared_inputs for name in identity.recipe_inputs):
+        fail(node_id, f"IDENTIFIES recipe_inputs are not declared inputs: {identity.recipe_inputs}")
+    if identity.token_input in identity.recipe_inputs:
+        fail(node_id, "IDENTIFIES lists its token_input among recipe_inputs")
+    if set(identity.recipe_inputs) & lazy_input_names(cls):
+        fail(node_id, "an IDENTIFIES recipe input is lazy")
+    for name in names:
+        value = policy.output_policy(cls, name)
+        passthrough = any(policy.declaration_matches(key, name) for key in identity.passthrough)
+        if passthrough and not isinstance(value, policy.Inherits):
+            fail(node_id, f"passthrough output {name} must be INHERITS")
+        if not passthrough and value != policy.DESCRIPTOR:
+            fail(node_id, f"IDENTIFIES output {name} is not DESCRIPTOR or a declared passthrough")
+    if getattr(cls, "INPUT_IS_LIST", False) or any(getattr(cls, "OUTPUT_IS_LIST", None) or ()):
+        fail(node_id, "IDENTIFIES on a list-mapped node")
+
 editor = info.get("SonderEditor")
 out["editor_hidden"] = editor["hidden"] if editor else None
 out["editor_exact"] = [slot for slot, name in enumerate(editor["names"])
@@ -323,6 +382,22 @@ def test_the_bridges_value_outputs_are_exact_and_prepared(registry):
     assert registry["exact"]["SonderReferenceSelector"] == [1, 2]
     assert registry["exact"]["SonderReferencePromptBridge"] == list(range(18))
     assert set(registry["exact"]) == set(registry["prepared"]) | {"SonderEditor"}
+
+
+def test_the_sonder_routers_declare_their_one_lazy_rule(registry):
+    # Phase 3, Part A: the only nodes whose lazy inputs the pipeline may follow.
+    assert registry["lazy"] == ["SonderGate", "SonderLazyCluster", "SonderLazySwitch"]
+
+
+def test_the_identified_bridges_are_the_canonical_list(registry):
+    # Phase 3, Part B: bridges whose media outputs carry a recipe-and-content identity.
+    assert sorted(registry["identified"]) == IDENTIFIED
+    for node_id, item in registry["identified"].items():
+        assert item["descriptors"], node_id
+
+
+IDENTIFIED = ["SonderDriverBridge", "SonderGuidesBridgeStart", "SonderReferenceAudioBridge",
+              "SonderReferenceImageBridge"]
 
 
 def test_the_editor_has_only_the_hidden_inputs_the_early_run_supplies(registry):

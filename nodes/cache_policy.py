@@ -43,6 +43,18 @@ and the frozen job, publishes JSON-safe values under the declared
 ``_execution_context`` keys only, reads nothing a save mutates, and does nothing
 else (no file writes, claims, receipts, run-record changes).
 
+**Routers** (``SONDER_CACHE_LAZY = LAZY_REQUESTS(method, deciding)``): a Sonder
+lazy router whose ``method`` is the one rule for which lazy inputs it requests,
+called by its own ``check_lazy_status`` and by the pipeline with the
+``deciding`` inputs' values when they are known before cache keys. The pipeline
+then treats the requested branch as certain to run.
+
+**Identity** (``SONDER_CACHE_IDENTITY = IDENTIFIES(token_input, recipe_inputs)``):
+a bridge whose ``DESCRIPTOR`` outputs come from a decode recipe
+(``cache_recipe``) plus the bytes of the files it names. The pipeline hashes
+both before cache keys and hands the bridge a token in place of its
+``token_input`` link (M2); ``nodes/cache_identity.py`` owns the contract.
+
 The ``SONDER_`` prefix keeps these names clear of any future ComfyUI attribute.
 """
 
@@ -72,6 +84,8 @@ PROOFS = (TAKES_PROJECT, NAN_FINGERPRINT)
 POLICY_ATTRIBUTE = "SONDER_CACHE_POLICY"
 EXECUTION_ATTRIBUTE = "SONDER_CACHE_EXECUTION"
 PREPARE_ATTRIBUTE = "SONDER_CACHE_PREPARE"
+LAZY_ATTRIBUTE = "SONDER_CACHE_LAZY"
+IDENTITY_ATTRIBUTE = "SONDER_CACHE_IDENTITY"
 # {output name: (case, ...)}: the invalidation cases a DESCRIPTOR output registers.
 INVALIDATION_ATTRIBUTE = "SONDER_CACHE_INVALIDATION"
 
@@ -100,6 +114,53 @@ def PREPARES(publishes=()) -> Prepares:  # noqa: N802
     """The node may be run early by the cache pipeline; ``publishes`` names the
     ``_execution_context`` keys its ``execute`` writes (a tuple of strings)."""
     return Prepares(tuple(publishes) if isinstance(publishes, (tuple, list)) else publishes)
+
+
+@dataclass(frozen=True)
+class LazyRequests:
+    method: str
+    deciding: tuple
+
+
+def LAZY_REQUESTS(method: str, deciding=()) -> LazyRequests:  # noqa: N802
+    """``method(deciding: dict, connected: frozenset) -> list[str]`` is the router's one lazy rule."""
+    return LazyRequests(str(method or ""), tuple(deciding))
+
+
+@dataclass(frozen=True)
+class Identifies:
+    token_input: str
+    recipe_inputs: tuple
+    passthrough: tuple
+
+
+def IDENTIFIES(token_input: str, recipe_inputs=(), passthrough=()) -> Identifies:  # noqa: N802
+    """The class's ``DESCRIPTOR`` outputs are identified by ``cache_recipe`` plus file content.
+
+    ``token_input`` is the project-derived input the pipeline replaces with the
+    identity token; ``recipe_inputs`` are the other inputs ``cache_recipe`` reads
+    (each must be a literal); ``passthrough`` names output patterns that only
+    forward linked inputs (declared ``INHERITS``).
+    """
+    return Identifies(str(token_input or ""), tuple(recipe_inputs), tuple(passthrough))
+
+
+# The generated invalidation cases every identified output registers
+# (tests/test_cache_identity.py runs each one for every IDENTIFIES class):
+# any input the stock path reads that changes the decode changes the token; a
+# different file at the same path, even with the same size and a copied mtime,
+# changes it; identical bytes rewritten keep it.
+IDENTITY_INVALIDATION = ("inputs_reach_identity", "same_path_content", "unchanged_content")
+
+
+def lazy_policy(class_def: Any) -> LazyRequests | None:
+    declared = getattr(class_def, LAZY_ATTRIBUTE, None)
+    return declared if isinstance(declared, LazyRequests) else None
+
+
+def identity_policy(class_def: Any) -> Identifies | None:
+    declared = getattr(class_def, IDENTITY_ATTRIBUTE, None)
+    return declared if isinstance(declared, Identifies) else None
 
 
 def INHERITS(reason: str) -> Inherits:  # noqa: N802 - reads as a policy constant

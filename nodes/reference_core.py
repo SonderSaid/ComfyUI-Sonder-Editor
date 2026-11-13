@@ -439,18 +439,31 @@ def _snap_span_frame_count(target_count: int, hard: dict | None = None) -> int:
     return max(minimum, offset + max(0, (span - offset) // step) * step)
 
 
+def _member_interpretation(record: dict[str, Any]):
+    """A member's colour interpretation: the one its recipe resolved, else resolved now.
+
+    Video members may probe the file; stills never do (their stored metadata decides).
+    """
+    if "interpretation" in record:
+        return record["interpretation"]
+    asset = record["asset"]
+    if getattr(asset, "asset_type", "") == "video":
+        return resolve_source_color_interpretation(asset, record["path"])
+    return resolve_source_color_interpretation(asset, record["path"], allow_probe=False)
+
+
 def _load_member_image(record: dict[str, Any]) -> np.ndarray:
     asset, member, path = record["asset"], record["member"], record["path"]
     if getattr(asset, "asset_type", "") == "video":
         fps = _asset_video_fps(asset)
         frame_index = max(0, round(_float(getattr(member, "source_start_sec", 0.0)) * fps))
-        interpretation = resolve_source_color_interpretation(asset, path)
+        interpretation = _member_interpretation(record)
         frame = decode_video_frame(path, frame_index, color_interpretation=interpretation)
     else:
         raw = cv2.imread(path, cv2.IMREAD_COLOR)
         frame = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB) if raw is not None else None
         if frame is not None:
-            interpretation = resolve_source_color_interpretation(asset, path, allow_probe=False)
+            interpretation = _member_interpretation(record)
             frame = apply_rgb_color_correction(frame, color_correction_for_interpretation(interpretation))
     if frame is None or frame.size == 0:
         raise RuntimeError(f"Reference member {getattr(member, 'member_id', '')} could not be decoded.")
@@ -501,7 +514,7 @@ def _load_member_images(
     for relative_index in requested:
         by_source_index[relative_index] = by_source_index.get(relative_index, 0) + 1
 
-    interpretation = resolve_source_color_interpretation(asset, record["path"])
+    interpretation = _member_interpretation(record)
     frames = []
     decode_end = source_start + max(requested) + 1
     for relative_index, frame in enumerate(decode_video_range(
@@ -947,7 +960,7 @@ def _decode_lane_images(context) -> list[torch.Tensor]:
         # context-class references occupy the final temporal segment.
         records.sort(key=lambda record: getattr(record["reference"], "reference_class", "") == "context")
     decode_span = assembly in {"batch", "slots"}
-    target_fps = _reference_frame_rate(context)
+    target_fps = context["target_fps"] if "target_fps" in context else _reference_frame_rate(context)
     member_frames = [
         _load_member_images(record, decode_span=decode_span, target_fps=target_fps, hard=hard)
         for record in records
@@ -1023,22 +1036,130 @@ def _image_reserved_slots(context) -> int:
     return context["reserved_span"] if assembly == "slots" else int(context["reserved_span"] > 0)
 
 
-def decode_reference_images(reference_set, unused_slots="placeholder") -> tuple:
-    """Return r01..r16 with each selected lane occupying a stable span."""
+# --- Recipes: the Reference media decode, split for the cache pipeline's identity ----------------
+#
+# ``reference_*_recipe`` reads the reference set, the project's References and
+# assets, the external-links setting and the colour metadata, and returns JSON:
+# every value the decode uses that is not file content, plus ``sources``.
+# ``decode_reference_*_recipe`` reads only that recipe and the files it names
+# (nodes/cache_identity.py). The decode_reference_* functions are the two in a row.
+#
+# Fields are kept raw, as the stock path always read them: a value JSON cannot
+# hold exactly (a NaN, a tuple, a non-JSON type) makes the recipe fail its round
+# trip, and the bridge then gets no identity and decodes on the stock path.
+
+
+def _member_recipe(record: dict[str, Any]) -> dict[str, Any]:
+    asset, member = record["asset"], record["member"]
+    interpretation = _member_interpretation(record)
+    return {
+        "path": record["path"],
+        "member_id": str(getattr(member, "member_id", "") or ""),
+        "context": getattr(record["reference"], "reference_class", "") == "context",
+        "asset_type": str(getattr(asset, "asset_type", "") or ""),
+        "fps": getattr(asset, "fps", 0.0),
+        "duration_sec": getattr(asset, "duration_sec", 0.0),
+        "frame_count": getattr(asset, "frame_count", 0),
+        "source_start_sec": getattr(member, "source_start_sec", 0.0),
+        "source_end_sec": getattr(member, "source_end_sec", None),
+        # The decode ignores anything but a dict crop.
+        "crop": getattr(member, "crop", None) if isinstance(getattr(member, "crop", None), dict) else None,
+        "interpretation": list(interpretation) if interpretation else None,
+    }
+
+
+def _recipe_record(member: dict[str, Any]) -> dict[str, Any]:
+    """The decode's view of a member: only what the recipe holds."""
+    from types import SimpleNamespace
+
+    interpretation = member["interpretation"]
+    return {
+        "reference": SimpleNamespace(reference_class="context" if member["context"] else ""),
+        "member": SimpleNamespace(member_id=member["member_id"], source_start_sec=member["source_start_sec"],
+                                  source_end_sec=member["source_end_sec"], crop=member["crop"]),
+        "asset": SimpleNamespace(asset_type=member["asset_type"], fps=member["fps"],
+                                 duration_sec=member["duration_sec"], frame_count=member["frame_count"]),
+        "path": member["path"],
+        "interpretation": tuple(interpretation) if interpretation else None,
+    }
+
+
+def _lane_recipe(context: dict[str, Any], slot: str) -> dict[str, Any]:
+    decodes = context["present"] and slot in context.get("live", set())
+    return {
+        "lane_index": context["lane_index"],
+        "present": bool(context["present"]),
+        "media_kind": context["media_kind"],
+        "width": context["width"],
+        "height": context["height"],
+        "hard": context["hard"],
+        # The decode only tests membership.
+        "live": sorted(str(name) for name in context.get("live", set())),
+        "reserved_span": context["reserved_span"],
+        "sequence_frames": context["item"].get("sequence_frames"),
+        "framing": context["framing"],
+        "target_fps": _reference_frame_rate(context) if decodes and slot == "image_slots" else None,
+        # Only a lane that decodes opens its members' files.
+        "members": [_member_recipe(record) for record in context["records"]] if decodes else [],
+    }
+
+
+def _context_from_recipe(lane: dict[str, Any]) -> dict[str, Any]:
+    context = {
+        "present": lane["present"],
+        "lane_index": lane["lane_index"],
+        "width": lane["width"],
+        "height": lane["height"],
+        "item": {"sequence_frames": lane["sequence_frames"]},
+        "hard": lane["hard"],
+        "live": set(lane["live"]),
+        "records": [_recipe_record(member) for member in lane["members"]],
+        "media_kind": lane["media_kind"],
+        "reserved_span": lane["reserved_span"],
+        "framing": lane["framing"],
+        "ref": {},
+    }
+    if lane["target_fps"] is not None:
+        context["target_fps"] = lane["target_fps"]
+    return context
+
+
+def _recipe_sources(lanes: list[dict[str, Any]]) -> list[str]:
+    sources: list[str] = []
+    for lane in lanes:
+        for member in lane["members"]:
+            if member["path"] not in sources:
+                sources.append(member["path"])
+    return sources
+
+
+def reference_image_recipe(reference_set, unused_slots="placeholder") -> dict[str, Any]:
+    """The Image Bridge's decode recipe. Raises what the decode raised (conflicts, capacity, members)."""
     ref = reference_set if isinstance(reference_set, dict) else {}
     contexts = _reference_decode_contexts(ref, "image")
-    width = max(1, _int(ref.get("width"), 1280))
-    height = max(1, _int(ref.get("height"), 720))
-    fallback = None if unused_slots == "nothing" else _empty_image(width, height)
     reservations = [_image_reserved_slots(context) for context in contexts]
     _ensure_block_capacity(contexts, "Image", reservations)
+    lanes = [_lane_recipe(context, "image_slots") for context in contexts]
+    return {"kind": "image", "width": max(1, _int(ref.get("width"), 1280)),
+            "height": max(1, _int(ref.get("height"), 720)), "unused_slots": unused_slots,
+            "reservations": reservations, "lanes": lanes, "sources": _recipe_sources(lanes)}
+
+
+def decode_reference_image_recipe(recipe: dict[str, Any]) -> tuple:
+    """r01..r16 from an Image Bridge recipe and its files only."""
+    fallback = None if recipe["unused_slots"] == "nothing" else _empty_image(recipe["width"], recipe["height"])
     values = []
-    for context, reserved in zip(contexts, reservations):
-        lane_values = _decode_lane_images(context)
+    for lane, reserved in zip(recipe["lanes"], recipe["reservations"]):
+        lane_values = _decode_lane_images(_context_from_recipe(lane))
         values.extend(lane_values[:reserved])
         values.extend(fallback for _ in range(max(0, reserved - len(lane_values))))
     values.extend(fallback for _ in range(MAX_REFERENCE_SLOTS - len(values)))
     return tuple(values)
+
+
+def decode_reference_images(reference_set, unused_slots="placeholder") -> tuple:
+    """Return r01..r16 with each selected lane occupying a stable span."""
+    return decode_reference_image_recipe(reference_image_recipe(reference_set, unused_slots))
 
 
 def _decode_lane_audios(context) -> list[dict]:
@@ -1047,8 +1168,8 @@ def _decode_lane_audios(context) -> list[dict]:
     return [_audio_output(record) for record in context["records"]]
 
 
-def decode_reference_audios(reference_set, unused_slots="placeholder") -> tuple:
-    """Return a01..a16 with each selected lane occupying a stable span."""
+def reference_audio_recipe(reference_set, unused_slots="placeholder") -> dict[str, Any]:
+    """The Audio Bridge's decode recipe. Raises what the decode raised."""
     ref = reference_set if isinstance(reference_set, dict) else {}
     contexts = _reference_decode_contexts(ref, "audio")
     reservations = [
@@ -1058,17 +1179,29 @@ def decode_reference_audios(reference_set, unused_slots="placeholder") -> tuple:
         for context in contexts
     ]
     _ensure_block_capacity(contexts, "Audio", reservations)
+    lanes = [_lane_recipe(context, "audio_slots") for context in contexts]
+    return {"kind": "audio", "unused_slots": unused_slots, "reservations": reservations,
+            "lanes": lanes, "sources": _recipe_sources(lanes)}
+
+
+def decode_reference_audio_recipe(recipe: dict[str, Any]) -> tuple:
+    """a01..a16 from an Audio Bridge recipe and its files only."""
     values = []
-    for context, reserved in zip(contexts, reservations):
-        lane_values = _decode_lane_audios(context)
+    for lane, reserved in zip(recipe["lanes"], recipe["reservations"]):
+        lane_values = _decode_lane_audios(_context_from_recipe(lane))
         values.extend(lane_values[:reserved])
         values.extend(None for _ in range(max(0, reserved - len(lane_values))))
     values.extend(None for _ in range(MAX_REFERENCE_SLOTS - len(values)))
     # Live slots keep their own native rates. Placeholders share the highest live
     # rate (48 kHz when none are live), avoiding an unrelated legacy 44.1 kHz clock.
     rate = max((value["sample_rate"] for value in values if value is not None), default=48000)
-    return tuple(_silent_audio(sample_rate=rate) if value is None and unused_slots != "nothing" else value
+    return tuple(_silent_audio(sample_rate=rate) if value is None and recipe["unused_slots"] != "nothing" else value
                  for value in values)
+
+
+def decode_reference_audios(reference_set, unused_slots="placeholder") -> tuple:
+    """Return a01..a16 with each selected lane occupying a stable span."""
+    return decode_reference_audio_recipe(reference_audio_recipe(reference_set, unused_slots))
 
 
 def decode_reference_prompts(reference_set) -> tuple:

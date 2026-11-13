@@ -721,6 +721,36 @@ def _cached_color_probe(abs_path: str) -> dict:
     return result
 
 
+_HEURISTIC_SIZE_CACHE: dict[str, tuple[str, tuple[int, int]]] = {}
+_HEURISTIC_SIZE_LOCK = threading.Lock()
+
+
+def _cached_heuristic_size(abs_path: str) -> tuple[int, int]:
+    """The frame size the untagged-colour heuristic reads, cached like the colour probe.
+
+    Only ``resolve_source_color_interpretation`` uses it: the cache pipeline
+    builds a Driver's decode recipe on every prompt, and an untagged clip with
+    no asset dimensions would otherwise pay an ffprobe each time. Decoding still
+    probes its own frame size uncached (``decode_video_range``).
+    """
+    key = os.path.normcase(os.path.abspath(abs_path))
+    try:
+        stat = os.stat(abs_path)
+        signature = f"{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        return probe_video_size(abs_path)
+    with _HEURISTIC_SIZE_LOCK:
+        cached = _HEURISTIC_SIZE_CACHE.get(key)
+    if cached and cached[0] == signature:
+        return cached[1]
+    size = probe_video_size(abs_path)
+    with _HEURISTIC_SIZE_LOCK:
+        while len(_HEURISTIC_SIZE_CACHE) >= _COLOR_PROBE_CACHE_MAX:
+            _HEURISTIC_SIZE_CACHE.pop(next(iter(_HEURISTIC_SIZE_CACHE)))
+        _HEURISTIC_SIZE_CACHE[key] = (signature, size)
+    return size
+
+
 def _matrix_range_from_color_fields(color_space: str, color_range: str) -> tuple[str, str] | None | str:
     """Map normalized tag values to an interpretation. Returns a (matrix, range)
     tuple, None for RGB content (no matrix applies), or "" when untagged/unmapped."""
@@ -784,7 +814,7 @@ def resolve_source_color_interpretation(asset=None, abs_path: str = "", *, allow
 
     if (not width or not height) and allow_probe and abs_path:
         try:
-            width, height = probe_video_size(abs_path)
+            width, height = _cached_heuristic_size(abs_path)
         except Exception as exc:
             logger.debug("color heuristic size probe failed for %s: %s", abs_path, exc)
     return _untagged_interpretation(width, height)

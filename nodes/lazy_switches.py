@@ -16,6 +16,15 @@ except ImportError as exc:  # pragma: no cover - depends on installed ComfyUI ve
         raise
     from comfy_api.latest import io
 
+from .cache_policy import LAZY_REQUESTS
+
+# Each router's ``requested_lazy_inputs`` is the one rule for which lazy inputs it
+# asks for: ``check_lazy_status`` calls it when the scheduler asks, and the cache
+# pipeline calls it with values it knows before cache keys exist, to tell which
+# branch stock ComfyUI will certainly run (``SONDER_CACHE_LAZY``). Two properties
+# keep the two answers equal: it returns only names in ``connected``, and it
+# decides each lazy input from ``deciding`` alone, never from another lazy input.
+
 
 def _clamp_int(value: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, value))
@@ -134,28 +143,35 @@ class SonderLazySwitch(io.ComfyNode, _LazySelectionMixin):
             MAX_BRANCHES,
         )
 
+    SONDER_CACHE_LAZY = LAZY_REQUESTS(method="requested_lazy_inputs", deciding=("select",))
+
+    @classmethod
+    def requested_lazy_inputs(cls, deciding: dict, connected: frozenset) -> list[str]:
+        """The selected branch's input, when it is still unevaluated (``connected``)."""
+        idx = cls._selected_index(select=deciding["select"])
+        if cls._validate_index_max(idx, MAX_BRANCHES) is not True:
+            return []
+        key = cls._flat_key(cls._branch_key(idx))
+        return [key] if key in connected else []
+
     @classmethod
     def check_lazy_status(cls, select: int, branches: io.Autogrow.Type, **kwargs) -> list[str]:
-        idx = cls._selected_index(select=select)
-        idx_ok = cls._validate_index_max(idx, MAX_BRANCHES)
-        if idx_ok is not True:
-            return []
-
-        branch_key = cls._branch_key(idx)
-        if not isinstance(branches, dict) or branch_key not in branches:
-            return []
-
-        entry = branches[branch_key]
-        # Native Autogrow wraps hook values with their original input key.
-        # Unwrap only this metadata pair; execute receives the payload itself.
-        if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], str):
-            value, input_key = entry
-            return [input_key] if value is None else []
-        # Retain bare-None hook compatibility while that shape is supported;
-        # this does not repair eager scheduling in older ComfyUI cores.
-        if entry is None:
-            return [cls._flat_key(branch_key)]
-        return []
+        # The rule works on flat prompt names (``branches.itemN``); the request is
+        # made under the name the executor supplied for that branch.
+        request_name: dict[str, str] = {}
+        if isinstance(branches, dict):
+            for branch_key, entry in branches.items():
+                # Native Autogrow wraps hook values with their original input key.
+                # Unwrap only this metadata pair; execute receives the payload itself.
+                if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], str):
+                    if entry[0] is None:
+                        request_name[cls._flat_key(branch_key)] = entry[1]
+                # Retain bare-None hook compatibility while that shape is supported;
+                # this does not repair eager scheduling in older ComfyUI cores.
+                elif entry is None:
+                    request_name[cls._flat_key(branch_key)] = cls._flat_key(branch_key)
+        names = cls.requested_lazy_inputs({"select": select}, frozenset(request_name))
+        return [request_name[name] for name in names]
 
     @classmethod
     def validate_inputs(
@@ -301,19 +317,22 @@ class SonderLazyCluster(io.ComfyNode, _LazySelectionMixin):
             MAX_LANES,
         )
 
+    SONDER_CACHE_LAZY = LAZY_REQUESTS(method="requested_lazy_inputs", deciding=("select", "branches", "lanes"))
+
     @classmethod
-    def check_lazy_status(cls, select: int, branches: int, lanes: int, **kwargs) -> list[str]:
-        idx = cls._selected_index(select=select)
-        state_ok = cls._validate_cluster_state(idx, int(branches), int(lanes))
+    def requested_lazy_inputs(cls, deciding: dict, connected: frozenset) -> list[str]:
+        """The selected branch's unevaluated lanes, when the cluster's state is valid."""
+        idx = cls._selected_index(select=deciding["select"])
+        lanes = int(deciding["lanes"])
+        state_ok = cls._validate_cluster_state(idx, int(deciding["branches"]), lanes)
         if state_ok is not True:
             return []
+        return [key for lane_idx in range(lanes) if (key := cls._input_name(idx, lane_idx)) in connected]
 
-        needed: list[str] = []
-        for lane_idx in range(int(lanes)):
-            key = cls._input_name(idx, lane_idx)
-            if key in kwargs and kwargs[key] is None:
-                needed.append(key)
-        return needed
+    @classmethod
+    def check_lazy_status(cls, select: int, branches: int, lanes: int, **kwargs) -> list[str]:
+        connected = frozenset(key for key, value in kwargs.items() if value is None)
+        return cls.requested_lazy_inputs({"select": select, "branches": branches, "lanes": lanes}, connected)
 
     @classmethod
     def validate_inputs(cls, **kwargs) -> bool | str:
@@ -387,6 +406,9 @@ def _gate_open(condition: Any = _UNWIRED) -> bool:
 class SonderGate(io.ComfyNode):
     """Per-lane lazy gate: an open lane evaluates and passes its value, a closed one emits nothing."""
 
+    SONDER_CACHE_LAZY = LAZY_REQUESTS(method="requested_lazy_inputs",
+                                      deciding=tuple(f"when_{_lane_label(i)}" for i in range(MAX_GATE_LANES)))
+
     @classmethod
     def define_schema(cls) -> io.Schema:
         lane_templates = [
@@ -449,15 +471,19 @@ class SonderGate(io.ComfyNode):
         return _gate_open(kwargs.get(cls._when_name(lane_idx), _UNWIRED))
 
     @classmethod
+    def requested_lazy_inputs(cls, deciding: dict, connected: frozenset) -> list[str]:
+        """Each unevaluated value whose own lane is open. An absent ``when`` is unwired."""
+        return [key for lane_idx in range(MAX_GATE_LANES)
+                if (key := cls._value_name(lane_idx)) in connected and cls._lane_open(lane_idx, deciding)]
+
+    @classmethod
     def check_lazy_status(cls, **kwargs) -> list[str]:
         # 'when' is non-lazy, so it is already evaluated here: its None is a real
         # None. A connected lazy value that has not run yet arrives as None.
-        needed: list[str] = []
-        for lane_idx in range(MAX_GATE_LANES):
-            key = cls._value_name(lane_idx)
-            if key in kwargs and kwargs[key] is None and cls._lane_open(lane_idx, kwargs):
-                needed.append(key)
-        return needed
+        whens = {cls._when_name(lane_idx) for lane_idx in range(MAX_GATE_LANES)}
+        deciding = {key: value for key, value in kwargs.items() if key in whens}
+        connected = frozenset(key for key, value in kwargs.items() if value is None and key not in whens)
+        return cls.requested_lazy_inputs(deciding, connected)
 
     @classmethod
     def execute(cls, **kwargs) -> io.NodeOutput:

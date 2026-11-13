@@ -136,6 +136,13 @@ out["v3_gate_mutants"] = {name: hook.check_v3_call(module) for name, module in v
 out["v3_runtime_fields"] = sorted(hook._v3_runtime(execution))
 out["v3_runtime_mutant"] = sorted(hook._v3_runtime(v3_mutants["output"]))
 
+# The identity gate (Phase 3): a bridge finds its run through the same executing
+# context the executor sets; another CurrentNodeContext turns identity off.
+out["identity_gate_installed"] = hook.check_identity_context(execution)
+out["identity_gate_mutant"] = hook.check_identity_context(fake(CurrentNodeContext=context.CurrentNodeContext))
+out["identity_runtime"] = sorted(hook._identity_runtime(execution))
+out["identity_runtime_mutant"] = sorted(hook._identity_runtime(fake(CurrentNodeContext=context.CurrentNodeContext)))
+
 # Install: idempotent, not stacked.
 first = hook.install(execution)
 hooked = execution.IsChangedCache
@@ -244,6 +251,13 @@ def test_the_gate_names_each_mutation(result):
         "context": "CurrentNodeContext signature",
         "null_cache": "NullCache",
     }
+
+
+def test_the_identity_gate_passes_installed_and_fails_on_another_context(result):
+    assert result["identity_gate_installed"] is None
+    assert result["identity_gate_mutant"] == "CurrentNodeContext is not comfy_execution.utils'"
+    assert result["identity_runtime"] == ["identity"]
+    assert result["identity_runtime_mutant"] == []
 
 
 def test_the_v3_call_gate_passes_installed_and_names_each_mutation(result):

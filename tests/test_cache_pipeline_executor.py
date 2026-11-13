@@ -19,6 +19,15 @@ and saved-take provenance against stock (classic, ram); graph shapes, safety
 and a negative control that diverts publication (classic); eviction of a
 still-scheduled bridge (ram).
 
+Phase 3 adds media identity (``identity*`` cases): a Driver, a Reference Image
+Bridge and a Guides Start whose media consumers hit on an identical job, a
+Reference image replaced at the same path, a Driver strength and a guide
+strength edit each rerunning exactly their own chain, against stock (every
+mode; ``none`` asserts the bypass); a Driver behind a Sonder Cluster selected by
+``has_driver``, and a muted one that is never hashed (classic); a forged token,
+a source changed after hashing and a cancel while hashing (classic); a RAM
+eviction that re-stages an identified bridge (ram).
+
 Skips without a ComfyUI install (``SONDER_COMFYUI_ROOT`` or the test install's venv).
 """
 
@@ -35,10 +44,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 HELPER = REPO_ROOT / "tests" / "helpers" / "cache_pipeline_executor.py"
 CASES_BY_MODE = {
     "classic": ["acceptance", "fail_open", "tokens", "cancel", "errors", "shapes", "lazy", "misc",
-                "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative"],
-    "lru": ["acceptance", "cancel", "bridges"],
-    "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram"],
-    "none": ["acceptance", "bridges"],
+                "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative",
+                "identity", "identity_lazy", "identity_safety", "identity_shapes"],
+    "lru": ["acceptance", "cancel", "bridges", "identity"],
+    "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram",
+            "identity", "identity_ram"],
+    "none": ["acceptance", "bridges", "identity"],
 }
 
 
