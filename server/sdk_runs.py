@@ -148,6 +148,9 @@ def open_release(key: Any, prompt_id: Any = "", prompt: Any = None, roots: Any =
             # Media identities the cache pipeline handed bridges this run:
             # token -> (class type, canonical recipe JSON, source stat snapshots).
             "identities": {},
+            # Editor media the cache pipeline handed carriers this run:
+            # token -> (Editor call key, output slot), a pointer into "results".
+            "media": {},
             # O(1) here: a cancel can race the interval between get and ComfyUI
             # resetting its interrupt flag, so nothing heavy runs in this hook.
             "roots": _clean_roots(roots),
@@ -254,6 +257,7 @@ def close_release(key: Any) -> dict[str, Any] | None:
         record.pop("failures", None)
         record.pop("preparation", None)
         record.pop("identities", None)
+        record.pop("media", None)
         record.pop("prompt_ref", None)
         if record.get("scope") is _SCOPE_UNSET:
             record["scope"] = None
@@ -390,6 +394,50 @@ def identity_for(prompt_id: Any, token: Any) -> tuple[str, str, dict] | None:
         return (entry[0], entry[1], dict(entry[2])) if entry is not None else None
 
 
+# Bounded per run: one entry per Editor media output a carrier serves.
+MEDIA_LIMIT = 16
+
+
+def register_media(key: Any, prompt_id: Any, token: str, call_key: str, slot: int) -> str:
+    """Register the Editor media a carrier serves this run under ``token``.
+
+    Stores a pointer into this run's first results (``call_key``, ``slot``), never
+    the tensor. Returns "" on success, or why not: ``untrusted``,
+    ``prompt_id_ambiguous``, ``no_result`` (the Editor's result is not on the
+    record) or ``registry_full``. The same rules as ``register_identity``.
+    """
+    key, prompt_id, call_key = _key(key), str(prompt_id or ""), _key(call_key)
+    with _LOCK:
+        record = _RELEASES.get(key)
+        if record is None or record.get("media") is None:
+            return "untrusted"
+        if record.get("prompt_id") != prompt_id or _only_open_record_for_prompt_id(prompt_id) is not record:
+            return "prompt_id_ambiguous"
+        result = (record.get("results") or {}).get(call_key)
+        if (not isinstance(token, str) or not isinstance(slot, int) or isinstance(slot, bool)
+                or not isinstance(result, tuple) or not 0 <= slot < len(result)):
+            return "no_result"
+        media = record["media"]
+        if token not in media and len(media) >= MEDIA_LIMIT:
+            return "registry_full"
+        media[token] = (call_key, slot)
+        return ""
+
+
+def media_for(prompt_id: Any, token: Any) -> tuple[bool, Any]:
+    """``(True, value)``: the Editor output registered under ``token`` by the running prompt."""
+    with _LOCK:
+        record = _only_open_record_for_prompt_id(str(prompt_id or ""))
+        media = record.get("media") if record is not None else None
+        if not media or not isinstance(token, str) or token not in media:
+            return False, None
+        call_key, slot = media[token]
+        result = (record.get("results") or {}).get(call_key)
+        if not isinstance(result, tuple) or not 0 <= slot < len(result):
+            return False, None
+        return True, result[slot]
+
+
 def release_roots(key: Any) -> tuple[str, ...] | None:
     """The open run's execution roots (``outputs_to_execute``), or None when unknown."""
     with _LOCK:
@@ -451,7 +499,7 @@ def record_snapshot(key: Any) -> dict[str, Any] | None:
             return None
         return {name: value for name, value in record.items()
                 if name not in {"prompt_ref", "results", "leases", "projects", "failures", "preparation",
-                                "identities"}
+                                "identities", "media"}
                 and value is not _SCOPE_UNSET}
 
 

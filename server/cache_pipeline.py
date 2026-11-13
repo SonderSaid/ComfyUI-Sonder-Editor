@@ -28,6 +28,12 @@ Editor's text and number outputs without touching that guard:
 6. Overrides go through ``DynamicPrompt.override_node``, which feeds key
    construction and input resolution while hidden ``PROMPT``, history and display
    ids keep the submitted graph.
+7. **Editor media** (``CONTENT``): each media output with a consumer that can
+   gain is hashed (``nodes/cache_content.py``) and handed to an ephemeral
+   carrier (``nodes/media_carrier.py``) keyed by the digest; its consumers are
+   rewired to the carrier. ``executor_hook`` keys the carriers in this prompt's
+   ``set_prompt`` and rolls the graph back if it cannot. The content pass is
+   isolated like the bridge and identity passes.
 
 Fail-open: anything this module cannot prove leaves the prompt exactly as
 submitted. **A miss is acceptable; a false hit never is.** Only an exception
@@ -58,6 +64,8 @@ logger = logging.getLogger(__name__)
 
 EDITOR_CLASS_TYPE = "SonderEditor"
 EDITOR_HIDDEN = frozenset({"PROMPT", "UNIQUE_ID"})
+CARRIER_CLASS_TYPE = "SonderMediaCarrier"
+CARRIER_PREFIX = "sonder-media:"
 
 PREPARED = "prepared"
 SKIPPED = "skipped"
@@ -81,6 +89,10 @@ REASON_TEXT = {
     "prompt_identity": "the Sonder Editor's prompt could not be matched to its run",
     "call_key": "the Sonder Editor's run could not be identified",
     "result_shape": "the Sonder Editor returned an unexpected result",
+    # Editor media (CONTENT): why no carrier was planned.
+    "cache_type": "ComfyUI's output cache is not one Sonder can carry Editor media through",
+    "set_prompt_armed": "another extension changed ComfyUI's output cache for this run",
+    "carrier_class_missing": "the Sonder Media Carrier node is not registered",
 }
 _QUIET_REASONS = frozenset({"no_editor"})
 _LOGGED_REASONS: set[str] = set()
@@ -119,6 +131,36 @@ class Producer:
     result: tuple
     slot_policy: Callable[[int], Any]
     slot_type: Callable[[int], str]
+
+
+@dataclass(frozen=True)
+class MediaHost:
+    """What ``executor_hook`` lends the content pass for one prompt.
+
+    ``reason`` is "" when this prompt's outputs cache can take carriers, else why
+    not; ``arm(plan)`` makes that cache key the plan's carriers in its next
+    ``set_prompt``.
+    """
+
+    reason: str
+    arm: Callable[[Any], None]
+
+
+@dataclass
+class CarrierPlan:
+    """The carriers one prompt applies, and what undoes them (dictionary operations only)."""
+
+    key: str
+    editor_id: str
+    carrier_ids: list
+    carriers: dict  # carrier id -> ephemeral node
+    overrides: dict  # rewired consumer -> its node, merged with its Phase 1-3 override
+    restore: dict  # rewired consumer -> the node it had without carriers (None: no override)
+    payloads: dict  # carrier id -> the Editor's value (the memo's own object); cleared once stored
+    previous_real: Any = None  # the DynamicPrompt's own get_real_node_id attribute, if it had one
+
+
+_NO_ATTRIBUTE = object()
 
 
 def producer_for(class_def: Any, result: tuple) -> Producer:
@@ -782,11 +824,202 @@ def _identity_pass(runtime: ExecutorRuntime, prompt_id: str, key: str, dynprompt
     return tokens
 
 
+# --- Editor media (CONTENT): carriers keyed by a digest of the content ----------------------
+
+
+def carrier_id_for(editor_id: str, slot: int) -> str:
+    return f"{CARRIER_PREFIX}{editor_id}:{slot}"
+
+
+def plan_carriers(nodes_view: dict[str, dict], overrides: dict[str, dict], editor_id: str, editor_class: Any,
+                  tokens: dict[int, str] | None, input_type_of: Callable[[str, str], Any],
+                  ) -> tuple[dict[str, dict], dict[str, dict], dict[str, Any], set[int], list[dict]]:
+    """``(carriers, merged, restore, gaining, skips)`` for the Editor's ``CONTENT`` outputs. Pure.
+
+    A candidate is an input of an in-scope node, as the Phase 1-3 plan leaves it
+    (``overrides``), that links to a ``CONTENT`` slot of the Editor. A consumer
+    gains only when none of its other inputs links to the Editor once its
+    candidates are rewired (one that also takes ``project`` can never hit), and it
+    is left alone otherwise. ``gaining`` is every slot some gaining consumer
+    reads; ``tokens is None`` is the dry run (nothing built). With tokens, each
+    gaining consumer whose slots all have a token is rewired to the carriers,
+    merged into one deep copy of its current node; ``restore`` holds the node it
+    had without carriers (its Phase 1-3 override, or None for none). ``rawLink``,
+    malformed slots and unknown inputs are skipped with a reason.
+    """
+    content = set(cache_policy.content_slots(editor_class))
+    returns = tuple(editor_class.RETURN_TYPES)
+    skips: list[dict] = []
+    wanted: dict[str, dict[str, int]] = {}
+    for node_id, node in nodes_view.items():
+        if node_id == editor_id or not isinstance(node, dict):
+            continue
+        current = overrides.get(node_id) or node
+        inputs = current.get("inputs") or {}
+        rewires: dict[str, int] = {}
+        for name, value in inputs.items():
+            if not is_link(value) or str(value[0]) != editor_id:
+                continue
+            slot = _slot_index(value)
+            if slot is None or slot >= len(returns):
+                skips.append({"node": node_id, "input": name, "slot": slot, "reason": "slot"})
+                continue
+            if slot not in content:
+                continue
+            try:
+                info = input_type_of(node_id, name)
+            except Exception:
+                info = None
+            if not info:
+                skips.append({"node": node_id, "input": name, "slot": slot, "reason": "consumer_unknown"})
+                continue
+            extra = info[1] if isinstance(info, tuple) and len(info) == 2 else None
+            if isinstance(extra, dict) and extra.get("rawLink"):
+                skips.append({"node": node_id, "input": name, "slot": slot, "reason": "raw_link"})
+                continue
+            rewires[name] = slot
+        if not rewires:
+            continue
+        if any(is_link(value) and str(value[0]) == editor_id
+               for name, value in inputs.items() if name not in rewires):
+            skips.extend({"node": node_id, "input": name, "slot": slot, "reason": "no_gain"}
+                         for name, slot in rewires.items())
+            continue
+        wanted[node_id] = rewires
+    gaining = {slot for rewires in wanted.values() for slot in rewires.values()}
+    carriers: dict[str, dict] = {}
+    merged: dict[str, dict] = {}
+    restore: dict[str, Any] = {}
+    if tokens is None:
+        return carriers, merged, restore, gaining, skips
+    for node_id, rewires in wanted.items():
+        if any(slot not in tokens for slot in rewires.values()):
+            skips.extend({"node": node_id, "input": name, "slot": slot, "reason": "no_digest"}
+                         for name, slot in rewires.items())
+            continue
+        replacement = copy.deepcopy(overrides.get(node_id) or nodes_view[node_id])
+        for name, slot in rewires.items():
+            carrier_id = carrier_id_for(editor_id, slot)
+            carriers[carrier_id] = {"class_type": CARRIER_CLASS_TYPE, "inputs": {"token": tokens[slot]}}
+            replacement["inputs"][name] = [carrier_id, 0]
+        merged[node_id] = replacement
+        restore[node_id] = overrides.get(node_id)
+    return carriers, merged, restore, gaining, skips
+
+
+def _content_pass(runtime: ExecutorRuntime, prompt_id: str, key: str, dynprompt: Any, prompt: dict,
+                  nodes_view: dict[str, dict], editor_id: str, editor_class: Any, result: tuple, call_key: str,
+                  overrides: dict[str, dict], input_type_of: Callable[[str, str], Any], media: MediaHost | None,
+                  record: dict[str, Any]) -> CarrierPlan | None:
+    """Hash the Editor's media outputs that can gain and plan their carriers; the plan, or None.
+
+    A dry run of the planner first, so a slot is hashed only when some consumer
+    can gain from it. Each digest checks for an interrupt between batches; its
+    raise propagates. Every other failure leaves that slot (or every slot) on
+    today's path. Nothing is applied here.
+    """
+    from ..nodes import cache_content
+
+    reasons = record["content_reasons"]
+
+    def skip(reason: str, count: int = 1) -> None:
+        reasons[reason] = reasons.get(reason, 0) + count
+
+    if media is None or media.reason:
+        reason = media.reason if media is not None else "carrier_gate"
+        skip(reason)
+        if reason in REASON_TEXT:
+            _note_reason(reason)  # once per process; the gate itself logged at install
+        return None
+    if any(isinstance(node, dict) and node.get("class_type") == CARRIER_CLASS_TYPE for node in prompt.values()):
+        skip("carrier_in_prompt")
+        return None
+    _carriers, _merged, _restore, gaining, skips = plan_carriers(
+        nodes_view, overrides, editor_id, editor_class, None, input_type_of)
+    tokens: dict[int, str] = {}
+    payloads: dict[str, Any] = {}
+    content_bytes = 0
+    for slot in sorted(gaining):
+        carrier_id = carrier_id_for(editor_id, slot)
+        if dynprompt.has_node(carrier_id) or carrier_id in prompt:
+            skip("carrier_id_taken")
+            continue
+        socket = editor_class.RETURN_TYPES[slot]
+        value = result[slot]
+        digest = cache_content.digest(socket, value, runtime.before_node_execution)
+        if digest is None:
+            skip("no_digest")
+            continue
+        content_bytes += cache_content.payload_bytes(socket, value)
+        token = cache_content.token(digest)
+        refused = sdk_runs.register_media(key, prompt_id, token, call_key, slot)
+        if refused:
+            skip("registry_refused")
+            continue
+        tokens[slot] = token
+        payloads[carrier_id] = value
+    carriers, merged, restore, _gaining, skips = plan_carriers(
+        nodes_view, overrides, editor_id, editor_class, tokens, input_type_of)
+    for item in skips:
+        if item["reason"] != "no_digest":  # a slot without a token was counted above, once
+            skip(item["reason"])
+    record["content"] = {"carried": len(carriers), "skipped": sum(reasons.values())}
+    record["content_bytes"] = content_bytes
+    if not carriers:
+        return None
+    return CarrierPlan(key=key, editor_id=editor_id, carrier_ids=sorted(carriers), carriers=carriers,
+                       overrides=merged, restore=restore,
+                       payloads={carrier_id: payloads[carrier_id] for carrier_id in carriers})
+
+
+def apply_carriers(dynprompt: Any, plan: CarrierPlan) -> None:
+    """Attribution, then carriers, then consumers: no consumer ever links to a missing node.
+
+    The attribution makes ComfyUI report an error or a cancel at a carrier at the
+    Editor: ``handle_execution_error`` looks the failing node up in the submitted
+    prompt, which holds no carrier, and a ``KeyError`` there kills the prompt worker.
+    """
+    ids = frozenset(plan.carrier_ids)
+    editor_id = plan.editor_id
+    plan.previous_real = dynprompt.__dict__.get("get_real_node_id", _NO_ATTRIBUTE)
+    underlying = dynprompt.get_real_node_id
+
+    def get_real_node_id(node_id):
+        return editor_id if node_id in ids else underlying(node_id)
+
+    dynprompt.get_real_node_id = get_real_node_id
+    for carrier_id in plan.carrier_ids:
+        dynprompt.ephemeral_prompt[carrier_id] = plan.carriers[carrier_id]
+        dynprompt.ephemeral_display[carrier_id] = editor_id
+    for node_id, node in plan.overrides.items():
+        dynprompt.override_node(node_id, node)
+
+
+def rollback_carriers(dynprompt: Any, plan: CarrierPlan) -> None:
+    """Undo ``apply_carriers`` with dictionary operations: consumers, then carriers, then the attribution."""
+    overrides = dynprompt.node_overrides
+    for node_id, prior in plan.restore.items():
+        if prior is None:
+            overrides.pop(node_id, None)
+        else:
+            overrides[node_id] = prior
+    for carrier_id in plan.carrier_ids:
+        dynprompt.ephemeral_prompt.pop(carrier_id, None)
+        dynprompt.ephemeral_display.pop(carrier_id, None)
+    if plan.previous_real is _NO_ATTRIBUTE:
+        dynprompt.__dict__.pop("get_real_node_id", None)
+    elif plan.previous_real is not None:
+        dynprompt.__dict__["get_real_node_id"] = plan.previous_real
+
+
 # --- Preparation -------------------------------------------------------------------
 
 
-def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any) -> dict[str, Any]:
+def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, media: MediaHost | None = None) -> dict[str, Any]:
     """Prepare one prompt; returns the preparation record. Raises only what the hook guards.
+
+    ``media`` is the hook's carrier host for this prompt; without it the Editor's
+    media keeps today's path.
 
     Pipeline faults propagate to ``executor_hook``'s guard (no substitution was
     applied, because overrides are applied last). The Editor's own failures are
@@ -796,7 +1029,8 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any) -> dict[st
     timings: dict[str, float] = {}
     record: dict[str, Any] = {"outcome": SKIPPED, "reason": "", "editor": "", "substituted": 0,
                               "skipped": 0, "skip_reasons": {}, "bridges": {}, "bridge_reasons": {},
-                              "identities": {}, "identity_reasons": {}, "timings_ms": timings}
+                              "identities": {}, "identity_reasons": {}, "content": {}, "content_reasons": {},
+                              "content_bytes": 0, "timings_ms": timings}
     key = ""
     try:
         prompt = dynprompt.get_original_prompt()
@@ -856,7 +1090,8 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any) -> dict[st
             raise _Skip("editor_hidden")
 
         step = time.perf_counter()
-        outcome, result = _run_editor_early(runtime, prompt_id, dynprompt, prompt, editor_id, editor_class, key)
+        outcome, result, call_key = _run_editor_early(runtime, prompt_id, dynprompt, prompt, editor_id,
+                                                      editor_class, key)
         timings["editor"] = _ms(step)
         if outcome != PREPARED:
             record["outcome"] = outcome
@@ -922,9 +1157,38 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any) -> dict[st
                              exc_info=True)
         timings["identity"] = _ms(step)
 
+        # Editor media, isolated the same way: a fault keeps every substitution
+        # and token above and drops only carriers. An interrupt still propagates.
+        step = time.perf_counter()
+        plan: CarrierPlan | None = None
+        try:
+            plan = _content_pass(runtime, prompt_id, key, dynprompt, prompt, nodes_view, editor_id, editor_class,
+                                 result, call_key, overrides, input_type_of, media, record)
+        except runtime.interrupt_type:
+            raise
+        except Exception as exc:
+            plan = None
+            record["content_reasons"]["content_pass_error"] = 1
+            record["content_error"] = type(exc).__name__
+            logger.debug("Sonder cache pipeline: the content pass failed; Editor media runs as before",
+                         exc_info=True)
+        timings["content"] = _ms(step)
+
         # Applied only once the whole plan exists, so a planning fault leaves none.
         for node_id, node in overrides.items():
             dynprompt.override_node(node_id, node)
+        if plan is not None:
+            try:
+                apply_carriers(dynprompt, plan)
+                media.arm(plan)
+            except Exception as exc:
+                rollback_carriers(dynprompt, plan)
+                plan.payloads.clear()
+                record["content_reasons"]["carrier_apply_error"] = 1
+                record["content"] = {"carried": 0, "skipped": sum(record["content_reasons"].values())}
+                record["content_error"] = type(exc).__name__
+                logger.debug("Sonder cache pipeline: carriers could not be applied; Editor media runs as before",
+                             exc_info=True)
         record.update(outcome=PREPARED, substituted=substituted, skipped=len(skips))
         for item in skips:
             record["skip_reasons"][item["reason"]] = record["skip_reasons"].get(item["reason"], 0) + 1
@@ -946,8 +1210,8 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any) -> dict[st
 
 
 def _run_editor_early(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, prompt: dict,
-                      editor_id: str, editor_class: Any, key: str) -> tuple[str, Any]:
-    """Run the real Editor once, as the scheduler would. ``(outcome, result)``.
+                      editor_id: str, editor_class: Any, key: str) -> tuple[str, Any, str]:
+    """Run the real Editor once, as the scheduler would. ``(outcome, result, call key)``.
 
     Two boundaries: everything here except ``editor_class().execute`` is pipeline
     code, whose faults propagate (nothing stored); the Editor's own raise is
@@ -986,15 +1250,15 @@ def _run_editor_early(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, 
                 except runtime.interrupt_type:
                     sdk_runs.remember_failure(key, call_key, sdk_runs.CANCELLED)
                     runtime.rearm_interrupt()
-                    return CANCELLED, None
+                    return CANCELLED, None, call_key
                 except Exception as exc:
                     _clear_tracebacks(exc)
                     sdk_runs.remember_failure(key, call_key, exc)
-                    return EDITOR_FAILED, None
+                    return EDITOR_FAILED, None, call_key
     finally:
         if started_progress:
             progress.finish_progress(editor_id)
-    return PREPARED, result
+    return PREPARED, result, call_key
 
 
 def _clear_tracebacks(exc: BaseException) -> None:

@@ -14,8 +14,11 @@ publishes them to ComfyUI, and selects
 
 A selected node fails on a missing or stale output declaration, ``EXACT`` on a
 non-literal type, ``INHERITS`` with no reason, ``DESCRIPTOR`` with no registered
-invalidation cases, or (output and hidden-input nodes) a missing node-level
-declaration or an ``ALWAYS_RUNS`` proof that does not hold.
+invalidation cases, ``CONTENT`` on a type ``cache_content`` cannot digest or
+without every ``CONTENT_INVALIDATION`` case, or (output and hidden-input nodes) a
+missing node-level declaration or an ``ALWAYS_RUNS`` proof that does not hold.
+The canonical list of ``CONTENT`` outputs is the Editor's three media outputs,
+and the media carrier's shape is pinned.
 
 The walk needs ComfyUI's real ``comfy_api`` to finalise V3 schemas. ComfyUI's
 ``nodes`` and ``execution`` modules collide with this repository's packages, so
@@ -180,7 +183,8 @@ def fail(node_id, message):
 
 
 def valid_output_policy(value):
-    return value in (policy.EXACT, policy.DESCRIPTOR, policy.PER_RUN, policy.HANDLE) or isinstance(value, policy.Inherits)
+    return (value in (policy.EXACT, policy.DESCRIPTOR, policy.CONTENT, policy.PER_RUN, policy.HANDLE)
+            or isinstance(value, policy.Inherits))
 
 
 for node_id in sorted(selected):
@@ -204,6 +208,12 @@ for node_id in sorted(selected):
             cases = (getattr(cls, policy.INVALIDATION_ATTRIBUTE, None) or {}).get(name)
             if not cases:
                 fail(node_id, f"output {name} is DESCRIPTOR with no registered invalidation cases")
+        if value == policy.CONTENT:
+            if item["returns"][slot] not in policy.CONTENT_TYPES:
+                fail(node_id, f"output {name} is CONTENT on type {item['returns'][slot]}, which has no content digest")
+            cases = tuple((getattr(cls, policy.INVALIDATION_ATTRIBUTE, None) or {}).get(name) or ())
+            if set(cases) != set(policy.CONTENT_INVALIDATION):
+                fail(node_id, f"output {name} is CONTENT without the registered cases {policy.CONTENT_INVALIDATION}")
     for key in declared:
         if not any(policy.declaration_matches(key, name) for name in names):
             fail(node_id, f"declares {key!r}, which matches no output")
@@ -328,6 +338,36 @@ for node_id in sorted(mapping):
     if getattr(cls, "INPUT_IS_LIST", False) or any(getattr(cls, "OUTPUT_IS_LIST", None) or ()):
         fail(node_id, "IDENTIFIES on a list-mapped node")
 
+out["content"] = {}
+for node_id in sorted(mapping):
+    cls, item = mapping[node_id], info[node_id]
+    names = item["names"] or [f"#{index}" for index in range(len(item["returns"]))]
+    content = [name for name in names if policy.output_policy(cls, name) == policy.CONTENT]
+    if content:
+        out["content"][node_id] = content
+
+# The media carrier: internal, dev-only, V3, one STRING token, refuses submission.
+carrier = mapping.get("SonderMediaCarrier")
+out["carrier"] = None
+if carrier is not None:
+    schema = carrier.GET_SCHEMA()
+    try:
+        refused = carrier.validate_inputs(token="x")
+    except Exception as exc:
+        refused = f"raised {type(exc).__name__}"
+    out["carrier"] = {
+        "v3": isinstance(carrier, type) and issubclass(carrier, _ComfyNodeInternal),
+        "dev_only": bool(getattr(schema, "is_dev_only", False)),
+        "inputs": [(getattr(i, "id", None), i.get_io_type()) for i in schema.inputs],
+        "outputs": [(getattr(o, "id", None), o.get_io_type()) for o in schema.outputs],
+        "hidden": list(schema.hidden or []),
+        "fingerprint": first_real_override(carrier, "fingerprint_inputs") is not None,
+        "own_lazy_status": first_real_override(carrier, "check_lazy_status") is not None,
+        "validate_refuses": isinstance(refused, str) and bool(refused.strip()),
+        "selected": "SonderMediaCarrier" in selected,
+        "output_node": bool(getattr(schema, "is_output_node", False)),
+    }
+
 editor = info.get("SonderEditor")
 out["editor_hidden"] = editor["hidden"] if editor else None
 out["editor_exact"] = [slot for slot, name in enumerate(editor["names"])
@@ -398,6 +438,22 @@ def test_the_identified_bridges_are_the_canonical_list(registry):
 
 IDENTIFIED = ["SonderDriverBridge", "SonderGuidesBridgeStart", "SonderReferenceAudioBridge",
               "SonderReferenceImageBridge"]
+
+
+def test_the_editor_media_outputs_are_the_canonical_content_list(registry):
+    # Phase 4a: the only outputs whose identity is a digest of their content.
+    assert registry["content"] == {"SonderEditor": ["rendered_frames", "guide_images", "audio"]}
+
+
+def test_the_media_carrier_is_an_internal_dev_only_v3_node(registry):
+    carrier = registry["carrier"]
+    assert carrier is not None, "SonderMediaCarrier must register when comfy_api is present"
+    assert carrier == {
+        "v3": True, "dev_only": True,
+        "inputs": [["token", "STRING"]], "outputs": [["media", "*"]],
+        "hidden": [], "fingerprint": False, "own_lazy_status": False, "validate_refuses": True,
+        "selected": False, "output_node": False,
+    }
 
 
 def test_the_editor_has_only_the_hidden_inputs_the_early_run_supplies(registry):

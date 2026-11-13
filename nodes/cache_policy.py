@@ -14,6 +14,10 @@ on the class, beside its sockets):
   ``BOOLEAN`` outputs.
 - ``DESCRIPTOR``: identity computed before materialization (a later phase). Needs
   registered invalidation cases.
+- ``CONTENT``: identity is a digest of the materialized value
+  (``nodes/cache_content.py``). The pipeline hands consumers an ephemeral carrier
+  keyed by that digest (``nodes/media_carrier.py``). Only on ``IMAGE``/``AUDIO``
+  outputs, with the ``CONTENT_INVALIDATION`` cases registered.
 - ``PER_RUN``: never cacheable; consumers rerun every prompt.
 - ``INHERITS(reason)``: deliberately left on today's behaviour (the Editor's NaN
   reaches consumers). The reason names the phase or limit.
@@ -71,8 +75,18 @@ logger = logging.getLogger(__name__)
 
 EXACT = "EXACT"
 DESCRIPTOR = "DESCRIPTOR"
+CONTENT = "CONTENT"
 PER_RUN = "PER_RUN"
 HANDLE = "HANDLE"
+
+# Socket types a CONTENT output may have (cache_content.digest supports exactly these).
+CONTENT_TYPES = ("IMAGE", "AUDIO")
+# The invalidation cases every CONTENT output registers
+# (tests/test_cache_pipeline_executor.py runs them on the real executor): a change
+# to the output's content reruns its consumers; equal content, whatever produced
+# it, reuses them; the timeline's layout (clips moved without changing what
+# renders) is not part of the identity.
+CONTENT_INVALIDATION = ("content_changes", "equal_content", "layout_independent")
 
 # Socket type -> the exact Python type an EXACT value must have to become a literal.
 LITERAL_TYPES = {"STRING": str, "INT": int, "FLOAT": float, "BOOLEAN": bool}
@@ -208,6 +222,14 @@ def slot_policy(class_def: Any, slot: int) -> Any:
     if not isinstance(slot, int) or isinstance(slot, bool) or not 0 <= slot < len(names):
         return UNDECLARED
     return output_policy(class_def, names[slot])
+
+
+def content_slots(class_def: Any) -> tuple[int, ...]:
+    """The ``CONTENT`` output slots whose socket type is in ``CONTENT_TYPES``."""
+    types_ = tuple(getattr(class_def, "RETURN_TYPES", None) or ())
+    names = tuple(getattr(class_def, "RETURN_NAMES", None) or ())
+    return tuple(slot for slot, name in enumerate(names)
+                 if slot < len(types_) and types_[slot] in CONTENT_TYPES and output_policy(class_def, name) == CONTENT)
 
 
 def execution_policy(class_def: Any) -> Any:

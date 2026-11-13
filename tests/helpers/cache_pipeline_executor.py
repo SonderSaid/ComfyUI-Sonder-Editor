@@ -85,6 +85,7 @@ collector = sonder("nodes.metadata_collector")
 hook = sonder("server.executor_hook")
 pipeline = sonder("server.cache_pipeline")
 sdk_runs = sonder("server.sdk_runs")
+media_carrier = sonder("nodes.media_carrier")
 manager = sonder("server.project_manager")
 timeline = sonder("server.timeline_state")
 from comfy_extras.nodes_preview_any import PreviewAny  # noqa: E402
@@ -180,6 +181,93 @@ class CPMediaDigest:
         count("media", unique_id)
         tensor = frames.detach().cpu().contiguous()
         return (f"{list(tensor.shape)}:{hashlib.sha256(tensor.numpy().tobytes()).hexdigest()[:16]}",)
+
+
+class CPAudioDigest:
+    """An audio consumer whose output is a digest of the exact samples and rate it received."""
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "run"
+    CATEGORY = "CPH"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"audio": ("AUDIO",)}, "hidden": {"unique_id": "UNIQUE_ID"}}
+
+    def run(self, audio, unique_id=None):
+        import hashlib
+        count("audio", unique_id)
+        wave = audio["waveform"].detach().cpu().contiguous()
+        return (f"{audio['sample_rate']}:{list(wave.shape)}:{hashlib.sha256(wave.numpy().tobytes()).hexdigest()[:16]}",)
+
+
+class CPPixelSum:
+    """A frames consumer without UNIQUE_ID: ComfyUI may share its entry across nodes."""
+    RETURN_TYPES = ("FLOAT",)
+    FUNCTION = "run"
+    CATEGORY = "CPH"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"frames": ("IMAGE",)}}
+
+    def run(self, frames):
+        count("pixel_sum", "-")
+        return (round(float(frames.double().sum()), 6),)
+
+
+class CPTwo:
+    """Consumes two Editor media outputs."""
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "run"
+    CATEGORY = "CPH"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"frames": ("IMAGE",), "audio": ("AUDIO",)}, "hidden": {"unique_id": "UNIQUE_ID"}}
+
+    def run(self, frames, audio, unique_id=None):
+        count("two", unique_id)
+        return (f"{list(frames.shape)}|{round(float(frames.double().sum()), 4)}|{round(float(audio['waveform'].double().abs().sum()), 4)}",)
+
+
+class CPMixWidth:
+    """Consumes Editor frames and an Editor number (a carrier link and an M1 literal on one node)."""
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "run"
+    CATEGORY = "CPH"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"frames": ("IMAGE",), "width": ("INT", {"min": 0, "max": 99999})},
+                "hidden": {"unique_id": "UNIQUE_ID"}}
+
+    def run(self, frames, width, unique_id=None):
+        count("mix_width", unique_id)
+        dynprompt = CURRENT.get("dynprompt")
+        node = dynprompt.get_node(unique_id) if dynprompt is not None else {}
+        NOTES.append({"mix_width": unique_id, "width_literal": not pipeline.is_link(node.get("inputs", {}).get("width")),
+                      "frames_link": node.get("inputs", {}).get("frames")})
+        return (f"{list(frames.shape)}:{round(float(frames.double().sum()), 4)}:w{width}",)
+
+
+class CPPromptKeys:
+    """Records the node ids of hidden PROMPT (the submitted graph)."""
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "run"
+    CATEGORY = "CPH"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"anchor": ("STRING", {"forceInput": True})}, "hidden": {"prompt": "PROMPT"}}
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def run(self, anchor, prompt=None):
+        NOTES.append({"prompt_keys": sorted(prompt or {})})
+        return {"ui": {"text": (anchor,)}, "result": (anchor,)}
 
 
 class CPFail:
@@ -354,6 +442,10 @@ nodes.NODE_CLASS_MAPPINGS.update({
     "CPFail": CPFail, "CPMark": CPMark, "CPSwallow": CPSwallow, "CPEvict": CPEvict, "CPProjectTap": CPProjectTap,
     "CPDyn": CPDyn, "CPGuideBody": CPGuideBody, "CPIdV3": CPIdV3, "CPAfter": CPAfter,
     "CPMediaDigest": CPMediaDigest,
+    # Registered by the pack's __init__ in ComfyUI; the hook plans no carrier without it.
+    "SonderMediaCarrier": media_carrier.SonderMediaCarrier,
+    "CPAudioDigest": CPAudioDigest, "CPPixelSum": CPPixelSum, "CPTwo": CPTwo, "CPMixWidth": CPMixWidth,
+    "CPPromptKeys": CPPromptKeys,
 })
 nodes.NODE_CLASS_MAPPINGS.update(lazy.LAZY_NODE_CLASS_MAPPINGS)
 StringConcatenate.GET_SCHEMA()
@@ -374,10 +466,10 @@ INJECT = {"conflicts": 0, "render_error": False, "interrupt_at": None, "ram_rele
           "plan_fault": False, "resolver_fault": None, "interrupt_in": None, "bridge_pass_fault": False}
 
 
-def recording_prepare(runtime, prompt_id, dynprompt):
+def recording_prepare(runtime, prompt_id, dynprompt, *args):
     CURRENT["dynprompt"] = dynprompt
     try:
-        record = _real_prepare(runtime, prompt_id, dynprompt)
+        record = _real_prepare(runtime, prompt_id, dynprompt, *args)
     except BaseException as exc:
         PREPARATIONS.append({"outcome": "raised", "error": type(exc).__name__})
         raise
@@ -610,6 +702,10 @@ async def run(executor, graph, targets=None, client=True, trusted=True, extra=No
         "last_node_id": SERVER.last_node_id, "events": [event for event, _, _ in SERVER.events],
         "progress_state": {node_id: str(state.get("state")) for node_id, state in
                            (getattr(get_progress_state(), "nodes", {}) or {}).items()},
+        "history_json": json.dumps(executor.history_result or {}, default=str),
+        "node_errors": json.dumps(valid[3] if len(valid) > 3 else {}, default=str)[:4000],
+        "displayed": sorted({str(data.get("display_node")) for event, data, _ in SERVER.events
+                             if event == "executing" and data.get("node")}),
     }
 
 
@@ -686,7 +782,7 @@ def acceptance_graph():
     graph["latp"] = n("PreviewAny", source=["lat", 0])
     graph["cat"] = n("StringConcatenate", string_a=["1", 5], string_b="!", delimiter="")
     graph["catp"] = n("PreviewAny", source=["cat", 0])
-    # A wildcard consumer and a media consumer: accepted misses.
+    # A wildcard consumer (an accepted miss) and a media consumer (carried, Phase 4a).
     graph["wild"] = n("PreviewAny", source=["1", 5])
     graph["tap"] = n("CPImageTap", frames=["1", 1])
     graph["tapp"] = n("PreviewAny", source=["tap", 0])
@@ -765,8 +861,8 @@ async def case_acceptance():
           sorted(all_consumers & executed_nodes(identical)))
     check(case, "the Editor body ran once per prompt", all(len(row["editor_runs"]) == 1 for _, row in pipeline_rows),
           [len(row["editor_runs"]) for _, row in pipeline_rows])
-    check(case, "wildcard and media consumers still rerun (accepted misses)",
-          {"wild", "tap"} <= executed_nodes(identical), identical["executing"])
+    check(case, "the wildcard consumer still reruns (accepted miss); the frames consumer is carried and hits",
+          "wild" in executed_nodes(identical) and "tap" not in executed_nodes(identical), identical["executing"])
     check(case, "integer project fps is normalised and its consumer caches",
           "c7" not in executed_nodes(identical) and identical["outputs"].get("c7p") == "24.0", identical["outputs"].get("c7p"))
     check(case, "-0.0 is canonicalised to 0.0", base["outputs"].get("c12p") == "0.0", base["outputs"].get("c12p"))
@@ -2066,7 +2162,8 @@ async def case_identity_shapes():
     check(case, "three-guide loop: Start is identified and its clones resolve the token",
           prep(rows[0][0]).get("identities", {}).get("identified") == 1, prep(rows[0][0]).get("identity_reasons"))
 
-    # A loop whose value comes from the Editor's frames: Start's key folds that in, so it reruns.
+    # A loop whose value comes from the Editor's frames: carried since Phase 4a, so an
+    # identical second job reuses its Start (and the frames consumer feeding it).
     def media_loop(fx):
         graph = loop(fx)
         graph["tap"] = n("CPImageTap", frames=["1", 1])
@@ -2075,9 +2172,9 @@ async def case_identity_shapes():
 
     arms = await both_arms(media_loop, fixture_args={"reference": False, "guides": [0]}, label="idmedia")
     (_, rows), (_, stock_rows) = arms[True], arms[False]
-    check(case, "a loop fed by Editor frames equals stock and its Start reruns (the accepted miss)",
+    check(case, "a loop fed by Editor frames equals stock and its Start is reused on the second job",
           all(row["success"] and row["outputs"] == stock["outputs"] for (row, _), (stock, _) in zip(rows, stock_rows))
-          and "gs" in executed_nodes(rows[1][0]),
+          and not ({"tap", "gs"} & executed_nodes(rows[1][0])),
           [(row["outputs"], row.get("error"), row["executing"]) for (row, _) in rows])
 
     # A Reference Bridge behind a Cluster whose select comes from a Sonder Selector.
@@ -2255,6 +2352,356 @@ async def case_identity_ram():
           {"pipeline": row["outputs"], "stock": stock["outputs"], "error": row.get("error"), "prep": prep(row)})
 
 
+# --- Phase 4a: Editor media carried by content ----------------------------------------------------
+
+content_mod = sonder("nodes.cache_content")
+MEDIA = {"fd", "fs", "gd", "ad", "two", "mw"}
+FRAME_CONSUMERS, GUIDE_CONSUMERS, AUDIO_CONSUMERS = {"fd", "fs", "two", "mw"}, {"gd"}, {"ad", "two"}
+
+
+def write_tone(path, seconds=1.0, rate=48000, amplitude=8000):
+    import math
+    import struct
+    import wave
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        frames = bytearray()
+        for index in range(int(seconds * rate)):
+            value = int(amplitude * math.sin(2 * math.pi * 440 * index / rate))
+            frames += struct.pack("<hh", value, value)
+        handle.writeframes(bytes(frames))
+
+
+def content_fixture(label, runs):
+    fx = fixture(label, [{"text": "Content job", "end": 4, "snapshot": 0}] * runs, clip=True, guides=[0])
+
+    def add_audio(project, scene):
+        media = Path(project.project_dir) / "media"
+        write_tone(media / "tone.wav")
+        scene.audio_tracks = [timeline.AudioTrack(source_path="media/tone.wav", timeline_start_frame=0,
+                                                  timeline_end_frame=8, total_source_frames=24)]
+
+    edit_project(fx, add_audio)
+    return fx
+
+
+def content_graph(fx, ed="1"):
+    return {
+        # First in prompt order: its key is built first, downstream of a rewired consumer only.
+        "first": n("PreviewAny", source=["fd", 0]),
+        # Takes placed muted: a placed take would cover the clip and change the next render.
+        ed: editor(fx, selection_end=4, take_placement_muted=True),
+        "fd": n("CPMediaDigest", frames=[ed, 1]), "fdp": n("PreviewAny", source=["fd", 0]),
+        "fs": n("CPPixelSum", frames=[ed, 1]), "fsp": n("PreviewAny", source=["fs", 0]),
+        "gd": n("CPMediaDigest", frames=[ed, 2]), "gdp": n("PreviewAny", source=["gd", 0]),
+        "ad": n("CPAudioDigest", audio=[ed, 10]), "adp": n("PreviewAny", source=["ad", 0]),
+        "two": n("CPTwo", frames=[ed, 1], audio=[ed, 10]), "twop": n("PreviewAny", source=["two", 0]),
+        "mw": n("CPMixWidth", frames=[ed, 1], width=[ed, 8]), "mwp": n("PreviewAny", source=["mw", 0]),
+        "gi": n("CPText", value=[ed, 3]), "gip": n("PreviewAny", source=["gi", 0]),
+        "pk": n("CPPromptKeys", anchor=["fd", 0]),
+        # The saver depends on every consumer, so both arms save after all of them ran.
+        "after": n("CPAfter", image=[ed, 1], a=["fd", 0], b=["gd", 0], c=["ad", 0], d=["two", 0], e=["mw", 0],
+                   f=["fs", 0]),
+        "7": save([ed, 0], ["after", 0], mode="Take", embed=True),
+    }
+
+
+def replace_guide_image(fx, color):
+    from PIL import Image
+    Image.new("RGB", (16, 16), color).save(Path(fx["dir"]) / "media" / "guide.png")
+
+
+CONTENT_STEPS = ("base", "identical", "clip opacity", "guide moved", "guide image replaced", "audio volume")
+CONTENT_EXPECTED = {"identical": set(), "clip opacity": FRAME_CONSUMERS, "guide moved": set(),
+                    "guide image replaced": GUIDE_CONSUMERS, "audio volume": AUDIO_CONSUMERS}
+
+
+async def content_sequence(enabled, label, build=content_graph):
+    set_pipeline(enabled)
+    fx = content_fixture(f"{label}-{int(enabled)}", len(CONTENT_STEPS) + 1)
+    executor = new_executor()
+    rows = []
+    for name in CONTENT_STEPS:
+        if name == "clip opacity":
+            edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.5))
+        elif name == "guide moved":
+            edit_project(fx, lambda project, scene: setattr(scene.guide_frames[0], "frame_index", 1))
+        elif name == "guide image replaced":
+            replace_guide_image(fx, (0, 0, 255))
+        elif name == "audio volume":
+            edit_project(fx, lambda project, scene: setattr(scene.audio_tracks[0], "volume", 0.5))
+        rows.append((name, await run(executor, build(fx)), last_take_params(fx)))
+    return rows
+
+
+def _no_carrier_anywhere(row, params):
+    seen = [note["prompt_keys"] for note in row["notes"] if "prompt_keys" in note]
+    return (row["prompt_unchanged"] and "sonder-media" not in row["history_json"]
+            and "sonder-media" not in json.dumps(params, default=str)
+            and bool(seen) and not any(key.startswith("sonder-media") for keys in seen for key in keys))
+
+
+async def case_content():
+    case = "content"
+    pipeline_rows = await content_sequence(True, "content")
+    stock_rows = await content_sequence(False, "content")
+    for (label, row, params), (_, stock, _stock_params) in zip(pipeline_rows, stock_rows):
+        check(case, f"{label}: both arms succeed", row.get("success") and stock.get("success"),
+              {"pipeline": row.get("error") or row.get("invalid"), "stock": stock.get("error") or stock.get("invalid")})
+        check(case, f"{label}: differential oracle (every consumer equals stock)", row["outputs"] == stock["outputs"],
+              _diff(row["outputs"], stock["outputs"]))
+        check(case, f"{label}: stock reruns every media consumer", MEDIA <= executed_nodes(stock), stock["executing"])
+        check(case, f"{label}: no carrier in the prompt, hidden PROMPT, history or the take",
+              _no_carrier_anywhere(row, params), {"prompt_unchanged": row["prompt_unchanged"]})
+        if MODE == "none":
+            check(case, f"{label}: --cache-none bypasses carriers", not row["preparations"]
+                  and MEDIA <= executed_nodes(row), {"prep": prep(row), "executing": row["executing"]})
+            continue
+        check(case, f"{label}: three media outputs carried",
+              prep(row).get("content", {}).get("carried") == 3,
+              {"content": prep(row).get("content"), "reasons": prep(row).get("content_reasons")})
+        check(case, f"{label}: the Editor body ran once", len(row["editor_runs"]) == 1, len(row["editor_runs"]))
+        if label in CONTENT_EXPECTED and MODE in ("classic", "ram"):
+            reran = executed_nodes(row) & MEDIA
+            check(case, f"{label}: exactly the changed output's consumers rerun", reran == CONTENT_EXPECTED[label],
+                  {"ran": sorted(reran), "expected": sorted(CONTENT_EXPECTED[label])})
+            check(case, f"{label}: no carrier executes (each entry is stored before the run)",
+                  not any(str(node).startswith("sonder-media") for node in row["executing"]), row["executing"])
+    if MODE in ("classic", "ram"):
+        moved = pipeline_rows[3][1]
+        check(case, "guide moved: guide_idx's consumer reruns, guide image consumers hit (layout independent)",
+              "gi" in executed_nodes(moved) and "gd" not in executed_nodes(moved), moved["executing"])
+        base = pipeline_rows[0][1]
+        notes = [note for note in base["notes"] if "mix_width" in note]
+        check(case, "a consumer takes an M1 literal and a carrier link on one node",
+              notes and notes[0]["width_literal"] and str(notes[0]["frames_link"][0]).startswith("sonder-media"), notes)
+
+
+async def case_content_negative():
+    """Negative control: a digest that ignores the last frame must fail the oracle."""
+    case = "content_negative"
+    real = content_mod._tensor_digest
+
+    def without_last_frame(torch_module, tensor, check_interrupt):
+        return real(torch_module, tensor[:-1], check_interrupt)
+
+    content_mod._tensor_digest = without_last_frame
+    try:
+        rows = {}
+        for enabled in (True, False):
+            set_pipeline(enabled)
+            fx = content_fixture(f"negative-{int(enabled)}", 3)
+            executor = new_executor()
+            await run(executor, content_graph(fx))
+            replace_guide_image(fx, (0, 0, 255))  # guide_images holds one frame: the broken digest ignores it
+            rows[enabled] = await run(executor, content_graph(fx))
+    finally:
+        content_mod._tensor_digest = real
+    check(case, "the broken digest is caught: the stale guide consumer differs from stock",
+          rows[True]["outputs"].get("gdp") != rows[False]["outputs"].get("gdp") and "gd" not in executed_nodes(rows[True]),
+          {"pipeline": rows[True]["outputs"].get("gdp"), "stock": rows[False]["outputs"].get("gdp")})
+
+
+async def case_content_shapes():
+    """Graph shapes that must equal stock with carriers (classic)."""
+    case = "content_shapes"
+
+    # Editor frames on a Sonder Switch's lazy input: requested on the first lazy check.
+    def switched(fx):
+        return {"1": editor(fx, selection_end=4, take_placement_muted=True),
+                "fd": n("CPMediaDigest", frames=["1", 1]),
+                "o": n("StringConcatenate", string_a="nothing", string_b="", delimiter=""),
+                "sw": n("SonderLazySwitch", **{"select": 1, "branches.item0": ["fd", 0], "branches.item1": ["o", 0]}),
+                "swp": n("PreviewAny", source=["sw", 0]),
+                "after": n("CPAfter", image=["1", 1], a=["sw", 0]), "7": save(["1", 0], ["after", 0], mode="Take")}
+
+    # Phase 3's video-to-video Guides Start: its value_0 is Editor frames.
+    def v2v(fx):
+        return {"1": editor(fx, selection_end=4, take_placement_muted=True),
+                "gs": n("SonderGuidesBridgeStart", project=["1", 0], iteration_index=0, value_0=["1", 1]),
+                "gd": n("CPMediaDigest", frames=["gs", 1]), "vd": n("CPMediaDigest", frames=["gs", 4]),
+                "gb": n("StringConcatenate", string_a=["vd", 0], string_b=["gd", 0], delimiter="|"),
+                "ge": n("SonderGuidesBridgeEnd", project=["1", 0], flow_control=["gs", 0], value_0=["gb", 0]),
+                "gep": n("PreviewAny", source=["ge", 0]),
+                "after": n("CPAfter", image=["1", 1], a=["ge", 0]), "7": save(["1", 0], ["after", 0], mode="Take")}
+
+    # A Guides loop whose body takes Editor frames directly: clones come from DYNPROMPT.
+    def loop_body(fx):
+        return {"1": editor(fx, selection_end=4, take_placement_muted=True),
+                "gs": n("SonderGuidesBridgeStart", project=["1", 0], iteration_index=0, value_0="start"),
+                "body": n("CPAfter", image=["1", 1], a=["gs", 4]),
+                "bd": n("CPMediaDigest", frames=["body", 0]),
+                "gb": n("StringConcatenate", string_a=["gs", 4], string_b=["bd", 0], delimiter="|"),
+                "ge": n("SonderGuidesBridgeEnd", project=["1", 0], flow_control=["gs", 0], value_0=["gb", 0]),
+                "gep": n("PreviewAny", source=["ge", 0]),
+                "after": n("CPAfter", image=["1", 1], a=["ge", 0]), "7": save(["1", 0], ["after", 0], mode="Take")}
+
+    for label, build, guides, reused in (("lazy switch", switched, [0], {"fd"}), ("video-to-video Guides Start", v2v, [0], {"gs"}),
+                                         ("Guides loop body", loop_body, [0, 1, 2], set())):
+        rows = {}
+        for enabled in (True, False):
+            set_pipeline(enabled)
+            fx = fixture(f"cshape-{label[:6]}-{int(enabled)}", [{"text": "Shape", "end": 4, "snapshot": 0}] * 3, clip=True, guides=guides)
+            executor = new_executor()
+            rows[enabled] = [await run(executor, build(fx)) for _ in range(2)]
+        pipeline_rows, stock_rows = rows[True], rows[False]
+        check(case, f"{label}: every run equals stock",
+              all(row.get("success") and row["outputs"] == stock["outputs"] for row, stock in zip(pipeline_rows, stock_rows)),
+              [(row.get("error"), _diff(row["outputs"], stock["outputs"])) for row, stock in zip(pipeline_rows, stock_rows)])
+        check(case, f"{label}: carried, and the second job reuses what it should",
+              prep(pipeline_rows[0]).get("content", {}).get("carried", 0) >= 1
+              and not (reused & executed_nodes(pipeline_rows[1])),
+              {"content": prep(pipeline_rows[0]).get("content"), "reasons": prep(pipeline_rows[0]).get("content_reasons"),
+               "identities": prep(pipeline_rows[1]).get("identities"),
+               "identity_reasons": prep(pipeline_rows[1]).get("identity_reasons"),
+               "second": pipeline_rows[1]["executing"]})
+
+
+async def case_content_safety():
+    case = "content_safety"
+    set_pipeline(True)
+    fx = content_fixture("csafety", 12)
+
+    # A carrier in a submitted prompt is refused by validation.
+    graph = content_graph(fx)
+    graph["c"] = n("SonderMediaCarrier", token=content_mod.TOKEN_PREFIX + "0" * 64)
+    graph["fd"]["inputs"]["frames"] = ["c", 0]
+    row = await run(new_executor(), graph)
+    # ComfyUI drops the outputs that depend on a refused node and runs the rest.
+    refused = (row.get("invalid") or "") + row.get("node_errors", "")
+    check(case, "a submitted carrier is refused by validation and nothing that depends on it runs",
+          "cannot be part of a submitted" in refused and not ({"c", "fd", "first", "pk", "after", "7"} & executed_nodes(row)),
+          {key: row.get(key) for key in ("invalid", "error", "success", "executing")})
+
+    # The carrier's own execute refuses a forged token and another prompt's token.
+    class Context:
+        def __init__(self, prompt_id):
+            self.prompt_id = prompt_id
+
+    refusals = []
+    real_context = media_carrier.get_executing_context
+    for context in (None, Context("not-a-running-prompt")):
+        media_carrier.get_executing_context = lambda context=context: context
+        try:
+            media_carrier.SonderMediaCarrier.execute(content_mod.TOKEN_PREFIX + "1" * 64)
+            refusals.append("accepted")
+        except RuntimeError as exc:
+            refusals.append("did not create" in str(exc))
+        finally:
+            media_carrier.get_executing_context = real_context
+    check(case, "the carrier refuses a forged token and a token of no running prompt", refusals == [True, True], refusals)
+
+    # A keying fault through the real hook: rollback, no worker death, equal results, next run fine.
+    executor = new_executor()
+    await run(executor, content_graph(fx))
+    from comfy_execution import caching
+    real_add_keys = caching.CacheKeySetInputSignature.add_keys
+
+    async def skipping_carriers(self, node_ids):
+        return await real_add_keys(self, [node for node in node_ids if not str(node).startswith("sonder-media")])
+
+    edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.75))
+    caching.CacheKeySetInputSignature.add_keys = skipping_carriers
+    try:
+        faulted = await run(executor, content_graph(fx))
+    finally:
+        caching.CacheKeySetInputSignature.add_keys = real_add_keys
+    set_pipeline(False)
+    stock = await run(new_executor(), content_graph(fx))
+    set_pipeline(True)
+    record = sdk_runs  # noqa: F841 - the preparation record is read below through the row
+    check(case, "a keying fault rolls back: the prompt completes, equals stock, and no carrier runs",
+          faulted.get("success") and faulted["outputs"] == stock["outputs"]
+          and not any(str(node).startswith("sonder-media") for node in faulted["executing"])
+          and MEDIA <= executed_nodes(faulted),
+          {"error": faulted.get("error"), "diff": _diff(faulted["outputs"], stock["outputs"]),
+           "executing": faulted["executing"]})
+    after = await run(executor, content_graph(fx))
+    check(case, "after a rollback the next run carries again and reuses the media consumers",
+          after.get("success") and prep(after).get("content", {}).get("carried") == 3, prep(after).get("content"))
+
+    # A carrier that must execute (no stored entry) and fails: reported at the Editor; the worker survives.
+    real_arm = hook._arm_carriers
+
+    def arm_without_store(carriers, cache, dynprompt, plan):
+        real_arm(carriers, cache, dynprompt, plan)
+        plan.payloads.clear()  # nothing to store: carriers execute when a consumer needs them
+
+    real_media_for = sdk_runs.media_for
+    completed_before_failures = sum(job["status"] == "completed" for job in jobs_of(fx).values())
+    for failure in ("raise", "cancel"):
+        def failing_media_for(prompt_id, token, failure=failure):
+            if failure == "cancel":
+                mm.interrupt_current_processing(True)
+                mm.throw_exception_if_processing_interrupted()
+            raise RuntimeError("injected carrier failure")
+
+        edit_project(fx, lambda project, scene, failure=failure: setattr(
+            scene.clips[0], "opacity", 0.6 if failure == "raise" else 0.65))
+        hook._arm_carriers = arm_without_store
+        sdk_runs.media_for = failing_media_for
+        try:
+            row = await run(executor, content_graph(fx))
+        finally:
+            hook._arm_carriers = real_arm
+            sdk_runs.media_for = real_media_for
+            mm.interrupt_current_processing(False)
+        event = "execution_interrupted" if failure == "cancel" else "execution_error"
+        check(case, f"a carrier {failure} is reported at the Editor and the worker survives",
+              not row.get("success") and (row.get("error") or {}).get("node") == "1"
+              and (row.get("error") or {}).get("event") == event and "raised" not in row,
+              {"error": row.get("error"), "executing": row["executing"]})
+        check(case, f"a carrier {failure}: the canvas shows the Editor while the carrier runs",
+              any(str(node).startswith("sonder-media") for node in row["executing"]) and "1" in row["displayed"]
+              and not any(str(node).startswith("sonder-media") for node in row["displayed"]),
+              {"executing": row["executing"], "displayed": row["displayed"]})
+        after = await run(executor, content_graph(fx))
+        check(case, f"after a carrier {failure} the next run succeeds", after.get("success"), after.get("error"))
+    jobs = jobs_of(fx)
+    check(case, "no job is left running after the failed runs (each returned to pending or completed)",
+          not any(job["status"] == "running" for job in jobs.values())
+          and sum(job["status"] == "completed" for job in jobs.values()) == completed_before_failures + 2, jobs)
+
+    # A carrier that executes and succeeds: it serves the memo's own frames, and every
+    # consumer equals the stock arm on the same timeline.
+    edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.45))
+    hook._arm_carriers = arm_without_store
+    try:
+        carried = await run(executor, content_graph(fx))
+    finally:
+        hook._arm_carriers = real_arm
+    set_pipeline(False)
+    stock = await run(new_executor(), content_graph(fx))
+    set_pipeline(True)
+    check(case, "a carrier that executes serves the frames: the run equals stock",
+          carried.get("success") and any(str(node).startswith("sonder-media") for node in carried["executing"])
+          and carried["outputs"] == stock["outputs"] and FRAME_CONSUMERS <= executed_nodes(carried),
+          {"error": carried.get("error"), "diff": _diff(carried["outputs"], stock["outputs"]),
+           "executing": carried["executing"]})
+
+    # A cancel while hashing: re-armed, nothing runs past it, the job returns to pending.
+    real_digest = content_mod.digest
+
+    def cancelling(socket, value, check_interrupt=None):
+        mm.interrupt_current_processing(True)
+        return real_digest(socket, value, check_interrupt)
+
+    edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.55))
+    content_mod.digest = cancelling
+    try:
+        row = await run(executor, content_graph(fx))
+    finally:
+        content_mod.digest = real_digest
+        mm.interrupt_current_processing(False)
+    check(case, "a cancel during hashing interrupts the run before any consumer",
+          not row.get("success") and (row.get("error") or {}).get("event") == "execution_interrupted"
+          and not (MEDIA & executed_nodes(row)), {"error": row.get("error"), "executing": row["executing"]})
+    row = await run(executor, content_graph(fx))
+    check(case, "the next run after a cancel during hashing succeeds", row.get("success"), row.get("error"))
+
+
 NOTES_OUT = {}
 CASES = {"acceptance": case_acceptance, "fail_open": case_fail_open, "tokens": case_tokens, "cancel": case_cancel,
          "errors": case_errors, "shapes": case_shapes, "lazy": case_lazy, "ram": case_ram, "misc": case_misc,
@@ -2262,15 +2709,18 @@ CASES = {"acceptance": case_acceptance, "fail_open": case_fail_open, "tokens": c
          "bridges_safety": case_bridges_safety, "bridges_ram": case_bridges_ram,
          "bridges_snapshot": case_bridges_snapshot, "bridges_negative": case_bridges_negative,
          "identity": case_identity, "identity_lazy": case_identity_lazy, "identity_safety": case_identity_safety,
-         "identity_ram": case_identity_ram, "identity_shapes": case_identity_shapes}
+         "identity_ram": case_identity_ram, "identity_shapes": case_identity_shapes,
+         "content": case_content, "content_negative": case_content_negative, "content_shapes": case_content_shapes,
+         "content_safety": case_content_safety}
 BY_MODE = {
     "classic": ["acceptance", "fail_open", "tokens", "cancel", "errors", "shapes", "lazy", "misc",
                 "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative",
-                "identity", "identity_lazy", "identity_safety", "identity_shapes"],
-    "lru": ["acceptance", "cancel", "bridges", "identity"],
+                "identity", "identity_lazy", "identity_safety", "identity_shapes",
+                "content", "content_negative", "content_shapes", "content_safety"],
+    "lru": ["acceptance", "cancel", "bridges", "identity", "content"],
     "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram",
-            "identity", "identity_ram"],
-    "none": ["acceptance", "bridges", "identity"],
+            "identity", "identity_ram", "content", "content_safety"],
+    "none": ["acceptance", "bridges", "identity", "content"],
 }
 
 

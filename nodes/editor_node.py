@@ -26,7 +26,7 @@ from ..server import run_scope
 from ..server import sdk_runs
 from ..server import view_timing
 from .prompt_once import run_once_per_prompt
-from .cache_policy import ALWAYS_RUNS, EXACT, INHERITS, NAN_FINGERPRINT, PER_RUN, normalise_outputs
+from .cache_policy import ALWAYS_RUNS, CONTENT, CONTENT_INVALIDATION, EXACT, NAN_FINGERPRINT, PER_RUN, normalise_outputs
 from ..server.editor_inputs import editor_optional_inputs
 from ..server.session_registry import project_event_aliases
 from ..server.timeline_state import (
@@ -246,11 +246,12 @@ class SonderEditor:
     )
     OUTPUT_SLOTS = {name: index for index, name in enumerate(RETURN_NAMES)}
     # How each output meets ComfyUI's cache (nodes/cache_policy.py). EXACT values
-    # reach their consumers as literals; media waits for a later phase.
+    # reach their consumers as literals; media reaches them through a carrier
+    # keyed by a digest of its content (CONTENT).
     SONDER_CACHE_POLICY = {
         "project": PER_RUN,
-        "rendered_frames": INHERITS("Editor media: Execution Cache Pipeline Phase 4"),
-        "guide_images": INHERITS("Editor media: Execution Cache Pipeline Phase 4"),
+        "rendered_frames": CONTENT,
+        "guide_images": CONTENT,
         "guide_idx": EXACT,
         "guide_strengths": EXACT,
         "prompt": EXACT,
@@ -258,9 +259,14 @@ class SonderEditor:
         "fps": EXACT,
         "width": EXACT,
         "height": EXACT,
-        "audio": INHERITS("Editor media: Execution Cache Pipeline Phase 4"),
+        "audio": CONTENT,
         "mask_start_time": EXACT,
         "mask_end_time": EXACT,
+    }
+    SONDER_CACHE_INVALIDATION = {
+        "rendered_frames": CONTENT_INVALIDATION,
+        "guide_images": CONTENT_INVALIDATION,
+        "audio": CONTENT_INVALIDATION,
     }
     SONDER_CACHE_EXECUTION = ALWAYS_RUNS(NAN_FINGERPRINT)
     OUTPUT_TOOLTIPS = (

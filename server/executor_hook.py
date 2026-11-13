@@ -24,6 +24,14 @@ Narrow by construction, in the ``kj_preview_adapter`` pattern:
   ``BaseException``s propagate as in stock. Bypassed under ``--cache-none``
   (``NullCache``), so the opt-out is exactly today's path.
 
+- **Carriers** (``check_carrier``, a fourth gate): when the pipeline hands the
+  Editor's media to ephemeral carriers, the hook arms a one-shot instance
+  attribute on this prompt's outputs cache that wraps its ``set_prompt``: the
+  stock method runs with the carrier ids appended, so they are keyed like any
+  node, then each carrier's entry is stored. Any fault rolls the graph back
+  with dictionary operations, while no cache key is being built, and runs the
+  stock method again with the submitted ids. A failed gate disables only carriers.
+
 Expiry: retire this hook when ComfyUI offers a supported hook that runs after
 the ``DynamicPrompt`` exists and before ``set_prompt`` builds cache keys.
 """
@@ -284,6 +292,193 @@ def _identity_runtime(execution: Any) -> dict[str, Any]:
     return {"identity": True}
 
 
+# execute_async builds keys this way (a carrier is keyed by the outputs cache's set_prompt).
+_CARRIER_EXECUTE_ASYNC_ORDER = (
+    "IsChangedCache(prompt_id, dynamic_prompt, self.caches.outputs)",
+    "for cache in self.caches.all:",
+    "await cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)",
+)
+_CARRIER_CACHE_TYPES = ("HierarchicalCache", "LRUCache", "RAMPressureCache")
+
+
+def check_carrier(execution: Any, stock_is_changed: Any = None) -> str | None:
+    """None when the executor keys and runs ephemeral carriers the way the hook arms them, else the reason.
+
+    Separate from ``check_shape``: a mismatch only stops carriers; Editor media
+    consumers then rerun on every run as before.
+    """
+    try:
+        caching = sys.modules.get("comfy_execution.caching")
+        if caching is None:
+            from comfy_execution import caching
+        source = _source(execution.PromptExecutor.execute_async)
+        last = -1
+        for token in _CARRIER_EXECUTE_ASYNC_ORDER:
+            at = source.find(token, last + 1)
+            if at < 0:
+                return f"carrier execute_async order: {token}"
+            last = at
+        if "self.all = [self.outputs, self.objects]" not in _source(execution.CacheSet.__init__):
+            return "CacheSet.all order"
+        basic = caching.BasicCache
+        if _params(basic.set_prompt) != ["self", "dynprompt", "node_ids", "is_changed_cache"]:
+            return "BasicCache.set_prompt signature"
+        basic_source = _source(basic.set_prompt)
+        assign = basic_source.find("self.cache_key_set = self.key_class(dynprompt, node_ids, is_changed_cache)")
+        keyed = basic_source.find("await self.cache_key_set.add_keys(node_ids)")
+        if assign < 0 or keyed < assign:
+            return "BasicCache.set_prompt keys"
+        if "set_prompt" in vars(caching.HierarchicalCache):
+            return "HierarchicalCache.set_prompt overridden"
+        for name in ("LRUCache", "RAMPressureCache"):
+            if "await super().set_prompt(dynprompt, node_ids, is_changed_cache)" not in _source(
+                    getattr(caching, name).set_prompt):
+                return f"{name}.set_prompt"
+        for name in ("BasicCache", "HierarchicalCache", "LRUCache", "RAMPressureCache"):
+            if _params(getattr(caching, name).set_local) != ["self", "node_id", "value"]:
+                return f"{name}.set_local signature"
+        add_keys = _source(caching.CacheKeySetInputSignature.add_keys)
+        if "if not self.dynprompt.has_node(node_id)" not in add_keys or "get_node_signature" not in add_keys:
+            return "CacheKeySetInputSignature.add_keys"
+        if "return self.keys.get(node_id, None)" not in _source(caching.CacheKeySet.get_data_key):
+            return "CacheKeySet.get_data_key"
+        if tuple(getattr(execution.CacheEntry, "_fields", ())) != ("ui", "outputs"):
+            return "CacheEntry fields"
+        dynamic_prompt = execution.DynamicPrompt
+        init = _source(dynamic_prompt.__init__)
+        for token in ("self.node_overrides = {}", "self.ephemeral_prompt = {}", "self.ephemeral_display = {}"):
+            if token not in init:
+                return f"DynamicPrompt.__init__: {token}"
+        if "self.ephemeral_prompt" not in _source(dynamic_prompt.has_node):
+            return "DynamicPrompt.has_node"
+        if "self.ephemeral_display" not in _source(dynamic_prompt.get_display_node_id):
+            return "DynamicPrompt.get_display_node_id"
+        if "get_real_node_id" not in vars(dynamic_prompt) or "__slots__" in vars(dynamic_prompt):
+            return "DynamicPrompt.get_real_node_id"
+        execute_source = _source(execution.execute)
+        if "real_node_id = dynprompt.get_real_node_id(unique_id)" not in execute_source:
+            return "execute real_node_id"
+        # The attribution works only while an error names the node by its real id and the
+        # handler looks that id up in the submitted prompt (an unattributed carrier kills the worker).
+        if execute_source.count('"node_id": real_node_id') < 2:
+            return "execute error node_id"
+        handler = _source(execution.PromptExecutor.handle_execution_error)
+        if 'node_id = error["node_id"]' not in handler or 'prompt[node_id]["class_type"]' not in handler:
+            return "handle_execution_error lookup"
+        is_changed = stock_is_changed if stock_is_changed is not None else execution.IsChangedCache
+        if "self.is_changed = {}" not in _source(is_changed.__init__):
+            return "IsChangedCache.is_changed"
+        if "validate_inputs(prompt_id, prompt, o, validated)" not in _source(execution.validate_prompt):
+            return "validate_prompt validates submitted outputs"
+        return None
+    except Exception as exc:
+        return f"carrier gate error: {type(exc).__name__}"
+
+
+def _carrier_runtime(execution: Any, stock_is_changed: Any) -> dict[str, Any] | None:
+    """What the hook needs to arm carriers, or None (logged once) when the gate fails."""
+    reason = check_carrier(execution, stock_is_changed)
+    if reason is None:
+        try:
+            from ..nodes import media_carrier
+        except Exception as exc:  # no comfy_api: the class is not registered either
+            reason = f"carrier class unavailable: {type(exc).__name__}"
+    if reason is None:
+        try:
+            from comfy_execution import caching
+            return {
+                "cache_types": {getattr(caching, name): getattr(caching, name).set_prompt
+                                for name in _CARRIER_CACHE_TYPES},
+                "key_class": caching.CacheKeySetInputSignature,
+                "entry": execution.CacheEntry,
+                "carrier": media_carrier.SonderMediaCarrier,
+                "mappings": lambda: execution.nodes.NODE_CLASS_MAPPINGS,
+            }
+        except Exception as exc:  # never costs Phases 1-3 their hook
+            reason = f"carrier runtime: {type(exc).__name__}"
+    logger.info("Sonder cache pipeline: nodes after the Sonder Editor rerun on every run while Editor media "
+                "cannot be carried by content on this ComfyUI (%s).", reason)
+    return None
+
+
+def _carrier_precondition(carriers: dict[str, Any] | None, outputs_cache: Any) -> str:
+    """Empty when this prompt's outputs cache can take carriers, else the reason code."""
+    if carriers is None:
+        return "carrier_gate"
+    cache_type = type(outputs_cache)
+    if cache_type not in carriers["cache_types"] or getattr(outputs_cache, "key_class", None) is not carriers["key_class"]:
+        return "cache_type"
+    if cache_type.set_prompt is not carriers["cache_types"][cache_type]:
+        return "cache_type"  # set_prompt replaced on the class after install
+    if "set_prompt" in getattr(outputs_cache, "__dict__", {}):
+        return "set_prompt_armed"
+    if carriers["mappings"]().get(cache_pipeline.CARRIER_CLASS_TYPE) is not carriers["carrier"]:
+        return "carrier_class_missing"
+    return ""
+
+
+def _note_rollback(key: str, exc: BaseException) -> None:
+    """Merge the keying rollback into the run's preparation record (note_preparation replaces it)."""
+    try:
+        from . import sdk_runs
+        record = sdk_runs.preparation(key) or {}
+        reasons = dict(record.get("content_reasons") or {})
+        reasons["keying_rolled_back"] = reasons.get("keying_rolled_back", 0) + 1
+        content = dict(record.get("content") or {})
+        content.update(carried=0, skipped=int(content.get("skipped", 0)) + int(content.get("carried", 0)))
+        record.update(content_reasons=reasons, content=content, content_error=type(exc).__name__)
+        sdk_runs.note_preparation(key, record)
+    except Exception:
+        logger.debug("Sonder cache pipeline could not record a carrier rollback", exc_info=True)
+
+
+def _arm_carriers(carriers: dict[str, Any], outputs_cache: Any, dynprompt: Any, plan: Any) -> None:
+    """Arm this prompt's outputs cache to key ``plan``'s carriers in its next ``set_prompt``.
+
+    A one-shot instance attribute: it removes itself when called, and passes any
+    other prompt straight to the stock method. The stock method runs with the
+    carrier ids appended, so carriers are keyed like any node (and LRU and RAM
+    mark them used); then each carrier's entry is stored, holding the same
+    object as the Editor's memo. If keying fails, the graph is rolled back with
+    dictionary operations, while no key is being built, and the stock method runs
+    again with the submitted ids: every consumer then misses on its own inputs.
+    """
+    stock = type(outputs_cache).set_prompt
+    entry = carriers["entry"]
+    carrier_ids = list(plan.carrier_ids)
+
+    async def set_prompt(prompt_dynprompt, node_ids, is_changed_cache):
+        outputs_cache.__dict__.pop("set_prompt", None)
+        if prompt_dynprompt is not dynprompt:
+            return await stock(outputs_cache, prompt_dynprompt, node_ids, is_changed_cache)
+        submitted = list(node_ids)
+        try:
+            await stock(outputs_cache, prompt_dynprompt, submitted + carrier_ids, is_changed_cache)
+            key_set = outputs_cache.cache_key_set
+            if any(key_set.get_data_key(carrier_id) is None for carrier_id in carrier_ids):
+                raise LookupError("a media carrier has no cache key")
+        except Exception as exc:
+            cache_pipeline.rollback_carriers(dynprompt, plan)
+            memo = getattr(is_changed_cache, "is_changed", None)
+            if isinstance(memo, dict):
+                for node_id in (*carrier_ids, *plan.restore):
+                    memo.pop(node_id, None)
+            logger.debug("Sonder cache pipeline: carrier keying failed; Editor media runs uncached", exc_info=True)
+            _note_rollback(plan.key, exc)
+            plan.payloads.clear()
+            return await stock(outputs_cache, prompt_dynprompt, submitted, is_changed_cache)
+        try:
+            # An optimisation: a carrier whose entry is stored never executes.
+            for carrier_id in carrier_ids:
+                outputs_cache.set_local(carrier_id, entry(ui=None, outputs=[[plan.payloads[carrier_id]]]))
+        except Exception:
+            logger.debug("Sonder cache pipeline: a carrier entry was not stored; it runs if needed", exc_info=True)
+        finally:
+            plan.payloads.clear()
+
+    outputs_cache.set_prompt = set_prompt
+
+
 def _build_runtime(execution: Any, prompt_server: Any) -> cache_pipeline.ExecutorRuntime:
     # Every name is looked up when called, as the executor itself does, so a pack
     # that wraps one after Sonder loads is seen by the early run too.
@@ -325,13 +520,17 @@ def _guarded_prepare(prompt_id: Any, dynprompt: Any, outputs_cache: Any) -> None
     with _LOCK:
         runtime = _INSTALLED.get("runtime")
         null_cache = _INSTALLED.get("null_cache")
+        carriers = _INSTALLED.get("carriers")
     if runtime is None:
         return
     started = time.perf_counter()
     try:
         if null_cache is not None and isinstance(outputs_cache, null_cache):
             return  # --cache-none: exactly today's path
-        cache_pipeline.prepare(runtime, str(prompt_id), dynprompt)
+        media = cache_pipeline.MediaHost(
+            reason=_carrier_precondition(carriers, outputs_cache),
+            arm=lambda plan: _arm_carriers(carriers, outputs_cache, dynprompt, plan))
+        cache_pipeline.prepare(runtime, str(prompt_id), dynprompt, media)
     except runtime.interrupt_type:
         # Raising cleared ComfyUI's flag: set it again so the first scheduled node stops.
         try:
@@ -386,9 +585,10 @@ def install(execution: Any = None, prompt_server: Any = None) -> dict[str, Any]:
             return _set(STATE_UNSUPPORTED, reason=reason)
         with _LOCK:
             runtime = _build_runtime(execution, _INSTALLED.get("prompt_server"))
+            carriers = _carrier_runtime(execution, current)
             hooked = _make_subclass(current)
             _INSTALLED.update(execution=execution, stock=current, hooked=hooked, runtime=runtime,
-                              null_cache=execution.NullCache)
+                              null_cache=execution.NullCache, carriers=carriers)
             execution.IsChangedCache = hooked
         return _set(STATE_OK)
     except Exception:

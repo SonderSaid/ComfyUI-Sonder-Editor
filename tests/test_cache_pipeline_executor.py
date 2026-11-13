@@ -28,6 +28,17 @@ mode; ``none`` asserts the bypass); a Driver behind a Sonder Cluster selected by
 a source changed after hashing and a cancel while hashing (classic); a RAM
 eviction that re-stages an identified bridge (ram).
 
+Phase 4a adds Editor media carried by content (``content*`` cases): frames,
+guide images and audio consumers that hit on an identical job, a clip opacity,
+a guide move, a guide image and an audio volume edit each rerunning exactly
+their own consumers, against stock, with no carrier in hidden ``PROMPT``,
+history or the take (every mode; ``none`` asserts the bypass); a negative
+control whose digest ignores the last frame (classic); a lazy switch, a
+video-to-video Guides Start and a Guides loop body on Editor frames (classic);
+a submitted carrier, forged tokens, a keying fault rolled back on the hazard
+ordering, a carrier error and cancel reported at the Editor, and a cancel while
+hashing (classic, ram).
+
 Skips without a ComfyUI install (``SONDER_COMFYUI_ROOT`` or the test install's venv).
 """
 
@@ -45,11 +56,12 @@ HELPER = REPO_ROOT / "tests" / "helpers" / "cache_pipeline_executor.py"
 CASES_BY_MODE = {
     "classic": ["acceptance", "fail_open", "tokens", "cancel", "errors", "shapes", "lazy", "misc",
                 "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative",
-                "identity", "identity_lazy", "identity_safety", "identity_shapes"],
-    "lru": ["acceptance", "cancel", "bridges", "identity"],
+                "identity", "identity_lazy", "identity_safety", "identity_shapes",
+                "content", "content_negative", "content_shapes", "content_safety"],
+    "lru": ["acceptance", "cancel", "bridges", "identity", "content"],
     "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram",
-            "identity", "identity_ram"],
-    "none": ["acceptance", "bridges", "identity"],
+            "identity", "identity_ram", "content", "content_safety"],
+    "none": ["acceptance", "bridges", "identity", "content"],
 }
 
 

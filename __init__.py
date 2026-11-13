@@ -154,6 +154,26 @@ try:
         NODE_CLASS_MAPPINGS[RELAY_NODE_ID] = SonderControlRelay
         NODE_DISPLAY_NAME_MAPPINGS[RELAY_NODE_ID] = RELAY_DISPLAY_NAME
 
+    # Internal to the cache pipeline (never in a saved workflow). Without it the
+    # pipeline plans no carriers and Editor media consumers rerun as before.
+    try:
+        from .nodes.media_carrier import DISPLAY_NAME as CARRIER_DISPLAY_NAME, NODE_ID as CARRIER_NODE_ID, SonderMediaCarrier
+        _carrier_schema = SonderMediaCarrier.GET_SCHEMA()
+        if getattr(_carrier_schema, "node_id", None) != CARRIER_NODE_ID:
+            raise RuntimeError("Sonder Media Carrier schema returned an unexpected node id")
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").startswith("comfy_api"):
+            logging.getLogger(__name__).warning(
+                "Sonder Media Carrier import failed: %s", exc, exc_info=True
+            )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Sonder Media Carrier unavailable: %s", exc, exc_info=True
+        )
+    else:
+        NODE_CLASS_MAPPINGS[CARRIER_NODE_ID] = SonderMediaCarrier
+        NODE_DISPLAY_NAME_MAPPINGS[CARRIER_NODE_ID] = CARRIER_DISPLAY_NAME
+
     WEB_DIRECTORY = "./web"
 
     # Import server module to register API routes with PromptServer

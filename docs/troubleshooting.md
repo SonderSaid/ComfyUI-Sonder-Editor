@@ -64,14 +64,13 @@ Nodes that use only text and number outputs of the Editor or of a Sonder
 bridge, such as text encoding, are reused while those values don't change.
 The bridges are the **Prompt Relay Bridge**, the **Masks Bridge** times, the
 **Driver Selector**, the **Reference Selector** and the **Reference Prompt
-Bridge**. Nodes that use only the media of a **Driver Bridge**, a **Reference
+Bridge**. Nodes that use the Editor's frames, guide images or audio, such as
+VAE encoding, are reused while that content doesn't change. Nodes that use only the media of a **Driver Bridge**, a **Reference
 Image Bridge**, a **Reference Audio Bridge** or the first guide of a **Guides
 Bridge Start** are reused while that media and its settings don't change. They
 run every time when:
 
-- The node also takes something made from the Editor's frames or audio, such
-  as a latent encoded from them. The supplied workflows' Prompt Relay encoders
-  and mask nodes do, so they run every take.
+- The node also takes the Editor's `project`, or something made from it.
 - ComfyUI was started with `--cache-none`. Remove it.
 - The workflow has more than one **Sonder Editor**. Keep one.
 - An input of the **Sonder Editor** is wired to another node. Set the value
@@ -80,19 +79,18 @@ run every time when:
   to another node. Set it on the bridge instead.
 - The value passes through a **Sonder Switch**, **Sonder Cluster** or
   **Sonder Gate** whose other branch comes from a Sonder bridge or from the
-  Editor's `project`, `rendered_frames`, `guide_images` or `audio`. The LTX 2.5
-  Edit & VFX workflow's prompt does this, so its text encoding runs every take.
-- The value reaches the node through an input that accepts any type.
+  Editor's `project`.
+- A text or number value reaches the node through an input that accepts any
+  type.
 - The bridge is on a branch of a **Sonder Switch** or **Sonder Cluster** whose
   `select` comes from another node. Set `select` on the node, or take it from a
   **Sonder Selector**, `has_driver` or `has_reference`.
 - The bridge is on a branch of a **Sonder Gate** whose `when` input comes from
   a node other than a **Sonder Selector** or a primitive.
-- A **Guides Bridge Start** `value_*` input comes from the Editor's frames or
-  audio.
 - The bridge's media files add up to more than 512 MB.
 - The ComfyUI console shows `Sonder cache pipeline is unavailable on this
-  ComfyUI`. Update ComfyUI and Sonder Editor; the reason in brackets names what
+  ComfyUI`, or, for frames, guide images and audio only, `Editor media cannot
+  be carried by content on this ComfyUI`. Update ComfyUI and Sonder Editor; the reason in brackets names what
   differs.
 
 The console names any other reason once, in a line starting
@@ -100,9 +98,8 @@ The console names any other reason once, in a line starting
 `Sonder cache pipeline failed` means that run fell back to running everything;
 report it with the lines that follow.
 
-Nodes fed by the Editor's `rendered_frames`, `guide_images` or `audio`, by a
-**Masks Bridge** mask, or by a **Guides Bridge** after its first guide, always
-run.
+Nodes fed by a **Masks Bridge** mask, or by a **Guides Bridge** after its
+first guide, always run.
 
 ### A run fails with "… changed while this run was reading it"
 

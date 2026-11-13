@@ -143,6 +143,163 @@ out["identity_gate_mutant"] = hook.check_identity_context(fake(CurrentNodeContex
 out["identity_runtime"] = sorted(hook._identity_runtime(execution))
 out["identity_runtime_mutant"] = sorted(hook._identity_runtime(fake(CurrentNodeContext=context.CurrentNodeContext)))
 
+# The carrier gate (Phase 4a): passes on the installed source, names each mutation.
+from comfy_execution import caching
+out["carrier_gate_installed"] = hook.check_carrier(execution, stock)
+no_loop = from_source("no_loop", """
+    class PromptExecutor:
+        async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+            is_changed_cache = IsChangedCache(prompt_id, dynamic_prompt, self.caches.outputs)
+            await self.caches.outputs.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
+""")
+cache_set = from_source("cache_set", """
+    class CacheSet:
+        def __init__(self, cache_type=None, cache_args={}):
+            self.all = [self.objects, self.outputs]
+""")
+real_execute = from_source("real_execute", """
+    async def execute(server, dynprompt, caches, current_item, *rest):
+        real_node_id = current_item
+""")
+validate = from_source("validate", """
+    async def validate_prompt(prompt_id, prompt, partial_execution_list):
+        return (True, None, [], {})
+""")
+no_memo = from_source("no_memo", """
+    class IsChangedCache:
+        def __init__(self, prompt_id, dynprompt, outputs_cache):
+            self.memo = {}
+""")
+import collections
+no_real = type("DynamicPrompt", (), {k: v for k, v in vars(DynamicPrompt).items() if k != "get_real_node_id"})
+carrier_mutants = {
+    "order": hook.check_carrier(fake(PromptExecutor=no_loop.PromptExecutor), stock),
+    "cache_set": hook.check_carrier(fake(CacheSet=cache_set.CacheSet), stock),
+    "entry": hook.check_carrier(fake(CacheEntry=collections.namedtuple("CacheEntry", "outputs ui")), stock),
+    "real_node_id": hook.check_carrier(fake(execute=real_execute.execute), stock),
+    "dynprompt": hook.check_carrier(fake(DynamicPrompt=no_real), stock),
+    "is_changed": hook.check_carrier(execution, no_memo.IsChangedCache),
+    "validate": hook.check_carrier(fake(validate_prompt=validate.validate_prompt), stock),
+}
+real_set_prompt = caching.BasicCache.set_prompt
+
+
+set_prompt_mutants = from_source("set_prompt_mutants", """
+    async def reordered_set_prompt(self, dynprompt, node_ids, is_changed_cache):
+        await self.cache_key_set.add_keys(node_ids)
+        self.cache_key_set = self.key_class(dynprompt, node_ids, is_changed_cache)
+
+    async def lru_without_super(self, dynprompt, node_ids, is_changed_cache):
+        self.generation += 1
+""")
+caching.BasicCache.set_prompt = set_prompt_mutants.reordered_set_prompt
+carrier_mutants["set_prompt"] = hook.check_carrier(execution, stock)
+caching.BasicCache.set_prompt = real_set_prompt
+real_lru = caching.LRUCache.set_prompt
+
+
+caching.LRUCache.set_prompt = set_prompt_mutants.lru_without_super
+carrier_mutants["lru"] = hook.check_carrier(execution, stock)
+caching.LRUCache.set_prompt = real_lru
+
+# The rest of the gate's tokens, one mutant each: patched on the real classes, then restored.
+more = from_source("more_mutants", """
+    async def set_prompt_extra(self, dynprompt, node_ids, is_changed_cache, extra=None):
+        self.cache_key_set = self.key_class(dynprompt, node_ids, is_changed_cache)
+        await self.cache_key_set.add_keys(node_ids)
+
+    async def own_set_prompt(self, dynprompt, node_ids, is_changed_cache):
+        self.cache_key_set = self.key_class(dynprompt, node_ids, is_changed_cache)
+        await self.cache_key_set.add_keys(node_ids)
+
+    async def ram_without_super(self, dynprompt, node_ids, is_changed_cache):
+        self.active_evictions = False
+
+    def set_local_renamed(self, key, value):
+        pass
+
+    async def add_keys_unchecked(self, node_ids):
+        for node_id in node_ids:
+            self.keys[node_id] = None
+
+    def get_data_key_other(self, node_id):
+        return self.keys[node_id]
+
+    class NoEphemeral:
+        def __init__(self, original_prompt):
+            self.original_prompt = original_prompt
+            self.node_overrides = {}
+            self.ephemeral_display = {}
+
+        def has_node(self, node_id):
+            return node_id in self.original_prompt
+
+        def get_display_node_id(self, node_id):
+            return node_id
+
+        def get_real_node_id(self, node_id):
+            return node_id
+
+    async def execute_unique_id(server, dynprompt, caches, current_item, *rest):
+        real_node_id = dynprompt.get_real_node_id(unique_id)
+        error_details = {"node_id": unique_id}
+        error_details = {"node_id": unique_id}
+
+    class Handler:
+        def handle_execution_error(self, prompt_id, prompt, current_outputs, executed, error, ex):
+            node_id = error["node_id"]
+            class_type = "unknown"
+""")
+
+
+def patched(owner, name, value, **gate):
+    original = owner.__dict__.get(name, None)
+    had = name in owner.__dict__
+    setattr(owner, name, value)
+    try:
+        return hook.check_carrier(gate.get("module", execution), stock)
+    finally:
+        if had:
+            setattr(owner, name, original)
+        else:
+            delattr(owner, name)
+
+
+carrier_mutants["set_prompt_signature"] = patched(caching.BasicCache, "set_prompt", more.set_prompt_extra)
+carrier_mutants["hierarchical_override"] = patched(caching.HierarchicalCache, "set_prompt", more.own_set_prompt)
+carrier_mutants["ram"] = patched(caching.RAMPressureCache, "set_prompt", more.ram_without_super)
+carrier_mutants["set_local"] = patched(caching.LRUCache, "set_local", more.set_local_renamed)
+carrier_mutants["add_keys"] = patched(caching.CacheKeySetInputSignature, "add_keys", more.add_keys_unchecked)
+carrier_mutants["get_data_key"] = patched(caching.CacheKeySet, "get_data_key", more.get_data_key_other)
+carrier_mutants["dynprompt_init"] = hook.check_carrier(fake(DynamicPrompt=more.NoEphemeral), stock)
+carrier_mutants["error_node_id"] = hook.check_carrier(fake(execute=more.execute_unique_id), stock)
+handler_executor = type("PromptExecutor", (execution.PromptExecutor,),
+                        {"handle_execution_error": more.Handler.handle_execution_error})
+carrier_mutants["handler"] = hook.check_carrier(fake(PromptExecutor=handler_executor), stock)
+out["carrier_gate_mutants"] = carrier_mutants
+
+# Per-prompt preconditions: the outputs cache must be a stock type, unarmed, with the carrier registered.
+import nodes as comfy_nodes
+carrier_runtime = hook._carrier_runtime(execution, stock)
+carrier_module = importlib.import_module("sonder_hook_pkg.nodes.media_carrier")
+classic = execution.HierarchicalCache(execution.CacheKeySetInputSignature)
+preconditions = {"unregistered": hook._carrier_precondition(carrier_runtime, classic)}
+comfy_nodes.NODE_CLASS_MAPPINGS["SonderMediaCarrier"] = carrier_module.SonderMediaCarrier
+preconditions["classic"] = hook._carrier_precondition(carrier_runtime, classic)
+preconditions["lru"] = hook._carrier_precondition(carrier_runtime, execution.LRUCache(execution.CacheKeySetInputSignature, 4))
+preconditions["ram"] = hook._carrier_precondition(carrier_runtime, caching.RAMPressureCache(execution.CacheKeySetInputSignature))
+preconditions["id_keys"] = hook._carrier_precondition(carrier_runtime, execution.HierarchicalCache(caching.CacheKeySetID))
+subclass = type("Sub", (execution.HierarchicalCache,), {})
+preconditions["subclass"] = hook._carrier_precondition(carrier_runtime, subclass(execution.CacheKeySetInputSignature))
+armed = execution.HierarchicalCache(execution.CacheKeySetInputSignature)
+armed.set_prompt = lambda *args: None
+preconditions["armed"] = hook._carrier_precondition(carrier_runtime, armed)
+preconditions["no_gate"] = hook._carrier_precondition(None, classic)
+comfy_nodes.NODE_CLASS_MAPPINGS["SonderMediaCarrier"] = object
+preconditions["foreign_class"] = hook._carrier_precondition(carrier_runtime, classic)
+comfy_nodes.NODE_CLASS_MAPPINGS.pop("SonderMediaCarrier", None)
+out["carrier_preconditions"] = preconditions
+
 # Install: idempotent, not stacked.
 first = hook.install(execution)
 hooked = execution.IsChangedCache
@@ -155,7 +312,7 @@ real_prepare = pipeline.prepare
 dyn = DynamicPrompt({"1": {"class_type": "SaveImage", "inputs": {}}})
 
 
-def spy(runtime, prompt_id, dynprompt):
+def spy(runtime, prompt_id, dynprompt, *media):
     calls.append(prompt_id)
     return {}
 
@@ -168,7 +325,7 @@ out["null_cache_bypass"] = list(calls)
 # The guard: a pipeline fault and an interrupt outside the Editor never escape.
 escaped = []
 for kind in ("fault", "interrupt"):
-    def broken(runtime, prompt_id, dynprompt, kind=kind):
+    def broken(runtime, prompt_id, dynprompt, *media, kind=kind):
         if kind == "fault":
             raise ValueError("pipeline bug")
         raise mm.InterruptProcessingException()
@@ -196,7 +353,7 @@ except TypeError as exc:
 out["four_args_prepared"] = list(calls)
 
 # Another BaseException still propagates as in stock.
-def exiting(runtime, prompt_id, dynprompt):
+def exiting(runtime, prompt_id, dynprompt, *media):
     raise KeyboardInterrupt()
 
 pipeline.prepare = exiting
@@ -273,6 +430,38 @@ def test_the_v3_call_gate_passes_installed_and_names_each_mutation(result):
     # needs only ComfyUI's V3 base, so a failed gate never makes a V3 class look V1.
     assert result["v3_runtime_fields"] == ["call_v3", "is_v3", "node_output_type", "own_lazy_status"]
     assert result["v3_runtime_mutant"] == ["is_v3"]
+
+
+def test_the_carrier_gate_passes_installed_and_names_each_mutation(result):
+    assert result["carrier_gate_installed"] is None
+    assert result["carrier_gate_mutants"] == {
+        "order": "carrier execute_async order: for cache in self.caches.all:",
+        "cache_set": "CacheSet.all order",
+        "entry": "CacheEntry fields",
+        "real_node_id": "execute real_node_id",
+        "dynprompt": "DynamicPrompt.get_real_node_id",
+        "is_changed": "IsChangedCache.is_changed",
+        "validate": "validate_prompt validates submitted outputs",
+        "set_prompt": "BasicCache.set_prompt keys",
+        "lru": "LRUCache.set_prompt",
+        "set_prompt_signature": "BasicCache.set_prompt signature",
+        "hierarchical_override": "HierarchicalCache.set_prompt overridden",
+        "ram": "RAMPressureCache.set_prompt",
+        "set_local": "LRUCache.set_local signature",
+        "add_keys": "CacheKeySetInputSignature.add_keys",
+        "get_data_key": "CacheKeySet.get_data_key",
+        "dynprompt_init": "DynamicPrompt.__init__: self.ephemeral_prompt = {}",
+        "error_node_id": "execute error node_id",
+        "handler": "handle_execution_error lookup",
+    }
+
+
+def test_carriers_are_planned_only_on_a_stock_unarmed_cache_with_the_carrier_registered(result):
+    assert result["carrier_preconditions"] == {
+        "unregistered": "carrier_class_missing", "classic": "", "lru": "", "ram": "", "id_keys": "cache_type",
+        "subclass": "cache_type", "armed": "set_prompt_armed", "no_gate": "carrier_gate",
+        "foreign_class": "carrier_class_missing",
+    }
 
 
 def test_install_is_idempotent_and_subclasses_the_stock_class(result):
