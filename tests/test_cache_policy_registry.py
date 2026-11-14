@@ -17,8 +17,10 @@ non-literal type, ``INHERITS`` with no reason, ``DESCRIPTOR`` with no registered
 invalidation cases, ``CONTENT`` on a type ``cache_content`` cannot digest or
 without every ``CONTENT_INVALIDATION`` case, or (output and hidden-input nodes) a
 missing node-level declaration or an ``ALWAYS_RUNS`` proof that does not hold.
-The canonical list of ``CONTENT`` outputs is the Editor's three media outputs,
-and the media carrier's shape is pinned.
+The canonical list of ``CONTENT`` outputs is the Editor's guide images, the
+canonical list of deferred outputs (``DEFERS``, Phase 4b) is the Editor's frames
+and audio, a ``DESCRIPTOR`` output belongs to a class declaring ``IDENTIFIES`` or
+``DEFERS``, and the media carrier's shape is pinned.
 
 The walk needs ComfyUI's real ``comfy_api`` to finalise V3 schemas. ComfyUI's
 ``nodes`` and ``execution`` modules collide with this repository's packages, so
@@ -290,7 +292,7 @@ handle_types = {mapping[node_id].RETURN_TYPES[slot]
                 for node_id in out["prepared"]
                 for slot, name in enumerate(info[node_id]["names"])
                 if policy.output_policy(mapping[node_id], name) == policy.HANDLE}
-out["lazy"], out["identified"] = [], {}
+out["lazy"], out["identified"], out["deferred"] = [], {}, {}
 for node_id in sorted(mapping):
     cls, item = mapping[node_id], info[node_id]
     declared_inputs = {name for category in item["inputs"].values() for name in category}
@@ -312,8 +314,30 @@ for node_id in sorted(mapping):
         fail(node_id, "SONDER_CACHE_IDENTITY is not an IDENTIFIES declaration")
     names = item["names"] or [f"#{index}" for index in range(len(item["returns"]))]
     descriptors = [name for name in names if policy.output_policy(cls, name) == policy.DESCRIPTOR]
+    deferred = policy.defer_policy(cls)
+    if getattr(cls, policy.DEFER_ATTRIBUTE, None) is not None and deferred is None:
+        fail(node_id, "SONDER_CACHE_DEFERRED is not a DEFERS declaration")
+    if deferred is not None:
+        out["deferred"][node_id] = list(deferred.outputs)
+        for name in deferred.outputs:
+            if name not in names:
+                fail(node_id, f"DEFERS names {name!r}, which is not an output")
+                continue
+            if policy.output_policy(cls, name) != policy.DESCRIPTOR:
+                fail(node_id, f"deferred output {name} is not DESCRIPTOR")
+            if names.index(name) < len(item["returns"]) and item["returns"][names.index(name)] not in policy.CONTENT_TYPES:
+                fail(node_id, f"deferred output {name} is not media ({policy.CONTENT_TYPES})")
+            cases = tuple((getattr(cls, policy.INVALIDATION_ATTRIBUTE, None) or {}).get(name) or ())
+            if set(cases) != set(policy.DEFERRED_INVALIDATION):
+                fail(node_id, f"deferred output {name} is without the registered cases {policy.DEFERRED_INVALIDATION}")
+        if identity is not None:
+            fail(node_id, "a class declares both IDENTIFIES and DEFERS")
+        undeclared = [name for name in descriptors if name not in deferred.outputs]
+        if undeclared:
+            fail(node_id, f"DESCRIPTOR outputs neither deferred nor identified: {undeclared}")
+        continue
     if descriptors and identity is None:
-        fail(node_id, "DESCRIPTOR outputs without SONDER_CACHE_IDENTITY (IDENTIFIES)")
+        fail(node_id, "DESCRIPTOR outputs without SONDER_CACHE_IDENTITY (IDENTIFIES) or SONDER_CACHE_DEFERRED (DEFERS)")
     if identity is None:
         continue
     out["identified"][node_id] = {"token_input": identity.token_input, "descriptors": descriptors}
@@ -441,8 +465,15 @@ IDENTIFIED = ["SonderDriverBridge", "SonderGuidesBridgeStart", "SonderReferenceA
 
 
 def test_the_editor_media_outputs_are_the_canonical_content_list(registry):
-    # Phase 4a: the only outputs whose identity is a digest of their content.
-    assert registry["content"] == {"SonderEditor": ["rendered_frames", "guide_images", "audio"]}
+    # Phase 4a: the only outputs whose identity is a digest of their content. Phase 4b
+    # moved frames and audio to a pre-render identity; guide images stay CONTENT (their
+    # load decides guide_idx and guide_strengths, so it cannot leave the resolve stage).
+    assert registry["content"] == {"SonderEditor": ["guide_images"]}
+
+
+def test_the_editor_render_and_mix_are_the_canonical_deferred_list(registry):
+    # Phase 4b: the only outputs whose materialization waits for ComfyUI's cache.
+    assert registry["deferred"] == {"SonderEditor": ["rendered_frames", "audio"]}
 
 
 def test_the_media_carrier_is_an_internal_dev_only_v3_node(registry):

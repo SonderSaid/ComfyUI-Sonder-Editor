@@ -490,7 +490,17 @@ def instrumented_consume(self, proj):
     return _real_consume(self, proj)
 
 
+WORK = {"render": 0, "mix": 0}
+_real_load_audio = SonderEditor._load_scene_audio
+
+
+def instrumented_load_audio(self, proj, scene, start, end, **kwargs):
+    WORK["mix"] += 1
+    return _real_load_audio(self, proj, scene, start, end, **kwargs)
+
+
 def instrumented_render(self, proj, scene, start, end, **kwargs):
+    WORK["render"] += 1
     if INJECT["render_error"]:
         raise RuntimeError("Injected render failure after the claim")
     progress = kwargs.get("progress")
@@ -546,6 +556,7 @@ pipeline.plan_substitutions = faulty_plan
 SonderEditor._execute_once = instrumented_execute_once
 SonderEditor._consume_queue_job = instrumented_consume
 SonderEditor._render_scene_frames = instrumented_render
+SonderEditor._load_scene_audio = instrumented_load_audio
 editor_node.save_project = instrumented_save_project
 
 CACHE = {"classic": (execution.CacheType.CLASSIC, {}), "lru": (execution.CacheType.LRU, {"lru": 10}),
@@ -670,6 +681,8 @@ async def run(executor, graph, targets=None, client=True, trusted=True, extra=No
         store.clear()
     CALLS.clear()
     RESOLVER_CALLS.clear()
+    WORK.update(render=0, mix=0)
+    sdk_runs_settled.clear()
     SERVER.events.clear()
     valid = await execution.validate_prompt(prompt_id, prompt, targets)
     if not valid[0]:
@@ -706,6 +719,8 @@ async def run(executor, graph, targets=None, client=True, trusted=True, extra=No
         "node_errors": json.dumps(valid[3] if len(valid) > 3 else {}, default=str)[:4000],
         "displayed": sorted({str(data.get("display_node")) for event, data, _ in SERVER.events
                              if event == "executing" and data.get("node")}),
+        "work": dict(WORK),
+        "settled": (sdk_runs_settled.get("value") or {}),
     }
 
 
@@ -961,7 +976,11 @@ async def case_cancel():
     check(case, "no other node ran after the cancel", not any(key.split(":")[0] in ("mark", "text", "int", "generation")
                                                             for key in row["calls"]), row["calls"])
     check(case, "the claimed job returned to pending", jobs_of(fx)[f"cancel-1"]["status"] == "pending", jobs_of(fx))
-    check(case, "the early run stored a cancellation", prep(row).get("outcome") == "cancelled", prep(row))
+    # Phase 4b: the render is deferred, so the cancel lands while set_prompt settles it,
+    # which stores the cancellation and rolls the carriers back (none mode: the early run).
+    check(case, "the run stored a cancellation (early run, or while settling)",
+          prep(row).get("outcome") == "cancelled" or row["settled"].get("outcome") == "rollback",
+          {"prep": prep(row), "settled": row["settled"]})
     following = await run(executor, core(fx, tap=True, selection_end=6))
     check(case, "the executor survives and the next prompt claims the returned job",
           following["success"] and following["editor_runs"] and following["editor_runs"][0]["job_ref_id"] == "cancel-1"
@@ -1158,6 +1177,8 @@ async def case_ram():
 
 
 async def case_misc():
+    global editor_media_module
+    editor_media_module = sonder("nodes.editor_media")
     case = "misc"
     set_pipeline(True)
     fx = fixture("noclient", [{"text": "No client"}] * 2)
@@ -1168,11 +1189,18 @@ async def case_misc():
 
     # A third-party node swallows the re-armed interrupt: the scheduled Editor
     # replays the cancellation and never re-runs its body or claims again.
+    # The render runs in the early run here (deferral off): only then is the cancel
+    # re-armed before set_prompt, where this node's IS_CHANGED clears it.
     fx = fixture("swallow", [{"text": "Swallow A", "end": 6}] * 2, frames=8, clip=True)
     graph = core(fx, tap=True, selection_end=6)
     graph["sw"] = n("CPSwallow", text="swallow")
     INJECT["interrupt_at"] = 2
-    row = await run(new_executor(), graph)
+    real_requested = editor_media_module.deferral_requested
+    editor_media_module.deferral_requested = lambda unique_id: False
+    try:
+        row = await run(new_executor(), graph)
+    finally:
+        editor_media_module.deferral_requested = real_requested
     reset_injections()
     check(case, "swallowed interrupt: a node really cleared the re-armed flag",
           any(note.get("swallowed") for note in row["notes"]), row["notes"])
@@ -1183,6 +1211,20 @@ async def case_misc():
           and row["error"]["event"] == "execution_interrupted" and row["error"]["node"] == "1", row["error"])
     check(case, "swallowed interrupt: the job returned to pending", jobs_of(fx)["swallow-1"]["status"] == "pending",
           jobs_of(fx))
+    # Deferred (Phase 4b): the cancel lands while settling, after every key (and this
+    # node's IS_CHANGED); the stored cancellation and the re-armed flag stop the run,
+    # and the Editor body and claim ran once.
+    fx = fixture("swallowd", [{"text": "Swallow D", "end": 6}] * 2, frames=8, clip=True)
+    graph = core(fx, tap=True, selection_end=6)
+    graph["sw"] = n("CPSwallow", text="swallow")
+    INJECT["interrupt_at"] = 2
+    row = await run(new_executor(), graph)
+    reset_injections()
+    check(case, "deferred cancel while settling: interrupted, body and claim once, the job returned to pending",
+          row["error"] and row["error"]["event"] == "execution_interrupted" and len(row["editor_runs"]) == 1
+          and row["claims"] == 1 and row["settled"].get("outcome") == "rollback"
+          and jobs_of(fx)["swallowd-1"]["status"] == "pending",
+          {"error": row["error"], "runs": row["editor_runs"], "settled": row["settled"], "jobs": jobs_of(fx)})
 
     # Inference mode on the prepared path, as on stock.
     taps = {}
@@ -1982,7 +2024,9 @@ async def case_bridges_safety():
         INJECT["interrupt_in"] = inject
         row = await run(executor, graph)
         reset_injections()
-        expected_outcome = "raised" if inject == "masks" else "prepared"
+        # Phase 4b: a cancel set after the last bridge is caught by the deferred
+        # render's own check before the early render, so preparation raises too.
+        expected_outcome = "raised"
         check(case, f"cancel {label}: interrupted, no consumer ran, the job returned to pending",
               row["error"] and row["error"]["event"] == "execution_interrupted"
               and not any(key.split(":")[0] in ("text", "float", "int") for key in row["calls"])
@@ -2166,6 +2210,9 @@ async def case_identity_shapes():
     # identical second job reuses its Start (and the frames consumer feeding it).
     def media_loop(fx):
         graph = loop(fx)
+        # Takes placed muted: since Phase 4b the frames' identity is the timeline's recipe,
+        # so a placed take is a new timeline even when it renders the same pixels.
+        graph["1"] = editor(fx, selection_end=4, take_placement_muted=True)
         graph["tap"] = n("CPImageTap", frames=["1", 1])
         graph["gs"]["inputs"]["value_0"] = ["tap", 0]
         return graph
@@ -2628,6 +2675,7 @@ async def case_content_safety():
     def arm_without_store(carriers, cache, dynprompt, plan):
         real_arm(carriers, cache, dynprompt, plan)
         plan.payloads.clear()  # nothing to store: carriers execute when a consumer needs them
+        plan.settle = None  # Phase 4b: deferred carriers are left for the carrier's own net
 
     real_media_for = sdk_runs.media_for
     completed_before_failures = sum(job["status"] == "completed" for job in jobs_of(fx).values())
@@ -2702,6 +2750,321 @@ async def case_content_safety():
     check(case, "the next run after a cancel during hashing succeeds", row.get("success"), row.get("error"))
 
 
+# --- Phase 4b: the Editor's render and mix deferred to set_prompt ---------------------------------
+
+sdk_runs_settled = {}
+_real_note_settled = pipeline._note_settled
+
+
+def recording_note_settled(key, hits, misses, outcome):
+    sdk_runs_settled["value"] = {"hits": hits, "misses": misses, "outcome": outcome or "settled"}
+    return _real_note_settled(key, hits, misses, outcome)
+
+
+pipeline._note_settled = recording_note_settled
+editor_media = sonder("nodes.editor_media")
+
+
+class CPFramesProject:
+    """A frames consumer that also takes the Editor's project: it can never hit."""
+    RETURN_TYPES = ("STRING",)
+    FUNCTION = "run"
+    CATEGORY = "CPH"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"frames": ("IMAGE",), "project": ("SONDER_PROJECT",)},
+                "hidden": {"unique_id": "UNIQUE_ID"}}
+
+    def run(self, frames, project, unique_id=None):
+        import hashlib
+        count("media", unique_id)
+        tensor = frames.detach().cpu().contiguous()
+        return (f"{list(tensor.shape)}:{hashlib.sha256(tensor.numpy().tobytes()).hexdigest()[:16]}",)
+
+
+nodes.NODE_CLASS_MAPPINGS["CPFramesProject"] = CPFramesProject
+
+DEFERRED_STEPS = ("base", "identical", "clip opacity", "audio volume", "guide strength", "guide image replaced",
+                  "identical again")
+# (renders, mixes) the pipeline arm does at each step: a hit does neither.
+DEFERRED_WORK = {"base": (1, 1), "identical": (0, 0), "clip opacity": (1, 0), "audio volume": (0, 1),
+                 "guide strength": (0, 0), "guide image replaced": (0, 0), "identical again": (0, 0)}
+DEFERRED_RERUN = {"identical": set(), "clip opacity": FRAME_CONSUMERS, "audio volume": AUDIO_CONSUMERS,
+                  "guide strength": set(), "guide image replaced": GUIDE_CONSUMERS, "identical again": set()}
+
+
+async def deferred_sequence(enabled, label, build=content_graph, fixture_args=None):
+    set_pipeline(enabled)
+    fx = content_fixture(f"{label}-{int(enabled)}", len(DEFERRED_STEPS) + 1)
+    executor = new_executor()
+    rows = []
+    for name in DEFERRED_STEPS:
+        if name == "clip opacity":
+            edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.5))
+        elif name == "audio volume":
+            edit_project(fx, lambda project, scene: setattr(scene.audio_tracks[0], "volume", 0.5))
+        elif name == "guide strength":
+            edit_project(fx, lambda project, scene: setattr(scene.guide_frames[0], "strength", 0.4))
+        elif name == "guide image replaced":
+            replace_guide_image(fx, (0, 255, 0))
+        sdk_runs_settled.clear()
+        rows.append((name, await run(executor, build(fx)), last_take_params(fx)))
+    return rows
+
+
+async def case_deferred():
+    """Phase 4b: an unchanged timeline renders and mixes nothing; a change renders exactly its slot."""
+    case = "deferred"
+    pipeline_rows = await deferred_sequence(True, "deferred")
+    stock_rows = await deferred_sequence(False, "deferred")
+    for (label, row, params), (_, stock, _stock_params) in zip(pipeline_rows, stock_rows):
+        check(case, f"{label}: both arms succeed", row.get("success") and stock.get("success"),
+              {"pipeline": row.get("error") or row.get("invalid"), "stock": stock.get("error") or stock.get("invalid")})
+        check(case, f"{label}: differential oracle (every consumer equals stock)", row["outputs"] == stock["outputs"],
+              _diff(row["outputs"], stock["outputs"]))
+        check(case, f"{label}: stock renders and mixes every run", stock["work"] == {"render": 1, "mix": 1},
+              stock["work"])
+        check(case, f"{label}: no carrier in the prompt, hidden PROMPT, history or the take",
+              _no_carrier_anywhere(row, params), {"prompt_unchanged": row["prompt_unchanged"]})
+        if MODE == "none":
+            check(case, f"{label}: --cache-none bypasses deferral (renders and mixes as stock)",
+                  not row["preparations"] and row["work"] == {"render": 1, "mix": 1}, row["work"])
+            continue
+        content = prep(row).get("content", {})
+        check(case, f"{label}: frames and audio carried by their pre-render identity",
+              content.get("carried") == 3 and content.get("deferred") == 2,
+              {"content": content, "reasons": prep(row).get("content_reasons")})
+        renders, mixes = DEFERRED_WORK[label]
+        check(case, f"{label}: renders {renders}, mixes {mixes}", row["work"] == {"render": renders, "mix": mixes},
+              {"work": row["work"], "settled": row["settled"]})
+        check(case, f"{label}: settled in set_prompt", row["settled"].get("outcome") == "settled"
+              and row["settled"].get("hits", 0) + row["settled"].get("misses", 0) == 2, row["settled"])
+        check(case, f"{label}: the Editor body ran once", len(row["editor_runs"]) == 1, len(row["editor_runs"]))
+        if label in DEFERRED_RERUN and MODE in ("classic", "ram"):
+            reran = executed_nodes(row) & MEDIA
+            check(case, f"{label}: exactly the changed output's consumers rerun", reran == DEFERRED_RERUN[label],
+                  {"ran": sorted(reran), "expected": sorted(DEFERRED_RERUN[label])})
+            check(case, f"{label}: no carrier executes", not any(str(node).startswith("sonder-media")
+                                                                for node in row["executing"]), row["executing"])
+    if MODE != "none":
+        # The Editor's progress opens for the early run and for the scheduled Editor;
+        # a miss opens it once more while settling, a hit never.
+        hit, miss = pipeline_rows[1][1], pipeline_rows[2][1]
+        check(case, "a hit opens no render stage at the Editor; a miss opens one while settling",
+              miss["progress_calls"].count(("start", "1")) == hit["progress_calls"].count(("start", "1")) + 1,
+              {"hit": hit["progress_calls"], "miss": miss["progress_calls"]})
+
+
+def drift_fixture(label, runs):
+    fx = fixture(label, [{"text": "Drift job", "end": 12, "snapshot": 0}] * runs, clip=True, frames=16)
+    return fx
+
+
+def drift_graph(fx, mask_pre=0):
+    return {
+        "1": editor(fx, selection_start=4, selection_end=12, pre_context_frames=4, post_context_frames=4,
+                    mask_pre_offset=mask_pre, take_placement_muted=True),
+        "fd": n("CPMediaDigest", frames=["1", 1]), "fdp": n("PreviewAny", source=["fd", 0]),
+        "after": n("CPAfter", image=["1", 1], a=["fd", 0], b=["fd", 0], c=["fd", 0], d=["fd", 0], e=["fd", 0],
+                   f=["fd", 0]),
+        "7": {"class_type": "SonderSaveVideo", "inputs": dict(
+            project=["1", 0], frames=["after", 0], filename_prefix="cph", fps=24.0, mode="Take",
+            place_audio_on_timeline=False, mark_queue_complete=True, embed_metadata=False,
+            color_drift_correction=True)},
+    }
+
+
+def drift_record(params):
+    record = params.get(sonder("server.color_correction").COLOR_DRIFT_METADATA_KEY) if params else None
+    return json.loads(json.dumps(record, default=str, sort_keys=True)) if record is not None else None
+
+
+async def case_deferred_shapes():
+    """Graph shapes with deferred media that must equal stock (classic)."""
+    case = "deferred_shapes"
+
+    def with_project_reader(fx):
+        graph = content_graph(fx)
+        graph["fp"] = n("CPFramesProject", frames=["1", 1], project=["1", 0])
+        graph["fpp"] = n("PreviewAny", source=["fp", 0])
+        return graph
+
+    rows = {}
+    for enabled in (True, False):
+        set_pipeline(enabled)
+        fx = content_fixture(f"dshape-{int(enabled)}", 3)
+        executor = new_executor()
+        rows[enabled] = [await run(executor, with_project_reader(fx)) for _ in range(2)]
+    for index, label in enumerate(("first", "identical")):
+        row, stock = rows[True][index], rows[False][index]
+        check(case, f"a carried consumer and a project reader of one slot ({label}): equals stock",
+              row.get("success") and row["outputs"] == stock["outputs"], _diff(row["outputs"], stock["outputs"]))
+    check(case, "a carried consumer and a project reader of one slot: one render on a miss, none on a hit",
+          rows[True][0]["work"]["render"] == 1 and rows[True][1]["work"]["render"] == 0,
+          [row["work"] for row in rows[True]])
+    check(case, "the project reader reruns and still gets the frames",
+          "fp" in executed_nodes(rows[True][1]), rows[True][1]["executing"])
+
+    # A fractional clip start: no identity, rendered as today, equal to stock.
+    frac = {}
+    for enabled in (True, False):
+        set_pipeline(enabled)
+        fx = content_fixture(f"dfrac-{int(enabled)}", 3)
+        edit_project(fx, lambda project, scene: setattr(scene.clips[0], "timeline_start_frame", 0.5))
+        executor = new_executor()
+        frac[enabled] = [await run(executor, content_graph(fx)) for _ in range(2)]
+    # Its frames have no recipe, so the early run renders them and they are carried by
+    # content (Phase 4a); the audio keeps its pre-render identity.
+    check(case, "a fractional clip start gets no identity, renders every run, and equals stock",
+          all(row.get("success") for row in frac[True])
+          and all(a["outputs"] == b["outputs"] for a, b in zip(frac[True], frac[False]))
+          and prep(frac[True][1]).get("content", {}).get("deferred") == 1
+          and [row["work"]["render"] for row in frac[True]] == [1, 1],
+          {"content": prep(frac[True][1]).get("content"), "work": [row["work"] for row in frac[True]],
+           "diff": _diff(frac[True][1]["outputs"], frac[False][1]["outputs"])})
+
+    # A colour-correcting Save Video with context frames: the take's drift record equals stock on a hit
+    # and after a mask offset change (which changes neither recipe).
+    drift = {}
+    for enabled in (True, False):
+        set_pipeline(enabled)
+        fx = drift_fixture(f"ddrift-{int(enabled)}", 4)
+        executor = new_executor()
+        drift[enabled] = []
+        for mask_pre in (0, 0, 2):
+            row = await run(executor, drift_graph(fx, mask_pre))
+            drift[enabled].append((row, drift_record(last_take_params(fx))))
+    for index, label in enumerate(("first", "identical (hit)", "mask offset changed")):
+        (row, record), (stock, stock_record) = drift[True][index], drift[False][index]
+        check(case, f"colour drift ({label}): the take's drift record equals stock",
+              row.get("success") and record == stock_record and record is not None,
+              {"pipeline": record, "stock": stock_record, "error": row.get("error")})
+    check(case, "colour drift: the identical run and the mask offset change render nothing",
+          [row["work"]["render"] for row, _ in drift[True]] == [1, 0, 0], [row["work"] for row, _ in drift[True]])
+
+
+async def case_deferred_safety():
+    """Failures while settling deferred media (classic, ram)."""
+    case = "deferred_safety"
+    set_pipeline(True)
+    fx = content_fixture("dsafety", 12)
+    executor = new_executor()
+    base = await run(executor, content_graph(fx))
+    check(case, "base run succeeds", base.get("success"), base.get("error"))
+
+    # A render that raises while settling: replayed at the Editor, its job failed once, the worker survives.
+    edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.7))
+    INJECT["render_error"] = True
+    try:
+        row = await run(executor, content_graph(fx))
+    finally:
+        INJECT["render_error"] = False
+    check(case, "a render raise while settling is reported at the Editor",
+          not row.get("success") and (row.get("error") or {}).get("node") == "1"
+          and "Injected render failure" in (row.get("error") or {}).get("message", ""),
+          {"error": row.get("error"), "settled": row["settled"]})
+    check(case, "a render raise while settling rolls the carriers back",
+          row["settled"].get("outcome") == "rollback", {"settled": row["settled"]})
+    # Its value substitutions go too: the guide_idx consumer ("gi") waits for the Editor,
+    # which replays the failure, so it never runs (as after a failed early run).
+    check(case, "a render raise while settling: no consumer of an Editor value runs",
+          "gi" not in executed_nodes(row) and not any(key.startswith("text:") for key in row["calls"]),
+          {"executing": row["executing"], "calls": row["calls"]})
+    failed = [job for job in jobs_of(fx).values() if job["status"] == "failed"]
+    check(case, "a render raise while settling marks its job failed once", len(failed) == 1, jobs_of(fx))
+    after = await run(executor, content_graph(fx))
+    check(case, "the next run after a settle raise works", after.get("success"), after.get("error"))
+
+    # A cancel while settling: interrupted, its job returned to pending, the next run works.
+    edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.8))
+    statuses_before = jobs_of(fx)
+    INJECT["interrupt_at"] = 1
+    try:
+        row = await run(executor, content_graph(fx))
+    finally:
+        INJECT["interrupt_at"] = None
+        mm.interrupt_current_processing(False)
+    check(case, "a cancel while settling interrupts the run",
+          not row.get("success") and (row.get("error") or {}).get("event") == "execution_interrupted",
+          {"error": row.get("error"), "settled": row["settled"]})
+    check(case, "a cancel while settling leaves no job failed or running",
+          [job["status"] for job in jobs_of(fx).values() if job["status"] in ("failed", "running")]
+          == [job["status"] for job in statuses_before.values() if job["status"] in ("failed", "running")],
+          jobs_of(fx))
+    after = await run(executor, content_graph(fx))
+    check(case, "the next run after a settle cancel works", after.get("success"), after.get("error"))
+
+    # A source rewritten between its hash and the render: the run fails, nothing is cached, the job is pending.
+    edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.9))
+    clip_path = Path(fx["dir"]) / "media" / "timeline.mkv"
+    real_identify = editor_media.PendingMedia.identify
+
+    def identify_then_touch(self, slot, check_interrupt=None):
+        result = real_identify(self, slot, check_interrupt)
+        if result[0] and self.plans[slot].kind == "frames":
+            with open(clip_path, "ab") as handle:
+                handle.write(b"\0" * 16)
+        return result
+
+    editor_media.PendingMedia.identify = identify_then_touch
+    try:
+        row = await run(executor, content_graph(fx))
+    finally:
+        editor_media.PendingMedia.identify = real_identify
+    check(case, "a source changed after its hash fails the run at the Editor",
+          not row.get("success") and "changed while this run was reading it" in (row.get("error") or {}).get("message", ""),
+          {"error": row.get("error"), "settled": row["settled"]})
+    check(case, "a source changed after its hash marks no job failed",
+          sum(job["status"] == "failed" for job in jobs_of(fx).values()) == 1, jobs_of(fx))
+    after = await run(executor, content_graph(fx))
+    check(case, "the run after a changed source renders again and succeeds",
+          after.get("success") and after["work"]["render"] == 1, {"error": after.get("error"), "work": after["work"]})
+
+    # Pipeline faults: each ends in a correct render, equal to stock.
+    real_entry_value, real_plan_carriers, real_leftovers = (
+        pipeline._entry_value, pipeline.plan_carriers, pipeline._settle_leftovers)
+
+    def broken(*args, **kwargs):
+        raise ValueError("injected pipeline fault")
+
+    faults = {"settle fault (carrier net)": ("_entry_value", broken),
+              "media pass fault (rendered early)": ("plan_carriers", broken)}
+    for index, (label, (name, replacement)) in enumerate(faults.items()):
+        rows = {}
+        for enabled in (True, False):
+            set_pipeline(enabled)
+            fxf = content_fixture(f"dfault{index}-{int(enabled)}", 3)
+            executor_f = new_executor()
+            setattr(pipeline, name, replacement)
+            try:
+                rows[enabled] = await run(executor_f, content_graph(fxf))
+            finally:
+                pipeline._entry_value, pipeline.plan_carriers = real_entry_value, real_plan_carriers
+        row = rows[True]
+        check(case, f"{label}: the run succeeds and equals stock",
+              row.get("success") and row["outputs"] == rows[False]["outputs"],
+              {"error": row.get("error"), "diff": _diff(row["outputs"], rows[False]["outputs"]),
+               "settled": row["settled"], "reasons": prep(row).get("content_reasons")})
+        check(case, f"{label}: rendered and mixed once", row["work"] == {"render": 1, "mix": 1}, row["work"])
+    # The media pass and the early render both fault: the scheduled Editor settles.
+    rows = {}
+    for enabled in (True, False):
+        set_pipeline(enabled)
+        fxf = content_fixture(f"dfault9-{int(enabled)}", 3)
+        executor_f = new_executor()
+        pipeline.plan_carriers, pipeline._settle_leftovers = broken, broken
+        try:
+            rows[enabled] = await run(executor_f, content_graph(fxf))
+        finally:
+            pipeline.plan_carriers, pipeline._settle_leftovers = real_plan_carriers, real_leftovers
+    check(case, "every pipeline fault: the scheduled Editor's net renders, equal to stock",
+          rows[True].get("success") and rows[True]["outputs"] == rows[False]["outputs"]
+          and rows[True]["work"] == {"render": 1, "mix": 1},
+          {"error": rows[True].get("error"), "work": rows[True]["work"],
+           "diff": _diff(rows[True]["outputs"], rows[False]["outputs"])})
+
+
 NOTES_OUT = {}
 CASES = {"acceptance": case_acceptance, "fail_open": case_fail_open, "tokens": case_tokens, "cancel": case_cancel,
          "errors": case_errors, "shapes": case_shapes, "lazy": case_lazy, "ram": case_ram, "misc": case_misc,
@@ -2711,16 +3074,18 @@ CASES = {"acceptance": case_acceptance, "fail_open": case_fail_open, "tokens": c
          "identity": case_identity, "identity_lazy": case_identity_lazy, "identity_safety": case_identity_safety,
          "identity_ram": case_identity_ram, "identity_shapes": case_identity_shapes,
          "content": case_content, "content_negative": case_content_negative, "content_shapes": case_content_shapes,
-         "content_safety": case_content_safety}
+         "content_safety": case_content_safety, "deferred": case_deferred,
+         "deferred_shapes": case_deferred_shapes, "deferred_safety": case_deferred_safety}
 BY_MODE = {
     "classic": ["acceptance", "fail_open", "tokens", "cancel", "errors", "shapes", "lazy", "misc",
                 "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative",
                 "identity", "identity_lazy", "identity_safety", "identity_shapes",
-                "content", "content_negative", "content_shapes", "content_safety"],
-    "lru": ["acceptance", "cancel", "bridges", "identity", "content"],
+                "content", "content_negative", "content_shapes", "content_safety",
+                "deferred", "deferred_shapes", "deferred_safety"],
+    "lru": ["acceptance", "cancel", "bridges", "identity", "content", "deferred"],
     "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram",
-            "identity", "identity_ram", "content", "content_safety"],
-    "none": ["acceptance", "bridges", "identity", "content"],
+            "identity", "identity_ram", "content", "content_safety", "deferred", "deferred_safety"],
+    "none": ["acceptance", "bridges", "identity", "content", "deferred"],
 }
 
 

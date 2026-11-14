@@ -101,10 +101,33 @@ report it with the lines that follow.
 Nodes fed by a **Masks Bridge** mask, or by a **Guides Bridge** after its
 first guide, always run.
 
+### The Sonder Editor renders again with nothing changed
+
+The **Sonder Editor** skips its render and audio mix only when the part of the
+timeline the run uses is unchanged and ComfyUI still holds the previous
+result. It renders again when:
+
+- Each saved take lands on the timeline and changes what the next run
+  renders. Tick **New Takes Start Muted** (**Settings** ▸ **Render**) so a new
+  take doesn't change it until you unmute it.
+- ComfyUI dropped the previous result: after **Free model and node cache**, a
+  restart, or when ComfyUI frees memory.
+- Every node that reads the frames or audio also takes the Editor's `project`.
+  Connect at least one node to the frames or audio only.
+- A clip or audio item has a fractional position or trim. Move or trim it again
+  so it snaps to a whole frame.
+- The video files under the run add up to more than 160 MB (512 MB with the
+  render cache off), or the audio files to more than 96 MB.
+- One of the conditions in the previous section applies, such as `--cache-none`
+  or more than one **Sonder Editor**.
+- The ComfyUI console shows `the Sonder Editor renders on every run on this
+  ComfyUI`. Update ComfyUI and Sonder Editor; the reason in brackets names what
+  differs.
+
 ### A run fails with "… changed while this run was reading it"
 
-A Driver, Reference or guide file was replaced while the run was reading it.
-Run again.
+A Driver, Reference, guide, timeline video or timeline audio file was replaced
+while the run was reading it. Run again; a queued job goes back to pending.
 
 ### Memory runs higher while the Sonder Editor renders, with `--cache-classic`
 

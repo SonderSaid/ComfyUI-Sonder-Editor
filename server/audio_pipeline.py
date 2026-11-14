@@ -81,10 +81,12 @@ def audible_sources(project, scene):
             logger.warning("Skipping missing audio source: %s", track.source_path)
 
 
-def scene_audio_spec(project, scene, start, end):
-    sources = list(audible_sources(project, scene))
-    # Classify overlap before probing: one path can have several placements.
-    # Read actual media, never repair persisted metadata as a rendering side effect.
+def _classify_sources(sources, start, end):
+    """``(window paths, vote paths)``: the files mixed in ``[start, end)`` and the files that vote on its rate.
+
+    Every audible track with a positive volume and length votes, wherever it
+    sits; one path can have several placements.
+    """
     window_paths, vote_paths = set(), dict.fromkeys(
         path for track, path in sources
         if effective_volume(track) > 0 and track.timeline_end_frame > track.timeline_start_frame
@@ -92,6 +94,34 @@ def scene_audio_spec(project, scene, start, end):
     for track, path in sources:
         if effective_volume(track) > 0 and max(start, track.timeline_start_frame) < min(end, track.timeline_end_frame):
             window_paths.add(path)
+    return window_paths, vote_paths
+
+
+def audio_identity_sources(project, scene, start, end):
+    """``(sources, window paths, vote paths)`` as ``scene_audio_spec`` classifies them, without probing.
+
+    ``sources`` is ``audible_sources``' ``(track, path)`` list in the scene's own
+    order. The Editor's pre-render identity (``nodes/editor_media.py``) and the
+    mix share this classification, so the files hashed are the files the mix reads.
+    """
+    sources = list(audible_sources(project, scene))
+    window_paths, vote_paths = _classify_sources(sources, start, end)
+    return sources, window_paths, list(vote_paths)
+
+
+def scene_audio_spec(project, scene, start, end, *, sources=None, fps=None):
+    """``(rate, length, contributors)`` for the mix of ``[start, end)``.
+
+    ``sources`` (``(track, path)`` pairs already resolved) and ``fps`` replace the
+    reads of ``project`` and ``scene`` when given, so a mix can run from a recipe.
+    """
+    if sources is None:
+        sources = list(audible_sources(project, scene))
+    else:
+        sources = list(sources)
+    # Classify overlap before probing: one path can have several placements.
+    # Read actual media, never repair persisted metadata as a rendering side effect.
+    window_paths, vote_paths = _classify_sources(sources, start, end)
     rates = {}
     for path in vote_paths:
         try:
@@ -101,7 +131,8 @@ def scene_audio_spec(project, scene, start, end):
                 raise media.MediaProbeError(f"Could not read audio source '{os.path.basename(path)}': {exc}") from exc
             logger.warning("Skipping unprobeable audio source outside output window: %s (%s)", path, exc)
     rate = max(rates.values(), default=48000)
-    fps = effective_scene_fps(project, scene)
+    if fps is None:
+        fps = effective_scene_fps(project, scene)
     origin = frame_sample(start, rate, fps)
     length = max(0, frame_sample(end, rate, fps) - origin)
     contributors = []
@@ -129,10 +160,18 @@ def active_contributors(contributors):
     return [entry for entry in contributors if entry["volume"] > 0 and entry["sample_count"] > 0]
 
 
-def mix_scene_audio_to_wav(project, scene, start_frame, end_frame, output_wav, *, cancel_event=None):
-    """Stream the unbounded stereo float mix for [start_frame, end_frame)."""
+def mix_scene_audio_to_wav(project, scene, start_frame, end_frame, output_wav, *, cancel_event=None, request=None):
+    """Stream the unbounded stereo float mix for [start_frame, end_frame).
+
+    ``request`` (``{"sources": [(track, path), ...], "fps": float}``) replaces the
+    reads of ``project`` and ``scene``.
+    """
     check_cancel(cancel_event)
-    rate, length, contributors = scene_audio_spec(project, scene, start_frame, end_frame)
+    if request is not None:
+        rate, length, contributors = scene_audio_spec(None, None, start_frame, end_frame,
+                                                      sources=request["sources"], fps=request["fps"])
+    else:
+        rate, length, contributors = scene_audio_spec(project, scene, start_frame, end_frame)
     os.makedirs(os.path.dirname(os.path.abspath(output_wav)), exist_ok=True)
     if length == 0:
         write_float_wav(output_wav, np.empty((2, 0), np.float32), rate)
@@ -170,10 +209,10 @@ def mix_scene_audio_to_wav(project, scene, start_frame, end_frame, output_wav, *
     return contributors
 
 
-def scene_audio_samples(project, scene, start, end, *, work_dir=None, cancel_event=None):
+def scene_audio_samples(project, scene, start, end, *, work_dir=None, cancel_event=None, request=None):
     with tempfile.TemporaryDirectory(prefix="sonder_audio_context_", dir=work_dir or media.transient_temp_dir()) as directory:
         path = os.path.join(directory, "mix.wav")
-        mix_scene_audio_to_wav(project, scene, start, end, path, cancel_event=cancel_event)
+        mix_scene_audio_to_wav(project, scene, start, end, path, cancel_event=cancel_event, request=request)
         with mapped_float_wav(path) as (rate, samples):
             # Copy before closing the Windows mapping, including mono/empty inputs.
             return np.array(samples.T, dtype=np.float32, order="C", copy=True), rate

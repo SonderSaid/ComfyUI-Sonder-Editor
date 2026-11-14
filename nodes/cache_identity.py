@@ -61,6 +61,15 @@ class SourceMissing(Exception):
     """A recipe names a source that is not a readable file: no identity this run."""
 
 
+class SourceChanged(RuntimeError):
+    """A source moved between its hash and the decode or render that read it: the run fails, nothing is cached.
+
+    A ``RuntimeError``, as before Phase 4b, so callers that caught that keep
+    working; the Editor's materializer tells it apart from a render failure and
+    leaves the claimed job to its release (pending), never marks it failed.
+    """
+
+
 class RecipeNotCanonical(Exception):
     """The recipe does not survive a JSON round trip with exact types."""
 
@@ -179,7 +188,7 @@ def _check_sources(snapshots: dict) -> None:
         except OSError:
             current = None
         if current != snapshot:
-            raise RuntimeError(f"{os.path.basename(path)} changed while this run was reading it. Run again.")
+            raise SourceChanged(f"{os.path.basename(path)} changed while this run was reading it. Run again.")
 
 
 @contextlib.contextmanager

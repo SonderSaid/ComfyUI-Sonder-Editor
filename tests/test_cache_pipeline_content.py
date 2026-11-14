@@ -275,7 +275,7 @@ def test_prepare_carries_each_media_output_with_a_gaining_consumer():
     graph["mix"]["inputs"]["text"] = "literal"  # no other Editor link: mix gains too
     record, dynprompt, host = _prepare(graph)
     assert record["outcome"] == "prepared"
-    assert record["content"] == {"carried": 2, "skipped": 1}  # save: no_gain
+    assert record["content"] == {"carried": 2, "skipped": 1, "deferred": 0}  # save: no_gain
     assert record["content_reasons"] == {"no_gain": 1}
     assert record["content_bytes"] == FRAMES.numel() * 4 + AUDIO["waveform"].numel() * 4
     assert set(dynprompt.ephemeral_prompt) == {"sonder-media:1:1", "sonder-media:1:4"}
@@ -435,3 +435,234 @@ def test_register_media_follows_the_identity_rules():
     closed = sdk_runs.close_release("k1")
     assert "media" not in closed and sdk_runs.media_for("p1", "t") == (False, None)
     assert "media" not in (sdk_runs.record_snapshot("k1") or {})
+
+
+# --- Deferred Editor media (Phase 4b): the media pass, leftovers, the settle in set_prompt ----------
+
+editor_media = _module("nodes.editor_media")
+FRAME_RECIPE = {"kind": "frames", "width": 4, "height": 4, "fps": 24.0, "duration": 3, "scene_id": "s",
+                "clips": [], "media": {}, "store": "", "sources": [], "start": 0, "end": 3, "render_cache": False,
+                "padding_target": 0}
+AUDIO_RECIPE = {"kind": "audio", "tracks": [], "fps": 24.0, "sources": [], "start": 0, "end": 3,
+                "padding_target": 0, "pad_fps": 24.0}
+MATERIALIZED = []
+
+
+class DeferredEditor(FakeEditor):
+    """The Editor's deferral protocol, with fake plans: frames and audio deferred, guides rendered."""
+
+    SONDER_CACHE_POLICY = {"project": policy.PER_RUN, "rendered_frames": policy.DESCRIPTOR,
+                           "guide_images": policy.CONTENT, "prompt": policy.EXACT, "audio": policy.DESCRIPTOR}
+    SONDER_CACHE_DEFERRED = policy.DEFERS(outputs=("rendered_frames", "audio"))
+    exact = True
+    fail = None  # a slot whose materialization raises, or ("cancel", slot)
+
+    def execute(self, project, prompt=None, unique_id=None):
+        prompt_once = _module("nodes.prompt_once")
+        defer = editor_media.deferral_requested(unique_id)
+        DeferredEditor.runs += 1
+
+        def body():
+            key = sdk_runs.trusted_key_for_prompt(prompt)
+            pending = editor_media.PendingMedia(key=key, call_key=prompt_once.call_key(unique_id) if defer else "",
+                                                deferred=defer)
+            values = {1: FRAMES, 4: AUDIO}
+            for slot, recipe in ((1, FRAME_RECIPE), (4, AUDIO_RECIPE)):
+                def materialize(_request, slot=slot):
+                    MATERIALIZED.append(slot)
+                    if DeferredEditor.fail == slot:
+                        raise RuntimeError(f"render {slot} failed")
+                    if DeferredEditor.fail == ("cancel", slot):
+                        raise Interrupt()
+                    return values[slot]
+
+                def expect(value, slot=slot):
+                    if slot == 1:
+                        return isinstance(value, torch.Tensor) and tuple(value.shape) == tuple(FRAMES.shape)
+                    return isinstance(value, dict) and set(value) == {"waveform", "sample_rate"}
+
+                pending.add(slot, editor_media._finish(editor_media.MediaPlan(
+                    recipe["kind"], None, dict(recipe) if DeferredEditor.exact else None,
+                    "" if DeferredEditor.exact else "recipe_inexact", materialize, expect, 1 << 20)))
+            out = ["P", None, GUIDES, "a prompt", None]
+            for slot in (1, 4):
+                out[slot] = editor_media.DEFERRED if defer and pending.can_defer(slot) else pending.value(slot)
+            if defer:
+                sdk_runs.remember_pending(key, pending.call_key, pending)
+            return tuple(out)
+
+        result = prompt_once.run_once_per_prompt(prompt, unique_id, "SonderEditor", body)
+        return result if defer else editor_media.settle_scheduled(prompt, unique_id, result)
+
+
+class Entry(tuple):
+    """The shape of a ComfyUI CacheEntry: (ui, outputs)."""
+
+    def __new__(cls, ui=None, outputs=None):
+        item = super().__new__(cls, (ui, outputs))
+        item.ui, item.outputs = ui, outputs
+        return item
+
+
+class FakeOutputs:
+    def __init__(self):
+        self.entries = {}
+
+    def get_local(self, node_id):
+        return self.entries.get(node_id)
+
+    def set_local(self, node_id, value):
+        self.entries[node_id] = value
+
+
+@pytest.fixture()
+def deferred():
+    MATERIALIZED.clear()
+    DeferredEditor.exact, DeferredEditor.fail, DeferredEditor.runs = True, None, 0
+    yield
+    MATERIALIZED.clear()
+
+
+def _prepare_deferred(graph=None, before=None, key="k1", prompt_id="p1", rearmed=None):
+    graph = graph or _graph()
+    sdk_runs.open_release(key, prompt_id, graph, roots=list(ROOTS))
+    dynprompt = FakeDynPrompt(graph)
+    host = Host()
+    base = _runtime(before)
+    fields = {name: getattr(base, name) for name in base.__dataclass_fields__}
+    fields["class_mappings"] = lambda: {"SonderEditor": DeferredEditor}
+    fields["rearm_interrupt"] = (lambda: rearmed.append(True)) if rearmed is not None else (lambda: None)
+    runtime = pipeline.ExecutorRuntime(**fields)
+    media = pipeline.MediaHost(reason="", arm=host.arm, defer=True)
+    record = pipeline.prepare(runtime, prompt_id, dynprompt, media)
+    return record, dynprompt, host, runtime
+
+
+def _graph_gaining():
+    graph = _graph()
+    graph["mix"]["inputs"]["text"] = "literal"
+    return graph
+
+
+def _graph_audio_stuck():
+    """mix also links the Editor's project, so audio has no consumer that can gain."""
+    graph = _graph()
+    graph["mix"]["inputs"]["text"] = ["1", 0]
+    return graph
+
+
+def test_a_deferred_slot_with_an_identity_is_carried_without_rendering(deferred):
+    record, dynprompt, host, _runtime_ = _prepare_deferred(_graph_gaining())
+    assert record["outcome"] == "prepared" and MATERIALIZED == []
+    plan = host.plans[0]
+    assert plan.deferred == {"sonder-media:1:1": 1, "sonder-media:1:4": 4} and plan.payloads == {}
+    assert callable(plan.settle) and record["content"]["deferred"] == 2
+    token = dynprompt.ephemeral_prompt["sonder-media:1:1"]["inputs"]["token"]
+    assert content.is_token(token)
+    found, value = sdk_runs.media_for("p1", token)
+    assert found and editor_media.is_deferred(value)  # nothing settled it yet
+
+
+def test_the_plan_names_the_value_substitutions_a_settle_failure_drops(deferred):
+    _record, dynprompt, host, _runtime_ = _prepare_deferred(_graph())  # mix takes the prompt as a literal
+    assert host.plans[0].value_overrides == ["mix"] and "mix" in dynprompt.node_overrides
+
+
+def test_the_settle_renders_a_miss_and_reuses_a_hit(deferred):
+    outputs = FakeOutputs()
+    _record, _dynprompt, host, _runtime_ = _prepare_deferred(_graph_gaining())
+    assert host.plans[0].settle(outputs, Entry) == ""
+    assert sorted(MATERIALIZED) == [1, 4]
+    found, result = sdk_runs.first_result("k1", "1#0")
+    assert found and result[1] is FRAMES and result[4] is AUDIO
+    assert outputs.entries["sonder-media:1:1"].outputs == [[FRAMES]]
+    # The next prompt with the same recipe and sources: the same tokens, a hit, nothing rendered.
+    sdk_runs.close_release("k1")
+    MATERIALIZED.clear()
+    _record, _dynprompt, host, _runtime_ = _prepare_deferred(_graph_gaining(), key="k2", prompt_id="p2")
+    assert host.plans[0].settle(outputs, Entry) == "" and MATERIALIZED == []
+    found, result = sdk_runs.first_result("k2", "1#0")
+    assert found and result[1] is FRAMES and result[4] is AUDIO
+
+
+def test_an_entry_of_the_wrong_shape_is_a_miss(deferred):
+    outputs = FakeOutputs()
+    outputs.entries["sonder-media:1:1"] = Entry(None, [[torch.zeros(1, 2, 2, 3)]])
+    outputs.entries["sonder-media:1:4"] = Entry(None, [["not audio"]])
+    _record, _dynprompt, host, _runtime_ = _prepare_deferred(_graph_gaining())
+    assert host.plans[0].settle(outputs, Entry) == "" and sorted(MATERIALIZED) == [1, 4]
+    assert outputs.entries["sonder-media:1:1"].outputs == [[FRAMES]]
+
+
+def test_a_render_that_raises_while_settling_is_stored_for_replay_and_rolls_back(deferred):
+    _record, _dynprompt, host, _runtime_ = _prepare_deferred(_graph_gaining())
+    DeferredEditor.fail = 1
+    assert host.plans[0].settle(FakeOutputs(), Entry) == "rollback"
+    failure = sdk_runs.first_failure("k1", "1#0")
+    assert isinstance(failure, RuntimeError) and "render 1 failed" in str(failure)
+
+
+def test_a_cancel_while_settling_stores_a_cancellation_and_rearms(deferred):
+    rearmed = []
+    _record, _dynprompt, host, _runtime_ = _prepare_deferred(_graph_gaining(), rearmed=rearmed)
+    DeferredEditor.fail = ("cancel", 1)
+    assert host.plans[0].settle(FakeOutputs(), Entry) == "rollback"
+    assert sdk_runs.first_failure("k1", "1#0") is sdk_runs.CANCELLED and rearmed == [True]
+
+
+def test_a_pipeline_fault_while_settling_stores_nothing_and_leaves_the_slots_deferred(deferred):
+    class Broken(FakeOutputs):
+        def get_local(self, node_id):
+            raise ValueError("cache bug")
+
+    _record, dynprompt, host, _runtime_ = _prepare_deferred(_graph_gaining())
+    assert host.plans[0].settle(Broken(), Entry) == "fault"
+    assert sdk_runs.first_failure("k1", "1#0") is None and MATERIALIZED == []
+    found, result = sdk_runs.first_result("k1", "1#0")
+    assert editor_media.is_deferred(result[1])
+    # The carrier's net settles a slot still deferred.
+    token = dynprompt.ephemeral_prompt["sonder-media:1:1"]["inputs"]["token"]
+    assert editor_media.settle_carrier("p1", token, result[1]) is FRAMES and MATERIALIZED == [1]
+
+
+def test_a_slot_without_an_identity_is_rendered_by_the_early_run_and_carried_by_content(deferred):
+    DeferredEditor.exact = False
+    _record, _dynprompt, host, _runtime_ = _prepare_deferred(_graph_gaining())
+    # Inexact plans are never deferred: the early run rendered them, as stock does.
+    assert sorted(MATERIALIZED) == [1, 4]
+    plan = host.plans[0]
+    assert plan.deferred == {} and set(plan.payloads) == {"sonder-media:1:1", "sonder-media:1:4"}
+
+
+def test_a_deferred_slot_without_a_gaining_consumer_is_rendered_early(deferred):
+    record, _dynprompt, host, _runtime_ = _prepare_deferred(_graph_audio_stuck())
+    # enc gains frames; audio's only consumer cannot gain, so it renders now.
+    assert MATERIALIZED == [4] and record.get("deferred_rendered_early") == 1
+    assert host.plans[0].deferred == {"sonder-media:1:1": 1}
+    found, result = sdk_runs.first_result("k1", "1#0")
+    assert result[4] is AUDIO and editor_media.is_deferred(result[1])
+
+
+def test_an_early_render_failure_applies_no_carrier_and_is_replayed(deferred):
+    DeferredEditor.fail = 4
+    record, dynprompt, host, _runtime_ = _prepare_deferred(_graph_audio_stuck())
+    assert record["content_reasons"].get("editor_failed") == 1 and record["outcome"] == "editor_failed"
+    # As after a failed early run: no carrier and no value substitution, so every consumer
+    # still waits for the scheduled Editor, which replays the failure.
+    assert dynprompt.ephemeral_prompt == {} and host.plans == [] and dynprompt.node_overrides == {}
+    assert "render 4 failed" in str(sdk_runs.first_failure("k1", "1#0"))
+
+
+def test_the_scheduled_editor_settles_whatever_is_still_deferred(deferred):
+    _record, dynprompt, _host, runtime = _prepare_deferred(_graph_gaining())
+    prompt = dynprompt.get_original_prompt()
+    with runtime.node_context("p1", "1", 0):
+        result = DeferredEditor().execute("p", prompt=prompt, unique_id="1")
+    assert result[1] is FRAMES and result[4] is AUDIO and sorted(MATERIALIZED) == [1, 4]
+
+
+def test_pending_media_is_dropped_at_close(deferred):
+    _prepare_deferred(_graph_gaining())
+    assert sdk_runs.pending_for("k1", "1#0") is not None
+    closed = sdk_runs.close_release("k1")
+    assert "pending" not in closed and sdk_runs.pending_for("k1", "1#0") is None

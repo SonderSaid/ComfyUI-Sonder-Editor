@@ -39,6 +39,15 @@ a submitted carrier, forged tokens, a keying fault rolled back on the hazard
 ordering, a carrier error and cancel reported at the Editor, and a cancel while
 hashing (classic, ram).
 
+Phase 4b defers the Editor's render and mix (``deferred*`` cases): an identical
+job renders and mixes nothing, a clip edit renders only, an audio edit mixes
+only, guide edits do neither, every consumer equals stock (every mode; ``none``
+asserts the bypass); a project reader beside a carried consumer, a fractional
+clip start (no identity) and a colour-correcting Save Video's drift record on a
+hit and after a mask offset change (classic); a render raise and a cancel while
+settling, a source changed after its hash, and pipeline faults that end in the
+carrier's or the scheduled Editor's net (classic, ram).
+
 Skips without a ComfyUI install (``SONDER_COMFYUI_ROOT`` or the test install's venv).
 """
 
@@ -57,11 +66,12 @@ CASES_BY_MODE = {
     "classic": ["acceptance", "fail_open", "tokens", "cancel", "errors", "shapes", "lazy", "misc",
                 "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative",
                 "identity", "identity_lazy", "identity_safety", "identity_shapes",
-                "content", "content_negative", "content_shapes", "content_safety"],
-    "lru": ["acceptance", "cancel", "bridges", "identity", "content"],
+                "content", "content_negative", "content_shapes", "content_safety",
+                "deferred", "deferred_shapes", "deferred_safety"],
+    "lru": ["acceptance", "cancel", "bridges", "identity", "content", "deferred"],
     "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram",
-            "identity", "identity_ram", "content", "content_safety"],
-    "none": ["acceptance", "bridges", "identity", "content"],
+            "identity", "identity_ram", "content", "content_safety", "deferred", "deferred_safety"],
+    "none": ["acceptance", "bridges", "identity", "content", "deferred"],
 }
 
 
@@ -89,7 +99,7 @@ def _run(mode: str) -> dict:
         out = Path(folder) / f"{mode}.json"
         completed = subprocess.run(
             [sys.executable, str(HELPER), str(comfy_root), str(REPO_ROOT), mode, str(out)],
-            cwd=str(comfy_root), capture_output=True, text=True, timeout=900,
+            cwd=str(comfy_root), capture_output=True, text=True, timeout=1800,
             env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         )
         assert out.is_file(), (completed.stdout[-2000:], completed.stderr[-4000:])

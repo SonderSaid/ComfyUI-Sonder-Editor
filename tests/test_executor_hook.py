@@ -278,6 +278,73 @@ handler_executor = type("PromptExecutor", (execution.PromptExecutor,),
 carrier_mutants["handler"] = hook.check_carrier(fake(PromptExecutor=handler_executor), stock)
 out["carrier_gate_mutants"] = carrier_mutants
 
+# The deferral gate (Phase 4b): passes on the installed source, names each mutation.
+out["deferral_gate_installed"] = hook.check_deferral(execution)
+deferral = from_source("deferral_mutants", """
+    class PromptExecutor:
+        async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+            for cache in self.caches.all:
+                cache.clean_unused()
+                await cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
+
+    def get_local_extra(self, node_id, default=None):
+        cache_key = self.cache_key_set.get_data_key(node_id)
+        return self.cache[cache_key]
+
+    def get_local_elsewhere(self, node_id):
+        cache_key = self.cache_key_set.get_data_key(node_id)
+        return self.store.get(cache_key)
+
+    def get_local_unkeyed(self, node_id):
+        return self.cache[node_id]
+
+    def hierarchical_get_local(self, node_id):
+        return None
+
+    def lru_get_local(self, node_id):
+        return None
+
+    def init_without_cache(self, key_class, enable_providers=False):
+        self.key_class = key_class
+        self.store = {}
+""")
+
+
+def deferral_patched(owner, name, value):
+    original = owner.__dict__.get(name, None)
+    had = name in owner.__dict__
+    setattr(owner, name, value)
+    try:
+        return hook.check_deferral(execution)
+    finally:
+        if had:
+            setattr(owner, name, original)
+        else:
+            delattr(owner, name)
+
+
+out["deferral_gate_mutants"] = {
+    "order": hook.check_deferral(fake(PromptExecutor=deferral.PromptExecutor)),
+    "signature": deferral_patched(caching.BasicCache, "get_local", deferral.get_local_extra),
+    "lookup": deferral_patched(caching.BasicCache, "get_local", deferral.get_local_elsewhere),
+    "keyed": deferral_patched(caching.BasicCache, "get_local", deferral.get_local_unkeyed),
+    "hierarchical": deferral_patched(caching.HierarchicalCache, "get_local", deferral.hierarchical_get_local),
+    "lru": deferral_patched(caching.LRUCache, "get_local", deferral.lru_get_local),
+    "ram": deferral_patched(caching.RAMPressureCache, "get_local", deferral.lru_get_local),
+    "cache_dict": deferral_patched(caching.BasicCache, "__init__", deferral.init_without_cache),
+    "entry": hook.check_deferral(fake(CacheEntry=collections.namedtuple("CacheEntry", "outputs ui"))),
+}
+# A failed deferral gate keeps the carriers: the carrier runtime still exists, with defer off.
+real_get_local = caching.BasicCache.get_local
+caching.BasicCache.get_local = deferral.get_local_unkeyed
+try:
+    runtime_without_deferral = hook._carrier_runtime(execution, stock)
+finally:
+    caching.BasicCache.get_local = real_get_local
+out["deferral_off_keeps_carriers"] = (runtime_without_deferral is not None
+                                      and runtime_without_deferral.get("defer") is False)
+out["deferral_on"] = bool((hook._carrier_runtime(execution, stock) or {}).get("defer"))
+
 # Per-prompt preconditions: the outputs cache must be a stock type, unarmed, with the carrier registered.
 import nodes as comfy_nodes
 carrier_runtime = hook._carrier_runtime(execution, stock)
@@ -454,6 +521,26 @@ def test_the_carrier_gate_passes_installed_and_names_each_mutation(result):
         "error_node_id": "execute error node_id",
         "handler": "handle_execution_error lookup",
     }
+
+
+def test_the_deferral_gate_passes_installed_and_names_each_mutation(result):
+    assert result["deferral_gate_installed"] is None
+    assert result["deferral_gate_mutants"] == {
+        "order": "deferral execute_async order: cache.clean_unused()",
+        "signature": "BasicCache.get_local signature",
+        "lookup": "BasicCache.get_local: return self.cache[cache_key]",
+        "keyed": "BasicCache.get_local: cache_key = self.cache_key_set.get_data_key(node_id)",
+        "hierarchical": "HierarchicalCache.get_local",
+        "lru": "LRUCache.get_local overridden",
+        "ram": "RAMPressureCache.get_local overridden",
+        "cache_dict": "BasicCache.cache",
+        "entry": "CacheEntry fields",
+    }
+
+
+def test_a_failed_deferral_gate_disables_only_deferral(result):
+    assert result["deferral_on"] is True
+    assert result["deferral_off_keeps_carriers"] is True
 
 
 def test_carriers_are_planned_only_on_a_stock_unarmed_cache_with_the_carrier_registered(result):

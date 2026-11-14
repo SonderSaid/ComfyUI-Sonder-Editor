@@ -1,0 +1,1473 @@
+{
+ "cases": {
+  "cancelled_render_consume": {
+   "jobs": [
+    {
+     "error": "",
+     "job_id": "job-1",
+     "status": "running"
+    }
+   ],
+   "message": "",
+   "notes": [
+    [
+     "note_job",
+     [
+      "<GenerationJob>",
+      "consume"
+     ]
+    ],
+    [
+     "note_window",
+     [
+      {
+       "fps": "24.0",
+       "frame_count": 30,
+       "frame_count_padding": 0,
+       "generation_end": 28,
+       "generation_start": 8,
+       "queue": "consume",
+       "render_end": 34,
+       "render_start": 4,
+       "scene_id": "scene-1",
+       "scene_name": "Scene 1",
+       "source_frame_count": 30
+      },
+      [
+       "<id>",
+       "editor-media-golden-cancelled_render_consume"
+      ]
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "rendering"
+     ]
+    ]
+   ],
+   "raised": "FakeInterrupt",
+   "views": []
+  },
+  "failing_audio_consume": {
+   "jobs": [
+    {
+     "error": "Could not read audio source 'voice.wav': Could not probe usable audio duration and sample rate for voice.wav",
+     "job_id": "job-1",
+     "status": "failed"
+    }
+   ],
+   "message": "Could not read audio source 'voice.wav': Could not probe usable audio duration and sample rate for voice.wav",
+   "notes": [
+    [
+     "note_job",
+     [
+      "<GenerationJob>",
+      "consume"
+     ]
+    ],
+    [
+     "note_window",
+     [
+      {
+       "fps": "24.0",
+       "frame_count": 30,
+       "frame_count_padding": 0,
+       "generation_end": 28,
+       "generation_start": 8,
+       "queue": "consume",
+       "render_end": 34,
+       "render_start": 4,
+       "scene_id": "scene-1",
+       "scene_name": "Scene 1",
+       "source_frame_count": 30
+      },
+      [
+       "<id>",
+       "editor-media-golden-failing_audio_consume"
+      ]
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "rendering"
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "preparing_inputs"
+     ]
+    ]
+   ],
+   "raised": "MediaProbeError",
+   "views": []
+  },
+  "live_full_cached": {
+   "context": {
+    "_color_drift_reference": null,
+    "_render_raster_hw": [
+     12,
+     16
+    ],
+    "actual_post_context_frames": 0,
+    "actual_pre_context_frames": 0,
+    "context_end": 60,
+    "context_start": 0,
+    "frame_constraint": null,
+    "frame_count": 60,
+    "frame_count_padding": 0,
+    "guide_injection": {
+     "auto_offset_enabled": true,
+     "collision_count": 0,
+     "driver_coords": [],
+     "driver_driver_collision_count": 0,
+     "entries": [
+      {
+       "bridge_override_key": "g1:12",
+       "collided": false,
+       "collided_with": "",
+       "effective_local_idx": 12,
+       "guide_id": "gd1",
+       "original_local_idx": 12
+      }
+     ],
+     "frame_constraint": null,
+     "frame_count": 60,
+     "max_excess_latents": 0,
+     "predicted_unresolved": false,
+     "schema": "sonder_guide_injection_v1",
+     "unresolved_collision_count": 0
+    },
+    "mask_end_frame": 60,
+    "mask_post_offset": 0,
+    "mask_pre_offset": 0,
+    "mask_start_frame": 0,
+    "placement_fps": "24.0",
+    "post_context_frames": 0,
+    "pre_context_frames": 0,
+    "prompt": "a quiet street",
+    "queue_job_id": "",
+    "queue_job_ref_id": "",
+    "requested_mask_post_offset": 0,
+    "requested_mask_pre_offset": 0,
+    "scene_id": "scene-1",
+    "scene_name": "Scene 1",
+    "selection_end": 60,
+    "selection_start": 0,
+    "source_frame_count": 60,
+    "take_crop_position": "center",
+    "take_fit_mode": "pad_edge",
+    "take_keep_padding": false,
+    "take_placement_linked": true,
+    "take_placement_mode": "trimmed",
+    "take_placement_muted": false,
+    "template_id": "free"
+   },
+   "jobs": [],
+   "notes": [
+    [
+     "note_window",
+     [
+      {
+       "fps": "24.0",
+       "frame_count": 60,
+       "frame_count_padding": 0,
+       "generation_end": 60,
+       "generation_start": 0,
+       "queue": "live",
+       "render_end": 60,
+       "render_start": 0,
+       "scene_id": "scene-1",
+       "scene_name": "Scene 1",
+       "source_frame_count": 60
+      },
+      [
+       "<id>",
+       "editor-media-golden-live_full_cached"
+      ]
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "rendering"
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "preparing_inputs"
+     ]
+    ],
+    [
+     "note_reference_sources_removed",
+     [
+      "Scene 1",
+      [
+       {
+        "channel_key": "speech",
+        "code": "empty_channel",
+        "message": "Prompt channel speech is empty and will be omitted."
+       },
+       {
+        "channel_key": "sounds",
+        "code": "empty_channel",
+        "message": "Prompt channel sounds is empty and will be omitted."
+       }
+      ]
+     ]
+    ]
+   ],
+   "outputs": [
+    {
+     "dtype": "float32",
+     "sha256": "b63157a475cdabead2a5b7107a70f4b61c09420d4a1e6acdd2b45110111ef803",
+     "shape": [
+      60,
+      12,
+      16,
+      3
+     ]
+    },
+    {
+     "dtype": "float32",
+     "sha256": "78ea9974426c13bf8b2d68e9af0c9f3698ca5d11e442ba690b05abb201d2b89d",
+     "shape": [
+      1,
+      12,
+      16,
+      3
+     ]
+    },
+    "12",
+    "0.7500",
+    "a quiet street",
+    60,
+    "24.0",
+    16,
+    12,
+    {
+     "sample_rate": 44100,
+     "waveform": {
+      "dtype": "float32",
+      "sha256": "abf18344f3187959d84fc12d638f0909ab9870dc223471b3f6b3743f597a8c4e",
+      "shape": [
+       1,
+       2,
+       110250
+      ]
+     }
+    },
+    "0.0",
+    "2.5"
+   ],
+   "views": [
+    {
+     "actual_post": 0,
+     "actual_pre": 0,
+     "fps": "24.0",
+     "frame_count": 60,
+     "frame_count_padding": 0,
+     "generation_end": 60,
+     "generation_start": 0,
+     "mask_end_frame": 60,
+     "mask_start_frame": 0,
+     "project_folder": "editor-media-golden-live_full_cached",
+     "queue": "live",
+     "queue_job_ref_id": "",
+     "render_end": 60,
+     "render_start": 0,
+     "scene_id": "scene-1",
+     "source_frame_count": 60
+    }
+   ]
+  },
+  "live_full_uncached": {
+   "context": {
+    "_color_drift_reference": null,
+    "_render_raster_hw": [
+     12,
+     16
+    ],
+    "actual_post_context_frames": 0,
+    "actual_pre_context_frames": 0,
+    "context_end": 60,
+    "context_start": 0,
+    "frame_constraint": null,
+    "frame_count": 60,
+    "frame_count_padding": 0,
+    "guide_injection": {
+     "auto_offset_enabled": true,
+     "collision_count": 0,
+     "driver_coords": [],
+     "driver_driver_collision_count": 0,
+     "entries": [
+      {
+       "bridge_override_key": "g1:12",
+       "collided": false,
+       "collided_with": "",
+       "effective_local_idx": 12,
+       "guide_id": "gd1",
+       "original_local_idx": 12
+      }
+     ],
+     "frame_constraint": null,
+     "frame_count": 60,
+     "max_excess_latents": 0,
+     "predicted_unresolved": false,
+     "schema": "sonder_guide_injection_v1",
+     "unresolved_collision_count": 0
+    },
+    "mask_end_frame": 60,
+    "mask_post_offset": 0,
+    "mask_pre_offset": 0,
+    "mask_start_frame": 0,
+    "placement_fps": "24.0",
+    "post_context_frames": 0,
+    "pre_context_frames": 0,
+    "prompt": "a quiet street",
+    "queue_job_id": "",
+    "queue_job_ref_id": "",
+    "requested_mask_post_offset": 0,
+    "requested_mask_pre_offset": 0,
+    "scene_id": "scene-1",
+    "scene_name": "Scene 1",
+    "selection_end": 60,
+    "selection_start": 0,
+    "source_frame_count": 60,
+    "take_crop_position": "center",
+    "take_fit_mode": "pad_edge",
+    "take_keep_padding": false,
+    "take_placement_linked": true,
+    "take_placement_mode": "trimmed",
+    "take_placement_muted": false,
+    "template_id": "free"
+   },
+   "jobs": [],
+   "notes": [
+    [
+     "note_window",
+     [
+      {
+       "fps": "24.0",
+       "frame_count": 60,
+       "frame_count_padding": 0,
+       "generation_end": 60,
+       "generation_start": 0,
+       "queue": "live",
+       "render_end": 60,
+       "render_start": 0,
+       "scene_id": "scene-1",
+       "scene_name": "Scene 1",
+       "source_frame_count": 60
+      },
+      [
+       "<id>",
+       "editor-media-golden-live_full_uncached"
+      ]
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "rendering"
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "preparing_inputs"
+     ]
+    ],
+    [
+     "note_reference_sources_removed",
+     [
+      "Scene 1",
+      [
+       {
+        "channel_key": "speech",
+        "code": "empty_channel",
+        "message": "Prompt channel speech is empty and will be omitted."
+       },
+       {
+        "channel_key": "sounds",
+        "code": "empty_channel",
+        "message": "Prompt channel sounds is empty and will be omitted."
+       }
+      ]
+     ]
+    ]
+   ],
+   "outputs": [
+    {
+     "dtype": "float32",
+     "sha256": "b63157a475cdabead2a5b7107a70f4b61c09420d4a1e6acdd2b45110111ef803",
+     "shape": [
+      60,
+      12,
+      16,
+      3
+     ]
+    },
+    {
+     "dtype": "float32",
+     "sha256": "78ea9974426c13bf8b2d68e9af0c9f3698ca5d11e442ba690b05abb201d2b89d",
+     "shape": [
+      1,
+      12,
+      16,
+      3
+     ]
+    },
+    "12",
+    "0.7500",
+    "a quiet street",
+    60,
+    "24.0",
+    16,
+    12,
+    {
+     "sample_rate": 44100,
+     "waveform": {
+      "dtype": "float32",
+      "sha256": "abf18344f3187959d84fc12d638f0909ab9870dc223471b3f6b3743f597a8c4e",
+      "shape": [
+       1,
+       2,
+       110250
+      ]
+     }
+    },
+    "0.0",
+    "2.5"
+   ],
+   "views": [
+    {
+     "actual_post": 0,
+     "actual_pre": 0,
+     "fps": "24.0",
+     "frame_count": 60,
+     "frame_count_padding": 0,
+     "generation_end": 60,
+     "generation_start": 0,
+     "mask_end_frame": 60,
+     "mask_start_frame": 0,
+     "project_folder": "editor-media-golden-live_full_uncached",
+     "queue": "live",
+     "queue_job_ref_id": "",
+     "render_end": 60,
+     "render_start": 0,
+     "scene_id": "scene-1",
+     "source_frame_count": 60
+    }
+   ]
+  },
+  "live_padding_ltx": {
+   "context": {
+    "_color_drift_reference": null,
+    "_render_raster_hw": [
+     12,
+     16
+    ],
+    "actual_post_context_frames": 0,
+    "actual_pre_context_frames": 0,
+    "context_end": 19,
+    "context_start": 5,
+    "frame_constraint": {
+     "min": 9,
+     "offset": 1,
+     "step": 8
+    },
+    "frame_count": 17,
+    "frame_count_padding": 3,
+    "guide_injection": {
+     "auto_offset_enabled": true,
+     "collision_count": 0,
+     "driver_coords": [
+      {
+       "clip_id": "d1",
+       "coords": [
+        0,
+        1,
+        9
+       ],
+       "lane_index": 0,
+       "local_idx": 0,
+       "pixel_len": 17,
+       "snapped_start": 0
+      }
+     ],
+     "driver_driver_collision_count": 0,
+     "entries": [
+      {
+       "bridge_override_key": "g1:12",
+       "collided": false,
+       "collided_with": "",
+       "effective_local_idx": 7,
+       "guide_id": "gd1",
+       "original_local_idx": 7
+      }
+     ],
+     "frame_constraint": {
+      "min": 9,
+      "offset": 1,
+      "step": 8
+     },
+     "frame_count": 17,
+     "max_excess_latents": 0,
+     "predicted_unresolved": false,
+     "schema": "sonder_guide_injection_v1",
+     "unresolved_collision_count": 0
+    },
+    "mask_end_frame": 17,
+    "mask_post_offset": 0,
+    "mask_pre_offset": 0,
+    "mask_start_frame": 0,
+    "placement_fps": "24.0",
+    "post_context_frames": 0,
+    "pre_context_frames": 0,
+    "prompt": "a quiet street",
+    "queue_job_id": "",
+    "queue_job_ref_id": "",
+    "requested_mask_post_offset": 0,
+    "requested_mask_pre_offset": 0,
+    "scene_id": "scene-1",
+    "scene_name": "Scene 1",
+    "selection_end": 19,
+    "selection_start": 5,
+    "source_frame_count": 14,
+    "take_crop_position": "center",
+    "take_fit_mode": "pad_edge",
+    "take_keep_padding": false,
+    "take_placement_linked": true,
+    "take_placement_mode": "trimmed",
+    "take_placement_muted": false,
+    "template_id": "free"
+   },
+   "jobs": [],
+   "notes": [
+    [
+     "note_window",
+     [
+      {
+       "fps": "24.0",
+       "frame_count": 17,
+       "frame_count_padding": 3,
+       "generation_end": 19,
+       "generation_start": 5,
+       "queue": "live",
+       "render_end": 19,
+       "render_start": 5,
+       "scene_id": "scene-1",
+       "scene_name": "Scene 1",
+       "source_frame_count": 14
+      },
+      [
+       "<id>",
+       "editor-media-golden-live_padding_ltx"
+      ]
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "rendering"
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "preparing_inputs"
+     ]
+    ],
+    [
+     "note_reference_sources_removed",
+     [
+      "Scene 1",
+      [
+       {
+        "channel_key": "speech",
+        "code": "empty_channel",
+        "message": "Prompt channel speech is empty and will be omitted."
+       },
+       {
+        "channel_key": "sounds",
+        "code": "empty_channel",
+        "message": "Prompt channel sounds is empty and will be omitted."
+       }
+      ]
+     ]
+    ]
+   ],
+   "outputs": [
+    {
+     "dtype": "float32",
+     "sha256": "d2c70e965d933e8fc322d92abe95f734a742b5486daec666519beb08ce9fdb7e",
+     "shape": [
+      17,
+      12,
+      16,
+      3
+     ]
+    },
+    {
+     "dtype": "float32",
+     "sha256": "78ea9974426c13bf8b2d68e9af0c9f3698ca5d11e442ba690b05abb201d2b89d",
+     "shape": [
+      1,
+      12,
+      16,
+      3
+     ]
+    },
+    "7",
+    "0.7500",
+    "a quiet street",
+    17,
+    "24.0",
+    16,
+    12,
+    {
+     "sample_rate": 44100,
+     "waveform": {
+      "dtype": "float32",
+      "sha256": "47915fc8f5eaef524cafcc667c79e15396c26e5902001ea60a2aef2b6c027dc9",
+      "shape": [
+       1,
+       2,
+       31238
+      ]
+     }
+    },
+    "0.0",
+    "0.7083333333333334"
+   ],
+   "views": [
+    {
+     "actual_post": 0,
+     "actual_pre": 0,
+     "fps": "24.0",
+     "frame_count": 17,
+     "frame_count_padding": 3,
+     "generation_end": 19,
+     "generation_start": 5,
+     "mask_end_frame": 17,
+     "mask_start_frame": 0,
+     "project_folder": "editor-media-golden-live_padding_ltx",
+     "queue": "live",
+     "queue_job_ref_id": "",
+     "render_end": 19,
+     "render_start": 5,
+     "scene_id": "scene-1",
+     "source_frame_count": 14
+    }
+   ]
+  },
+  "live_selection_context": {
+   "context": {
+    "_color_drift_reference": {
+     "frame_count": 28,
+     "frames": {
+      "dtype": "uint8",
+      "sha256": "5357621970f52c75f704de2d9fb5a1500e5e541dcd85cee28f6d48c4e5406da5",
+      "shape": [
+       6,
+       12,
+       16,
+       3
+      ]
+     },
+     "indices": [
+      0,
+      1,
+      24,
+      25,
+      26,
+      27
+     ],
+     "long_edge": 320,
+     "mask_end_frame": 23,
+     "mask_start_frame": 3
+    },
+    "_render_raster_hw": [
+     12,
+     16
+    ],
+    "actual_post_context_frames": 5,
+    "actual_pre_context_frames": 3,
+    "context_end": 33,
+    "context_start": 5,
+    "frame_constraint": null,
+    "frame_count": 28,
+    "frame_count_padding": 0,
+    "guide_injection": {
+     "auto_offset_enabled": true,
+     "collision_count": 0,
+     "driver_coords": [],
+     "driver_driver_collision_count": 0,
+     "entries": [
+      {
+       "bridge_override_key": "g1:12",
+       "collided": false,
+       "collided_with": "",
+       "effective_local_idx": 7,
+       "guide_id": "gd1",
+       "original_local_idx": 7
+      }
+     ],
+     "frame_constraint": null,
+     "frame_count": 28,
+     "max_excess_latents": 0,
+     "predicted_unresolved": false,
+     "schema": "sonder_guide_injection_v1",
+     "unresolved_collision_count": 0
+    },
+    "mask_end_frame": 23,
+    "mask_post_offset": 0,
+    "mask_pre_offset": 0,
+    "mask_start_frame": 3,
+    "placement_fps": "24.0",
+    "post_context_frames": 5,
+    "pre_context_frames": 3,
+    "prompt": "a quiet street",
+    "queue_job_id": "",
+    "queue_job_ref_id": "",
+    "requested_mask_post_offset": 0,
+    "requested_mask_pre_offset": 0,
+    "scene_id": "scene-1",
+    "scene_name": "Scene 1",
+    "selection_end": 28,
+    "selection_start": 8,
+    "source_frame_count": 28,
+    "take_crop_position": "center",
+    "take_fit_mode": "pad_edge",
+    "take_keep_padding": false,
+    "take_placement_linked": true,
+    "take_placement_mode": "trimmed",
+    "take_placement_muted": false,
+    "template_id": "free"
+   },
+   "jobs": [],
+   "notes": [
+    [
+     "note_window",
+     [
+      {
+       "fps": "24.0",
+       "frame_count": 28,
+       "frame_count_padding": 0,
+       "generation_end": 28,
+       "generation_start": 8,
+       "queue": "live",
+       "render_end": 33,
+       "render_start": 5,
+       "scene_id": "scene-1",
+       "scene_name": "Scene 1",
+       "source_frame_count": 28
+      },
+      [
+       "<id>",
+       "editor-media-golden-live_selection_context"
+      ]
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "rendering"
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "preparing_inputs"
+     ]
+    ],
+    [
+     "note_reference_sources_removed",
+     [
+      "Scene 1",
+      [
+       {
+        "channel_key": "speech",
+        "code": "empty_channel",
+        "message": "Prompt channel speech is empty and will be omitted."
+       },
+       {
+        "channel_key": "sounds",
+        "code": "empty_channel",
+        "message": "Prompt channel sounds is empty and will be omitted."
+       }
+      ]
+     ]
+    ]
+   ],
+   "outputs": [
+    {
+     "dtype": "float32",
+     "sha256": "c4d8b7608086bc1745cb2a8f23f58844649a4d745a4caf783f10812f605185fa",
+     "shape": [
+      28,
+      12,
+      16,
+      3
+     ]
+    },
+    {
+     "dtype": "float32",
+     "sha256": "78ea9974426c13bf8b2d68e9af0c9f3698ca5d11e442ba690b05abb201d2b89d",
+     "shape": [
+      1,
+      12,
+      16,
+      3
+     ]
+    },
+    "7",
+    "0.7500",
+    "a quiet street",
+    28,
+    "24.0",
+    16,
+    12,
+    {
+     "sample_rate": 44100,
+     "waveform": {
+      "dtype": "float32",
+      "sha256": "271b991195d9cac731c86feb81443aa0b1ec91e8ffc89a99fb589022ae9ad202",
+      "shape": [
+       1,
+       2,
+       51450
+      ]
+     }
+    },
+    "0.125",
+    "0.9583333333333334"
+   ],
+   "views": [
+    {
+     "actual_post": 5,
+     "actual_pre": 3,
+     "fps": "24.0",
+     "frame_count": 28,
+     "frame_count_padding": 0,
+     "generation_end": 28,
+     "generation_start": 8,
+     "mask_end_frame": 23,
+     "mask_start_frame": 3,
+     "project_folder": "editor-media-golden-live_selection_context",
+     "queue": "live",
+     "queue_job_ref_id": "",
+     "render_end": 33,
+     "render_start": 5,
+     "scene_id": "scene-1",
+     "source_frame_count": 28
+    }
+   ]
+  },
+  "live_selection_context_cached": {
+   "context": {
+    "_color_drift_reference": {
+     "frame_count": 28,
+     "frames": {
+      "dtype": "uint8",
+      "sha256": "5357621970f52c75f704de2d9fb5a1500e5e541dcd85cee28f6d48c4e5406da5",
+      "shape": [
+       6,
+       12,
+       16,
+       3
+      ]
+     },
+     "indices": [
+      0,
+      1,
+      24,
+      25,
+      26,
+      27
+     ],
+     "long_edge": 320,
+     "mask_end_frame": 23,
+     "mask_start_frame": 3
+    },
+    "_render_raster_hw": [
+     12,
+     16
+    ],
+    "actual_post_context_frames": 5,
+    "actual_pre_context_frames": 3,
+    "context_end": 33,
+    "context_start": 5,
+    "frame_constraint": null,
+    "frame_count": 28,
+    "frame_count_padding": 0,
+    "guide_injection": {
+     "auto_offset_enabled": true,
+     "collision_count": 0,
+     "driver_coords": [],
+     "driver_driver_collision_count": 0,
+     "entries": [
+      {
+       "bridge_override_key": "g1:12",
+       "collided": false,
+       "collided_with": "",
+       "effective_local_idx": 7,
+       "guide_id": "gd1",
+       "original_local_idx": 7
+      }
+     ],
+     "frame_constraint": null,
+     "frame_count": 28,
+     "max_excess_latents": 0,
+     "predicted_unresolved": false,
+     "schema": "sonder_guide_injection_v1",
+     "unresolved_collision_count": 0
+    },
+    "mask_end_frame": 23,
+    "mask_post_offset": 0,
+    "mask_pre_offset": 0,
+    "mask_start_frame": 3,
+    "placement_fps": "24.0",
+    "post_context_frames": 5,
+    "pre_context_frames": 3,
+    "prompt": "a quiet street",
+    "queue_job_id": "",
+    "queue_job_ref_id": "",
+    "requested_mask_post_offset": 0,
+    "requested_mask_pre_offset": 0,
+    "scene_id": "scene-1",
+    "scene_name": "Scene 1",
+    "selection_end": 28,
+    "selection_start": 8,
+    "source_frame_count": 28,
+    "take_crop_position": "center",
+    "take_fit_mode": "pad_edge",
+    "take_keep_padding": false,
+    "take_placement_linked": true,
+    "take_placement_mode": "trimmed",
+    "take_placement_muted": false,
+    "template_id": "free"
+   },
+   "jobs": [],
+   "notes": [
+    [
+     "note_window",
+     [
+      {
+       "fps": "24.0",
+       "frame_count": 28,
+       "frame_count_padding": 0,
+       "generation_end": 28,
+       "generation_start": 8,
+       "queue": "live",
+       "render_end": 33,
+       "render_start": 5,
+       "scene_id": "scene-1",
+       "scene_name": "Scene 1",
+       "source_frame_count": 28
+      },
+      [
+       "<id>",
+       "editor-media-golden-live_selection_context_cached"
+      ]
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "rendering"
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "preparing_inputs"
+     ]
+    ],
+    [
+     "note_reference_sources_removed",
+     [
+      "Scene 1",
+      [
+       {
+        "channel_key": "speech",
+        "code": "empty_channel",
+        "message": "Prompt channel speech is empty and will be omitted."
+       },
+       {
+        "channel_key": "sounds",
+        "code": "empty_channel",
+        "message": "Prompt channel sounds is empty and will be omitted."
+       }
+      ]
+     ]
+    ]
+   ],
+   "outputs": [
+    {
+     "dtype": "float32",
+     "sha256": "c4d8b7608086bc1745cb2a8f23f58844649a4d745a4caf783f10812f605185fa",
+     "shape": [
+      28,
+      12,
+      16,
+      3
+     ]
+    },
+    {
+     "dtype": "float32",
+     "sha256": "78ea9974426c13bf8b2d68e9af0c9f3698ca5d11e442ba690b05abb201d2b89d",
+     "shape": [
+      1,
+      12,
+      16,
+      3
+     ]
+    },
+    "7",
+    "0.7500",
+    "a quiet street",
+    28,
+    "24.0",
+    16,
+    12,
+    {
+     "sample_rate": 44100,
+     "waveform": {
+      "dtype": "float32",
+      "sha256": "271b991195d9cac731c86feb81443aa0b1ec91e8ffc89a99fb589022ae9ad202",
+      "shape": [
+       1,
+       2,
+       51450
+      ]
+     }
+    },
+    "0.125",
+    "0.9583333333333334"
+   ],
+   "views": [
+    {
+     "actual_post": 5,
+     "actual_pre": 3,
+     "fps": "24.0",
+     "frame_count": 28,
+     "frame_count_padding": 0,
+     "generation_end": 28,
+     "generation_start": 8,
+     "mask_end_frame": 23,
+     "mask_start_frame": 3,
+     "project_folder": "editor-media-golden-live_selection_context_cached",
+     "queue": "live",
+     "queue_job_ref_id": "",
+     "render_end": 33,
+     "render_start": 5,
+     "scene_id": "scene-1",
+     "source_frame_count": 28
+    }
+   ]
+  },
+  "queue_consume_frozen": {
+   "context": {
+    "_color_drift_reference": null,
+    "_render_raster_hw": [
+     14,
+     20
+    ],
+    "actual_post_context_frames": 8,
+    "actual_pre_context_frames": 4,
+    "context_end": 36,
+    "context_start": 4,
+    "frame_constraint": {
+     "min": 9,
+     "offset": 1,
+     "step": 8
+    },
+    "frame_count": 33,
+    "frame_count_padding": 1,
+    "guide_injection": {
+     "auto_offset_enabled": true,
+     "collision_count": 0,
+     "driver_coords": [
+      {
+       "clip_id": "d1",
+       "coords": [
+        0,
+        1,
+        9,
+        17
+       ],
+       "lane_index": 0,
+       "local_idx": 0,
+       "pixel_len": 24,
+       "snapped_start": 0
+      }
+     ],
+     "driver_driver_collision_count": 0,
+     "entries": [
+      {
+       "bridge_override_key": "g1:12",
+       "collided": false,
+       "collided_with": "",
+       "effective_local_idx": 8,
+       "guide_id": "gd1",
+       "original_local_idx": 8
+      }
+     ],
+     "frame_constraint": {
+      "min": 9,
+      "offset": 1,
+      "step": 8
+     },
+     "frame_count": 33,
+     "max_excess_latents": 0,
+     "predicted_unresolved": false,
+     "schema": "sonder_guide_injection_v1",
+     "unresolved_collision_count": 0
+    },
+    "mask_end_frame": 25,
+    "mask_post_offset": 0,
+    "mask_pre_offset": 0,
+    "mask_start_frame": 1,
+    "placement_fps": "24.0",
+    "post_context_frames": 8,
+    "pre_context_frames": 4,
+    "prompt": "queued prompt",
+    "queue_job_id": "job-1",
+    "queue_job_ref_id": "job-1",
+    "requested_mask_post_offset": 0,
+    "requested_mask_pre_offset": 0,
+    "scene_id": "scene-1",
+    "scene_name": "Scene 1",
+    "selection_end": 28,
+    "selection_start": 8,
+    "source_frame_count": 32,
+    "take_crop_position": "center",
+    "take_fit_mode": "pad_edge",
+    "take_keep_padding": false,
+    "take_placement_linked": true,
+    "take_placement_mode": "trimmed",
+    "take_placement_muted": false,
+    "template_id": "free"
+   },
+   "jobs": [
+    {
+     "error": "",
+     "job_id": "job-1",
+     "status": "running"
+    }
+   ],
+   "notes": [
+    [
+     "note_job",
+     [
+      "<GenerationJob>",
+      "consume"
+     ]
+    ],
+    [
+     "note_window",
+     [
+      {
+       "fps": "24.0",
+       "frame_count": 33,
+       "frame_count_padding": 1,
+       "generation_end": 28,
+       "generation_start": 8,
+       "queue": "consume",
+       "render_end": 36,
+       "render_start": 4,
+       "scene_id": "scene-1",
+       "scene_name": "Scene 1",
+       "source_frame_count": 32
+      },
+      [
+       "<id>",
+       "editor-media-golden-queue_consume_frozen"
+      ]
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "rendering"
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "preparing_inputs"
+     ]
+    ]
+   ],
+   "outputs": [
+    {
+     "dtype": "float32",
+     "sha256": "a6f894e35531f82ab35bcbd0c15501f3c2dfdf70189601ff08ff14c01147f32b",
+     "shape": [
+      33,
+      14,
+      20,
+      3
+     ]
+    },
+    {
+     "dtype": "float32",
+     "sha256": "97e80fd91b9f3bd6e2985ed5bc7cac78175c0b3c2a95a74fa3af39988a1883ef",
+     "shape": [
+      1,
+      14,
+      20,
+      3
+     ]
+    },
+    "8",
+    "0.7500",
+    "queued prompt",
+    33,
+    "24.0",
+    20,
+    14,
+    {
+     "sample_rate": 44100,
+     "waveform": {
+      "dtype": "float32",
+      "sha256": "0b09157e1352def1a4cba1dcb8e5d7e3b338cf89b9e50636302f298c80a9f7b8",
+      "shape": [
+       1,
+       2,
+       60638
+      ]
+     }
+    },
+    "0.041666666666666664",
+    "1.0416666666666667"
+   ],
+   "views": [
+    {
+     "actual_post": 8,
+     "actual_pre": 4,
+     "fps": "24.0",
+     "frame_count": 33,
+     "frame_count_padding": 1,
+     "generation_end": 28,
+     "generation_start": 8,
+     "mask_end_frame": 25,
+     "mask_start_frame": 1,
+     "project_folder": "editor-media-golden-queue_consume_frozen",
+     "queue": "consume",
+     "queue_job_ref_id": "job-1",
+     "render_end": 36,
+     "render_start": 4,
+     "scene_id": "scene-1",
+     "source_frame_count": 32
+    }
+   ]
+  },
+  "queue_peek_frozen": {
+   "context": {
+    "_color_drift_reference": {
+     "frame_count": 30,
+     "frames": {
+      "dtype": "uint8",
+      "sha256": "5da422bc57b4aac3538e5305fb37ac4e1a95ff2294412fb10a4d4d7c9f68e63b",
+      "shape": [
+       8,
+       14,
+       20,
+       3
+      ]
+     },
+     "indices": [
+      0,
+      1,
+      2,
+      25,
+      26,
+      27,
+      28,
+      29
+     ],
+     "long_edge": 320,
+     "mask_end_frame": 24,
+     "mask_start_frame": 4
+    },
+    "_render_raster_hw": [
+     14,
+     20
+    ],
+    "actual_post_context_frames": 6,
+    "actual_pre_context_frames": 4,
+    "context_end": 34,
+    "context_start": 4,
+    "frame_constraint": null,
+    "frame_count": 30,
+    "frame_count_padding": 0,
+    "guide_injection": {
+     "auto_offset_enabled": true,
+     "collision_count": 0,
+     "driver_coords": [],
+     "driver_driver_collision_count": 0,
+     "entries": [
+      {
+       "bridge_override_key": "g1:12",
+       "collided": false,
+       "collided_with": "",
+       "effective_local_idx": 8,
+       "guide_id": "gd1",
+       "original_local_idx": 8
+      }
+     ],
+     "frame_constraint": null,
+     "frame_count": 30,
+     "max_excess_latents": 0,
+     "predicted_unresolved": false,
+     "schema": "sonder_guide_injection_v1",
+     "unresolved_collision_count": 0
+    },
+    "mask_end_frame": 24,
+    "mask_post_offset": 0,
+    "mask_pre_offset": 0,
+    "mask_start_frame": 4,
+    "placement_fps": "24.0",
+    "post_context_frames": 6,
+    "pre_context_frames": 4,
+    "prompt": "queued prompt",
+    "queue_job_id": "",
+    "queue_job_ref_id": "job-1",
+    "requested_mask_post_offset": 0,
+    "requested_mask_pre_offset": 0,
+    "scene_id": "scene-1",
+    "scene_name": "Scene 1",
+    "selection_end": 28,
+    "selection_start": 8,
+    "source_frame_count": 30,
+    "take_crop_position": "center",
+    "take_fit_mode": "pad_edge",
+    "take_keep_padding": false,
+    "take_placement_linked": true,
+    "take_placement_mode": "trimmed",
+    "take_placement_muted": false,
+    "template_id": "free"
+   },
+   "jobs": [
+    {
+     "error": "",
+     "job_id": "job-1",
+     "status": "pending"
+    }
+   ],
+   "notes": [
+    [
+     "note_job",
+     [
+      "<GenerationJob>",
+      "peek"
+     ]
+    ],
+    [
+     "note_window",
+     [
+      {
+       "fps": "24.0",
+       "frame_count": 30,
+       "frame_count_padding": 0,
+       "generation_end": 28,
+       "generation_start": 8,
+       "queue": "peek",
+       "render_end": 34,
+       "render_start": 4,
+       "scene_id": "scene-1",
+       "scene_name": "Scene 1",
+       "source_frame_count": 30
+      },
+      [
+       "<id>",
+       "editor-media-golden-queue_peek_frozen"
+      ]
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "rendering"
+     ]
+    ],
+    [
+     "note_stage",
+     [
+      "preparing_inputs"
+     ]
+    ]
+   ],
+   "outputs": [
+    {
+     "dtype": "float32",
+     "sha256": "51521a05e74acbf0e5c9f26d36ac48852f722a123b1822b4ba958541e64f6cfd",
+     "shape": [
+      30,
+      14,
+      20,
+      3
+     ]
+    },
+    {
+     "dtype": "float32",
+     "sha256": "97e80fd91b9f3bd6e2985ed5bc7cac78175c0b3c2a95a74fa3af39988a1883ef",
+     "shape": [
+      1,
+      14,
+      20,
+      3
+     ]
+    },
+    "8",
+    "0.7500",
+    "queued prompt",
+    30,
+    "24.0",
+    20,
+    14,
+    {
+     "sample_rate": 44100,
+     "waveform": {
+      "dtype": "float32",
+      "sha256": "9bd2fdb364eeb9096796fb29210a302e4cad5e19136a2cf235ad216dcdcfad10",
+      "shape": [
+       1,
+       2,
+       55125
+      ]
+     }
+    },
+    "0.16666666666666666",
+    "1.0"
+   ],
+   "views": [
+    {
+     "actual_post": 6,
+     "actual_pre": 4,
+     "fps": "24.0",
+     "frame_count": 30,
+     "frame_count_padding": 0,
+     "generation_end": 28,
+     "generation_start": 8,
+     "mask_end_frame": 24,
+     "mask_start_frame": 4,
+     "project_folder": "editor-media-golden-queue_peek_frozen",
+     "queue": "peek",
+     "queue_job_ref_id": "job-1",
+     "render_end": 34,
+     "render_start": 4,
+     "scene_id": "scene-1",
+     "source_frame_count": 30
+    }
+   ]
+  }
+ },
+ "ffmpeg": "ffmpeg version 7.1-essentials_build-www.gyan.dev Copyright (c) 2000-2024 the FFmpeg developers"
+}

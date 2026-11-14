@@ -151,6 +151,10 @@ def open_release(key: Any, prompt_id: Any = "", prompt: Any = None, roots: Any =
             # Editor media the cache pipeline handed carriers this run:
             # token -> (Editor call key, output slot), a pointer into "results".
             "media": {},
+            # Editor media whose materialization waits (Phase 4b): call key ->
+            # the Editor's PendingMedia (nodes/editor_media.py), which fills its
+            # deferred slots in "results" (fill_result).
+            "pending": {},
             # O(1) here: a cancel can race the interval between get and ComfyUI
             # resetting its interrupt flag, so nothing heavy runs in this hook.
             "roots": _clean_roots(roots),
@@ -219,12 +223,14 @@ def take_lease(key: Any, project_dir: str, job_id: str) -> bool:
     return True
 
 
-def holds_lease(project_dir: str, job_id: str) -> bool:
-    """Whether an open run holds the lease on this job, so its release will return it."""
+def holds_lease(project_dir: str, job_id: str, key: Any = None) -> bool:
+    """Whether an open run (``key``'s, when given) holds the lease on this job, so its release will return it."""
     project_dir, job_id = str(project_dir or ""), str(job_id or "")
+    wanted = _key(key) if key is not None else None
     with _LOCK:
         return any(lease["project_dir"] == project_dir and lease["job_id"] == job_id
-                   for record in _RELEASES.values() for lease in record["leases"])
+                   for record_key, record in _RELEASES.items() if wanted is None or record_key == wanted
+                   for lease in record["leases"])
 
 
 def settle_lease(project_dir: str, job_id: str) -> bool:
@@ -258,6 +264,7 @@ def close_release(key: Any) -> dict[str, Any] | None:
         record.pop("preparation", None)
         record.pop("identities", None)
         record.pop("media", None)
+        record.pop("pending", None)
         record.pop("prompt_ref", None)
         if record.get("scope") is _SCOPE_UNSET:
             record["scope"] = None
@@ -436,6 +443,57 @@ def media_for(prompt_id: Any, token: Any) -> tuple[bool, Any]:
         if not isinstance(result, tuple) or not 0 <= slot < len(result):
             return False, None
         return True, result[slot]
+
+
+def remember_pending(key: Any, call_key: Any, pending: Any) -> bool:
+    """Keep the Editor's deferred media for this open run (Phase 4b). First wins; dropped at close."""
+    key, call_key = _key(key), _key(call_key)
+    with _LOCK:
+        record = _RELEASES.get(key)
+        table = record.get("pending") if record is not None else None
+        if not call_key or table is None:
+            return False
+        table.setdefault(call_key, pending)
+        return True
+
+
+def pending_for(key: Any, call_key: Any) -> Any:
+    """The open run's deferred Editor media for ``call_key``, or None."""
+    key, call_key = _key(key), _key(call_key)
+    with _LOCK:
+        record = _RELEASES.get(key)
+        table = record.get("pending") if record is not None else None
+        return table.get(call_key) if table and call_key else None
+
+
+def pending_for_prompt(prompt_id: Any, token: Any) -> Any:
+    """The deferred Editor media behind a carrier ``token`` of the running prompt, or None."""
+    with _LOCK:
+        record = _only_open_record_for_prompt_id(str(prompt_id or ""))
+        media = record.get("media") if record is not None else None
+        if not media or not isinstance(token, str) or token not in media:
+            return None
+        call_key, _slot = media[token]
+        return (record.get("pending") or {}).get(call_key)
+
+
+def fill_result(key: Any, call_key: Any, slot: int, value: Any, marker: Any) -> bool:
+    """Replace the deferred ``marker`` in ``call_key``'s first result at ``slot`` with ``value``.
+
+    Only a marker is ever replaced, so a filled slot keeps its first value. The
+    result is a tuple, so the record gets a new tuple; readers that already hold
+    the old one (the early run's return) never see the marker filled.
+    """
+    key, call_key = _key(key), _key(call_key)
+    with _LOCK:
+        record = _RELEASES.get(key)
+        results = record.get("results") if record is not None else None
+        result = results.get(call_key) if results is not None and call_key else None
+        if (not isinstance(result, tuple) or not isinstance(slot, int) or isinstance(slot, bool)
+                or not 0 <= slot < len(result) or result[slot] is not marker):
+            return False
+        results[call_key] = result[:slot] + (value,) + result[slot + 1:]
+        return True
 
 
 def release_roots(key: Any) -> tuple[str, ...] | None:

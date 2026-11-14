@@ -258,6 +258,85 @@ def _prepare_sources(project: TimelineProject, scene: Scene, clips: list) -> dic
     return prepared
 
 
+@dataclass(frozen=True)
+class RenderClip:
+    """A visible render clip as the renderer reads it, detached from the live scene."""
+
+    timeline_start_frame: int
+    timeline_end_frame: int
+    source_in_frame: int
+    track_index: int
+    opacity: float
+    fit_mode: str
+    crop_position: str
+    source_path: str
+    role: str = "render"
+    muted: bool = False
+
+
+@dataclass(frozen=True)
+class RenderSource:
+    """A clip source as ``_prepare_sources`` resolved it: path, asset rate and length, colour interpretation."""
+
+    abs_path: str
+    source_fps: float
+    native_frame_count: int
+    interpretation: tuple | None
+
+
+@dataclass(frozen=True)
+class RenderRequest:
+    """Everything a render reads apart from file content (Execution Cache Pipeline Phase 4b).
+
+    With a request, ``render_scene_frames`` and ``iter_scene_frames`` read no
+    project or scene: raster, rate, duration, the visible clips, their resolved
+    sources and the render cache's project directory all come from here
+    (``store`` empty: no render cache). ``sources`` is keyed by each clip's
+    ``source_path``.
+    """
+
+    width: int
+    height: int
+    scene_fps: float
+    duration: int
+    scene_id: str
+    clips: tuple
+    sources: dict
+    store: str = ""
+    # The Editor's own reading of the request (Phase 4b): the window it renders, whether
+    # the render cache is used, and the frame count it pads to (0: no padding). The
+    # renderer itself takes the window and cache flag from its arguments.
+    start: int = 0
+    end: int = 0
+    use_cache: bool = False
+    padding_target: int = 0
+
+
+def _prepare_request_sources(request: RenderRequest, clips: list | None = None) -> dict[str, _PreparedSource]:
+    """``_prepare_sources`` for a request: its resolved sources, with revisions read now."""
+    wanted = {str(getattr(clip, "source_path", "") or "") for clip in (request.clips if clips is None else clips)}
+    prepared = {}
+    for source_path in sorted(wanted):
+        source = request.sources.get(source_path)
+        if source is None:
+            continue
+        abs_path = str(source.abs_path or "")
+        interpretation = tuple(source.interpretation) if source.interpretation is not None else None
+        source_fps = float(source.source_fps)
+        prepared[source_path] = _PreparedSource(
+            source_path=_normalized_source_path(source_path),
+            abs_path=abs_path,
+            resolved_identity=os.path.normcase(os.path.realpath(abs_path)) if abs_path else "",
+            revision=_source_revision(abs_path),
+            source_fps=source_fps,
+            native_frame_count=int(source.native_frame_count),
+            interpretation=interpretation,
+            color_affine=color_correction_for_interpretation(interpretation),
+            rate_ratio=(source_fps / float(request.scene_fps)) if source_fps > 0 else 1.0,
+        )
+    return prepared
+
+
 def _current_source_state(source: _PreparedSource) -> tuple[str, str]:
     if not source.abs_path:
         return "", ""
@@ -363,17 +442,27 @@ def iter_scene_frames(
     prepared_sources: dict[str, _PreparedSource] | None = None,
     render_status: dict | None = None,
     cache_block_frames: int = 1,
+    request: RenderRequest | None = None,
 ):
-    """Yield uncached uint8 RGB scene frames for [start_frame, end_frame)."""
+    """Yield uncached uint8 RGB scene frames for [start_frame, end_frame).
+
+    With ``request`` (``RenderRequest``) nothing is read from ``project`` or
+    ``scene``. A given ``prepared_sources``, even an empty one, is used as is.
+    """
     _check_cancel(cancel_event)
     video_capture_factory = video_capture_factory or _default_video_capture
-    proj_w, proj_h = _scene_resolution(project, scene)
+    if request is not None:
+        proj_w, proj_h = int(request.width), int(request.height)
+        visible_clips = list(request.clips)
+    else:
+        proj_w, proj_h = _scene_resolution(project, scene)
+        visible_clips = _visible_render_clips(scene)
     render_start = max(0, int(start_frame or 0))
     render_end = max(render_start, int(end_frame or render_start))
 
-    visible_clips = _visible_render_clips(scene)
-    scene_fps = effective_scene_fps(project, scene)
-    prepared_sources = prepared_sources or _prepare_sources(project, scene, visible_clips)
+    if prepared_sources is None:
+        prepared_sources = (_prepare_request_sources(request, visible_clips) if request is not None
+                            else _prepare_sources(project, scene, visible_clips))
     # Readers per capture key. Several readers of one source exist only while
     # clips of that source are composited at different positions at once.
     readers: dict[tuple, list[_SourceReader]] = {}
@@ -578,6 +667,7 @@ def render_scene_frames(
     use_cache: bool = True,
     cache_max_bytes: int | None = None,
     progress=None,
+    request: RenderRequest | None = None,
 ) -> torch.Tensor:
     """Composite visible render clips into an RGB float tensor for [start_frame, end_frame).
 
@@ -588,13 +678,26 @@ def render_scene_frames(
     retried attempt starts again at 0. An exception raised by the callback
     (an interrupt) propagates after captures are released and staged blocks
     discarded.
+
+    With ``request`` (``RenderRequest``, Execution Cache Pipeline Phase 4b) the
+    render reads no project or scene, on every path: the uncached render, the
+    render cache and both fallbacks. Only the files the request names and the
+    render cache's blocks are read.
     """
     _check_cancel(cancel_event)
     video_capture_factory = video_capture_factory or _default_video_capture
-    proj_w, proj_h = _scene_resolution(project, scene)
+    if request is not None:
+        proj_w, proj_h = int(request.width), int(request.height)
+        declared_duration = max(0, int(request.duration))
+        scene_id = str(request.scene_id or "")
+        store_target = request.store or None
+    else:
+        proj_w, proj_h = _scene_resolution(project, scene)
+        declared_duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
+        scene_id = getattr(scene, "scene_id", "")
+        store_target = project
     render_start = max(0, int(start_frame or 0))
     render_end = max(render_start, int(end_frame or render_start))
-    declared_duration = max(0, int(getattr(scene, "duration_frames", 0) or 0))
     if declared_duration > 0:
         render_start = min(render_start, declared_duration)
         render_end = min(max(render_start, render_end), declared_duration)
@@ -603,14 +706,14 @@ def render_scene_frames(
     if num_frames <= 0:
         return torch.zeros(1, proj_h, proj_w, 3, dtype=torch.float32)
 
-    visible_clips = _visible_render_clips(scene)
+    visible_clips = list(request.clips) if request is not None else _visible_render_clips(scene)
     if not visible_clips and not use_cache:
         return torch.zeros(num_frames, proj_h, proj_w, 3, dtype=torch.float32)
 
     if not use_cache:
         logger.info(
             "Render cache outcome=disabled scene=%s range=%d-%d budget=%s",
-            getattr(scene, "scene_id", ""),
+            scene_id,
             render_start,
             render_end,
             0,
@@ -622,6 +725,7 @@ def render_scene_frames(
             render_end,
             cancel_event=cancel_event,
             video_capture_factory=video_capture_factory,
+            request=request,
         )
         frames = []
         if progress is not None:
@@ -637,17 +741,17 @@ def render_scene_frames(
         arr = np.stack(frames, axis=0).astype(np.float32) / 255.0
         return torch.from_numpy(arr)
 
-    scene_fps = effective_scene_fps(project, scene)
+    scene_fps = float(request.scene_fps) if request is not None else effective_scene_fps(project, scene)
     store_failure_reason = ""
     try:
-        store = cache_store(project, scene.scene_id, proj_w, proj_h, scene_fps)
+        store = cache_store(store_target, scene_id, proj_w, proj_h, scene_fps) if store_target else None
     except (OSError, RenderCacheError) as exc:
         store_failure_reason = str(exc)
         store = None
     if store is None:
         logger.warning(
             "Render cache outcome=store_unavailable scene=%s range=%d-%d reason=%s",
-            scene.scene_id,
+            scene_id,
             render_start,
             render_end,
             store_failure_reason or "no_store",
@@ -661,11 +765,12 @@ def render_scene_frames(
             video_capture_factory=video_capture_factory,
             use_cache=False,
             progress=progress,
+            request=request,
         )
 
     store_activity = active_cache_store(store)
     store_activity.__enter__()
-    scene_duration = max(render_end, int(getattr(scene, "duration_frames", 0) or 0))
+    scene_duration = max(render_end, declared_duration)
     try:
         prepare_store(store, scene_duration)
     except Exception as exc:
@@ -673,7 +778,7 @@ def render_scene_frames(
         logger.warning(
             "Render cache outcome=prepare_failed scene=%s root=%s store=%s "
             "block_frames=%d range=%d-%d reason=%s",
-            scene.scene_id,
+            scene_id,
             store.root,
             store.token,
             store.block_frames,
@@ -690,6 +795,7 @@ def render_scene_frames(
             video_capture_factory=video_capture_factory,
             use_cache=False,
             progress=progress,
+            request=request,
         )
 
     block_frames = store.block_frames
@@ -707,7 +813,7 @@ def render_scene_frames(
     logger.info(
         "Render cache outcome=ready scene=%s root=%s store=%s block_frames=%d "
         "range=%d-%d requested_blocks=%s budget=%s",
-        scene.scene_id,
+        scene_id,
         store.root,
         store.token,
         block_frames,
@@ -731,7 +837,8 @@ def render_scene_frames(
         if progress is not None:
             progress(0, num_frames)
         output = torch.zeros(num_frames, proj_h, proj_w, 3, dtype=torch.float32)
-        prepared = _prepare_sources(project, scene, coverage_clips)
+        prepared = (_prepare_request_sources(request, coverage_clips) if request is not None
+                    else _prepare_sources(project, scene, coverage_clips))
         block_info = {}
         misses = []
         delete_indices = set()
@@ -806,6 +913,7 @@ def render_scene_frames(
                 prepared_sources=prepared,
                 render_status=status,
                 cache_block_frames=block_frames,
+                request=request,
             )
             try:
                 for block_index in run:
@@ -870,7 +978,7 @@ def render_scene_frames(
                 logger.warning(
                     "Render cache outcome=fallback scene=%s store=%s reason=source_unstable "
                     "requested_blocks=%s hit_blocks=%s miss_blocks=%s staged=%d deletions=%s sources=%s",
-                    scene.scene_id,
+                    scene_id,
                     store.token,
                     requested_block_indices,
                     stats["hit_indices"],
@@ -886,7 +994,7 @@ def render_scene_frames(
             logger.warning(
                 "Render cache outcome=fallback scene=%s store=%s reason=staging_incomplete "
                 "requested_blocks=%s hit_blocks=%s miss_blocks=%s staged=%d deletions=%s",
-                scene.scene_id,
+                scene_id,
                 store.token,
                 requested_block_indices,
                 stats["hit_indices"],
@@ -907,7 +1015,7 @@ def render_scene_frames(
                 "Render cache outcome=publication_failed scene=%s store=%s "
                 "requested_blocks=%s hit_blocks=%s miss_blocks=%s staged=%d "
                 "published=partial_or_unknown deletions=%s reason=%s",
-                scene.scene_id,
+                scene_id,
                 store.token,
                 requested_block_indices,
                 stats["hit_indices"],
@@ -922,14 +1030,14 @@ def render_scene_frames(
             if should_enforce_retention:
                 try:
                     retention = enforce_render_cache_budget(
-                        project,
+                        store_target,
                         cache_max_bytes,
                         protected_tokens={store.token},
                     )
                 except Exception as exc:
                     logger.warning(
                         "Render cache retention_failed scene=%s store=%s budget=%s reason=%s",
-                        scene.scene_id,
+                        scene_id,
                         store.token,
                         "unlimited" if cache_max_bytes is None else cache_max_bytes,
                         exc,
@@ -939,7 +1047,7 @@ def render_scene_frames(
                     "Render cache retention_ready scene=%s store=%s budget=%s "
                     "entries=%d size_bytes=%d deleted=%s deleted_bytes=%d protected=%s "
                     "over_budget_bytes=%d pending=%s",
-                    scene.scene_id,
+                    scene_id,
                     store.token,
                     "unlimited" if cache_max_bytes is None else cache_max_bytes,
                     retention["entry_count"],
@@ -953,7 +1061,7 @@ def render_scene_frames(
             logger.info(
                 "Render cache outcome=ready scene=%s root=%s store=%s block_frames=%d "
                 "requested_blocks=%s hit_blocks=%s miss_blocks=%s staged=%d published=%d deletions=%s",
-                scene.scene_id,
+                scene_id,
                 store.root,
                 store.token,
                 block_frames,

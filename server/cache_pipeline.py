@@ -28,12 +28,16 @@ Editor's text and number outputs without touching that guard:
 6. Overrides go through ``DynamicPrompt.override_node``, which feeds key
    construction and input resolution while hidden ``PROMPT``, history and display
    ids keep the submitted graph.
-7. **Editor media** (``CONTENT``): each media output with a consumer that can
-   gain is hashed (``nodes/cache_content.py``) and handed to an ephemeral
-   carrier (``nodes/media_carrier.py``) keyed by the digest; its consumers are
-   rewired to the carrier. ``executor_hook`` keys the carriers in this prompt's
-   ``set_prompt`` and rolls the graph back if it cannot. The content pass is
-   isolated like the bridge and identity passes.
+7. **Editor media**: each media output with a consumer that can gain is handed
+   to an ephemeral carrier (``nodes/media_carrier.py``) and its consumers are
+   rewired to it. Guide images (``CONTENT``) are keyed by a digest of their
+   bytes (``nodes/cache_content.py``). Frames and audio (``DESCRIPTOR``,
+   deferred: ``nodes/editor_media.py``) are not rendered by the early run: their
+   carrier is keyed by a recipe of the render plus the content of every file it
+   reads, and ``executor_hook`` settles them in this prompt's ``set_prompt``,
+   from ComfyUI's cache on a hit, by rendering on a miss, before any node runs.
+   A deferred slot without an identity or a gaining consumer is rendered here.
+   The media pass is isolated like the bridge and identity passes.
 
 Fail-open: anything this module cannot prove leaves the prompt exactly as
 submitted. **A miss is acceptable; a false hit never is.** Only an exception
@@ -47,6 +51,7 @@ No second queue, resolver, memo or project store: the prepared result *is* the
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import inspect
 import logging
@@ -54,6 +59,7 @@ import math
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -144,6 +150,9 @@ class MediaHost:
 
     reason: str
     arm: Callable[[Any], None]
+    # Phase 4b: the hook's deferral gate passed, so the Editor may leave its render
+    # and mix for ``set_prompt`` to settle.
+    defer: bool = False
 
 
 @dataclass
@@ -158,6 +167,19 @@ class CarrierPlan:
     restore: dict  # rewired consumer -> the node it had without carriers (None: no override)
     payloads: dict  # carrier id -> the Editor's value (the memo's own object); cleared once stored
     previous_real: Any = None  # the DynamicPrompt's own get_real_node_id attribute, if it had one
+    # Phase 4b: carrier id -> the deferred Editor slot it serves, settled in set_prompt
+    # by ``settle(outputs_cache, entry_type)`` ("" settled, "rollback", "fault").
+    deferred: dict = None  # type: ignore[assignment]
+    settle: Any = None
+    # The Phase 1-3 overrides applied with the plan: dropped too when the Editor fails while
+    # settling, so nothing that took an Editor value runs before the Editor replays its failure.
+    value_overrides: list = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.deferred is None:
+            self.deferred = {}
+        if self.value_overrides is None:
+            self.value_overrides = []
 
 
 _NO_ATTRIBUTE = object()
@@ -847,7 +869,7 @@ def plan_carriers(nodes_view: dict[str, dict], overrides: dict[str, dict], edito
     had without carriers (its Phase 1-3 override, or None for none). ``rawLink``,
     malformed slots and unknown inputs are skipped with a reason.
     """
-    content = set(cache_policy.content_slots(editor_class))
+    content = set(cache_policy.carried_slots(editor_class))
     returns = tuple(editor_class.RETURN_TYPES)
     skips: list[dict] = []
     wanted: dict[str, dict[str, int]] = {}
@@ -907,18 +929,84 @@ def plan_carriers(nodes_view: dict[str, dict], overrides: dict[str, dict], edito
     return carriers, merged, restore, gaining, skips
 
 
-def _content_pass(runtime: ExecutorRuntime, prompt_id: str, key: str, dynprompt: Any, prompt: dict,
-                  nodes_view: dict[str, dict], editor_id: str, editor_class: Any, result: tuple, call_key: str,
-                  overrides: dict[str, dict], input_type_of: Callable[[str, str], Any], media: MediaHost | None,
-                  record: dict[str, Any]) -> CarrierPlan | None:
-    """Hash the Editor's media outputs that can gain and plan their carriers; the plan, or None.
+@contextmanager
+def _editor_stage(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, editor_id: str):
+    """The Editor's node context, progress and ``executing`` message, as the scheduler gives it a node.
 
-    A dry run of the planner first, so a slot is hashed only when some consumer
-    can gain from it. Each digest checks for an interrupt between batches; its
-    raise propagates. Every other failure leaves that slot (or every slot) on
-    today's path. Nothing is applied here.
+    Used by the early run and by every render or mix the pipeline settles. The
+    stock cancel check runs first; its interrupt propagates.
     """
-    from ..nodes import cache_content
+    display_id = dynprompt.get_display_node_id(editor_id)
+    progress = runtime.progress_state()
+    with runtime.node_context(prompt_id, editor_id, 0):
+        progress.start_progress(editor_id)
+        try:
+            server = runtime.server()
+            if server is not None and getattr(server, "client_id", None) is not None:
+                server.last_node_id = display_id
+                server.send_sync("executing", {"node": editor_id, "display_node": display_id,
+                                               "prompt_id": prompt_id}, server.client_id)
+            runtime.before_node_execution()
+            with runtime.inference_mode():
+                yield
+        finally:
+            progress.finish_progress(editor_id)
+
+
+class _EditorFailed(Exception):
+    """A deferred render or mix raised while the pipeline settled it: stored for replay."""
+
+
+def _materialize(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, editor_id: str, key: str,
+                 call_key: str, pending: Any, slots) -> None:
+    """Render or mix ``slots`` now, in the Editor's stage. Its failure is the Editor's, stored for replay.
+
+    An interrupt stores the cancellation and propagates. A raise from the
+    materialization stores the failure, applies its contract to the claimed job
+    and becomes ``_EditorFailed``; anything else is a pipeline fault and
+    propagates untouched (nothing stored).
+    """
+    slots = [slot for slot in slots if pending.defers(slot)]
+    if not slots:
+        return
+    try:
+        with _editor_stage(runtime, prompt_id, dynprompt, editor_id):
+            for slot in slots:
+                pending.value(slot)
+    except runtime.interrupt_type:
+        sdk_runs.remember_failure(key, call_key, sdk_runs.CANCELLED)
+        raise
+    except Exception as exc:
+        if not pending.failed_with(exc):
+            raise
+        _clear_tracebacks(exc)
+        sdk_runs.remember_failure(key, call_key, exc)
+        pending.fail(exc)
+        raise _EditorFailed() from None
+
+
+def _media_pass(runtime: ExecutorRuntime, prompt_id: str, key: str, dynprompt: Any, prompt: dict,
+                nodes_view: dict[str, dict], editor_id: str, editor_class: Any, result: tuple, call_key: str,
+                overrides: dict[str, dict], input_type_of: Callable[[str, str], Any], media: MediaHost | None,
+                record: dict[str, Any]) -> CarrierPlan | None:
+    """Plan carriers for the Editor's media outputs that can gain; the plan, or None.
+
+    A dry run of the planner first, so a slot is touched only when some consumer
+    can gain from it. Per gaining slot:
+
+    - a deferred slot (frames, audio) with a pre-render identity: its token is
+      registered and its carrier planned without a payload; ``set_prompt``
+      settles it (``settle_deferred``);
+    - any other slot (guide images, or a deferred slot without an identity,
+      rendered here first): its content is digested and its carrier carries
+      the value, as in Phase 4a.
+
+    Each digest and hash checks for an interrupt; its raise propagates. A
+    render that raises here is the Editor's failure (``_EditorFailed``). Every
+    other failure leaves that slot (or every slot) on today's path. Nothing is
+    applied here.
+    """
+    from ..nodes import cache_content, editor_media
 
     reasons = record["content_reasons"]
 
@@ -936,8 +1024,10 @@ def _content_pass(runtime: ExecutorRuntime, prompt_id: str, key: str, dynprompt:
         return None
     _carriers, _merged, _restore, gaining, skips = plan_carriers(
         nodes_view, overrides, editor_id, editor_class, None, input_type_of)
+    pending = sdk_runs.pending_for(key, call_key)
     tokens: dict[int, str] = {}
     payloads: dict[str, Any] = {}
+    deferred: dict[str, int] = {}
     content_bytes = 0
     for slot in sorted(gaining):
         carrier_id = carrier_id_for(editor_id, slot)
@@ -946,6 +1036,23 @@ def _content_pass(runtime: ExecutorRuntime, prompt_id: str, key: str, dynprompt:
             continue
         socket = editor_class.RETURN_TYPES[slot]
         value = result[slot]
+        if editor_media.is_deferred(value):
+            if pending is None:
+                skip("pending_missing")
+                continue
+            token, why = pending.identify(slot, runtime.before_node_execution)
+            if token:
+                refused = sdk_runs.register_media(key, prompt_id, token, call_key, slot)
+                if refused:
+                    skip("registry_refused")
+                    continue
+                tokens[slot] = token
+                deferred[carrier_id] = slot
+                continue
+            skip(why)
+            # No identity: render now, where today's early run rendered, and carry it by content.
+            _materialize(runtime, prompt_id, dynprompt, editor_id, key, call_key, pending, [slot])
+            value = pending.values[slot]
         digest = cache_content.digest(socket, value, runtime.before_node_execution)
         if digest is None:
             skip("no_digest")
@@ -963,13 +1070,111 @@ def _content_pass(runtime: ExecutorRuntime, prompt_id: str, key: str, dynprompt:
     for item in skips:
         if item["reason"] != "no_digest":  # a slot without a token was counted above, once
             skip(item["reason"])
-    record["content"] = {"carried": len(carriers), "skipped": sum(reasons.values())}
+    record["content"] = {"carried": len(carriers), "skipped": sum(reasons.values()),
+                         "deferred": sum(1 for carrier_id in deferred if carrier_id in carriers)}
     record["content_bytes"] = content_bytes
+    record["identity_bytes_editor"] = pending.identity_bytes() if pending is not None else 0
     if not carriers:
         return None
-    return CarrierPlan(key=key, editor_id=editor_id, carrier_ids=sorted(carriers), carriers=carriers,
+    plan = CarrierPlan(key=key, editor_id=editor_id, carrier_ids=sorted(carriers), carriers=carriers,
                        overrides=merged, restore=restore,
-                       payloads={carrier_id: payloads[carrier_id] for carrier_id in carriers})
+                       payloads={carrier_id: payloads[carrier_id] for carrier_id in carriers
+                                 if carrier_id in payloads},
+                       deferred={carrier_id: slot for carrier_id, slot in deferred.items() if carrier_id in carriers})
+    return plan
+
+
+def _settle_leftovers(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, editor_id: str, key: str,
+                      call_key: str, carried: set[int], record: dict[str, Any]) -> None:
+    """Render now every deferred slot no carrier settles, where today's early run rendered.
+
+    Raises ``_EditorFailed`` (stored for replay) or the interrupt (stored as a
+    cancellation); a pipeline fault propagates with nothing stored, and the
+    scheduled Editor settles the slot at its turn.
+    """
+    pending = sdk_runs.pending_for(key, call_key)
+    if pending is None:
+        return
+    left = [slot for slot in sorted(pending.plans) if pending.defers(slot) and slot not in carried]
+    if left:
+        record["deferred_rendered_early"] = len(left)
+        _materialize(runtime, prompt_id, dynprompt, editor_id, key, call_key, pending, left)
+
+
+def _entry_value(entry: Any, entry_type: Any) -> Any:
+    """The one value a carrier's cache entry holds, or None when it is not that shape."""
+    if entry_type is not None and not isinstance(entry, entry_type):
+        return None
+    outputs = getattr(entry, "outputs", None)
+    if not (isinstance(outputs, list) and len(outputs) == 1 and isinstance(outputs[0], list)
+            and len(outputs[0]) == 1):
+        return None
+    return outputs[0][0]
+
+
+def settle_deferred(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, plan: CarrierPlan,
+                    outputs_cache: Any, entry_type: Any, call_key: str) -> str:
+    """Settle the plan's deferred carriers inside this prompt's armed ``set_prompt``. Never raises.
+
+    After the stock keying, each deferred carrier looks in ComfyUI's outputs
+    cache (``get_local``): an entry holding a value of the planned type and
+    shape is a **hit**, and the Editor's memo takes it with nothing rendered.
+    Anything else is a **miss**: the slot is rendered now, in the Editor's
+    stage, before any node runs (where the render happens today), and its
+    entry is stored. The frames then give the colour-drift reference.
+
+    ``""`` when settled; ``"rollback"`` when the Editor failed (stored for
+    replay, its job handled by the failure contract) or a cancel arrived
+    (stored, re-armed): the caller rolls the carriers back. ``"fault"`` for a
+    fault in pipeline code: nothing stored, the slots stay deferred, and the
+    safety nets settle them.
+    """
+    key, editor_id = plan.key, plan.editor_id
+    pending = sdk_runs.pending_for(key, call_key)
+    if pending is None:
+        return "fault"
+    hits = misses = 0
+    try:
+        waiting = []
+        for carrier_id, slot in sorted(plan.deferred.items()):
+            if not pending.defers(slot):
+                continue
+            value = _entry_value(outputs_cache.get_local(carrier_id), entry_type)
+            if value is not None and pending.accept(slot, value):
+                hits += 1
+                continue
+            waiting.append((carrier_id, slot))
+        if waiting:
+            misses = len(waiting)
+            _materialize(runtime, prompt_id, dynprompt, editor_id, key, call_key, pending,
+                         [slot for _carrier_id, slot in waiting])
+            for carrier_id, slot in waiting:
+                outputs_cache.set_local(carrier_id, entry_type(ui=None, outputs=[[pending.values[slot]]]))
+        outcome = ""
+    except runtime.interrupt_type:
+        try:
+            runtime.rearm_interrupt()
+        except Exception:
+            logger.warning("Sonder cache pipeline could not re-arm a cancel", exc_info=True)
+        outcome = "rollback"
+    except _EditorFailed:
+        outcome = "rollback"
+    except Exception:
+        logger.debug("Sonder cache pipeline: settling deferred Editor media failed; it settles later",
+                     exc_info=True)
+        outcome = "fault"
+    _note_settled(key, hits, misses, outcome)
+    return outcome
+
+
+def _note_settled(key: str, hits: int, misses: int, outcome: str) -> None:
+    """Merge what ``set_prompt`` settled into the run's preparation record (tests, kits)."""
+    try:
+        record = sdk_runs.preparation(key) or {}
+        record["settled"] = {"hits": hits, "misses": misses, "outcome": outcome or "settled"}
+        sdk_runs.note_preparation(key, record)
+    except Exception:
+        logger.debug("Sonder cache pipeline could not record settled media", exc_info=True)
 
 
 def apply_carriers(dynprompt: Any, plan: CarrierPlan) -> None:
@@ -1090,8 +1295,10 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, media: Med
             raise _Skip("editor_hidden")
 
         step = time.perf_counter()
+        defer = bool(media is not None and not media.reason and media.defer
+                     and cache_policy.deferred_slots(editor_class))
         outcome, result, call_key = _run_editor_early(runtime, prompt_id, dynprompt, prompt, editor_id,
-                                                      editor_class, key)
+                                                      editor_class, key, defer)
         timings["editor"] = _ms(step)
         if outcome != PREPARED:
             record["outcome"] = outcome
@@ -1159,20 +1366,52 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, media: Med
 
         # Editor media, isolated the same way: a fault keeps every substitution
         # and token above and drops only carriers. An interrupt still propagates.
+        # A deferred slot no carrier settles is rendered now, where today's early
+        # run rendered it; a render that fails there is the Editor's failure, and
+        # then no carrier is applied (its consumers must not run on cached media
+        # while the Editor fails).
         step = time.perf_counter()
         plan: CarrierPlan | None = None
         try:
-            plan = _content_pass(runtime, prompt_id, key, dynprompt, prompt, nodes_view, editor_id, editor_class,
-                                 result, call_key, overrides, input_type_of, media, record)
+            plan = _media_pass(runtime, prompt_id, key, dynprompt, prompt, nodes_view, editor_id, editor_class,
+                               result, call_key, overrides, input_type_of, media, record)
         except runtime.interrupt_type:
             raise
+        except _EditorFailed:
+            plan = None
+            record["content_reasons"]["editor_failed"] = 1
         except Exception as exc:
             plan = None
             record["content_reasons"]["content_pass_error"] = 1
             record["content_error"] = type(exc).__name__
-            logger.debug("Sonder cache pipeline: the content pass failed; Editor media runs as before",
+            logger.debug("Sonder cache pipeline: the media pass failed; Editor media runs as before",
                          exc_info=True)
+        if defer and not record["content_reasons"].get("editor_failed"):
+            try:
+                _settle_leftovers(runtime, prompt_id, dynprompt, editor_id, key, call_key,
+                                  set((plan.deferred if plan is not None else {}).values()), record)
+            except runtime.interrupt_type:
+                raise
+            except _EditorFailed:
+                plan = None
+                record["content_reasons"]["editor_failed"] = 1
+            except Exception as exc:
+                # The scheduled Editor settles what is left (its safety net).
+                record["content_reasons"]["leftover_error"] = 1
+                record["content_error"] = type(exc).__name__
+                logger.debug("Sonder cache pipeline: deferred Editor media was not rendered early",
+                             exc_info=True)
         timings["content"] = _ms(step)
+        if record["content_reasons"].get("editor_failed"):
+            # A render or mix the early run deferred failed here: the Editor failed, as
+            # if its early run had raised. Nothing is substituted, so every consumer
+            # still waits for the scheduled Editor, which replays the stored failure.
+            record["outcome"] = EDITOR_FAILED
+            return record
+        if plan is not None and plan.deferred:
+            plan.value_overrides = sorted(overrides)
+            plan.settle = lambda outputs_cache, entry_type, _plan=plan: settle_deferred(
+                runtime, prompt_id, dynprompt, _plan, outputs_cache, entry_type, call_key)
 
         # Applied only once the whole plan exists, so a planning fault leaves none.
         for node_id, node in overrides.items():
@@ -1210,13 +1449,16 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, media: Med
 
 
 def _run_editor_early(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, prompt: dict,
-                      editor_id: str, editor_class: Any, key: str) -> tuple[str, Any, str]:
+                      editor_id: str, editor_class: Any, key: str, defer: bool = False) -> tuple[str, Any, str]:
     """Run the real Editor once, as the scheduler would. ``(outcome, result, call key)``.
 
     Two boundaries: everything here except ``editor_class().execute`` is pipeline
     code, whose faults propagate (nothing stored); the Editor's own raise is
-    stored for the scheduled call to replay.
+    stored for the scheduled call to replay. With ``defer`` the Editor leaves
+    the render and mix it can identify for ``set_prompt`` (``editor_media``).
     """
+    from ..nodes import editor_media
+
     inputs = dynprompt.get_node(editor_id).get("inputs") or {}
     # dynprompt is required: without it hidden PROMPT becomes {} and the run's key
     # is untrusted, so the scheduled Editor would claim again.
@@ -1226,38 +1468,25 @@ def _run_editor_early(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, 
     args = {name: values[0] for name, values in resolved.items()}
     if args.get("prompt") is not prompt or sdk_runs.trusted_key_for_prompt(args.get("prompt")) != key:
         raise _Skip("prompt_identity")
-    display_id = dynprompt.get_display_node_id(editor_id)
-    progress = runtime.progress_state()
-    started_progress = False
-    try:
-        with runtime.node_context(prompt_id, editor_id, 0):
-            call_key = prompt_once.call_key(editor_id)
-            if not call_key:
-                raise _Skip("call_key")
-            progress.start_progress(editor_id)
-            started_progress = True
-            server = runtime.server()
-            if server is not None and getattr(server, "client_id", None) is not None:
-                server.last_node_id = display_id
-                server.send_sync("executing", {"node": editor_id, "display_node": display_id,
-                                               "prompt_id": prompt_id}, server.client_id)
-            runtime.before_node_execution()
-            editor = editor_class()
-            with runtime.inference_mode():
-                # The replay boundary: only SonderEditor.execute itself.
-                try:
-                    result = editor.execute(**args)
-                except runtime.interrupt_type:
-                    sdk_runs.remember_failure(key, call_key, sdk_runs.CANCELLED)
-                    runtime.rearm_interrupt()
-                    return CANCELLED, None, call_key
-                except Exception as exc:
-                    _clear_tracebacks(exc)
-                    sdk_runs.remember_failure(key, call_key, exc)
-                    return EDITOR_FAILED, None, call_key
-    finally:
-        if started_progress:
-            progress.finish_progress(editor_id)
+    with runtime.node_context(prompt_id, editor_id, 0):
+        call_key = prompt_once.call_key(editor_id)
+    if not call_key:
+        raise _Skip("call_key")
+    # The same stage as every render the pipeline settles later (_editor_stage).
+    with _editor_stage(runtime, prompt_id, dynprompt, editor_id):
+        editor = editor_class()
+        # The replay boundary: only SonderEditor.execute itself.
+        try:
+            with (editor_media.deferring(call_key) if defer else contextlib.nullcontext()):
+                result = editor.execute(**args)
+        except runtime.interrupt_type:
+            sdk_runs.remember_failure(key, call_key, sdk_runs.CANCELLED)
+            runtime.rearm_interrupt()
+            return CANCELLED, None, call_key
+        except Exception as exc:
+            _clear_tracebacks(exc)
+            sdk_runs.remember_failure(key, call_key, exc)
+            return EDITOR_FAILED, None, call_key
     return PREPARED, result, call_key
 
 

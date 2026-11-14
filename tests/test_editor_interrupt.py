@@ -234,7 +234,7 @@ def test_an_interrupt_during_the_audio_mix_is_a_cancellation(tmp_path, monkeypat
     editor_node = _import_editor_node(tmp_path, monkeypatch)
     project_dir, _log, _claims = _queued_project(tmp_path, monkeypatch, editor_node, model_management=comfy)
 
-    def mixing(self, proj, scene, start, end, *, cancel_event=None):
+    def mixing(self, proj, scene, start, end, *, cancel_event=None, request=None):
         comfy.requested = True
         assert cancel_event.is_set()
         raise editor_node.MediaOperationCancelled("Audio processing cancelled")

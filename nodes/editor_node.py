@@ -25,8 +25,12 @@ from ..server import run_outputs
 from ..server import run_scope
 from ..server import sdk_runs
 from ..server import view_timing
-from .prompt_once import run_once_per_prompt
-from .cache_policy import ALWAYS_RUNS, CONTENT, CONTENT_INVALIDATION, EXACT, NAN_FINGERPRINT, PER_RUN, normalise_outputs
+from .prompt_once import call_key as prompt_call_key, run_once_per_prompt
+from . import cache_identity, editor_media
+from .cache_policy import (
+    ALWAYS_RUNS, CONTENT, CONTENT_INVALIDATION, DEFERRED_INVALIDATION, DEFERS, DESCRIPTOR, EXACT, NAN_FINGERPRINT,
+    PER_RUN, normalise_outputs,
+)
 from ..server.editor_inputs import editor_optional_inputs
 from ..server.session_registry import project_event_aliases
 from ..server.timeline_state import (
@@ -246,11 +250,13 @@ class SonderEditor:
     )
     OUTPUT_SLOTS = {name: index for index, name in enumerate(RETURN_NAMES)}
     # How each output meets ComfyUI's cache (nodes/cache_policy.py). EXACT values
-    # reach their consumers as literals; media reaches them through a carrier
-    # keyed by a digest of its content (CONTENT).
+    # reach their consumers as literals; guide images reach them through a carrier
+    # keyed by a digest of their content (CONTENT); frames and audio through a
+    # carrier keyed by their recipe and source content, before they are rendered
+    # (DESCRIPTOR, deferred: nodes/editor_media.py).
     SONDER_CACHE_POLICY = {
         "project": PER_RUN,
-        "rendered_frames": CONTENT,
+        "rendered_frames": DESCRIPTOR,
         "guide_images": CONTENT,
         "guide_idx": EXACT,
         "guide_strengths": EXACT,
@@ -259,14 +265,15 @@ class SonderEditor:
         "fps": EXACT,
         "width": EXACT,
         "height": EXACT,
-        "audio": CONTENT,
+        "audio": DESCRIPTOR,
         "mask_start_time": EXACT,
         "mask_end_time": EXACT,
     }
+    SONDER_CACHE_DEFERRED = DEFERS(outputs=("rendered_frames", "audio"))
     SONDER_CACHE_INVALIDATION = {
-        "rendered_frames": CONTENT_INVALIDATION,
+        "rendered_frames": DEFERRED_INVALIDATION,
         "guide_images": CONTENT_INVALIDATION,
-        "audio": CONTENT_INVALIDATION,
+        "audio": DEFERRED_INVALIDATION,
     }
     SONDER_CACHE_EXECUTION = ALWAYS_RUNS(NAN_FINGERPRINT)
     OUTPUT_TOOLTIPS = (
@@ -845,7 +852,11 @@ class SonderEditor:
         # normalised once here, so every return path and the memo carry them.
         # fps, width and height can arrive from project.json as the other numeric
         # type; normalise_outputs makes every EXACT slot exactly its socket's type.
-        return run_once_per_prompt(prompt, unique_id, "SonderEditor", lambda: normalise_outputs(SonderEditor, self._execute_once(
+        # Only the cache pipeline's early run asks to defer the render and mix
+        # (nodes/editor_media.py); any other call settles a slot still deferred
+        # before it returns, so no node ever receives the marker.
+        defer = editor_media.deferral_requested(unique_id)
+        result = run_once_per_prompt(prompt, unique_id, "SonderEditor", lambda: normalise_outputs(SonderEditor, self._execute_once(
             project, project_name, fps, width, height,
             scene_id=scene_id, selection_start=selection_start, selection_end=selection_end,
             pre_context_frames=pre_context_frames, post_context_frames=post_context_frames,
@@ -854,8 +865,31 @@ class SonderEditor:
             take_placement_linked=take_placement_linked, take_placement_muted=take_placement_muted,
             render_cache_max_bytes=render_cache_max_bytes, render_queue_active=render_queue_active,
             take_fit_mode=take_fit_mode, take_crop_position=take_crop_position,
-            take_keep_padding=take_keep_padding,
+            take_keep_padding=take_keep_padding, defer=defer,
         )))
+        return result if defer else editor_media.settle_scheduled(prompt, unique_id, result)
+
+    def _materialization_failed(self, proj, queue_job, consumed: bool, run_key: str, exc: BaseException) -> None:
+        """A render or mix failed outside ``_execute_once`` (deferred, settled later in the run).
+
+        An interrupt is not a failure, and a source changed mid-run leaves the
+        claimed job to the run's release (pending). Any other failure marks a
+        consumed job failed, as ``_execute_once`` does, but only while this run
+        still leases it: a save that already completed the job is never undone.
+        """
+        model_management = _comfy_model_management()
+        if not isinstance(exc, Exception) or _is_comfy_interrupt(exc, model_management):
+            return
+        if isinstance(exc, cache_identity.SourceChanged) or proj is None or queue_job is None or not consumed:
+            return
+        if not sdk_runs.holds_lease(getattr(proj, "project_dir", ""), getattr(queue_job, "job_id", ""), key=run_key):
+            return
+        try:
+            self._mark_queue_job_failed(
+                proj, queue_job,
+                PROJECT_STORAGE_UNREADABLE_MESSAGE if isinstance(exc, ProjectStorageError) else str(exc))
+        except Exception:
+            logger.warning("Marking the queue job failed after a late render failure failed", exc_info=True)
 
     def _execute_once(self, project, project_name, fps, width, height,
                       scene_id="", selection_start=0, selection_end=0,
@@ -865,7 +899,7 @@ class SonderEditor:
                       take_placement_linked=True, take_placement_muted=False,
                       render_cache_max_bytes=0, render_queue_active=True,
                       take_fit_mode=DEFAULT_FIT_MODE, take_crop_position=DEFAULT_CROP_POSITION,
-                      take_keep_padding=False):
+                      take_keep_padding=False, defer=False):
         base_dir = _get_projects_base_dir()
         execute_started_at = time.perf_counter()
         render_cache_requested = render_cache_max_bytes
@@ -918,6 +952,7 @@ class SonderEditor:
         proj = None
         queue_job = None
         queue_job_consumed = False
+        run_key = ""
         # ComfyUI checks for an interrupt only between nodes; the Editor checks
         # at its own stages and inside the render and audio mix.
         interrupt = _ComfyInterruptSignal(_comfy_model_management())
@@ -943,6 +978,7 @@ class SonderEditor:
             execution_base_modified_at = getattr(proj, "modified_at", "")
 
             run_key, run_token = self._bind_run(proj, prompt, unique_id)
+            run_key = run_key or ""
             terminal_save_reached = self._execution_reaches_terminal_save(prompt, unique_id, execution_scope)
             unmarked_save_reached = self._execution_targets_unmarked_save(prompt, unique_id, execution_scope)
             queue_length = len(getattr(proj, "generation_queue", []) or [])
@@ -1198,39 +1234,85 @@ class SonderEditor:
             }, project_event_aliases(proj))
 
             # --- Render composited frames ---
-            if render_needed:
+            # The render and the audio mix are plans (nodes/editor_media.py): built
+            # here from the live scene, materialized from their recipe. Without
+            # deferral each is materialized right where it always ran.
+            frames_slot = self.OUTPUT_SLOTS["rendered_frames"]
+            audio_slot = self.OUTPUT_SLOTS["audio"]
+            run_proj, run_scene = proj, scene
+            published: dict = {}
+            stash_args = {}
+
+            def materialize_frames(request):
+                # The window, cache flag and padding come from the request (rebuilt from
+                # the recipe JSON when there is one), never from this call's locals.
+                if request is not None:
+                    start, end = request.start, request.end
+                    use_cache, padding = request.use_cache, request.padding_target
+                else:
+                    start, end = render_start, render_end
+                    use_cache = render_cache_active
+                    padding = target_frame_count if frame_count_padding > 0 else 0
                 interrupt.raise_if_set()
                 render_started_at = time.perf_counter()
                 _note_run_feedback("note_stage", prompt, unique_id, "rendering")
-                logger.info("render start: scene_id=%s range=%d-%d", scene.scene_id, render_start, render_end)
+                logger.info("render start: scene_id=%s range=%d-%d", run_scene.scene_id, start, end)
                 logger.info("render stage=rendering scene_id=%s frames=%d elapsed=%.2fs",
-                            scene.scene_id, render_end - render_start,
+                            run_scene.scene_id, end - start,
                             render_started_at - execute_started_at)
                 progress_bar = _RenderProgressBar(interrupt.model_management)
                 try:
-                    rendered_frames = self._render_scene_frames(
-                        proj,
-                        scene,
-                        render_start,
-                        render_end,
-                        use_cache=render_cache_active,
+                    frames = self._render_scene_frames(
+                        run_proj,
+                        run_scene,
+                        start,
+                        end,
+                        use_cache=use_cache,
                         cache_max_bytes=render_cache_budget,
                         cancel_event=interrupt,
                         progress=progress_bar,
+                        request=request,
                     )
                 except TimelineRenderCancelled as cancelled:
                     interrupt.raise_cancelled(cancelled)
-                if frame_count_padding > 0:
-                    rendered_frames = self._pad_image_batch_to_frame_count(
-                        rendered_frames, target_frame_count
-                    )
-                progress_bar.finish(render_end - render_start)
+                if padding > 0:
+                    frames = self._pad_image_batch_to_frame_count(frames, padding)
+                progress_bar.finish(end - start)
                 logger.info(
                     "render end: scene_id=%s frames=%d duration=%.2fs",
-                    scene.scene_id,
-                    frame_count,
+                    run_scene.scene_id,
+                    int(frames.shape[0]) if torch.is_tensor(frames) and frames.ndim else 0,
                     time.perf_counter() - render_started_at,
                 )
+                return frames
+
+            def settled(slot, value):
+                # A deferred render settled later in the run (from ComfyUI's cache or
+                # rendered): its drift reference joins the context published below,
+                # before any node can read it.
+                if slot != frames_slot or not stash_args:
+                    return
+                try:
+                    published[DRIFT_STASH_CONTEXT_KEY] = build_context_reference_stash(value, **stash_args)
+                except Exception as e:
+                    logger.warning("color drift stash failed: scene_id=%s error=%s", run_scene.scene_id, e)
+
+            pending = editor_media.PendingMedia(
+                key=run_key, call_key=prompt_call_key(unique_id) if defer else "", deferred=bool(defer),
+                on_accept=settled if defer else None,
+                on_failure=lambda exc: self._materialization_failed(
+                    run_proj, queue_job, queue_job_consumed, run_key, exc))
+            if render_needed:
+                pending.add(frames_slot, editor_media.frames_plan(
+                    proj, scene, render_start, render_end, use_cache=render_cache_active,
+                    padding_target=target_frame_count if frame_count_padding > 0 else 0,
+                    materialize=materialize_frames))
+                # A render only the drift reference needs is never deferred: nothing
+                # consumes the frames, so nothing could reuse them.
+                if defer and render_explicitly_needed and pending.can_defer(frames_slot):
+                    rendered_frames = editor_media.DEFERRED
+                else:
+                    rendered_frames = pending.value(frames_slot)
             else:
                 rendered_frames = self._minimal_image_output()
             interrupt.raise_if_set()
@@ -1520,14 +1602,33 @@ class SonderEditor:
                                    getattr(scene, "name", "") or "", prompt_warnings)
 
             # --- Load audio from scene's audio tracks for the render range ---
-            if audio_needed:
+            def materialize_audio(request):
+                # As for the frames: the window and padding come from the request.
+                if request is not None:
+                    start, end = request["start"], request["end"]
+                    padding, pad_fps = request["padding_target"], request["pad_fps"]
+                else:
+                    start, end = render_start, render_end
+                    padding, pad_fps = (frame_count if frame_count_padding > 0 else 0), proj_fps
                 interrupt.raise_if_set()
                 try:
-                    audio = self._load_scene_audio(proj, scene, render_start, render_end, cancel_event=interrupt)
+                    mixed = self._load_scene_audio(run_proj, run_scene, start, end,
+                                                   cancel_event=interrupt, request=request)
                 except MediaOperationCancelled as cancelled:
                     interrupt.raise_cancelled(cancelled)
-                if frame_count_padding > 0:
-                    audio = self._pad_audio_to_frame_count(audio, frame_count, proj_fps)
+                if padding > 0:
+                    mixed = self._pad_audio_to_frame_count(mixed, padding, pad_fps)
+                return mixed
+
+            if audio_needed:
+                pending.add(audio_slot, editor_media.audio_plan(
+                    proj, scene, render_start, render_end,
+                    padding_target=frame_count if frame_count_padding > 0 else 0, pad_fps=proj_fps,
+                    materialize=materialize_audio))
+                if defer and pending.can_defer(audio_slot):
+                    audio = editor_media.DEFERRED
+                else:
+                    audio = pending.value(audio_slot)
             else:
                 audio = self._minimal_audio_output()
 
@@ -1545,16 +1646,16 @@ class SonderEditor:
             # `_` prefix is stripped by _public_execution_context).
             drift_stash = None
             interrupt.raise_if_set()
-            if render_needed:
+            stash_args.update(
+                frame_count=frame_count,
+                source_frame_count=source_frame_count,
+                mask_start_frame=mask_start_pixel,
+                mask_end_frame=mask_end_pixel,
+                frame_constraint=frame_constraint,
+            )
+            if render_needed and not editor_media.is_deferred(rendered_frames):
                 try:
-                    drift_stash = build_context_reference_stash(
-                        rendered_frames,
-                        frame_count=frame_count,
-                        source_frame_count=source_frame_count,
-                        mask_start_frame=mask_start_pixel,
-                        mask_end_frame=mask_end_pixel,
-                        frame_constraint=frame_constraint,
-                    )
+                    drift_stash = build_context_reference_stash(rendered_frames, **stash_args)
                 except Exception as e:
                     logger.warning("color drift stash failed: scene_id=%s error=%s", scene.scene_id, e)
 
@@ -1603,6 +1704,23 @@ class SonderEditor:
                 "queue_job_ref_id": queue_job.job_id if queue_job else "",
                 "base_modified_at": execution_base_modified_at,
             }
+            if editor_media.is_deferred(rendered_frames) or editor_media.is_deferred(audio):
+                # The settle writes the drift reference into this published context.
+                published = proj._execution_context
+                pending_registered = sdk_runs.remember_pending(run_key, pending.call_key, pending)
+                if not pending_registered:
+                    # No run record to keep it on: settle now, as the stock path would.
+                    pending.deferred = False
+                    pending.on_accept = None
+                    if editor_media.is_deferred(rendered_frames):
+                        rendered_frames = pending.value(frames_slot)
+                        try:
+                            published[DRIFT_STASH_CONTEXT_KEY] = build_context_reference_stash(
+                                rendered_frames, **stash_args)
+                        except Exception as e:
+                            logger.warning("color drift stash failed: scene_id=%s error=%s", scene.scene_id, e)
+                    if editor_media.is_deferred(audio):
+                        audio = pending.value(audio_slot)
             # What this run actually rendered, for its observed outputs (Output
             # Views): the queued window when a job supplied it, never live state.
             try:
@@ -1673,7 +1791,8 @@ class SonderEditor:
                 time.perf_counter() - execute_started_at,
                 e,
             )
-            if proj is not None and queue_job is not None and queue_job_consumed:
+            if (proj is not None and queue_job is not None and queue_job_consumed
+                    and not isinstance(e, cache_identity.SourceChanged)):
                 # `GenerationJob.error` is a serialized field: it is written into
                 # `project.json` and served by `GET /project/{id}/queue`. A path written
                 # here is permanent — no later redaction reaches a value already on
@@ -1689,11 +1808,12 @@ class SonderEditor:
                               render_start: int, render_end: int,
                               *, use_cache: bool = True,
                               cache_max_bytes: int | None = None,
-                              cancel_event=None, progress=None) -> torch.Tensor:
+                              cancel_event=None, progress=None, request=None) -> torch.Tensor:
         """Composite all visible video clips into frames for the given range.
 
         Returns (N, H, W, 3) float32 RGB tensor. Uses caching to skip
-        re-rendering when the scene hasn't changed.
+        re-rendering when the scene hasn't changed. With ``request``
+        (``RenderRequest``) nothing is read from ``proj`` or ``scene``.
         """
         return render_scene_frames(
             proj,
@@ -1704,6 +1824,7 @@ class SonderEditor:
             cache_max_bytes=cache_max_bytes,
             cancel_event=cancel_event,
             progress=progress,
+            request=request,
         )
 
     @staticmethod
@@ -1761,8 +1882,12 @@ class SonderEditor:
             return None
 
     def _load_scene_audio(self, proj: TimelineProject, scene: Scene,
-                          sel_start: int, sel_end: int, *, cancel_event=None) -> dict:
-        """Use the same unbounded float mix and sample clock as timeline export."""
+                          sel_start: int, sel_end: int, *, cancel_event=None, request=None) -> dict:
+        """Use the same unbounded float mix and sample clock as timeline export.
+
+        With ``request`` (resolved sources and rate) nothing is read from ``proj`` or ``scene``.
+        """
         from ..server.audio_pipeline import scene_audio_samples
-        samples, sample_rate = scene_audio_samples(proj, scene, sel_start, sel_end, cancel_event=cancel_event)
+        samples, sample_rate = scene_audio_samples(proj, scene, sel_start, sel_end, cancel_event=cancel_event,
+                                                   request=request)
         return {"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": sample_rate}

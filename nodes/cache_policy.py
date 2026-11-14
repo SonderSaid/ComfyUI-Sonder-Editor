@@ -59,6 +59,14 @@ a bridge whose ``DESCRIPTOR`` outputs come from a decode recipe
 both before cache keys and hands the bridge a token in place of its
 ``token_input`` link (M2); ``nodes/cache_identity.py`` owns the contract.
 
+**Deferred media** (``SONDER_CACHE_DEFERRED = DEFERS(outputs=(...))``, Phase 4b):
+the Editor's ``DESCRIPTOR`` media outputs whose identity is computed before
+they are materialized (``nodes/editor_media.py``): a recipe of everything the
+render or mix reads, plus the full content of every file it names. The early
+run leaves those slots deferred; the pipeline hands their consumers a carrier
+keyed by that identity and settles each slot in ComfyUI's ``set_prompt``, from
+the cache on a hit, by rendering on a miss.
+
 The ``SONDER_`` prefix keeps these names clear of any future ComfyUI attribute.
 """
 
@@ -100,6 +108,7 @@ EXECUTION_ATTRIBUTE = "SONDER_CACHE_EXECUTION"
 PREPARE_ATTRIBUTE = "SONDER_CACHE_PREPARE"
 LAZY_ATTRIBUTE = "SONDER_CACHE_LAZY"
 IDENTITY_ATTRIBUTE = "SONDER_CACHE_IDENTITY"
+DEFER_ATTRIBUTE = "SONDER_CACHE_DEFERRED"
 # {output name: (case, ...)}: the invalidation cases a DESCRIPTOR output registers.
 INVALIDATION_ATTRIBUTE = "SONDER_CACHE_INVALIDATION"
 
@@ -165,6 +174,46 @@ def IDENTIFIES(token_input: str, recipe_inputs=(), passthrough=()) -> Identifies
 # different file at the same path, even with the same size and a copied mtime,
 # changes it; identical bytes rewritten keep it.
 IDENTITY_INVALIDATION = ("inputs_reach_identity", "same_path_content", "unchanged_content")
+
+
+@dataclass(frozen=True)
+class Defers:
+    outputs: tuple
+
+
+def DEFERS(outputs=()) -> Defers:  # noqa: N802
+    """The class's named ``DESCRIPTOR`` media outputs are identified before they are materialized."""
+    return Defers(tuple(outputs) if isinstance(outputs, (tuple, list)) else outputs)
+
+
+# The invalidation cases every deferred output registers (tests/test_editor_media.py
+# runs each one for every DEFERS class): every input the render or mix reads that
+# changes its output changes the identity, fractional and mistyped values included,
+# or there is no identity; a different file at the same path changes it; identical
+# bytes rewritten keep it; the materializer reads only its recipe and the files it names.
+DEFERRED_INVALIDATION = ("inputs_reach_identity", "same_path_content", "unchanged_content", "recipe_only")
+
+
+def defer_policy(class_def: Any) -> Defers | None:
+    declared = getattr(class_def, DEFER_ATTRIBUTE, None)
+    return declared if isinstance(declared, Defers) else None
+
+
+def deferred_slots(class_def: Any) -> tuple[int, ...]:
+    """The ``DESCRIPTOR`` media slots the class defers (``DEFERS``), in output order."""
+    declared = defer_policy(class_def)
+    if declared is None:
+        return ()
+    types_ = tuple(getattr(class_def, "RETURN_TYPES", None) or ())
+    names = tuple(getattr(class_def, "RETURN_NAMES", None) or ())
+    return tuple(slot for slot, name in enumerate(names)
+                 if name in declared.outputs and slot < len(types_) and types_[slot] in CONTENT_TYPES
+                 and output_policy(class_def, name) == DESCRIPTOR)
+
+
+def carried_slots(class_def: Any) -> tuple[int, ...]:
+    """Every media slot a carrier may serve: ``CONTENT`` and deferred ``DESCRIPTOR`` outputs."""
+    return tuple(sorted(set(content_slots(class_def)) | set(deferred_slots(class_def))))
 
 
 def lazy_policy(class_def: Any) -> LazyRequests | None:

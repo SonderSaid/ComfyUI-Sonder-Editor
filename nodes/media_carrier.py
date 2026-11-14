@@ -11,7 +11,9 @@ workflow, hidden ``PROMPT`` or history.
 ``execute`` resolves the token only through the run record of the prompt that is
 executing (``sdk_runs.media_for``), which points into the Editor's per-prompt
 memo: the memo stays the only owner of the render, and a token typed into a
-prompt resolves to nothing. ``validate_inputs`` refuses every submitted carrier,
+prompt resolves to nothing. For the Editor's deferred frames and audio (Phase
+4b) the token is a pre-render identity, and the slot is settled before any node
+runs; a carrier that finds it still deferred materializes it from its recipe. ``validate_inputs`` refuses every submitted carrier,
 because ComfyUI validates only submitted nodes, never ephemeral ones.
 
 V3, dev-only: it is listed in ``/object_info`` but not offered in the node search
@@ -29,6 +31,7 @@ except ImportError as exc:  # pragma: no cover - depends on installed ComfyUI ve
     from comfy_api.latest import io
 
 from ..server import sdk_runs
+from . import editor_media
 
 try:
     from comfy_execution.utils import get_executing_context
@@ -69,4 +72,7 @@ class SonderMediaCarrier(io.ComfyNode):
         if not found:
             raise RuntimeError("This media carrier holds a token this run did not create. "
                                "Run the workflow again.")
+        # A deferred render or mix (Phase 4b) that nothing settled before this
+        # carrier ran (a pipeline fault): materialize it now, once, from its recipe.
+        value = editor_media.settle_carrier(getattr(context, "prompt_id", None), token, value)
         return io.NodeOutput(value)

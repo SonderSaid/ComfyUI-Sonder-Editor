@@ -31,6 +31,12 @@ Narrow by construction, in the ``kj_preview_adapter`` pattern:
   node, then each carrier's entry is stored. Any fault rolls the graph back
   with dictionary operations, while no cache key is being built, and runs the
   stock method again with the submitted ids. A failed gate disables only carriers.
+- **Deferred Editor media** (``check_deferral``, a fifth gate, Phase 4b): the
+  Editor's frames and audio are not rendered by the early run; after the stock
+  keying, the armed ``set_prompt`` settles each deferred carrier from the
+  outputs cache (``get_local``: a hit renders nothing) or by rendering it now,
+  before ``clean_unused`` and before any node runs. A failed gate disables only
+  deferral: Phase 4a's carriers keep working.
 
 Expiry: retire this hook when ComfyUI offers a supported hook that runs after
 the ``DynamicPrompt`` exists and before ``set_prompt`` builds cache keys.
@@ -375,6 +381,52 @@ def check_carrier(execution: Any, stock_is_changed: Any = None) -> str | None:
         return f"carrier gate error: {type(exc).__name__}"
 
 
+# execute_async settles a deferred carrier inside the outputs cache's set_prompt, before
+# clean_unused drops the previous prompt's unused entries.
+_DEFERRAL_EXECUTE_ASYNC_ORDER = (
+    "await cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)",
+    "cache.clean_unused()",
+)
+
+
+def check_deferral(execution: Any) -> str | None:
+    """None when a carrier's previous entry can be looked up inside ``set_prompt``, else the reason.
+
+    Separate from ``check_carrier``: a mismatch only stops the Editor deferring
+    its render and mix; Phase 4a's content carriers keep working.
+    """
+    try:
+        caching = sys.modules.get("comfy_execution.caching")
+        if caching is None:
+            from comfy_execution import caching
+        source = _source(execution.PromptExecutor.execute_async)
+        last = -1
+        for token in _DEFERRAL_EXECUTE_ASYNC_ORDER:
+            at = source.find(token, last + 1)
+            if at < 0:
+                return f"deferral execute_async order: {token}"
+            last = at
+        basic = caching.BasicCache
+        if _params(basic.get_local) != ["self", "node_id"]:
+            return "BasicCache.get_local signature"
+        get_local = _source(basic.get_local)
+        for token in ("cache_key = self.cache_key_set.get_data_key(node_id)", "return self.cache[cache_key]"):
+            if token not in get_local:
+                return f"BasicCache.get_local: {token}"
+        if "BasicCache.get_local(cache, node_id)" not in _source(caching.HierarchicalCache.get_local):
+            return "HierarchicalCache.get_local"
+        for name in ("LRUCache", "RAMPressureCache"):
+            if "get_local" in vars(getattr(caching, name)):
+                return f"{name}.get_local overridden"
+        if "self.cache = {}" not in _source(basic.__init__):
+            return "BasicCache.cache"
+        if tuple(getattr(execution.CacheEntry, "_fields", ())) != ("ui", "outputs"):
+            return "CacheEntry fields"
+        return None
+    except Exception as exc:
+        return f"deferral gate error: {type(exc).__name__}"
+
+
 def _carrier_runtime(execution: Any, stock_is_changed: Any) -> dict[str, Any] | None:
     """What the hook needs to arm carriers, or None (logged once) when the gate fails."""
     reason = check_carrier(execution, stock_is_changed)
@@ -386,6 +438,10 @@ def _carrier_runtime(execution: Any, stock_is_changed: Any) -> dict[str, Any] | 
     if reason is None:
         try:
             from comfy_execution import caching
+            deferral = check_deferral(execution)
+            if deferral is not None:
+                logger.info("Sonder cache pipeline: the Sonder Editor renders on every run on this ComfyUI (%s); "
+                            "nodes after it still reuse unchanged media.", deferral)
             return {
                 "cache_types": {getattr(caching, name): getattr(caching, name).set_prompt
                                 for name in _CARRIER_CACHE_TYPES},
@@ -393,6 +449,7 @@ def _carrier_runtime(execution: Any, stock_is_changed: Any) -> dict[str, Any] | 
                 "entry": execution.CacheEntry,
                 "carrier": media_carrier.SonderMediaCarrier,
                 "mappings": lambda: execution.nodes.NODE_CLASS_MAPPINGS,
+                "defer": deferral is None,
             }
         except Exception as exc:  # never costs Phases 1-3 their hook
             reason = f"carrier runtime: {type(exc).__name__}"
@@ -417,16 +474,18 @@ def _carrier_precondition(carriers: dict[str, Any] | None, outputs_cache: Any) -
     return ""
 
 
-def _note_rollback(key: str, exc: BaseException) -> None:
-    """Merge the keying rollback into the run's preparation record (note_preparation replaces it)."""
+def _note_rollback(key: str, exc: BaseException | None, reason: str = "keying_rolled_back") -> None:
+    """Merge a carrier rollback into the run's preparation record (note_preparation replaces it)."""
     try:
         from . import sdk_runs
         record = sdk_runs.preparation(key) or {}
         reasons = dict(record.get("content_reasons") or {})
-        reasons["keying_rolled_back"] = reasons.get("keying_rolled_back", 0) + 1
+        reasons[reason] = reasons.get(reason, 0) + 1
         content = dict(record.get("content") or {})
         content.update(carried=0, skipped=int(content.get("skipped", 0)) + int(content.get("carried", 0)))
-        record.update(content_reasons=reasons, content=content, content_error=type(exc).__name__)
+        record.update(content_reasons=reasons, content=content)
+        if exc is not None:
+            record["content_error"] = type(exc).__name__
         sdk_runs.note_preparation(key, record)
     except Exception:
         logger.debug("Sonder cache pipeline could not record a carrier rollback", exc_info=True)
@@ -447,6 +506,14 @@ def _arm_carriers(carriers: dict[str, Any], outputs_cache: Any, dynprompt: Any, 
     entry = carriers["entry"]
     carrier_ids = list(plan.carrier_ids)
 
+    def roll_back(is_changed_cache) -> None:
+        cache_pipeline.rollback_carriers(dynprompt, plan)
+        memo = getattr(is_changed_cache, "is_changed", None)
+        if isinstance(memo, dict):
+            for node_id in (*carrier_ids, *plan.restore):
+                memo.pop(node_id, None)
+        plan.payloads.clear()
+
     async def set_prompt(prompt_dynprompt, node_ids, is_changed_cache):
         outputs_cache.__dict__.pop("set_prompt", None)
         if prompt_dynprompt is not dynprompt:
@@ -458,23 +525,34 @@ def _arm_carriers(carriers: dict[str, Any], outputs_cache: Any, dynprompt: Any, 
             if any(key_set.get_data_key(carrier_id) is None for carrier_id in carrier_ids):
                 raise LookupError("a media carrier has no cache key")
         except Exception as exc:
-            cache_pipeline.rollback_carriers(dynprompt, plan)
-            memo = getattr(is_changed_cache, "is_changed", None)
-            if isinstance(memo, dict):
-                for node_id in (*carrier_ids, *plan.restore):
-                    memo.pop(node_id, None)
+            roll_back(is_changed_cache)
             logger.debug("Sonder cache pipeline: carrier keying failed; Editor media runs uncached", exc_info=True)
             _note_rollback(plan.key, exc)
-            plan.payloads.clear()
             return await stock(outputs_cache, prompt_dynprompt, submitted, is_changed_cache)
-        try:
-            # An optimisation: a carrier whose entry is stored never executes.
-            for carrier_id in carrier_ids:
-                outputs_cache.set_local(carrier_id, entry(ui=None, outputs=[[plan.payloads[carrier_id]]]))
-        except Exception:
-            logger.debug("Sonder cache pipeline: a carrier entry was not stored; it runs if needed", exc_info=True)
-        finally:
-            plan.payloads.clear()
+        # An optimisation: a carrier whose entry is stored never executes. Each
+        # carrier on its own, so one that fails (or is deferred) never stops another.
+        for carrier_id, payload in list(plan.payloads.items()):
+            try:
+                outputs_cache.set_local(carrier_id, entry(ui=None, outputs=[[payload]]))
+            except Exception:
+                logger.debug("Sonder cache pipeline: a carrier entry was not stored; it runs if needed",
+                             exc_info=True)
+        plan.payloads.clear()
+        settle = getattr(plan, "settle", None)
+        if getattr(plan, "deferred", None) and callable(settle):
+            # Phase 4b: the Editor's deferred frames and audio, from this cache on a
+            # hit or rendered now, before any node runs. settle never raises.
+            if settle(outputs_cache, entry) == "rollback":
+                roll_back(is_changed_cache)
+                # The Editor failed (stored for replay): its value substitutions go too, so
+                # every consumer waits for the scheduled Editor, as after a failed early run.
+                memo = getattr(is_changed_cache, "is_changed", None)
+                for node_id in getattr(plan, "value_overrides", None) or ():
+                    dynprompt.node_overrides.pop(node_id, None)
+                    if isinstance(memo, dict):
+                        memo.pop(node_id, None)
+                _note_rollback(plan.key, None, "settle_rolled_back")
+                return await stock(outputs_cache, prompt_dynprompt, submitted, is_changed_cache)
 
     outputs_cache.set_prompt = set_prompt
 
@@ -529,7 +607,8 @@ def _guarded_prepare(prompt_id: Any, dynprompt: Any, outputs_cache: Any) -> None
             return  # --cache-none: exactly today's path
         media = cache_pipeline.MediaHost(
             reason=_carrier_precondition(carriers, outputs_cache),
-            arm=lambda plan: _arm_carriers(carriers, outputs_cache, dynprompt, plan))
+            arm=lambda plan: _arm_carriers(carriers, outputs_cache, dynprompt, plan),
+            defer=bool(carriers and carriers.get("defer")))
         cache_pipeline.prepare(runtime, str(prompt_id), dynprompt, media)
     except runtime.interrupt_type:
         # Raising cleared ComfyUI's flag: set it again so the first scheduled node stops.
