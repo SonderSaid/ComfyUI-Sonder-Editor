@@ -1,6 +1,6 @@
 # ComfyUI-Sonder-Editor
 
-**Version 0.8.4** — see the [CHANGELOG](CHANGELOG.md) for release notes.
+**Version 0.8.4** — see the [CHANGELOG](CHANGELOG.md) for release notes · [![Run on swm cloud](https://img.shields.io/badge/swm%20cloud-Run%20Sonder%20Editor-0A84FF?logo=icloud&logoColor=white)](https://cloud.swmgpu.com/w/samofvaani/comfyart-panorama-canvas-studio)
 
 Sonder Editor is a timeline-based video editing studio for ComfyUI, built for
 iterative long-form video.
@@ -94,7 +94,7 @@ What you can do from the editor:
 
 <a id="quickstart"></a>
 New here? Install the pack, then follow
-[Make a first take](docs/getting-started.md#make-a-first-take).
+[Make a first take](docs/getting-started.md#make-a-first-take) — or launch a 1-click cloud GPU pod with Sonder Editor pre-installed via the [ComfyArt Infinite Canvas, 360° Panorama Stickers & Qwen-Image-Layered Studio on **swm cloud**](https://cloud.swmgpu.com/w/samofvaani/comfyart-panorama-canvas-studio).
 
 ## See it work
 
