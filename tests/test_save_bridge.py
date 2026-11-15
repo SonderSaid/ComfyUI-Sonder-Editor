@@ -1242,3 +1242,823 @@ def test_bridge_repeated_within_one_prompt_keeps_files_already_written(tmp_path,
     restored = _load_saved_project(project_manager, project)
     assert len(restored.assets) == 1
     runs.reset_for_tests()
+
+# --- One generated commit per prompt and project -----------------------------
+# A prompt's Bridges for one project and base version publish through one load
+# and one commit. Cases marked (base) set a real base version, so they reach
+# `save_generated_project`'s conflict and merge path instead of a blind save.
+
+MERGE_LINE = "Merged generated outputs into newer project version"
+
+
+def _group_setup(tmp_path, monkeypatch, *, base=True, stems=True):
+    io_nodes, timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes, "_schedule_bridge_preview_cleanup", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes, "schedule_project_event", lambda *args, **kwargs: None)
+    if stems:
+        # One stem per Bridge, from its prefix, so each entry's media names are known.
+        monkeypatch.setattr(io_nodes, "_build_bridge_naming_stem",
+                            lambda _project, _context, prefix: f"{prefix or 'out'}_stem")
+    io_nodes.sdk_runs.reset_for_tests()
+    project_manager.save_project(project)
+    project._execution_context = {"base_modified_at": project.modified_at} if base else {}
+    return io_nodes, timeline_state, project_manager, project
+
+
+def _add_bridge(io_nodes, project, prompt, node_id, *, files=1, mark=False, folder=""):
+    output_dir, _ = io_nodes.SonderSaveBridge().prepare_output(
+        project, target_folder=folder, prefix=node_id, mark_queue_complete=mark, prompt=prompt, unique_id=node_id)
+    for index in range(files):
+        _write_png(Path(output_dir) / f"{node_id}_{index}.png")
+    return output_dir
+
+
+def _registry_key(io_nodes):
+    keys = {key for (key, _node_id) in io_nodes._BRIDGE_REGISTRY.keys()}
+    assert len(keys) == 1
+    return next(iter(keys))
+
+
+def _count_project_saves(monkeypatch, io_nodes):
+    """Every `save_project` the Bridge path makes: blind saves (`io_nodes`) and
+    CAS/merge saves (`project_commit`). Records each call's expected version."""
+    commit = importlib.import_module(f"{TEST_PACKAGE}.server.project_commit")
+    calls = []
+    for module in (io_nodes, commit):
+        real = module.save_project
+
+        def counted(project_obj, *args, _real=real, **kwargs):
+            calls.append(kwargs.get("expected_modified_at"))
+            return _real(project_obj, *args, **kwargs)
+
+        monkeypatch.setattr(module, "save_project", counted)
+    return calls
+
+
+def _count_group_commits(monkeypatch, io_nodes):
+    calls = []
+    real = io_nodes._save_generated_project
+
+    def counted(project_obj, base_modified_at="", created_ids=None, auto_placement_ids=None):
+        calls.append(base_modified_at)
+        return real(project_obj, base_modified_at, created_ids=created_ids, auto_placement_ids=auto_placement_ids)
+
+    monkeypatch.setattr(io_nodes, "_save_generated_project", counted)
+    return calls
+
+
+def _assert_no_duplicates(restored):
+    ids = [asset.asset_id for asset in restored.assets]
+    paths = [asset.path.replace("\\", "/") for asset in restored.assets]
+    assert len(ids) == len(set(ids))
+    assert len(paths) == len(set(paths))
+
+
+def _media_pngs(project):
+    return sorted(path.name for path in (Path(project.project_dir) / "media").glob("*.png"))
+
+
+def test_group_three_bridges_one_project_commit_once(tmp_path, monkeypatch, caplog):
+    """(base) Test 1: one load, one save, no merge, one take_saved note."""
+    io_nodes, _ts, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    prompt = {}
+    for node_id in ("a", "b", "c"):
+        _add_bridge(io_nodes, project, prompt, node_id)
+    saves = _count_project_saves(monkeypatch, io_nodes)
+    loads = []
+    real_load = io_nodes.load_project
+    monkeypatch.setattr(io_nodes, "load_project", lambda path, *a, **k: (loads.append(path), real_load(path, *a, **k))[1])
+    noted = []
+    monkeypatch.setattr(io_nodes, "_note_saved_to_project", lambda key, committed: noted.append(key))
+    caplog.set_level("INFO", logger="sonder_editor")
+
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+
+    assert saves == [project.modified_at]
+    assert loads == [project.project_dir]
+    assert MERGE_LINE not in caplog.text
+    assert len(noted) == 1
+    restored = _load_saved_project(project_manager, project)
+    assert sorted(asset.name for asset in restored.assets) == ["a_stem_0001.png", "b_stem_0001.png", "c_stem_0001.png"]
+    _assert_no_duplicates(restored)
+
+
+def test_group_bridges_on_two_projects_commit_once_per_project(tmp_path, monkeypatch):
+    """Test 2."""
+    io_nodes, _ts, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    other = project_manager.create_project("Bridge Other", base_dir=str(Path(project.project_dir).parent))
+    project_manager.save_project(other)
+    other._execution_context = {"base_modified_at": other.modified_at}
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a")
+    _add_bridge(io_nodes, other, prompt, "b")
+    _add_bridge(io_nodes, project, prompt, "c")
+    commits = _count_group_commits(monkeypatch, io_nodes)
+
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+
+    assert len(commits) == 2
+    assert sorted(a.name for a in _load_saved_project(project_manager, project).assets) == ["a_stem_0001.png", "c_stem_0001.png"]
+    assert [a.name for a in _load_saved_project(project_manager, other).assets] == ["b_stem_0001.png"]
+
+
+def test_group_two_spellings_of_one_project_form_one_group_and_settle_the_lease(tmp_path, monkeypatch):
+    """Test 3: the canonical path groups; the lease taken under the Editor's own
+    spelling is settled even though the group loads under the first entry's."""
+    io_nodes, timeline_state, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    runs = io_nodes.sdk_runs
+    project.generation_queue.append(timeline_state.GenerationJob(job_id="job-1", scene_id="s", status="running"))
+    project_manager.save_project(project)
+    editor_spelling = project.project_dir
+    other_spelling = os.path.join(editor_spelling, "media", "..")
+    assert other_spelling != editor_spelling
+    alias = project_manager.load_project(other_spelling)
+    alias._execution_context = {"base_modified_at": project.modified_at, "queue_job_id": "job-1"}
+    project._execution_context = {"base_modified_at": project.modified_at, "queue_job_id": "job-1"}
+    prompt = {}
+    _add_bridge(io_nodes, alias, prompt, "a")
+    _add_bridge(io_nodes, project, prompt, "b", mark=True)
+    key = _registry_key(io_nodes)
+    runs.open_release(key, "prompt-3")
+    runs.take_lease(key, editor_spelling, "job-1")
+    commits = _count_group_commits(monkeypatch, io_nodes)
+
+    io_nodes._finalize_prompt_bridges(key, source="task_done", outcome="success")
+
+    assert len(commits) == 1
+    assert runs.holds_lease(editor_spelling, "job-1") is False
+    restored = _load_saved_project(project_manager, project)
+    assert sorted(a.name for a in restored.assets) == ["a_stem_0001.png", "b_stem_0001.png"]
+    job = restored.generation_queue[0]
+    assert job.status == "completed"
+    assert job.result_asset_id == next(a.asset_id for a in restored.assets if a.name == "b_stem_0001.png")
+    runs.reset_for_tests()
+
+
+def test_group_an_entry_whose_stage_raises_is_dropped(tmp_path, monkeypatch):
+    """Test 4: its directory vanished, so staging raises before touching the project."""
+    io_nodes, _ts, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a")
+    broken = _add_bridge(io_nodes, project, prompt, "b")
+    _add_bridge(io_nodes, project, prompt, "c")
+    shutil.rmtree(broken)
+    staged = []
+    real_stage = io_nodes._stage_bridge_entry
+
+    def recording_stage(project_obj, entry, outcome=""):
+        try:
+            return real_stage(project_obj, entry, outcome)
+        except Exception:
+            staged.append(entry["bridge_node_id"])
+            raise
+
+    monkeypatch.setattr(io_nodes, "_stage_bridge_entry", recording_stage)
+    commits = _count_group_commits(monkeypatch, io_nodes)
+
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+
+    assert staged == ["b"]
+    assert len(commits) == 1
+    assert sorted(a.name for a in _load_saved_project(project_manager, project).assets) == ["a_stem_0001.png", "c_stem_0001.png"]
+
+
+@pytest.mark.parametrize("unreadable", ["job", "placeholder"])
+def test_group_an_entry_whose_apply_raises_falls_back_and_only_it_fails(tmp_path, monkeypatch, unreadable):
+    """Test 5: apply hydrates (the queue job, a placeholder) and the read raises
+    `ProjectStorageError`. The group falls back; the other entries still register."""
+    io_nodes, timeline_state, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    storage = importlib.import_module(f"{TEST_PACKAGE}.server.project_storage")
+    commit = importlib.import_module(f"{TEST_PACKAGE}.server.project_commit")
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a")
+    if unreadable == "job":
+        project.generation_queue.append(timeline_state.GenerationJob(job_id="bad-job", scene_id="s", status="running"))
+        project_manager.save_project(project)
+        project._execution_context = {"base_modified_at": project.modified_at, "queue_job_id": "bad-job"}
+        real_hydrate_job = storage.hydrate_job
+
+        def unreadable_job(project_obj, job):
+            if job.job_id == "bad-job":
+                raise storage.ProjectStorageError("job component unreadable")
+            return real_hydrate_job(project_obj, job)
+
+        monkeypatch.setattr(storage, "hydrate_job", unreadable_job)
+        _add_bridge(io_nodes, project, prompt, "b", mark=True)
+        project._execution_context = {"base_modified_at": project._execution_context["base_modified_at"]}
+    else:
+        project.assets.append(timeline_state.Asset(asset_id="sync-placeholder", name="b_stem_0001.png",
+                                                   asset_type="image", path=os.path.join("media", "b_stem_0001.png")))
+        project_manager.save_project(project)
+        project._execution_context = {"base_modified_at": project.modified_at}
+        real_hydrate_asset = commit.hydrate_asset
+
+        def unreadable_placeholder(asset):
+            if asset.asset_id == "sync-placeholder":
+                raise storage.ProjectStorageError("placeholder component unreadable")
+            return real_hydrate_asset(asset)
+
+        monkeypatch.setattr(commit, "hydrate_asset", unreadable_placeholder)
+        _add_bridge(io_nodes, project, prompt, "b")
+    _add_bridge(io_nodes, project, prompt, "c")
+    failed = []
+    monkeypatch.setattr(io_nodes, "_log_bridge_failure", lambda entry: failed.append(entry["bridge_node_id"]))
+    commits = _count_group_commits(monkeypatch, io_nodes)
+
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+
+    assert failed == ["b"]
+    assert len(commits) == 2  # a and c, one each, through the fallback
+    restored = _load_saved_project(project_manager, project)
+    names = sorted(a.name for a in restored.assets)
+    assert "a_stem_0001.png" in names and "c_stem_0001.png" in names
+    _assert_no_duplicates(restored)
+    if unreadable == "job":
+        assert "b_stem_0001.png" not in names
+        assert restored.generation_queue[0].status == "running"
+    else:
+        assert [a.asset_id for a in restored.assets if a.path.replace("\\", "/") == "media/b_stem_0001.png"] == ["sync-placeholder"]
+
+
+def test_group_merge_keeps_every_entry_and_a_concurrent_edit_without_resurrecting(tmp_path, monkeypatch, caplog):
+    """(base) Test 6: an edit lands between the group's load and its commit."""
+    io_nodes, timeline_state, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    project.assets.append(timeline_state.Asset(asset_id="earlier-take", name="earlier.png", asset_type="image",
+                                               path=os.path.join("media", "earlier.png"), prompt="an earlier take"))
+    project_manager.save_project(project)
+    project._execution_context = {"base_modified_at": project.modified_at}
+    prompt = {}
+    for node_id in ("a", "b", "c"):
+        _add_bridge(io_nodes, project, prompt, node_id)
+    real_commit = io_nodes._save_generated_project
+
+    def edit_then_commit(project_obj, base_modified_at="", created_ids=None, auto_placement_ids=None):
+        current = project_manager.load_project(project.project_dir)
+        current.remove_asset("earlier-take")
+        current.assets.append(timeline_state.Asset(asset_id="user-import", name="user.png", asset_type="image",
+                                                   path=os.path.join("media", "user.png")))
+        current.metadata["edited_concurrently"] = True
+        project_manager.save_project(current)
+        return real_commit(project_obj, base_modified_at, created_ids=created_ids, auto_placement_ids=auto_placement_ids)
+
+    monkeypatch.setattr(io_nodes, "_save_generated_project", edit_then_commit)
+    caplog.set_level("INFO", logger="sonder_editor")
+
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+
+    assert caplog.text.count(MERGE_LINE) == 1
+    restored = _load_saved_project(project_manager, project)
+    ids = {a.asset_id for a in restored.assets}
+    assert "earlier-take" not in ids
+    assert "user-import" in ids
+    assert restored.metadata.get("edited_concurrently") is True
+    assert sorted(a.name for a in restored.assets if a.name.endswith("_stem_0001.png")) == [
+        "a_stem_0001.png", "b_stem_0001.png", "c_stem_0001.png"]
+    _assert_no_duplicates(restored)
+
+
+def test_group_registry_order_no_files_marked_bridge_fails_the_job_first(tmp_path, monkeypatch):
+    """Test 8: outcome "" (watcher). The first marked Bridge decides the job,
+    even when it has no files and a later marked Bridge has some."""
+    io_nodes, timeline_state, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    project.generation_queue.append(timeline_state.GenerationJob(job_id="job-1", scene_id="s", status="running"))
+    project_manager.save_project(project)
+    project._execution_context = {"base_modified_at": project.modified_at, "queue_job_id": "job-1"}
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a", files=0, mark=True)
+    _add_bridge(io_nodes, project, prompt, "b", mark=True)
+
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes), source="watcher")
+
+    restored = _load_saved_project(project_manager, project)
+    job = restored.generation_queue[0]
+    assert (job.status, job.error, job.result_asset_id) == ("failed", "Bridge terminal produced no files", "")
+    assert [a.name for a in restored.assets] == ["b_stem_0001.png"]
+
+
+@pytest.mark.parametrize("outcome", ["error", "interrupted"])
+def test_group_no_files_on_a_leased_job_after_error_stays_running(tmp_path, monkeypatch, outcome):
+    """Test 9: the release returns the job, so the group leaves it `running`."""
+    io_nodes, timeline_state, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    runs = io_nodes.sdk_runs
+    project.generation_queue.append(timeline_state.GenerationJob(job_id="job-1", scene_id="s", status="running"))
+    project_manager.save_project(project)
+    project._execution_context = {"base_modified_at": project.modified_at, "queue_job_id": "job-1"}
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a", files=0, mark=True)
+    _add_bridge(io_nodes, project, prompt, "b")
+    key = _registry_key(io_nodes)
+    runs.open_release(key, "prompt-9")
+    runs.take_lease(key, project.project_dir, "job-1")
+
+    io_nodes._finalize_prompt_bridges(key, source="task_done", outcome=outcome)
+
+    restored = _load_saved_project(project_manager, project)
+    assert restored.generation_queue[0].status == "running"
+    assert runs.holds_lease(project.project_dir, "job-1") is True
+    assert [a.name for a in restored.assets] == ["b_stem_0001.png"]
+    runs.reset_for_tests()
+
+
+def _write_then_raise_once(monkeypatch, module):
+    """Patch `module.save_project` so its first call writes `project.json` and then
+    raises, as `save_project` can after its atomic replace."""
+    real = module.save_project
+    state = {"raised": False}
+
+    def write_then_raise(project_obj, *args, **kwargs):
+        result = real(project_obj, *args, **kwargs)
+        if not state["raised"]:
+            state["raised"] = True
+            raise OSError("directory sync failed after the replace")
+        return result
+
+    monkeypatch.setattr(module, "save_project", write_then_raise)
+    return state
+
+
+def test_group_commit_that_wrote_then_raised_registers_nothing_twice(tmp_path, monkeypatch):
+    """(base) Test 10: the fallback finds every asset already held, saves nothing,
+    and still completes each entry. It also does the failed commit's bookkeeping:
+    the run's save is noted and the marked Bridge's lease is settled."""
+    io_nodes, timeline_state, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    commit = importlib.import_module(f"{TEST_PACKAGE}.server.project_commit")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+    runs = io_nodes.sdk_runs
+    thumbs = []
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda kind, source, thumb: thumbs.append(Path(source).name))
+    project.generation_queue.append(timeline_state.GenerationJob(job_id="job-1", scene_id="s", status="running"))
+    project_manager.save_project(project)
+    base = project.modified_at
+    prompt = {}
+    project._execution_context = {"base_modified_at": base, "queue_job_id": "job-1"}
+    _add_bridge(io_nodes, project, prompt, "a", mark=True)
+    project._execution_context = {"base_modified_at": base}
+    for node_id in ("b", "c"):
+        _add_bridge(io_nodes, project, prompt, node_id)
+    key = _registry_key(io_nodes)
+    runs.open_release(key, "prompt-10")
+    runs.take_lease(key, project.project_dir, "job-1")
+    state = _write_then_raise_once(monkeypatch, commit)
+    commits = _count_group_commits(monkeypatch, io_nodes)
+
+    io_nodes._finalize_prompt_bridges(key, source="task_done", outcome="success")
+
+    assert state["raised"] is True
+    assert len(commits) == 1  # the group's; the fallback found nothing to save
+    restored = _load_saved_project(project_manager, project)
+    assert sorted(a.name for a in restored.assets) == ["a_stem_0001.png", "b_stem_0001.png", "c_stem_0001.png"]
+    _assert_no_duplicates(restored)
+    assert _media_pngs(project) == ["a_stem_0001.png", "b_stem_0001.png", "c_stem_0001.png"]
+    assert sorted(thumbs) == ["a_stem_0001.png", "b_stem_0001.png", "c_stem_0001.png"]
+    job = restored.generation_queue[0]
+    assert job.status == "completed"
+    assert job.result_asset_id == next(a.asset_id for a in restored.assets if a.name == "a_stem_0001.png")
+    assert runs.record_snapshot(key)["saved_to_project"] is True
+    assert runs.holds_lease(project.project_dir, "job-1") is False
+    runs.reset_for_tests()
+
+
+def test_group_with_empty_base_commit_that_wrote_then_raised_adds_nothing_twice(tmp_path, monkeypatch):
+    """Test 11: a blind save (no base) that reached disk before raising."""
+    io_nodes, _ts, project_manager, project = _group_setup(tmp_path, monkeypatch, base=False)
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a")
+    _add_bridge(io_nodes, project, prompt, "b")
+    state = _write_then_raise_once(monkeypatch, io_nodes)
+    saves = _count_project_saves(monkeypatch, io_nodes)
+
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+
+    assert state["raised"] is True
+    # Only the group's blind save: the fallback finds both assets held and saves
+    # nothing (a duplicate id would otherwise be collapsed silently on save).
+    assert saves == [None]
+    restored = _load_saved_project(project_manager, project)
+    assert sorted(a.name for a in restored.assets) == ["a_stem_0001.png", "b_stem_0001.png"]
+    _assert_no_duplicates(restored)
+
+
+def test_group_commit_that_raised_before_writing_falls_back_per_entry(tmp_path, monkeypatch):
+    """(base) Test 12: each entry commits alone against its original base; no file
+    is published twice and the run still notes that its take was saved."""
+    io_nodes, _ts, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    commit = importlib.import_module(f"{TEST_PACKAGE}.server.project_commit")
+    runs = io_nodes.sdk_runs
+    base = project.modified_at
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a")
+    _add_bridge(io_nodes, project, prompt, "b")
+    key = _registry_key(io_nodes)
+    runs.open_release(key, "prompt-12")
+    real = commit.save_project
+    state = {"raised": False}
+
+    def raise_before_writing(project_obj, *args, **kwargs):
+        if not state["raised"]:
+            state["raised"] = True
+            raise OSError("disk full")
+        return real(project_obj, *args, **kwargs)
+
+    monkeypatch.setattr(commit, "save_project", raise_before_writing)
+    commits = _count_group_commits(monkeypatch, io_nodes)
+
+    io_nodes._finalize_prompt_bridges(key, source="task_done", outcome="success")
+
+    assert commits == [base, base, base]  # the group's, then one per entry
+    restored = _load_saved_project(project_manager, project)
+    assert sorted(a.name for a in restored.assets) == ["a_stem_0001.png", "b_stem_0001.png"]
+    _assert_no_duplicates(restored)
+    assert _media_pngs(project) == ["a_stem_0001.png", "b_stem_0001.png"]
+    snapshot = runs.record_snapshot(key)
+    assert snapshot["saved_to_project"] is True
+    assert snapshot["committed_modified_at"] == restored.modified_at
+    runs.reset_for_tests()
+
+
+def test_group_placeholder_remap_reaches_every_entry_thumbnail(tmp_path, monkeypatch):
+    """(base) Test 13: discovery sync registers a placeholder for the second
+    entry's file between the group's load and its commit; the merge keeps the
+    placeholder's id and completion thumbnails under it."""
+    io_nodes, timeline_state, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    project_storage = importlib.import_module(f"{TEST_PACKAGE}.server.project_storage")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+    thumbs = []
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail",
+                        lambda kind, source, thumb: thumbs.append((Path(source).name, Path(thumb).stem)))
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a")
+    _add_bridge(io_nodes, project, prompt, "b")
+    real_commit = io_nodes._save_generated_project
+
+    def sync_then_commit(project_obj, base_modified_at="", created_ids=None, auto_placement_ids=None):
+        current = project_manager.load_project(project.project_dir)
+        current.assets.append(timeline_state.Asset(asset_id="sync-placeholder", name="b_stem_0001.png",
+                                                   asset_type="image", path=os.path.join("media", "b_stem_0001.png")))
+        project_manager.save_project(current)
+        return real_commit(project_obj, base_modified_at, created_ids=created_ids, auto_placement_ids=auto_placement_ids)
+
+    monkeypatch.setattr(io_nodes, "_save_generated_project", sync_then_commit)
+
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+
+    restored = _load_saved_project(project_manager, project)
+    _assert_no_duplicates(restored)
+    by_name = {a.name: a for a in restored.assets}
+    assert by_name["b_stem_0001.png"].asset_id == "sync-placeholder"
+    project_storage.hydrate_asset(by_name["b_stem_0001.png"])
+    assert by_name["b_stem_0001.png"].generation_params["editor_export"]["produced_by"]["tool"] == "sonder-editor"
+    assert sorted(thumbs) == [("a_stem_0001.png", by_name["a_stem_0001.png"].asset_id),
+                              ("b_stem_0001.png", "sync-placeholder")]
+
+
+def test_group_preview_grace_per_entry_and_one_failed_completion_skips_no_other(tmp_path, monkeypatch):
+    """Test 14."""
+    io_nodes, _ts, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+    scheduled = []
+    monkeypatch.setattr(io_nodes, "_schedule_bridge_preview_cleanup",
+                        lambda project_arg, bridge_dir, expires_at: scheduled.append((Path(bridge_dir), expires_at)))
+    thumbs = []
+
+    def thumbnail(kind, source, thumb):
+        if Path(source).name == "a_stem_0001.png":
+            raise RuntimeError("thumbnail failed")
+        thumbs.append(Path(source).name)
+
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", thumbnail)
+    failed = []
+    monkeypatch.setattr(io_nodes, "_log_bridge_failure", lambda entry: failed.append(entry["bridge_node_id"]))
+    prompt = {}
+    dir_a = _add_bridge(io_nodes, project, prompt, "a")
+    dir_b = _add_bridge(io_nodes, project, prompt, "b")
+
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+
+    assert failed == ["a"]
+    assert thumbs == ["b_stem_0001.png"]
+    assert [path for path, _expiry in scheduled] == [Path(dir_a), Path(dir_b)]
+    assert all(expiry > time.time() + io_nodes.BRIDGE_PREVIEW_GRACE_SEC - 30 for _path, expiry in scheduled)
+    assert io_nodes._read_bridge_sidecar_payload(dir_b)["preview_expires_at"] == scheduled[1][1]
+    assert Path(dir_a).is_dir() and Path(dir_b).is_dir()
+    assert sorted(a.name for a in _load_saved_project(project_manager, project).assets) == ["a_stem_0001.png", "b_stem_0001.png"]
+
+
+def test_stale_dir_adoption_whose_finalize_raises_still_removes_the_dir(tmp_path, monkeypatch):
+    """Test 15: the single-entry path re-raises, so adoption's own cleanup runs."""
+    io_nodes, _timeline_state, project_manager, project = _make_project(tmp_path, monkeypatch)
+    stale_dir = Path(project.project_dir) / "cache" / "bridge_out" / "stale_fail"
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    _write_png(stale_dir / "leftover.png")
+    old_ts = time.time() - (io_nodes.BRIDGE_STALE_DIR_TTL_SEC + 60)
+    os.utime(stale_dir / "leftover.png", (old_ts, old_ts))
+    os.utime(stale_dir, (old_ts, old_ts))
+
+    def probe_fails(_path, _asset_type):
+        raise RuntimeError("probe crashed")
+
+    monkeypatch.setattr(io_nodes, "_extract_bridge_asset_metadata", probe_fails)
+    raised = []
+    real_finalize = io_nodes._finalize_bridge_entry
+
+    def recording_finalize(entry, outcome=""):
+        try:
+            return real_finalize(entry, outcome)
+        except Exception as exc:
+            raised.append(exc)
+            raise
+
+    monkeypatch.setattr(io_nodes, "_finalize_bridge_entry", recording_finalize)
+
+    io_nodes._cleanup_stale_bridge_dirs(project.project_dir)
+
+    assert [str(exc) for exc in raised] == ["probe crashed"]
+    assert not stale_dir.exists()
+    assert _load_saved_project(project_manager, project).assets == []
+
+
+def test_group_watcher_path_groups_by_base_and_commits_each_group(tmp_path, monkeypatch, caplog):
+    """(base) Test 16: the watcher fallback finalizes through the same grouping;
+    two bases in one prompt form two groups and both commit."""
+    io_nodes, _ts, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    first_base = project.modified_at
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a")
+    project_manager.save_project(project)
+    second_base = project.modified_at
+    project._execution_context = {"base_modified_at": second_base}
+    _add_bridge(io_nodes, project, prompt, "b")
+    project._execution_context = {"base_modified_at": first_base}
+    _add_bridge(io_nodes, project, prompt, "c")
+    key = _registry_key(io_nodes)
+    commits = _count_group_commits(monkeypatch, io_nodes)
+    for name in ("BRIDGE_FALLBACK_MIN_WAIT_SEC", "BRIDGE_IDLE_SETTLE_SEC", "BRIDGE_POLL_INTERVAL_SEC"):
+        monkeypatch.setattr(io_nodes, name, 0)
+    monkeypatch.setattr(io_nodes, "_prompt_currently_running", lambda *_args: False)
+    caplog.set_level("INFO", logger="sonder_editor")
+
+    io_nodes._watch_prompt_for_bridge_completion(key, prompt)
+
+    assert "path=watcher" in caplog.text
+    assert commits == [first_base, second_base]
+    assert not io_nodes._BRIDGE_REGISTRY
+    restored = _load_saved_project(project_manager, project)
+    assert sorted(a.name for a in restored.assets) == ["a_stem_0001.png", "b_stem_0001.png", "c_stem_0001.png"]
+    _assert_no_duplicates(restored)
+
+
+def test_group_render_queue_real_editor_consume_merges_once_and_settles(tmp_path, monkeypatch, caplog):
+    """(base, real Editor consume) Test 7: Render Queue on, two Bridges, one
+    marked. The Editor's claim save advances the version past the base, so the
+    prompt merges exactly once; the job completes and the lease is gone."""
+    from test_editor_node import _import_editor_node, _prompt_graph, _prompt_node
+    from PIL import Image
+
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    timeline_state = importlib.import_module(f"{TEST_PACKAGE}.server.timeline_state")
+    project_manager = importlib.import_module(f"{TEST_PACKAGE}.server.project_manager")
+    thumbnail_service = importlib.import_module(f"{TEST_PACKAGE}.server.thumbnail_service")
+    runs = io_nodes.sdk_runs
+    runs.reset_for_tests()
+    monkeypatch.setattr(thumbnail_service, "ensure_thumbnail", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes, "schedule_project_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(io_nodes, "_schedule_bridge_preview_cleanup", lambda *args, **kwargs: None)
+
+    base_dir = tmp_path / "sonder-projects"
+    base_dir.mkdir(exist_ok=True)
+    project = project_manager.create_project("Bridge_RQ", base_dir=str(base_dir))
+    project.add_scene(timeline_state.Scene(scene_id="scene-1", name="Scene 1", duration_frames=24))
+    project.generation_queue.append(timeline_state.GenerationJob(
+        job_id="job-1", scene_id="scene-1", selection_start=0, selection_end=24, status="pending",
+        prompt="queued prompt"))
+    project_manager.save_project(project)
+    monkeypatch.setattr(editor_node, "_get_projects_base_dir", lambda: str(base_dir))
+    monkeypatch.setattr(editor_node.SonderEditor, "_render_scene_frames",
+                        lambda *args, **kwargs: pytest.fail("project-only execution rendered frames"))
+    monkeypatch.setattr(editor_node.SonderEditor, "_load_scene_audio",
+                        lambda *args, **kwargs: pytest.fail("project-only execution mixed audio"))
+    _clear_bridge_state(io_nodes)
+    monkeypatch.setattr(io_nodes, "_ensure_prompt_bridge_watcher", lambda *args, **kwargs: None)
+
+    prompt = _prompt_graph({
+        "editor-1": _prompt_node("SonderEditor"),
+        "bridge-1": _prompt_node("SonderSaveBridge", {"project": ["editor-1", 0], "mark_queue_complete": True}),
+        "bridge-2": _prompt_node("SonderSaveBridge", {"project": ["editor-1", 0], "mark_queue_complete": False}),
+    })
+    key = "prompt-rq"
+    io_nodes._set_bridge_prompt_key_for_object(key, prompt)
+    runs.open_release(key, key, prompt)
+
+    editor_result = editor_node.SonderEditor().execute(
+        project=os.path.basename(project.project_dir), project_name="Ignored", fps=24.0, width=768, height=512,
+        prompt=prompt, unique_id="editor-1")
+    proj_after_editor = editor_result[0]
+    context = proj_after_editor._execution_context
+    assert context["queue_job_id"] == "job-1"
+    assert context["base_modified_at"]
+    assert runs.holds_lease(proj_after_editor.project_dir, "job-1") is True
+    claimed = project_manager.load_project(proj_after_editor.project_dir)
+    assert claimed.modified_at != context["base_modified_at"]  # the claim save advanced it
+
+    for node_id, mark in (("bridge-1", True), ("bridge-2", False)):
+        output_dir, _ = io_nodes.SonderSaveBridge().prepare_output(
+            proj_after_editor, mark_queue_complete=mark, prompt=prompt, unique_id=node_id)
+        Image.new("RGB", (2, 2), color=(10, 20, 30)).save(Path(output_dir) / f"{node_id}.png")
+    assert _registry_key(io_nodes) == key
+    caplog.set_level("INFO", logger="sonder_editor")
+
+    io_nodes._finalize_prompt_bridges(key, source="task_done", outcome="success")
+
+    assert caplog.text.count(MERGE_LINE) == 1
+    restored = project_manager.load_project(proj_after_editor.project_dir)
+    assert len(restored.assets) == 2
+    _assert_no_duplicates(restored)
+    job = restored.generation_queue[0]
+    assert job.status == "completed"
+    marked_asset = next(a for a in restored.assets if a.asset_id == job.result_asset_id)
+    assert marked_asset.name.endswith("_0001.png")
+    assert runs.holds_lease(proj_after_editor.project_dir, "job-1") is False
+    assert runs.record_snapshot(key)["saved_to_project"] is True
+    runs.reset_for_tests()
+
+
+def test_apply_works_on_copies_so_a_failed_attempt_never_changes_the_next(tmp_path, monkeypatch):
+    """Apply's contract (no plan number): what one attempt does to its project's
+    assets never reaches the staged assets a later attempt applies."""
+    io_nodes, _ts, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    _add_bridge(io_nodes, project, {}, "a", folder="Takes")
+    entry = next(iter(io_nodes._BRIDGE_REGISTRY.values()))
+    first = project_manager.load_project(project.project_dir)
+    staged = io_nodes._stage_bridge_entry(first, entry, "")
+    staged_asset = staged["items"][0]["asset"]
+
+    assert io_nodes._apply_staged_bridge(first, staged) is True
+    applied = next(a for a in first.assets if a.asset_id == staged_asset.asset_id)
+    assert applied is not staged_asset
+    applied.folder = "changed by a failed attempt"
+    applied.generation_params["changed_by_a_failed_attempt"] = True
+
+    second = project_manager.load_project(project.project_dir)
+    assert io_nodes._apply_staged_bridge(second, staged) is True
+    again = next(a for a in second.assets if a.asset_id == staged_asset.asset_id)
+    assert again.folder == "Takes"
+    assert "changed_by_a_failed_attempt" not in again.generation_params
+    assert io_nodes._apply_staged_bridge(second, staged) is False  # idempotent
+    assert [a.asset_id for a in second.assets].count(staged_asset.asset_id) == 1
+
+
+# --- Implementation audit findings (2026-11-14) ---------------------------------
+
+
+def _make_dir_alias(target, alias):
+    """A second spelling of ``target``: a directory junction on Windows (no
+    privilege needed), a symlink elsewhere. Skips where neither can be made."""
+    try:
+        if os.name == "nt":
+            import _winapi
+
+            _winapi.CreateJunction(str(target), str(alias))
+        else:
+            os.symlink(str(target), str(alias), target_is_directory=True)
+    except (OSError, AttributeError, NotImplementedError) as exc:
+        pytest.skip(f"cannot create a directory alias here: {exc}")
+
+
+def test_group_with_external_links_keeps_two_spellings_of_one_project_apart(tmp_path, monkeypatch):
+    """Audit finding 1: with external links on, paths compare as written, so a
+    Bridge staged under another spelling than the group's load would be
+    quarantined. Two spellings form two groups; both register, and the marked
+    Bridge on the alias completes its job and settles its lease."""
+    io_nodes, timeline_state, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    external_links = importlib.import_module(f"{TEST_PACKAGE}.server.external_links")
+    monkeypatch.setattr(external_links, "is_enabled", lambda: True)
+    runs = io_nodes.sdk_runs
+    project.generation_queue.append(timeline_state.GenerationJob(job_id="job-1", scene_id="s", status="running"))
+    project_manager.save_project(project)
+    base = project.modified_at
+    alias_dir = tmp_path / "project-alias"
+    _make_dir_alias(project.project_dir, alias_dir)
+    alias = project_manager.load_project(str(alias_dir))
+    project._execution_context = {"base_modified_at": base}
+    alias._execution_context = {"base_modified_at": base, "queue_job_id": "job-1"}
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a")
+    _add_bridge(io_nodes, alias, prompt, "b", mark=True)
+    key = _registry_key(io_nodes)
+    runs.open_release(key, "prompt-links")
+    runs.take_lease(key, str(alias_dir), "job-1")
+    groups = []
+    real_group = io_nodes._finalize_bridge_group
+
+    def counted_group(entries, outcome=""):
+        groups.append([entry["bridge_node_id"] for entry in entries])
+        return real_group(entries, outcome)
+
+    monkeypatch.setattr(io_nodes, "_finalize_bridge_group", counted_group)
+    failed = []
+    monkeypatch.setattr(io_nodes, "_log_bridge_failure", lambda entry: failed.append(entry["bridge_node_id"]))
+
+    io_nodes._finalize_prompt_bridges(key, source="task_done", outcome="success")
+
+    assert groups == [["a"], ["b"]]
+    assert failed == []
+    restored = _load_saved_project(project_manager, project)
+    assert sorted(a.name for a in restored.assets) == ["a_stem_0001.png", "b_stem_0001.png"]
+    job = restored.generation_queue[0]
+    assert job.status == "completed"
+    assert job.result_asset_id == next(a.asset_id for a in restored.assets if a.name == "b_stem_0001.png")
+    assert runs.holds_lease(str(alias_dir), "job-1") is False
+    runs.reset_for_tests()
+
+
+def test_a_trashed_record_at_the_output_path_does_not_absorb_the_new_output(tmp_path, monkeypatch):
+    """Audit finding 3: an unrelated record at the same path (trashed, file gone)
+    is not this output's; the output registers as its own asset and completes the job."""
+    io_nodes, timeline_state, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    project_storage = importlib.import_module(f"{TEST_PACKAGE}.server.project_storage")
+    output_path = os.path.join("media", "a_stem_0001.png")
+    project.assets.append(timeline_state.Asset(asset_id="old-take", name="a_stem_0001.png", asset_type="image",
+                                               path=output_path, prompt="an old take",
+                                               trashed_at="2026-01-01T00:00:00"))
+    project.generation_queue.append(timeline_state.GenerationJob(job_id="job-1", scene_id="s", status="running"))
+    project_manager.save_project(project)
+    assert not (Path(project.project_dir) / output_path).exists()
+    project._execution_context = {"base_modified_at": project.modified_at, "queue_job_id": "job-1"}
+    _add_bridge(io_nodes, project, {}, "a", mark=True, folder="New takes")
+
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+
+    restored = _load_saved_project(project_manager, project)
+    at_path = [a for a in restored.assets if a.path.replace("\\", "/") == "media/a_stem_0001.png"]
+    assert sorted(a.asset_id == "old-take" for a in at_path) == [False, True]
+    new = next(a for a in at_path if a.asset_id != "old-take")
+    old = next(a for a in at_path if a.asset_id == "old-take")
+    assert (old.prompt, old.folder) == ("an old take", "")
+    assert new.folder == "New takes"
+    project_storage.hydrate_asset(new)
+    assert new.generation_params["editor_export"]["produced_by"]["tool"] == "sonder-editor"
+    assert restored.generation_queue[0].status == "completed"
+    assert restored.generation_queue[0].result_asset_id == new.asset_id
+
+
+def test_group_fallback_after_a_merge_onto_a_placeholder_keeps_one_record(tmp_path, monkeypatch):
+    """Audit finding 3, the case the registration match must keep: the group's
+    merge reconciled an output onto a sync placeholder (keeping its id), wrote,
+    then raised. The fallback recognises the placeholder as that output and adds
+    nothing."""
+    io_nodes, timeline_state, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    commit = importlib.import_module(f"{TEST_PACKAGE}.server.project_commit")
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a")
+    _add_bridge(io_nodes, project, prompt, "b")
+    real_commit = io_nodes._save_generated_project
+
+    def sync_then_commit(project_obj, base_modified_at="", created_ids=None, auto_placement_ids=None):
+        current = project_manager.load_project(project.project_dir)
+        current.assets.append(timeline_state.Asset(asset_id="sync-placeholder", name="b_stem_0001.png",
+                                                   asset_type="image", path=os.path.join("media", "b_stem_0001.png")))
+        project_manager.save_project(current)
+        return real_commit(project_obj, base_modified_at, created_ids=created_ids, auto_placement_ids=auto_placement_ids)
+
+    monkeypatch.setattr(io_nodes, "_save_generated_project", sync_then_commit)
+    state = _write_then_raise_once(monkeypatch, commit)  # the merge's save writes, then raises
+    commits = _count_group_commits(monkeypatch, io_nodes)
+    failed = []
+    monkeypatch.setattr(io_nodes, "_log_bridge_failure", lambda entry: failed.append(entry["bridge_node_id"]))
+
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+
+    assert state["raised"] is True
+    assert failed == []
+    assert len(commits) == 1  # the group's; the fallback found both outputs held
+    restored = _load_saved_project(project_manager, project)
+    _assert_no_duplicates(restored)
+    by_name = {a.name: a.asset_id for a in restored.assets}
+    assert set(by_name) == {"a_stem_0001.png", "b_stem_0001.png"}
+    assert by_name["b_stem_0001.png"] == "sync-placeholder"
+
+
+def test_a_bridge_entry_with_an_unusable_project_dir_fails_alone(tmp_path, monkeypatch):
+    """Audit finding 4: grouping a path that cannot be normalised (embedded NUL)
+    must not lose the prompt's other entries. On Windows Python 3.12 `realpath`
+    and `abspath` accept the NUL, so this pins the outcome (the bad entry keys
+    and fails alone) rather than reproducing a raise there."""
+    io_nodes, _ts, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "good")
+    key = _registry_key(io_nodes)
+    with io_nodes._BRIDGE_REGISTRY_LOCK:
+        good = io_nodes._BRIDGE_REGISTRY.pop((key, "good"))
+        bad = dict(good, project_dir=project.project_dir + "\x00bad", bridge_node_id="bad")
+        io_nodes._BRIDGE_REGISTRY[(key, "bad")] = bad
+        io_nodes._BRIDGE_REGISTRY[(key, "good")] = good
+    failed = []
+    monkeypatch.setattr(io_nodes, "_log_bridge_failure", lambda entry: failed.append(entry["bridge_node_id"]))
+
+    io_nodes._finalize_prompt_bridges(key)
+
+    assert failed == ["bad"]
+    assert [a.name for a in _load_saved_project(project_manager, project).assets] == ["good_stem_0001.png"]

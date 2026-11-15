@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
+from copy import deepcopy
 from datetime import datetime
 
 import cv2
@@ -41,6 +42,7 @@ from ..server.path_security import (
 )
 from ..server.project_commit import (
     _copy_generated_asset_registration,
+    _remap_generation_params,
     _same_path_placeholder_can_upgrade,
     created_ids_since,
     save_generated_project,
@@ -1879,11 +1881,15 @@ def _upgrade_bridge_placeholder_asset(project, source_asset: Asset) -> tuple[Ass
     return source_asset, False
 
 
-def _finalize_bridge_entry(entry: dict, outcome: str = "") -> list[Asset]:
-    """Register a Bridge's files. ``outcome`` is how the run ended (``_run_outcome``),
-    or empty when unknown (the watcher fallback)."""
-    project = load_project(entry["project_dir"])
-    _pre_item_ids = snapshot_item_ids(project)
+def _stage_bridge_entry(project, entry: dict, outcome: str = "") -> dict:
+    """Publish a Bridge's files into project media and build their assets.
+
+    Disk work that may raise; it never mutates ``project``. A prompt's entries
+    stage in order, so each publishes before the next reserves media names. The
+    queue intent is recorded here and decided at apply, in registry order.
+    ``outcome`` is how the run ended (``_run_outcome``), or empty when unknown
+    (the watcher fallback).
+    """
     queue_job_id = str(entry.get("queue_job_id") or "")
     target_folder = _normalize_asset_folder(entry.get("target_folder", ""))
     bridge_dir = _validated_bridge_dir(project, entry.get("bridge_dir", ""), must_exist=True)
@@ -1898,7 +1904,7 @@ def _finalize_bridge_entry(entry: dict, outcome: str = "") -> list[Asset]:
         if rel_path not in existed
     )
 
-    registered_assets = []
+    items = []
     media_dir = _require_project_media_root(project)
 
     counter = 0
@@ -2018,14 +2024,12 @@ def _finalize_bridge_entry(entry: dict, outcome: str = "") -> list[Asset]:
             "rel_path": rel_path,
         })
 
-    completed_moves = []
     modes_at_run = _bridge_modes_section(entry)
     full_text_kept = False
     for pending in pending_moves:
         moved_path = _publish_bridge_output_file(pending)
         if not moved_path:
             continue
-        pending["final_path"] = moved_path
         asset_type, artifact_kind = classify_asset_path(moved_path)
         try:
             metadata = _extract_bridge_asset_metadata(moved_path, asset_type)
@@ -2065,31 +2069,133 @@ def _finalize_bridge_entry(entry: dict, outcome: str = "") -> list[Asset]:
             has_audio=metadata["has_audio"],
             folder=target_folder,
         )
-        asset, upgraded_placeholder = _upgrade_bridge_placeholder_asset(project, asset)
-        if not upgraded_placeholder:
-            project.add_asset(asset)
-        pending["asset"] = asset
-        pending["asset_type"] = asset_type
-        registered_assets.append((pending["rel_path"], asset))
-        completed_moves.append(pending)
+        items.append({
+            "asset": asset,
+            "asset_type": asset_type,
+            "final_path": moved_path,
+            "rel_path": pending["rel_path"],
+        })
 
-    changed = bool(registered_assets)
-    if target_folder and registered_assets:
-        _ensure_asset_folder_metadata(project, target_folder)
-        changed = True
-    if entry.get("mark_queue_complete") and not queue_job_id:
+    mark_queue_complete = bool(entry.get("mark_queue_complete"))
+    if mark_queue_complete and not queue_job_id:
         logger.warning(
             "Bridge mark_queue_complete=True but execution context had no queue_job_id; "
             "queue completion skipped. prompt=%s node=%s registered=%d. "
             "Any 'running' queue job will need to be inspected manually.",
             entry.get("prompt_key"),
             entry.get("bridge_node_id"),
-            len(registered_assets),
+            len(items),
         )
-    elif registered_assets and entry.get("mark_queue_complete"):
-        first_asset = registered_assets[0][1]
-        changed = _mark_queue_job_completed(project, queue_job_id, first_asset.asset_id) or changed
-    elif (entry.get("mark_queue_complete") and not registered_assets and outcome in ("error", "interrupted")
+
+    preview_expires_at = None
+    retain_native_preview = bool(items) and entry.get("prompt_key_source") != "recovered"
+    if retain_native_preview:
+        preview_expires_at = time.time() + BRIDGE_PREVIEW_GRACE_SEC
+        try:
+            _write_bridge_sidecar(
+                bridge_dir,
+                _list_bridge_files(bridge_dir),
+                preview_expires_at=preview_expires_at,
+            )
+        except Exception:
+            _cleanup_bridge_output_dir(project, bridge_dir)
+            raise
+
+    return {
+        "entry": entry,
+        "outcome": str(outcome or ""),
+        "bridge_dir": bridge_dir,
+        "target_folder": target_folder,
+        "naming_stem": naming_stem,
+        "queue_job_id": queue_job_id,
+        "mark_queue_complete": mark_queue_complete,
+        "items": items,
+        "retain_native_preview": retain_native_preview,
+        "preview_expires_at": preview_expires_at,
+        # Written by each apply: the id each item has in the project it was
+        # applied to (a placeholder's own id when one was upgraded).
+        "applied_ids": [],
+    }
+
+
+def _asset_holding_registration(project, source: Asset):
+    """The record ``project`` already holds for ``source`` under another id, or None.
+
+    That happens when a generated merge reconciled ``source`` onto a same-path
+    placeholder (keeping the placeholder's id) and the commit then raised: the
+    placeholder now carries exactly what ``_copy_generated_asset_registration``
+    copied. A record that merely shares the path (a trashed or older take whose
+    file is gone) is not ``source``'s and must not absorb it. May hydrate.
+    """
+    from ..server.project_storage import hydrate_asset
+
+    wanted = _normalize_asset_path_for_compare(source.path)
+    if not wanted:
+        return None
+    for existing in getattr(project, "assets", []) or []:
+        if _normalize_asset_path_for_compare(existing.path) != wanted:
+            continue
+        if str(getattr(existing, "trashed_at", "") or ""):
+            continue
+        if (existing.name, existing.prompt, existing.folder) != (source.name, source.prompt, source.folder):
+            continue
+        hydrate_asset(existing)
+        # The merge remaps the asset's own id inside its params to the record's.
+        expected = _remap_generation_params(source.generation_params, {source.asset_id: existing.asset_id})
+        if existing.generation_params == expected:
+            return existing
+    return None
+
+
+def _apply_staged_bridge(project, staged: dict) -> bool:
+    """Register a staged Bridge's assets and queue result in ``project``.
+
+    Publishes and writes nothing, but may hydrate (the queue job, a placeholder)
+    and so raise ``ProjectStorageError``. Works on copies of the staged assets
+    (same ids), so a failed attempt never changes the next attempt's input. It is
+    idempotent: an asset ``project`` already holds, under its own id or as a
+    same-path record carrying its registration (``_asset_holding_registration``),
+    is not added again, which lets the per-entry fallback run after a group commit
+    that reached disk before it raised. Returns whether ``project`` changed.
+    """
+    entry = staged["entry"]
+    items = staged["items"]
+    queue_job_id = staged["queue_job_id"]
+    applied_ids = []
+    staged["applied_ids"] = applied_ids
+    changed = False
+    held_ids = {asset.asset_id for asset in getattr(project, "assets", []) or []}
+    for item in items:
+        asset = deepcopy(item["asset"])
+        if asset.asset_id in held_ids:
+            applied_ids.append(asset.asset_id)
+            continue
+        asset, upgraded_placeholder = _upgrade_bridge_placeholder_asset(project, asset)
+        if upgraded_placeholder:
+            changed = True
+        else:
+            held = _asset_holding_registration(project, asset)
+            if held is not None:
+                asset = held
+            else:
+                project.add_asset(asset)
+                changed = True
+        held_ids.add(asset.asset_id)
+        applied_ids.append(asset.asset_id)
+
+    target_folder = staged["target_folder"]
+    if target_folder and items:
+        folders_before = list(project.metadata.get("asset_folders", []) or [])
+        _ensure_asset_folder_metadata(project, target_folder)
+        changed = changed or list(project.metadata.get("asset_folders", []) or []) != folders_before
+
+    mark_queue_complete = staged["mark_queue_complete"]
+    outcome = staged["outcome"]
+    if mark_queue_complete and not queue_job_id:
+        pass  # Logged at stage; nothing to mark.
+    elif items and mark_queue_complete:
+        changed = _mark_queue_job_completed(project, queue_job_id, applied_ids[0]) or changed
+    elif (mark_queue_complete and not items and outcome in ("error", "interrupted")
           and sdk_runs.holds_lease(entry.get("project_dir", ""), queue_job_id)):
         # The run did not finish, so no files is not the Bridge's failure: leave
         # the leased job running for the run's release to return it to pending
@@ -2103,78 +2209,95 @@ def _finalize_bridge_entry(entry: dict, outcome: str = "") -> list[Asset]:
             entry.get("prompt_key"),
             entry.get("bridge_node_id"),
         )
-    elif entry.get("mark_queue_complete") and not registered_assets:
+    elif mark_queue_complete and not items:
         changed = _mark_queue_job_failed(project, queue_job_id, "Bridge terminal produced no files") or changed
-    elif not registered_assets:
+    elif not items:
         logger.info(
             "Bridge produced no files for prompt=%s node=%s",
             entry.get("prompt_key"),
             entry.get("bridge_node_id"),
         )
+    return changed
 
-    preview_expires_at = None
-    retain_native_preview = bool(registered_assets) and entry.get("prompt_key_source") != "recovered"
-    if retain_native_preview:
-        preview_expires_at = time.time() + BRIDGE_PREVIEW_GRACE_SEC
+
+def _complete_bridge_entry(project, staged: dict, asset_id_remap) -> None:
+    """After a commit: proxies, thumbnails, the refreshed preview grace and the log line.
+
+    ``asset_id_remap`` is the commit's ``_asset_id_remap``, or None when nothing
+    was committed. Ids come from the last apply, so an asset the project already
+    held is completed under the id it has there.
+    """
+    entry = staged["entry"]
+    remap = asset_id_remap or {}
+    applied = list(zip(staged["items"], staged["applied_ids"]))
+    if applied:
+        from ..server import proxy_media
+        proxy_media.enqueue_after_commit(project.project_dir, [
+            remap.get(asset_id, asset_id)
+            for item, asset_id in applied if item["asset_type"] == "video"
+        ])
+        for item, asset_id in applied:
+            if item["asset_type"] in {"video", "image", "audio"}:
+                from ..server.thumbnail_service import ensure_thumbnail
+                committed_asset_id = remap.get(asset_id, asset_id)
+                thumb_path = _project_thumbnail_path(project, committed_asset_id, purpose="bridge asset thumbnail path")
+                if thumb_path:
+                    ensure_thumbnail(item["asset_type"], item["final_path"], thumb_path)
+
+    if staged["retain_native_preview"]:
+        refreshed_expires_at = time.time() + BRIDGE_PREVIEW_GRACE_SEC
         try:
             _write_bridge_sidecar(
-                bridge_dir,
-                _list_bridge_files(bridge_dir),
-                preview_expires_at=preview_expires_at,
+                staged["bridge_dir"],
+                _list_bridge_files(staged["bridge_dir"]),
+                preview_expires_at=refreshed_expires_at,
             )
+            staged["preview_expires_at"] = refreshed_expires_at
         except Exception:
-            _cleanup_bridge_output_dir(project, bridge_dir)
-            raise
+            logger.warning(
+                "Failed to refresh bridge preview grace after durable registration for %s",
+                staged["bridge_dir"],
+                exc_info=True,
+            )
 
+    logger.info(
+        "Bridge finalize: prompt=%s node=%s published=%d target_folder=%s stem=%s",
+        entry.get("prompt_key"),
+        entry.get("bridge_node_id"),
+        len(staged["items"]),
+        staged["target_folder"] or "(root)",
+        staged["naming_stem"],
+    )
+
+
+def _release_bridge_entry_dir(project, staged: dict) -> None:
+    """Keep the bridge directory for its preview grace, or remove it now."""
+    if staged["preview_expires_at"] is not None:
+        _schedule_bridge_preview_cleanup(project, staged["bridge_dir"], staged["preview_expires_at"])
+    else:
+        _cleanup_bridge_output_dir(project, staged["bridge_dir"])
+
+
+def _finalize_bridge_entry(entry: dict, outcome: str = "") -> list[Asset]:
+    """Register one Bridge's files on its own: stage, apply, commit, complete.
+
+    Re-raises any failure and never uses the group fallback: stale-directory
+    adoption depends on the raise to remove a bad directory. ``outcome`` is how
+    the run ended (``_run_outcome``), or empty when unknown (the watcher fallback).
+    """
+    project = load_project(entry["project_dir"])
+    _pre_item_ids = snapshot_item_ids(project)
+    staged = _stage_bridge_entry(project, entry, outcome)
     try:
-        if changed:
+        asset_id_remap = None
+        if _apply_staged_bridge(project, staged):
             committed_project = _save_generated_project(project, entry.get("base_modified_at", ""), created_ids=created_ids_since(_pre_item_ids, project))
             _note_saved_to_project(entry.get("prompt_key", ""), committed_project)
             asset_id_remap = getattr(committed_project, "_asset_id_remap", {}) if committed_project is not None else {}
-            from ..server import proxy_media
-            proxy_media.enqueue_after_commit(project.project_dir, [
-                asset_id_remap.get(pending["asset"].asset_id, pending["asset"].asset_id)
-                for pending in completed_moves if pending["asset_type"] == "video"
-            ])
-            for pending in completed_moves:
-                if pending["asset_type"] in {"video", "image", "audio"}:
-                    from ..server.thumbnail_service import ensure_thumbnail
-                    asset = pending["asset"]
-                    committed_asset_id = asset_id_remap.get(asset.asset_id, asset.asset_id)
-                    thumb_path = _project_thumbnail_path(project, committed_asset_id, purpose="bridge asset thumbnail path")
-                    if thumb_path:
-                        ensure_thumbnail(pending["asset_type"], pending["final_path"], thumb_path)
-
-        if retain_native_preview:
-            refreshed_expires_at = time.time() + BRIDGE_PREVIEW_GRACE_SEC
-            try:
-                _write_bridge_sidecar(
-                    bridge_dir,
-                    _list_bridge_files(bridge_dir),
-                    preview_expires_at=refreshed_expires_at,
-                )
-                preview_expires_at = refreshed_expires_at
-            except Exception:
-                logger.warning(
-                    "Failed to refresh bridge preview grace after durable registration for %s",
-                    bridge_dir,
-                    exc_info=True,
-                )
-
-        logger.info(
-            "Bridge finalize: prompt=%s node=%s published=%d target_folder=%s stem=%s",
-            entry.get("prompt_key"),
-            entry.get("bridge_node_id"),
-            len(registered_assets),
-            target_folder or "(root)",
-            naming_stem,
-        )
+        _complete_bridge_entry(project, staged, asset_id_remap)
     finally:
-        if preview_expires_at is not None:
-            _schedule_bridge_preview_cleanup(project, bridge_dir, preview_expires_at)
-        else:
-            _cleanup_bridge_output_dir(project, bridge_dir)
-    return [asset for _rel_path, asset in registered_assets]
+        _release_bridge_entry_dir(project, staged)
+    return [item["asset"] for item in staged["items"]]
 
 
 def _finalize_prompt_bridges(prompt_key: str, source: str = "unknown", outcome: str = "") -> None:
@@ -2197,15 +2320,184 @@ def _finalize_prompt_bridges(prompt_key: str, source: str = "unknown", outcome: 
             len(entries),
         )
 
+    for group in _group_bridge_entries(entries):
+        try:
+            _finalize_bridge_group(group, outcome)
+        except Exception:
+            for entry in group:
+                _log_bridge_failure(entry)
+
+
+def _log_bridge_failure(entry: dict) -> None:
+    logger.exception(
+        "Bridge finalization failed for prompt=%s node=%s",
+        entry.get("prompt_key"),
+        entry.get("bridge_node_id"),
+    )
+
+
+def _bridge_group_key(entry: dict) -> tuple[str, str]:
+    """``(canonical project directory, base version)``. The canonical path only
+    groups: loads, saves and leases keep an entry's own spelling, because
+    ``sdk_runs`` compares that string exactly.
+
+    It normalises as ``path_security.project_root`` does, because every entry of a
+    group is staged against the project loaded under the first entry's spelling:
+    with external links on, paths compare as written, so two spellings of one
+    project must stay two groups. A path that cannot be normalised keys on its raw
+    string (marked so it never equals a normalised one) and fails alone.
+    """
+    base_modified_at = str(entry.get("base_modified_at") or "")
+    project_dir = ""
+    try:
+        project_dir = str(entry.get("project_dir") or "")
+        if not project_dir or "\x00" in project_dir:
+            raise ValueError("unusable project directory")
+        normalized = os.path.abspath(project_dir) if external_links.is_enabled() else os.path.realpath(project_dir)
+        return os.path.normcase(normalized), base_modified_at
+    except Exception:
+        return "\x00" + project_dir, base_modified_at
+
+
+def _group_bridge_entries(entries: list[dict]) -> list[list[dict]]:
+    """Group a prompt's entries by project and base, keeping registry order within
+    each group and ordering groups by their first entry."""
+    groups = {}
+    for entry in entries:
+        groups.setdefault(_bridge_group_key(entry), []).append(entry)
+    return list(groups.values())
+
+
+def _finalize_bridge_group(entries: list[dict], outcome: str = "") -> None:
+    """Register a prompt's Bridges for one project and base through one load and
+    one generated commit, so later Bridges never conflict with earlier ones and
+    the browser refreshes once.
+
+    An entry whose stage raises is logged and dropped. If an apply or the commit
+    raises, the group project is discarded and each staged entry registers alone
+    against its original base (``_finalize_staged_bridge_alone``). Never raises
+    for one entry's failure.
+    """
+    first = entries[0]
+    # The first entry's own spelling: lease calls compare the string exactly.
+    project_dir = first.get("project_dir", "")
+    base_modified_at = first.get("base_modified_at", "")
+    project = load_project(project_dir)
+    _pre_item_ids = snapshot_item_ids(project)
+
+    staged_entries = []
     for entry in entries:
         try:
-            _finalize_bridge_entry(entry, outcome)
+            staged_entries.append(_stage_bridge_entry(project, entry, outcome))
         except Exception:
-            logger.exception(
-                "Bridge finalization failed for prompt=%s node=%s",
-                entry.get("prompt_key"),
-                entry.get("bridge_node_id"),
-            )
+            _log_bridge_failure(entry)
+    if not staged_entries:
+        return
+
+    committed_project = None
+    settle_job_ids = []
+    group_failed = False
+    # The fallback boundary is exactly the applies and the commit call.
+    try:
+        changed = False
+        for staged in staged_entries:
+            changed = _apply_staged_bridge(project, staged) or changed
+        if changed:
+            settle_job_ids = list(getattr(project, "_sonder_settle_after_save", None) or [])
+            committed_project = _save_generated_project(project, base_modified_at, created_ids=created_ids_since(_pre_item_ids, project))
+    except Exception:
+        logger.warning(
+            "Bridge group commit failed for prompt=%s project=%s; registering %d entries one by one",
+            first.get("prompt_key"),
+            project_dir,
+            len(staged_entries),
+            exc_info=True,
+        )
+        group_failed = True
+    if group_failed:
+        # Outside the handler, so the discarded group project is not kept alive
+        # by the traceback while the entries register one by one.
+        del project
+        for staged in staged_entries:
+            _finalize_staged_bridge_alone(staged)
+        return
+
+    asset_id_remap = None
+    if committed_project is not None:
+        asset_id_remap = getattr(committed_project, "_asset_id_remap", {}) or {}
+        try:
+            # `_save_generated_project` settled leases under the group's spelling;
+            # an entry that spells the project differently settles under its own.
+            for spelling in {str(staged["entry"].get("project_dir") or "") for staged in staged_entries}:
+                if spelling and spelling != project_dir:
+                    for job_id in settle_job_ids:
+                        sdk_runs.settle_lease(spelling, job_id)
+            _note_saved_to_project(first.get("prompt_key", ""), committed_project)
+        except Exception:
+            logger.exception("Bridge group bookkeeping failed for prompt=%s", first.get("prompt_key"))
+
+    for staged in staged_entries:
+        try:
+            try:
+                _complete_bridge_entry(project, staged, asset_id_remap)
+            finally:
+                _release_bridge_entry_dir(project, staged)
+        except Exception:
+            _log_bridge_failure(staged["entry"])
+
+
+def _finalize_staged_bridge_alone(staged: dict) -> None:
+    """The group fallback for one staged entry: load fresh, apply alone, commit
+    against the entry's original base, complete with that commit's own remap.
+
+    Apply is idempotent, so assets a failed group commit already wrote are not
+    added again; nothing is published twice, because staging already did that.
+    Logs its own failure; the bridge directory is kept or removed as usual.
+    """
+    entry = staged["entry"]
+    project = None
+    try:
+        try:
+            project = load_project(entry.get("project_dir", ""))
+            _pre_item_ids = snapshot_item_ids(project)
+            asset_id_remap = None
+            if _apply_staged_bridge(project, staged):
+                committed_project = _save_generated_project(project, entry.get("base_modified_at", ""), created_ids=created_ids_since(_pre_item_ids, project))
+                _note_saved_to_project(entry.get("prompt_key", ""), committed_project)
+                asset_id_remap = getattr(committed_project, "_asset_id_remap", {}) or {}
+            else:
+                _settle_bookkeeping_for_held_outputs(project, staged)
+            _complete_bridge_entry(project, staged, asset_id_remap)
+        finally:
+            _release_bridge_entry_dir(project if project is not None else entry.get("project_dir", ""), staged)
+    except Exception:
+        _log_bridge_failure(entry)
+
+
+def _settle_bookkeeping_for_held_outputs(project, staged: dict) -> None:
+    """The fallback found nothing to apply. When that is because a group commit
+    reached disk before it raised, do that commit's bookkeeping: note the run's
+    save and settle the lease of the job this entry completed or failed there.
+
+    Only assets held under their own staged ids count as this run's; nothing is
+    noted for an entry whose files never registered. Reads the job's root fields
+    only, so nothing is hydrated.
+    """
+    entry = staged["entry"]
+    held_ids = {asset.asset_id for asset in getattr(project, "assets", []) or []}
+    own_ids = {item["asset"].asset_id for item in staged["items"]}
+    if own_ids & held_ids:
+        _note_saved_to_project(entry.get("prompt_key", ""), project)
+    queue_job_id = staged["queue_job_id"]
+    if not (staged["mark_queue_complete"] and queue_job_id):
+        return
+    applied_ids = set(staged["applied_ids"])
+    for job in getattr(project, "generation_queue", []) or []:
+        if getattr(job, "job_id", "") != queue_job_id:
+            continue
+        if str(getattr(job, "result_asset_id", "") or "") in applied_ids:
+            sdk_runs.settle_lease(entry.get("project_dir", ""), queue_job_id)
+        return
 
 
 def _watch_prompt_for_bridge_completion(prompt_key: str, prompt) -> None:
