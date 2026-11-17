@@ -37,6 +37,12 @@ Narrow by construction, in the ``kj_preview_adapter`` pattern:
   outputs cache (``get_local``: a hit renders nothing) or by rendering it now,
   before ``clean_unused`` and before any node runs. A failed gate disables only
   deferral: Phase 4a's carriers keep working.
+- **Early release** (``check_early_release``, a sixth gate): before that render,
+  the armed ``set_prompt`` makes the calls ComfyUI makes next (``clean_unused``,
+  and in RAM mode ``ram_release`` to the executor's inactive headroom), so the
+  previous prompt's unused entries are not resident during the render. The
+  executor is read from the awaiting ``execute_async`` frame. A failed gate
+  disables only the early release.
 
 Expiry: retire this hook when ComfyUI offers a supported hook that runs after
 the ``DynamicPrompt`` exists and before ``set_prompt`` builds cache keys.
@@ -427,6 +433,162 @@ def check_deferral(execution: Any) -> str | None:
         return f"deferral gate error: {type(exc).__name__}"
 
 
+# execute_async releases the outputs cache this way: clean_unused right after keying, and in
+# RAM mode ram_release to the inactive headroom after every node that succeeds. Early release
+# makes the same calls a step sooner, inside the armed set_prompt, on a deferred miss.
+# Expiry: the early release (this gate, _early_release_runtime, _awaiting_executor,
+# _release_obsolete and the frame read in _arm_carriers) exists only because the deferred
+# render runs inside set_prompt, before ComfyUI's own cleanup. Remove it when that render
+# leaves set_prompt, or when ComfyUI releases obsolete entries before set_prompt returns.
+_EARLY_RELEASE_EXECUTE_ASYNC_ORDER = (
+    'ram_inactive_headroom = int(self.cache_args["ram_inactive"] * (1024 ** 3))',
+    "ram_release_callback = self.caches.outputs.ram_release if self.cache_type == CacheType.RAM_PRESSURE else None",
+    "await cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)",
+    "cache.clean_unused()",
+    "ram_release_callback(ram_inactive_headroom)",
+)
+
+
+def check_early_release(execution: Any) -> str | None:
+    """None when releasing obsolete entries before a deferred render does what ComfyUI does next.
+
+    Separate from ``check_deferral``: a mismatch only stops the early release; the
+    deferred render then runs with the previous prompt's unused entries resident,
+    as before.
+    """
+    try:
+        caching = sys.modules.get("comfy_execution.caching")
+        if caching is None:
+            from comfy_execution import caching
+        executor = execution.PromptExecutor
+        source = _source(executor.execute_async)
+        last = -1
+        for token in _EARLY_RELEASE_EXECUTE_ASYNC_ORDER:
+            at = source.find(token, last + 1)
+            if at < 0:
+                return f"early release execute_async order: {token}"
+            last = at
+        init = _source(executor.__init__)
+        for token in ("self.cache_args = cache_args", "self.cache_type = cache_type"):
+            if token not in init:
+                return f"PromptExecutor.__init__: {token}"
+        if "self.caches = CacheSet(cache_type=self.cache_type, cache_args=self.cache_args)" not in _source(
+                executor.reset):
+            return "PromptExecutor.reset"
+        basic = _source(caching.BasicCache.clean_unused)
+        if "self._clean_cache()" not in basic or "self._clean_subcaches()" not in basic:
+            return "BasicCache.clean_unused"
+        if "clean_unused" in vars(caching.HierarchicalCache):
+            return "HierarchicalCache.clean_unused overridden"
+        lru = caching.LRUCache
+        if "self.min_generation < self.generation" not in _source(lru.clean_unused):
+            return "LRUCache.clean_unused"
+        lru_keys = _source(lru.set_prompt)
+        if "self.generation += 1" not in lru_keys or "self._mark_used(node_id)" not in lru_keys:
+            return "LRUCache.set_prompt"
+        ram = caching.RAMPressureCache
+        ram_clean = _source(ram.clean_unused)
+        if "self._clean_subcaches()" not in ram_clean or "_clean_cache" in ram_clean:
+            return "RAMPressureCache.clean_unused"
+        if _params(ram.ram_release) != ["self", "target", "free_active", "min_entry_size"]:
+            return "RAMPressureCache.ram_release signature"
+        if inspect.signature(ram.ram_release).parameters["free_active"].default is not False:
+            return "RAMPressureCache.ram_release free_active default"
+        # RAM keys through LRUCache.set_prompt, which marks this prompt's entries current.
+        if "await super().set_prompt(dynprompt, node_ids, is_changed_cache)" not in _source(ram.set_prompt):
+            return "RAMPressureCache.set_prompt"
+        if "if not free_active and self.used_generation[key] == self.generation:" not in _source(ram.ram_release):
+            return "RAMPressureCache.ram_release keeps the current generation"
+        if not hasattr(getattr(execution, "CacheType", None), "RAM_PRESSURE"):
+            return "CacheType.RAM_PRESSURE"
+        if not callable(getattr(execution.comfy.model_management, "processing_interrupted", None)):
+            return "model_management.processing_interrupted"
+        return None
+    except Exception as exc:
+        return f"early release gate error: {type(exc).__name__}"
+
+
+def _early_release_runtime(execution: Any) -> dict[str, Any] | None:
+    """What the armed ``set_prompt`` needs to release early, or None (logged once) when the gate fails."""
+    reason = check_early_release(execution)
+    if reason is None:
+        try:
+            from comfy_execution import caching
+            return {
+                # The awaiting frame's code: the stock body, through any functools.wraps wrapper.
+                "code": inspect.unwrap(execution.PromptExecutor.execute_async).__code__,
+                "ram_type": caching.RAMPressureCache,
+                "ram_cache_type": execution.CacheType.RAM_PRESSURE,
+                "interrupted": lambda: execution.comfy.model_management.processing_interrupted(),
+            }
+        except Exception as exc:
+            reason = f"early release runtime: {type(exc).__name__}"
+    logger.info("Sonder cache pipeline: when the Sonder Editor renders a changed timeline, the previous "
+                "run's unused results stay in memory until ComfyUI frees them on this ComfyUI (%s).", reason)
+    return None
+
+
+def _awaiting_executor(early: dict[str, Any], frame: Any, outputs_cache: Any) -> Any:
+    """The ``PromptExecutor`` whose ``execute_async`` awaits this ``set_prompt``, or None.
+
+    Read from the awaiting frame, never copied, so the release uses the
+    executor's live ``cache_type`` and ``cache_args`` (expiry: drop with the
+    early release when the render leaves ``set_prompt``).
+    """
+    try:
+        if frame is None or frame.f_code is not early["code"]:
+            return None
+        owner = frame.f_locals.get("self")
+        if getattr(getattr(owner, "caches", None), "outputs", None) is not outputs_cache:
+            return None
+        return owner
+    except Exception:
+        return None
+
+
+_EARLY_RELEASE_SKIP_LOGGED = False
+
+
+def _release_obsolete(early: dict[str, Any], outputs_cache: Any, executor: Any) -> dict[str, Any]:
+    """Release what ComfyUI releases next, before a deferred render. Never raises.
+
+    ``clean_unused`` on every cache type (Classic drops entries this prompt does
+    not use, LRU only generations over capacity, RAM only subcaches; the stock
+    call right after then removes nothing more). RAM also ``ram_release`` to the
+    executor's inactive headroom with ``free_active=False``, the call the
+    executor makes after every successful node, unless a cancel is pending.
+    """
+    global _EARLY_RELEASE_SKIP_LOGGED
+    record: dict[str, Any] = {}
+    try:
+        before = len(outputs_cache.cache)
+        outputs_cache.clean_unused()
+        record["cleaned"] = max(0, before - len(outputs_cache.cache))
+    except Exception as exc:
+        record["clean_error"] = type(exc).__name__
+        logger.debug("Sonder cache pipeline: the early clean_unused failed", exc_info=True)
+    if type(outputs_cache) is not early["ram_type"]:
+        return record
+    try:
+        if executor is None or executor.cache_type != early["ram_cache_type"]:
+            record["ram"] = "executor_unknown"
+            if not _EARLY_RELEASE_SKIP_LOGGED:
+                _EARLY_RELEASE_SKIP_LOGGED = True
+                logger.info("Sonder cache pipeline: the previous run's unused results stay in memory while the "
+                            "Sonder Editor renders (this ComfyUI's executor was not recognised).")
+        elif early["interrupted"]():
+            record["ram"] = "interrupted"
+        else:
+            headroom = int(executor.cache_args["ram_inactive"] * (1024 ** 3))
+            record["ram_freed"] = int(outputs_cache.ram_release(headroom) or 0)
+            record["ram"] = "released"
+    except Exception as exc:
+        record["ram"] = "error"
+        record["ram_error"] = type(exc).__name__
+        logger.debug("Sonder cache pipeline: the early ram_release failed", exc_info=True)
+    return record
+
+
 def _carrier_runtime(execution: Any, stock_is_changed: Any) -> dict[str, Any] | None:
     """What the hook needs to arm carriers, or None (logged once) when the gate fails."""
     reason = check_carrier(execution, stock_is_changed)
@@ -450,6 +612,7 @@ def _carrier_runtime(execution: Any, stock_is_changed: Any) -> dict[str, Any] | 
                 "carrier": media_carrier.SonderMediaCarrier,
                 "mappings": lambda: execution.nodes.NODE_CLASS_MAPPINGS,
                 "defer": deferral is None,
+                "early_release": _early_release_runtime(execution) if deferral is None else None,
             }
         except Exception as exc:  # never costs Phases 1-3 their hook
             reason = f"carrier runtime: {type(exc).__name__}"
@@ -504,6 +667,7 @@ def _arm_carriers(carriers: dict[str, Any], outputs_cache: Any, dynprompt: Any, 
     """
     stock = type(outputs_cache).set_prompt
     entry = carriers["entry"]
+    early = carriers.get("early_release")
     carrier_ids = list(plan.carrier_ids)
 
     def roll_back(is_changed_cache) -> None:
@@ -518,6 +682,16 @@ def _arm_carriers(carriers: dict[str, Any], outputs_cache: Any, dynprompt: Any, 
         outputs_cache.__dict__.pop("set_prompt", None)
         if prompt_dynprompt is not dynprompt:
             return await stock(outputs_cache, prompt_dynprompt, node_ids, is_changed_cache)
+        # execute_async awaits this directly: its frame names the executor (the RAM headroom).
+        # Early release only; expiry with it (see _EARLY_RELEASE_EXECUTE_ASYNC_ORDER).
+        executor = None
+        if early is not None:
+            try:
+                frame = sys._getframe(1)
+            except Exception:
+                frame = None
+            executor = _awaiting_executor(early, frame, outputs_cache)
+            del frame
         submitted = list(node_ids)
         try:
             await stock(outputs_cache, prompt_dynprompt, submitted + carrier_ids, is_changed_cache)
@@ -541,8 +715,12 @@ def _arm_carriers(carriers: dict[str, Any], outputs_cache: Any, dynprompt: Any, 
         settle = getattr(plan, "settle", None)
         if getattr(plan, "deferred", None) and callable(settle):
             # Phase 4b: the Editor's deferred frames and audio, from this cache on a
-            # hit or rendered now, before any node runs. settle never raises.
-            if settle(outputs_cache, entry) == "rollback":
+            # hit or rendered now, before any node runs. settle never raises. On a
+            # miss it first releases what ComfyUI releases next (early release).
+            release = None
+            if early is not None:
+                release = lambda: _release_obsolete(early, outputs_cache, executor)  # noqa: E731
+            if settle(outputs_cache, entry, release) == "rollback":
                 roll_back(is_changed_cache)
                 # The Editor failed (stored for replay): its value substitutions go too, so
                 # every consumer waits for the scheduled Editor, as after a failed early run.
@@ -693,7 +871,7 @@ def install_on_startup(prompt_server: Any) -> None:
 
 def uninstall_for_tests() -> None:
     """Restore the stock class (the differential oracle's "pipeline off" arm)."""
-    global _FAULT_LOGGED
+    global _FAULT_LOGGED, _EARLY_RELEASE_SKIP_LOGGED
     with _LOCK:
         execution, stock, hooked = _INSTALLED.get("execution"), _INSTALLED.get("stock"), _INSTALLED.get("hooked")
         if execution is not None and stock is not None and getattr(execution, "IsChangedCache", None) is hooked:
@@ -702,6 +880,7 @@ def uninstall_for_tests() -> None:
         _STATUS.clear()
         _STATUS["state"] = STATE_ABSENT
         _FAULT_LOGGED = False
+        _EARLY_RELEASE_SKIP_LOGGED = False
 
 
 def reset_for_tests() -> None:

@@ -345,6 +345,187 @@ out["deferral_off_keeps_carriers"] = (runtime_without_deferral is not None
                                       and runtime_without_deferral.get("defer") is False)
 out["deferral_on"] = bool((hook._carrier_runtime(execution, stock) or {}).get("defer"))
 
+# The early-release gate: passes on the installed source, names each mutation.
+out["early_gate_installed"] = hook.check_early_release(execution)
+early_mut = from_source("early_mutants", """
+    class PromptExecutor:
+        async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
+            ram_inactive_headroom = int(self.cache_args["ram_inactive"] * (1024 ** 3))
+            ram_release_callback = self.caches.outputs.ram_release if self.cache_type == CacheType.RAM_PRESSURE else None
+            for cache in self.caches.all:
+                await cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
+                cache.clean_unused()
+
+    def init_without_args(self, server, cache_type=False, cache_args=None, asset_manager=None):
+        self.cache_type = cache_type
+        self.reset()
+
+    def init_without_type(self, server, cache_type=False, cache_args=None, asset_manager=None):
+        self.cache_args = cache_args
+        self.reset()
+
+    def ram_release_active_default(self, target, free_active=True, min_entry_size=0):
+        for key in list(self.cache):
+            if not free_active and self.used_generation[key] == self.generation:
+                continue
+        return 0
+
+    async def ram_set_prompt_unmarked(self, dynprompt, node_ids, is_changed_cache):
+        self.active_evictions = False
+
+    def reset_elsewhere(self):
+        self.caches = CacheSet(cache_type=self.cache_type, cache_args={})
+
+    def basic_clean_cache_only(self):
+        assert self.initialized
+        self._clean_cache()
+
+    def own_clean_unused(self):
+        self._clean_cache()
+        self._clean_subcaches()
+
+    def lru_clean_everything(self):
+        while len(self.cache) > self.max_size:
+            self.cache.clear()
+
+    async def lru_set_prompt_unmarked(self, dynprompt, node_ids, is_changed_cache):
+        await super().set_prompt(dynprompt, node_ids, is_changed_cache)
+
+    def ram_clean_all(self):
+        self._clean_cache()
+        self._clean_subcaches()
+
+    def ram_release_short(self, target, free_active=False):
+        return 0
+
+    def ram_release_all(self, target, free_active=False, min_entry_size=0):
+        for key in list(self.cache):
+            del self.cache[key]
+        return 0
+""")
+import enum
+
+
+def early_patched(owner, name, value):
+    had = name in owner.__dict__
+    original = owner.__dict__.get(name, None)
+    setattr(owner, name, value)
+    try:
+        return hook.check_early_release(execution)
+    finally:
+        if had:
+            setattr(owner, name, original)
+        else:
+            delattr(owner, name)
+
+
+def executor_with(name, value):
+    return fake(PromptExecutor=type("PromptExecutor", (execution.PromptExecutor,), {name: value}))
+
+
+def without_order_token(index):
+    """execute_async with every early-release order token except one."""
+    kept = [token for at, token in enumerate(hook._EARLY_RELEASE_EXECUTE_ASYNC_ORDER) if at != index]
+    body = "\n".join("            " + token for token in kept)
+    module = from_source(f"early_order_{index}", (
+        "\n    class PromptExecutor:\n"
+        "        async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):\n"
+        + body + "\n"))
+    return hook.check_early_release(fake(PromptExecutor=module.PromptExecutor))
+
+
+out["early_order_mutants"] = [without_order_token(index)
+                              for index in range(len(hook._EARLY_RELEASE_EXECUTE_ASYNC_ORDER))]
+out["early_order_tokens"] = list(hook._EARLY_RELEASE_EXECUTE_ASYNC_ORDER)
+out["early_gate_mutants"] = {
+    "order": hook.check_early_release(fake(PromptExecutor=early_mut.PromptExecutor)),
+    "init": hook.check_early_release(executor_with("__init__", early_mut.init_without_args)),
+    "init_type": hook.check_early_release(executor_with("__init__", early_mut.init_without_type)),
+    "ram_free_active": early_patched(caching.RAMPressureCache, "ram_release", early_mut.ram_release_active_default),
+    "ram_keys": early_patched(caching.RAMPressureCache, "set_prompt", early_mut.ram_set_prompt_unmarked),
+    "reset": hook.check_early_release(executor_with("reset", early_mut.reset_elsewhere)),
+    "basic_clean": early_patched(caching.BasicCache, "clean_unused", early_mut.basic_clean_cache_only),
+    "hierarchical": early_patched(caching.HierarchicalCache, "clean_unused", early_mut.own_clean_unused),
+    "lru_clean": early_patched(caching.LRUCache, "clean_unused", early_mut.lru_clean_everything),
+    "lru_keys": early_patched(caching.LRUCache, "set_prompt", early_mut.lru_set_prompt_unmarked),
+    "ram_clean": early_patched(caching.RAMPressureCache, "clean_unused", early_mut.ram_clean_all),
+    "ram_signature": early_patched(caching.RAMPressureCache, "ram_release", early_mut.ram_release_short),
+    "ram_current": early_patched(caching.RAMPressureCache, "ram_release", early_mut.ram_release_all),
+    "cache_type": hook.check_early_release(fake(CacheType=enum.Enum("CacheType", "CLASSIC LRU NONE"))),
+    "interrupted": hook.check_early_release(fake(comfy=types.SimpleNamespace(model_management=types.SimpleNamespace()))),
+}
+# A failed early-release gate keeps deferral and carriers; a passing one arms the release.
+real_ram_release = caching.RAMPressureCache.ram_release
+caching.RAMPressureCache.ram_release = early_mut.ram_release_all
+try:
+    runtime_without_early = hook._carrier_runtime(execution, stock)
+finally:
+    caching.RAMPressureCache.ram_release = real_ram_release
+out["early_off_keeps_deferral"] = (runtime_without_early is not None and runtime_without_early.get("defer") is True
+                                   and runtime_without_early.get("early_release") is None)
+early = (hook._carrier_runtime(execution, stock) or {}).get("early_release")
+out["early_on"] = early is not None and early["code"] is execution.PromptExecutor.execute_async.__code__
+
+# The release: what it calls on each cache type, and never raising.
+GIB = 1024 ** 3
+
+
+def ram_cache(release_result=123, raise_release=False, raise_clean=False):
+    cache = caching.RAMPressureCache(execution.CacheKeySetInputSignature)
+    calls = []
+
+    def ram_release(*args, **kwargs):
+        calls.append([list(args), sorted(kwargs)])
+        if raise_release:
+            raise RuntimeError("ram_release")
+        return release_result
+
+    def clean_unused():
+        calls.append("clean_unused")
+        if raise_clean:
+            raise RuntimeError("clean_unused")
+
+    cache.ram_release, cache.clean_unused = ram_release, clean_unused
+    return cache, calls
+
+
+ram_executor = types.SimpleNamespace(cache_type=execution.CacheType.RAM_PRESSURE, cache_args={"ram_inactive": 2.5})
+classic_executor = types.SimpleNamespace(cache_type=execution.CacheType.CLASSIC, cache_args={"ram_inactive": 2.5})
+release = {}
+cache, calls = ram_cache()
+release["ram"] = [hook._release_obsolete(early, cache, ram_executor), calls]
+cache, calls = ram_cache()
+release["ram_interrupted"] = [hook._release_obsolete(dict(early, interrupted=lambda: True), cache, ram_executor), calls]
+cache, calls = ram_cache()
+release["ram_no_executor"] = [hook._release_obsolete(early, cache, None), calls]
+cache, calls = ram_cache()
+release["ram_wrong_type"] = [hook._release_obsolete(early, cache, classic_executor), calls]
+cache, calls = ram_cache(raise_release=True)
+release["ram_raises"] = [hook._release_obsolete(early, cache, ram_executor), calls]
+cache, calls = ram_cache(raise_clean=True)
+release["clean_raises"] = [hook._release_obsolete(early, cache, ram_executor), calls]
+classic_cache = execution.HierarchicalCache(execution.CacheKeySetInputSignature)
+classic_cache.cache.update(old=1, kept=2)
+classic_cache.clean_unused = lambda: classic_cache.cache.pop("old")
+release["classic"] = [hook._release_obsolete(early, classic_cache, classic_executor), sorted(classic_cache.cache)]
+lru_cache = execution.LRUCache(execution.CacheKeySetInputSignature, 2)
+lru_calls = []
+lru_cache.clean_unused = lambda: lru_calls.append("clean_unused")
+lru_cache.ram_release = lambda *a, **k: lru_calls.append("ram_release")
+release["lru"] = [hook._release_obsolete(early, lru_cache, ram_executor), lru_calls]
+out["early_release"] = release
+
+# The executor is read only from a frame running the stock execute_async for this outputs cache.
+owner = types.SimpleNamespace(caches=types.SimpleNamespace(outputs=classic_cache))
+frame = lambda code, owner: types.SimpleNamespace(f_code=code, f_locals={"self": owner})  # noqa: E731
+out["awaiting_executor"] = {
+    "match": hook._awaiting_executor(early, frame(early["code"], owner), classic_cache) is owner,
+    "other_code": hook._awaiting_executor(early, frame(hook.check_shape.__code__, owner), classic_cache),
+    "other_cache": hook._awaiting_executor(early, frame(early["code"], owner), lru_cache),
+    "no_frame": hook._awaiting_executor(early, None, classic_cache),
+    "no_self": hook._awaiting_executor(early, types.SimpleNamespace(f_code=early["code"], f_locals={}), classic_cache),
+}
+
 # Per-prompt preconditions: the outputs cache must be a stock type, unarmed, with the carrier registered.
 import nodes as comfy_nodes
 carrier_runtime = hook._carrier_runtime(execution, stock)
@@ -541,6 +722,60 @@ def test_the_deferral_gate_passes_installed_and_names_each_mutation(result):
 def test_a_failed_deferral_gate_disables_only_deferral(result):
     assert result["deferral_on"] is True
     assert result["deferral_off_keeps_carriers"] is True
+
+
+def test_the_early_release_gate_passes_installed_and_names_each_mutation(result):
+    assert result["early_gate_installed"] is None
+    assert result["early_gate_mutants"] == {
+        "order": "early release execute_async order: ram_release_callback(ram_inactive_headroom)",
+        "init": "PromptExecutor.__init__: self.cache_args = cache_args",
+        "init_type": "PromptExecutor.__init__: self.cache_type = cache_type",
+        "ram_free_active": "RAMPressureCache.ram_release free_active default",
+        "ram_keys": "RAMPressureCache.set_prompt",
+        "reset": "PromptExecutor.reset",
+        "basic_clean": "BasicCache.clean_unused",
+        "hierarchical": "HierarchicalCache.clean_unused overridden",
+        "lru_clean": "LRUCache.clean_unused",
+        "lru_keys": "LRUCache.set_prompt",
+        "ram_clean": "RAMPressureCache.clean_unused",
+        "ram_signature": "RAMPressureCache.ram_release signature",
+        "ram_current": "RAMPressureCache.ram_release keeps the current generation",
+        "cache_type": "CacheType.RAM_PRESSURE",
+        "interrupted": "model_management.processing_interrupted",
+    }
+
+
+def test_the_early_release_gate_names_each_missing_execute_async_token(result):
+    tokens = result["early_order_tokens"]
+    assert len(tokens) == 5
+    assert result["early_order_mutants"] == [f"early release execute_async order: {token}" for token in tokens]
+
+
+def test_a_failed_early_release_gate_disables_only_the_early_release(result):
+    assert result["early_on"] is True
+    assert result["early_off_keeps_deferral"] is True
+
+
+def test_the_early_release_makes_comfyuis_next_calls_and_never_raises(result):
+    release = result["early_release"]
+    # RAM: clean_unused, then ram_release to the executor's live inactive headroom, free_active left False.
+    assert release["ram"] == [{"cleaned": 0, "ram_freed": 123, "ram": "released"},
+                              ["clean_unused", [[int(2.5 * 1024 ** 3)], []]]]
+    # A pending cancel, an unknown or non-RAM executor: clean_unused only.
+    assert release["ram_interrupted"] == [{"cleaned": 0, "ram": "interrupted"}, ["clean_unused"]]
+    assert release["ram_no_executor"] == [{"cleaned": 0, "ram": "executor_unknown"}, ["clean_unused"]]
+    assert release["ram_wrong_type"] == [{"cleaned": 0, "ram": "executor_unknown"}, ["clean_unused"]]
+    # Faults are recorded, never raised; a failed clean still lets the RAM release run.
+    assert release["ram_raises"][0] == {"cleaned": 0, "ram": "error", "ram_error": "RuntimeError"}
+    assert release["clean_raises"][0] == {"clean_error": "RuntimeError", "ram_freed": 123, "ram": "released"}
+    # Classic and LRU: clean_unused only (LRU's own call evicts only generations over capacity).
+    assert release["classic"] == [{"cleaned": 1}, ["kept"]]
+    assert release["lru"] == [{"cleaned": 0}, ["clean_unused"]]
+
+
+def test_the_executor_is_read_only_from_the_stock_execute_async_frame_of_this_cache(result):
+    assert result["awaiting_executor"] == {"match": True, "other_code": None, "other_cache": None,
+                                           "no_frame": None, "no_self": None}
 
 
 def test_carriers_are_planned_only_on_a_stock_unarmed_cache_with_the_carrier_registered(result):

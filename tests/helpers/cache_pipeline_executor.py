@@ -514,7 +514,17 @@ def instrumented_render(self, proj, scene, start, end, **kwargs):
     if INJECT["ram_release_in_render"]:
         cache = CURRENT["executor"].caches.outputs
         NOTES.append({"ram_release_in_render": cache.ram_release(float("inf"), free_active=True)})
-    return _real_render(self, proj, scene, start, end, **kwargs)
+    if FRAME_WATCH["on"]:
+        # Early release: is any earlier render's frame batch still resident when this one starts?
+        FRAME_WATCH["alive_at_start"].append(any(not ref.expired() for ref in FRAME_WATCH["refs"]))
+    frames = _real_render(self, proj, scene, start, end, **kwargs)
+    if FRAME_WATCH["on"]:
+        from torch.multiprocessing.reductions import StorageWeakRef
+        FRAME_WATCH["refs"].append(StorageWeakRef(frames.untyped_storage()))
+    return frames
+
+
+FRAME_WATCH = {"on": False, "refs": [], "alive_at_start": []}
 
 
 def instrumented_save_project(proj, *args, **kwargs):
@@ -563,9 +573,19 @@ CACHE = {"classic": (execution.CacheType.CLASSIC, {}), "lru": (execution.CacheTy
          "ram": (execution.CacheType.RAM_PRESSURE, {}), "none": (execution.CacheType.NONE, {})}[MODE]
 
 
+def production_ram_args():
+    """main.py's RAM defaults: the active headroom 10% of RAM (2-10 GiB), the inactive headroom all of it."""
+    import comfy.system_memory
+    total = comfy.system_memory.virtual_memory_total()
+    return {"ram": min(10.0, max(2.0, total * 0.10 / 1024 ** 3)), "ram_inactive": min(128.0, total / 1024 ** 3)}
+
+
 def new_executor():
     cache_type, args = CACHE
-    executor = execution.PromptExecutor(SERVER, cache_type=cache_type, cache_args={"ram": 0, "ram_inactive": 0, **args})
+    base = {"ram": 0, "ram_inactive": 0}
+    if MODE == "ram" and os.environ.get("SONDER_CACHE_PIPELINE_RAM_HEADROOM") == "production":
+        base = production_ram_args()  # the early release then frees inactive entries, as in production
+    executor = execution.PromptExecutor(SERVER, cache_type=cache_type, cache_args={**base, **args})
     CURRENT["executor"] = executor
     return executor
 
@@ -3065,6 +3085,259 @@ async def case_deferred_safety():
            "diff": _diff(rows[True]["outputs"], rows[False]["outputs"])})
 
 
+# --- Early release: obsolete entries released before a deferred render ---------------------------
+
+RELEASES = []
+_real_release_obsolete = hook._release_obsolete
+
+
+def recording_release_obsolete(early, outputs_cache, executor):
+    """The hook's release, with its RAM call spied on (target and arguments)."""
+    calls = []
+    real = getattr(outputs_cache, "ram_release", None)
+    if real is not None:
+        def spy(target, *args, **kwargs):
+            calls.append({"target": target, "args": list(args), "kwargs": sorted(kwargs)})
+            return real(target, *args, **kwargs)
+        outputs_cache.ram_release = spy
+    try:
+        result = _real_release_obsolete(early, outputs_cache, executor)
+    finally:
+        if real is not None:
+            outputs_cache.__dict__.pop("ram_release", None)
+    RELEASES.append({"result": result, "ram_calls": calls})
+    return result
+
+
+RELEASED_RECORDS = []
+_real_note_released = pipeline._note_released
+
+
+def recording_note_released(key, released):
+    """The real merge, then the run's settled record as sdk_runs now holds it."""
+    _real_note_released(key, released)
+    RELEASED_RECORDS.append((sdk_runs.preparation(key) or {}).get("settled"))
+
+
+pipeline._note_released = recording_note_released
+
+
+def memory_graph(fx, ed="1"):
+    """No node passes the Editor's frames through, so only cache entries can hold them."""
+    return {
+        ed: editor(fx, selection_end=4, take_placement_muted=True),
+        "fd": n("CPMediaDigest", frames=[ed, 1]), "fdp": n("PreviewAny", source=["fd", 0]),
+        "gd": n("CPMediaDigest", frames=[ed, 2]), "gdp": n("PreviewAny", source=["gd", 0]),
+        "ad": n("CPAudioDigest", audio=[ed, 10]), "adp": n("PreviewAny", source=["ad", 0]),
+        "el": n("EmptyLatentImage", width=64, height=64, batch_size=1), "elp": n("PreviewAny", source=["el", 0]),
+    }
+
+
+MEMORY_NODES = {"fd", "gd", "ad", "el"}
+GIB = 1024 ** 3
+
+
+def memory_arms():
+    """(label, cache_args, retains): whether this arm keeps the previous run's results by its own policy."""
+    if MODE == "classic":
+        return [("classic", {}, False)]
+    if MODE == "lru":
+        return [("lru over capacity", {"lru": 2}, False), ("lru within capacity", {"lru": 100}, True)]
+    return [("ram production", production_ram_args(), False),
+            # No inactive headroom: the executor keeps inactive entries, so must the release.
+            ("ram no inactive headroom", {"ram": 0, "ram_inactive": 0}, True),
+            # A real threshold far below what is free: nothing inactive is released either.
+            ("ram threshold met", {"ram": 0, "ram_inactive": 1 / 1024}, True)]
+
+
+async def run_isolated(executor, graph):
+    """One event loop per prompt, as ComfyUI's prompt_worker (PromptExecutor.execute -> asyncio.run)."""
+    return await asyncio.to_thread(asyncio.run, run(executor, graph))
+
+
+# (step, clip opacity, audio volume, (renders, mixes) for an arm that does not retain, consumers that rerun).
+MEMORY_STEPS = (
+    ("base", 1.0, 1.0, (1, 1), MEMORY_NODES),
+    ("identical", 1.0, 1.0, (0, 0), set()),
+    ("clip edit", 0.5, 1.0, (1, 0), {"fd"}),
+    ("clip revert", 1.0, 1.0, (1, 0), {"fd"}),
+    ("audio edit", 1.0, 0.5, (0, 1), {"ad"}),
+    ("both edited", 0.25, 0.25, (1, 1), {"fd", "ad"}),
+)
+
+
+async def memory_sequence(enabled, label, args):
+    set_pipeline(enabled)
+    fx = content_fixture(f"dmem-{label.replace(' ', '-')}-{int(enabled)}", len(MEMORY_STEPS) + 6)
+    cache_type, mode_args = CACHE
+    executor = execution.PromptExecutor(SERVER, cache_type=cache_type,
+                                        cache_args={"ram": 0, "ram_inactive": 0, **mode_args, **args})
+    CURRENT["executor"] = executor
+    rows = []
+    for name, opacity, volume, _work, _rerun in MEMORY_STEPS:
+        def edit(project, scene, opacity=opacity, volume=volume):
+            scene.clips[0].opacity = opacity
+            scene.audio_tracks[0].volume = volume
+        edit_project(fx, edit)
+        RELEASES.clear()
+        RELEASED_RECORDS.clear()
+        FRAME_WATCH["alive_at_start"] = []
+        renders_before = len(FRAME_WATCH["refs"])
+        row = await run_isolated(executor, memory_graph(fx))
+        # Non-vacuous residency: the frames this prompt rendered are the ones its cache now holds.
+        held = (len(FRAME_WATCH["refs"]) == renders_before + 1 and not FRAME_WATCH["refs"][-1].expired()
+                if row["work"]["render"] else None)
+        rows.append((name, row, list(RELEASES), list(FRAME_WATCH["alive_at_start"]),
+                     list(RELEASED_RECORDS), held))
+    return fx, executor, rows
+
+
+def no_release(early, outputs_cache, executor):
+    RELEASES.append({"result": {}, "ram_calls": []})
+    return {}
+
+
+async def case_deferred_memory():
+    """A deferred miss releases what ComfyUI releases next, before it renders (classic, lru, ram)."""
+    case = "deferred_memory"
+    hook._release_obsolete = recording_release_obsolete
+    FRAME_WATCH.update(on=True, refs=[], alive_at_start=[])
+    try:
+        if MODE == "classic":
+            # Negative control: with the release a no-op, the previous frames are resident at render start.
+            hook._release_obsolete = no_release
+            try:
+                _, _, control = await memory_sequence(True, "release disabled", {})
+            finally:
+                hook._release_obsolete = recording_release_obsolete
+            FRAME_WATCH["refs"] = []
+            alive = {name: alive for name, _row, _releases, alive, _records, _held in control}
+            check(case, "negative control (release disabled): the previous frames are resident at every re-render",
+                  alive["clip edit"] == alive["clip revert"] == alive["both edited"] == [True], alive)
+        for arm, args, retains in memory_arms():
+            fx, executor, rows = await memory_sequence(True, arm, args)
+            FRAME_WATCH["refs"] = []
+            _, _, stock_rows = await memory_sequence(False, arm, args)
+            FRAME_WATCH["refs"] = []
+            set_pipeline(True)  # the oracle arm uninstalled the hook; the checks below need it
+            for (name, row, releases, alive, records, held), (_, stock, *_rest) in zip(rows, stock_rows):
+                step = next(item for item in MEMORY_STEPS if item[0] == name)
+                renders, mixes = step[3]
+                rerun = step[4]
+                if retains and name == "clip revert":
+                    renders, rerun = 0, set()  # this arm still holds the base run's frames: a hit
+                label = f"{arm}, {name}"
+                check(case, f"{label}: succeeds and every consumer equals stock",
+                      row.get("success") and stock.get("success") and row["outputs"] == stock["outputs"],
+                      {"error": row.get("error"), "diff": _diff(row["outputs"], stock["outputs"])})
+                check(case, f"{label}: renders {renders}, mixes {mixes}", row["work"] == {"render": renders, "mix": mixes},
+                      {"work": row["work"], "settled": row["settled"]})
+                check(case, f"{label}: exactly the changed outputs' consumers rerun; every hit is kept",
+                      executed_nodes(row) & MEMORY_NODES == rerun,
+                      {"ran": sorted(executed_nodes(row) & MEMORY_NODES), "expected": sorted(rerun)})
+                missed = renders + mixes > 0 and name != "base"
+                check(case, f"{label}: the release runs once on a miss and never on a hit",
+                      len(releases) == (1 if renders + mixes > 0 else 0), releases)
+                if renders:
+                    check(case, f"{label}: the rendered frames are the ones the cache holds after the run",
+                          held is True, held)
+                if renders and name != "base":
+                    check(case, f"{label}: the previous frames are {'still' if retains else 'no longer'} resident "
+                                f"when the render starts", alive == [retains], alive)
+                if releases:
+                    record = records[0] if len(records) == 1 else None
+                    check(case, f"{label}: the run's settled record carries the release",
+                          isinstance(record, dict) and record.get("released") == releases[0]["result"]
+                          and record.get("outcome") == "settled" and record.get("misses") == renders + mixes,
+                          {"records": records, "release": releases[0]["result"]})
+                if missed and releases and MODE == "ram":
+                    target = int(args["ram_inactive"] * GIB)
+                    result = releases[0]["result"]
+                    check(case, f"{label}: ram_release once, to the executor's inactive headroom, free_active False",
+                          result.get("ram") == "released"
+                          and releases[0]["ram_calls"] == [{"target": target, "args": [], "kwargs": []}],
+                          releases[0])
+                elif missed and releases:
+                    check(case, f"{label}: clean_unused only", "ram" not in releases[0]["result"]
+                          and not releases[0]["ram_calls"], releases[0])
+
+            if retains:
+                continue
+            # A raise and a cancel during the render, after the release: rolled back, the next run works.
+            edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.6))
+            INJECT["render_error"] = True
+            RELEASES.clear()
+            try:
+                row = await run_isolated(executor, memory_graph(fx))
+            finally:
+                INJECT["render_error"] = False
+            check(case, f"{arm}: a render raise after the release is reported at the Editor",
+                  not row.get("success") and (row.get("error") or {}).get("node") == "1" and len(RELEASES) == 1,
+                  {"error": row.get("error"), "releases": list(RELEASES)})
+            after = await run_isolated(executor, memory_graph(fx))
+            check(case, f"{arm}: the run after a raise renders and succeeds",
+                  after.get("success") and after["work"]["render"] == 1, {"error": after.get("error"),
+                                                                           "work": after["work"]})
+            edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.7))
+            INJECT["interrupt_at"] = 1
+            RELEASES.clear()
+            try:
+                row = await run_isolated(executor, memory_graph(fx))
+            finally:
+                INJECT["interrupt_at"] = None
+                mm.interrupt_current_processing(False)
+            check(case, f"{arm}: a cancel during the render after the release interrupts the run",
+                  not row.get("success") and (row.get("error") or {}).get("event") == "execution_interrupted"
+                  and len(RELEASES) == 1, {"error": row.get("error"), "releases": list(RELEASES)})
+            # Back to the last completed timeline: what the cancelled prompt released is gone, so it
+            # renders again (in RAM mode stock keeps inactive entries after a failed prompt: the accepted cost).
+            edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.6))
+            after = await run_isolated(executor, memory_graph(fx))
+            check(case, f"{arm}: after a cancel, going back renders again and succeeds",
+                  after.get("success") and after["work"]["render"] == 1,
+                  {"error": after.get("error"), "work": after["work"]})
+            if MODE == "ram":
+                # A cancel already pending when the release runs: clean_unused only, no ram_release.
+                def cancel_then_release(early, outputs_cache, executor):
+                    mm.interrupt_current_processing(True)
+                    return recording_release_obsolete(early, outputs_cache, executor)
+
+                edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.45))
+                hook._release_obsolete = cancel_then_release
+                RELEASES.clear()
+                try:
+                    row = await run_isolated(executor, memory_graph(fx))
+                finally:
+                    hook._release_obsolete = recording_release_obsolete
+                    mm.interrupt_current_processing(False)
+                check(case, f"{arm}: with a cancel pending the release skips ram_release and the run is interrupted",
+                      not row.get("success") and (row.get("error") or {}).get("event") == "execution_interrupted"
+                      and len(RELEASES) == 1 and RELEASES[0]["result"].get("ram") == "interrupted"
+                      and not RELEASES[0]["ram_calls"], {"error": row.get("error"), "releases": list(RELEASES)})
+                edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.6))
+                after = await run_isolated(executor, memory_graph(fx))
+                check(case, f"{arm}: the run after a pending cancel succeeds", after.get("success"), after.get("error"))
+            # After ComfyUI's cache reset (Free model and node cache): the release still applies.
+            executor.reset()
+            CURRENT["executor"] = executor
+            FRAME_WATCH["refs"] = []
+            cold = await run_isolated(executor, memory_graph(fx))
+            edit_project(fx, lambda project, scene: setattr(scene.clips[0], "opacity", 0.35))
+            RELEASES.clear()
+            FRAME_WATCH["alive_at_start"] = []
+            row = await run_isolated(executor, memory_graph(fx))
+            check(case, f"{arm}: after executor.reset() the release still runs before the render",
+                  cold.get("success") and row.get("success") and len(RELEASES) == 1
+                  and FRAME_WATCH["alive_at_start"] == [False]
+                  and (MODE != "ram" or RELEASES[0]["result"].get("ram") == "released"),
+                  {"releases": list(RELEASES), "alive": FRAME_WATCH["alive_at_start"], "error": row.get("error"),
+                   "work": row["work"], "settled": row["settled"], "content": prep(row).get("content"),
+                   "reasons": prep(row).get("content_reasons"), "outcome": prep(row).get("outcome")})
+    finally:
+        hook._release_obsolete = _real_release_obsolete
+        FRAME_WATCH.update(on=False, refs=[], alive_at_start=[])
+
+
 NOTES_OUT = {}
 CASES = {"acceptance": case_acceptance, "fail_open": case_fail_open, "tokens": case_tokens, "cancel": case_cancel,
          "errors": case_errors, "shapes": case_shapes, "lazy": case_lazy, "ram": case_ram, "misc": case_misc,
@@ -3075,16 +3348,18 @@ CASES = {"acceptance": case_acceptance, "fail_open": case_fail_open, "tokens": c
          "identity_ram": case_identity_ram, "identity_shapes": case_identity_shapes,
          "content": case_content, "content_negative": case_content_negative, "content_shapes": case_content_shapes,
          "content_safety": case_content_safety, "deferred": case_deferred,
-         "deferred_shapes": case_deferred_shapes, "deferred_safety": case_deferred_safety}
+         "deferred_shapes": case_deferred_shapes, "deferred_safety": case_deferred_safety,
+         "deferred_memory": case_deferred_memory}
 BY_MODE = {
     "classic": ["acceptance", "fail_open", "tokens", "cancel", "errors", "shapes", "lazy", "misc",
                 "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative",
                 "identity", "identity_lazy", "identity_safety", "identity_shapes",
                 "content", "content_negative", "content_shapes", "content_safety",
-                "deferred", "deferred_shapes", "deferred_safety"],
-    "lru": ["acceptance", "cancel", "bridges", "identity", "content", "deferred"],
+                "deferred", "deferred_shapes", "deferred_safety", "deferred_memory"],
+    "lru": ["acceptance", "cancel", "bridges", "identity", "content", "deferred", "deferred_memory"],
     "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram",
-            "identity", "identity_ram", "content", "content_safety", "deferred", "deferred_safety"],
+            "identity", "identity_ram", "content", "content_safety", "deferred", "deferred_safety",
+            "deferred_memory"],
     "none": ["acceptance", "bridges", "identity", "content", "deferred"],
 }
 

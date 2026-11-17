@@ -67,12 +67,18 @@ CASES_BY_MODE = {
                 "bridges", "bridges_real", "bridges_snapshot", "bridges_shapes", "bridges_safety", "bridges_negative",
                 "identity", "identity_lazy", "identity_safety", "identity_shapes",
                 "content", "content_negative", "content_shapes", "content_safety",
-                "deferred", "deferred_shapes", "deferred_safety"],
-    "lru": ["acceptance", "cancel", "bridges", "identity", "content", "deferred"],
+                "deferred", "deferred_shapes", "deferred_safety", "deferred_memory"],
+    "lru": ["acceptance", "cancel", "bridges", "identity", "content", "deferred", "deferred_memory"],
     "ram": ["acceptance", "cancel", "errors", "ram", "bridges", "bridges_real", "bridges_snapshot", "bridges_ram",
-            "identity", "identity_ram", "content", "content_safety", "deferred", "deferred_safety"],
+            "identity", "identity_ram", "content", "content_safety", "deferred", "deferred_safety",
+            "deferred_memory"],
+    # RAM with main.py's default headroom (the harness default is 0), so the early release
+    # frees inactive entries in these cases as it does in production.
+    "ram-production": ["cancel", "errors", "content_safety", "deferred", "deferred_safety"],
     "none": ["acceptance", "bridges", "identity", "content", "deferred"],
 }
+# A pytest arm -> (the helper's cache mode, extra environment).
+HELPER_MODE = {"ram-production": ("ram", {"SONDER_CACHE_PIPELINE_RAM_HEADROOM": "production"})}
 
 
 def _comfy_root() -> Path | None:
@@ -97,10 +103,12 @@ def _run(mode: str) -> dict:
         pytest.skip("needs a ComfyUI install (SONDER_COMFYUI_ROOT or the test install's venv)")
     with tempfile.TemporaryDirectory(prefix="sonder-cache-pipeline-result-") as folder:
         out = Path(folder) / f"{mode}.json"
+        helper_mode, extra_env = HELPER_MODE.get(mode, (mode, {}))
+        only = [",".join(CASES_BY_MODE[mode])] if mode in HELPER_MODE else []
         completed = subprocess.run(
-            [sys.executable, str(HELPER), str(comfy_root), str(REPO_ROOT), mode, str(out)],
+            [sys.executable, str(HELPER), str(comfy_root), str(REPO_ROOT), helper_mode, str(out), *only],
             cwd=str(comfy_root), capture_output=True, text=True, timeout=1800,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **extra_env},
         )
         assert out.is_file(), (completed.stdout[-2000:], completed.stderr[-4000:])
         _RESULTS[mode] = json.loads(out.read_text(encoding="utf-8"))

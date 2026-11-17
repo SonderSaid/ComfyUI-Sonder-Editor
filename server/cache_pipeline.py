@@ -1113,7 +1113,8 @@ def _entry_value(entry: Any, entry_type: Any) -> Any:
 
 
 def settle_deferred(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, plan: CarrierPlan,
-                    outputs_cache: Any, entry_type: Any, call_key: str) -> str:
+                    outputs_cache: Any, entry_type: Any, call_key: str,
+                    release_obsolete: Callable[[], dict] | None = None) -> str:
     """Settle the plan's deferred carriers inside this prompt's armed ``set_prompt``. Never raises.
 
     After the stock keying, each deferred carrier looks in ComfyUI's outputs
@@ -1122,6 +1123,10 @@ def settle_deferred(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, pl
     Anything else is a **miss**: the slot is rendered now, in the Editor's
     stage, before any node runs (where the render happens today), and its
     entry is stored. The frames then give the colour-drift reference.
+
+    Before the first miss renders, ``release_obsolete`` (the hook's, when its
+    gate passed) releases what ComfyUI releases next, once: every hit was
+    already looked up under this prompt's keys, which the release keeps.
 
     ``""`` when settled; ``"rollback"`` when the Editor failed (stored for
     replay, its job handled by the failure contract) or a cancel arrived
@@ -1134,6 +1139,7 @@ def settle_deferred(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, pl
     if pending is None:
         return "fault"
     hits = misses = 0
+    released = None
     try:
         waiting = []
         for carrier_id, slot in sorted(plan.deferred.items()):
@@ -1146,6 +1152,11 @@ def settle_deferred(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, pl
             waiting.append((carrier_id, slot))
         if waiting:
             misses = len(waiting)
+            if release_obsolete is not None:
+                try:
+                    released = release_obsolete()
+                except Exception as exc:  # the hook's never raises; a fault here only keeps the overlap
+                    released = {"error": type(exc).__name__}
             _materialize(runtime, prompt_id, dynprompt, editor_id, key, call_key, pending,
                          [slot for _carrier_id, slot in waiting])
             for carrier_id, slot in waiting:
@@ -1164,6 +1175,8 @@ def settle_deferred(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, pl
                      exc_info=True)
         outcome = "fault"
     _note_settled(key, hits, misses, outcome)
+    if released is not None:
+        _note_released(key, released)
     return outcome
 
 
@@ -1175,6 +1188,18 @@ def _note_settled(key: str, hits: int, misses: int, outcome: str) -> None:
         sdk_runs.note_preparation(key, record)
     except Exception:
         logger.debug("Sonder cache pipeline could not record settled media", exc_info=True)
+
+
+def _note_released(key: str, released: dict) -> None:
+    """Merge the early release into the run's settled record (tests, kits). Never raises."""
+    try:
+        record = sdk_runs.preparation(key) or {}
+        settled = dict(record.get("settled") or {})
+        settled["released"] = dict(released)
+        record["settled"] = settled
+        sdk_runs.note_preparation(key, record)
+    except Exception:
+        logger.debug("Sonder cache pipeline could not record the early release", exc_info=True)
 
 
 def apply_carriers(dynprompt: Any, plan: CarrierPlan) -> None:
@@ -1410,8 +1435,8 @@ def prepare(runtime: ExecutorRuntime, prompt_id: str, dynprompt: Any, media: Med
             return record
         if plan is not None and plan.deferred:
             plan.value_overrides = sorted(overrides)
-            plan.settle = lambda outputs_cache, entry_type, _plan=plan: settle_deferred(
-                runtime, prompt_id, dynprompt, _plan, outputs_cache, entry_type, call_key)
+            plan.settle = lambda outputs_cache, entry_type, release_obsolete=None, _plan=plan: settle_deferred(
+                runtime, prompt_id, dynprompt, _plan, outputs_cache, entry_type, call_key, release_obsolete)
 
         # Applied only once the whole plan exists, so a planning fault leaves none.
         for node_id, node in overrides.items():

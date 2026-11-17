@@ -129,11 +129,18 @@ result. It renders again when:
 A Driver, Reference, guide, timeline video or timeline audio file was replaced
 while the run was reading it. Run again; a queued job goes back to pending.
 
-### Memory runs higher while the Sonder Editor renders, with `--cache-classic`
+### Memory runs higher while the Sonder Editor renders
 
-With `--cache-classic`, a run can briefly hold the previous take's frames and
-results while the **Sonder Editor** renders. Remove the flag to use ComfyUI's
-default cache, or start ComfyUI with `--cache-none`.
+While the **Sonder Editor** renders, ComfyUI can still hold the previous run's
+frames and the results made from them. This happens when the Editor renders on
+every run although nothing changed;
+[The Sonder Editor renders again with nothing changed](#the-sonder-editor-renders-again-with-nothing-changed)
+lists the reasons and their fixes. If no fix there applies, for example
+because the video files under the run are over the size limit, start ComfyUI
+with `--cache-none`.
+
+If the ComfyUI console shows `the previous run's unused results stay in
+memory`, update ComfyUI and Sonder Editor.
 
 ## Projects & storage
 
