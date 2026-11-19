@@ -195,7 +195,7 @@ version and opening instructions, is on
 
 Sonder generates nothing itself, so what a project can do depends on the model
 and workflow wired underneath it. **Model templates** carry each model's legal
-frame counts, FPS and resolution rules, so the timeline snaps to what your
+frame counts, FPS, resolution rules and audio grid, so the timeline snaps to what your
 graph can actually render.
 
 Built in: **No Model Template** (no constraints), **LTX 2.3 / 2.5**, **MiniMax H3**,
@@ -224,7 +224,7 @@ adapters, grouped under the `Sonder`, `Sonder/IO`, `Sonder/Logic`, and
 | **Sonder Reference Prompt Bridge** | Outputs the selected lanes' prompt text: `reference_prompt`, `reference_names`, and `p01`–`p16`. |
 | **Sonder Masks Bridge** | Outputs the generation window's picture and sound masks, each set to **Edit** or **Freeze**; see [Masking an audio-video latent](docs/generating.md#masking-an-audio-video-latent). An optional spatial mask limits the video edit to a moving region; see [Edit a moving region](docs/generating.md#edit-a-moving-region). |
 | **Sonder Prompt Relay Bridge** | Exports the generation window's prompt lanes as ComfyUI-PromptRelay payload strings (no model patching). |
-| **Sonder Template Helper** | Reads a model template's **Audio grid** (sample rate and block) from a model's audio VAE, for setting up a custom template; see [Model templates](docs/generating.md#model-templates). |
+| **Sonder Template Helper** | Shows the **Audio grid** (sample rate and block) to enter in a model template, read from a model's audio VAE; see [Model templates](docs/generating.md#model-templates). |
 
 ### Save & preview — `Sonder/IO`
 

@@ -89,15 +89,9 @@ in the toolbar's scene-geometry group.
 
 - **Hard constraints snap**: dimension step/offset, the frame rule
   (e.g. LTX's `8n+1`), the allowed-FPS list, and the **Audio grid**.
-- **Audio grid** (LTX 2.3 / 2.5 and MiniMax H3): the sample rate and block size
-  of the model's audio encoder. The editor sends its audio at that rate and
-  pads it to whole blocks, so the encoder keeps the start of the audio. In the
-  template editor choose **Built-in**, **Off**, or **Custom** with a rate and a
-  block. An existing project picks up its template's audio grid the next time
-  you open it in the Sonder Editor. For a model without a built-in grid, add a
-  **Sonder Template Helper** node, wire the model's audio VAE into it and run
-  the workflow: the node shows the rate and block to enter, or says why the
-  model needs none.
+- **Audio grid**: the sample rate and block size of the model's audio encoder.
+  **LTX 2.3 / 2.5** and **MiniMax H3** have it built in. For another model that
+  encodes audio, set it, or the audio the model keeps can play slightly early.
 - **Soft constraints only advise**: recommended/max resolution and a
   recommended duration band show a **⚠** hint when exceeded but never clamp
   your values.
@@ -107,6 +101,13 @@ them in **Settings ▸ Model Templates**: create custom templates, edit any
 built-in (with reset), and pick the default for new projects. Custom templates
 are saved in your browser, so a project opened on another computer without
 your custom template uses **No Model Template**.
+
+To set a template's **Audio grid**, click **Edit** on it in **Settings ▸ Model
+Templates**, choose **Built-in (…)** (the model's own, on built-in templates
+only), **Off** or **Custom**, and for **Custom** fill in **Audio rate /
+block**. To find the values, add a **Sonder Template Helper** node, wire the
+model's audio VAE into it and run the workflow: the node shows the rate and
+block, or says why there are none.
 
 Switching to a template with a different frame rule clears **In** and **Out**;
 a template with the same rule keeps them. Queued jobs keep the template they

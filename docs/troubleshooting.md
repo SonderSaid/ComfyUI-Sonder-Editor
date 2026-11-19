@@ -60,69 +60,58 @@ If a branch still runs, check whether another active node also consumes it.
 
 ### Nodes after the Sonder Editor run again on every take
 
-Nodes that use only text and number outputs of the Editor or of a Sonder
-bridge, such as text encoding, are reused while those values don't change.
-The bridges are the **Prompt Relay Bridge**, the **Masks Bridge** times, the
-**Driver Selector**, the **Reference Selector** and the **Reference Prompt
-Bridge**. Nodes that use the Editor's frames, guide images or audio, such as
-VAE encoding, are reused while that content doesn't change. Nodes that use only the media of a **Driver Bridge**, a **Reference
-Image Bridge**, a **Reference Audio Bridge** or the first guide of a **Guides
-Bridge Start** are reused while that media and its settings don't change. They
-run every time when:
+ComfyUI reuses a node's last result while its inputs don't change, including
+nodes fed by the **Sonder Editor** and Sonder bridges. If one runs on every
+take anyway, check these in order:
 
-- The node also takes the Editor's `project`, or something made from it.
-- ComfyUI was started with `--cache-none`. Remove it.
-- The workflow has more than one **Sonder Editor**. Keep one.
-- An input of the **Sonder Editor** is wired to another node. Set the value
-  on the Editor instead.
-- A setting on the bridge, such as the **Masks Bridge** `edit_audio`, is wired
-  to another node. Set it on the bridge instead.
-- The value passes through a **Sonder Switch**, **Sonder Cluster** or
-  **Sonder Gate** whose other branch comes from a Sonder bridge or from the
-  Editor's `project`.
-- A text or number value reaches the node through an input that accepts any
-  type.
-- The bridge is on a branch of a **Sonder Switch** or **Sonder Cluster** whose
-  `select` comes from another node. Set `select` on the node, or take it from a
-  **Sonder Selector**, `has_driver` or `has_reference`.
-- The bridge is on a branch of a **Sonder Gate** whose `when` input comes from
-  a node other than a **Sonder Selector** or a primitive.
-- The bridge's media files add up to more than 512 MB.
-- The ComfyUI console shows `Sonder cache pipeline is unavailable on this
-  ComfyUI`, or, for frames, guide images and audio only, `Editor media cannot
-  be carried by content on this ComfyUI`. Update ComfyUI and Sonder Editor; the reason in brackets names what
-  differs.
+1. ComfyUI was started with `--cache-none`. Remove it.
+2. The workflow has more than one **Sonder Editor**. Keep one.
+3. An input of the **Sonder Editor**, or a setting on a bridge (such as the
+   **Sonder Masks Bridge** `edit_audio`), is wired from another node. Set it on
+   the node itself.
+4. A bridge sits behind a **Sonder Switch** or **Sonder Cluster** whose
+   `select` comes from a node other than a **Sonder Selector**, `has_driver` or
+   `has_reference`, or behind a **Sonder Gate** whose `when` comes from a node
+   other than a **Sonder Selector** or a primitive. Set the value on the node
+   itself, or take it from a **Sonder Selector**.
+5. The ComfyUI console shows `Sonder cache pipeline is unavailable on this
+   ComfyUI` or `Editor media cannot be carried by content on this ComfyUI`.
+   Update ComfyUI and Sonder Editor.
 
-The console names any other reason once, in a line starting
+If none applies, the console names the reason once, in a line starting
 `Sonder cache pipeline: nodes after the Sonder Editor rerun`. A line starting
 `Sonder cache pipeline failed` means that run fell back to running everything;
 report it with the lines that follow.
 
-Nodes fed by a **Masks Bridge** mask, or by a **Guides Bridge** after its
-first guide, always run.
+These nodes always run, and that is expected:
+
+- a node that takes the Editor's `project`, or anything made from it;
+- a node fed by a **Sonder Masks Bridge** mask, or by a **Sonder Guides
+  Bridge** after its first guide;
+- a node that gets a value through an any-type (`*`) input, or through a
+  **Sonder Switch**, **Sonder Cluster** or **Sonder Gate** whose other branch
+  comes from a Sonder bridge or from the Editor's `project`;
+- a node fed by bridge media files that add up to more than 512 MB.
 
 ### The Sonder Editor renders again with nothing changed
 
-The **Sonder Editor** skips its render and audio mix only when the part of the
-timeline the run uses is unchanged and ComfyUI still holds the previous
-result. It renders again when:
+The **Sonder Editor** reuses its last render and audio mix while the part of
+the timeline a run uses doesn't change. It renders again when:
 
-- Each saved take lands on the timeline and changes what the next run
-  renders. Tick **New Takes Start Muted** (**Settings** ▸ **Render**) so a new
-  take doesn't change it until you unmute it.
-- ComfyUI dropped the previous result: after **Free model and node cache**, a
-  restart, or when ComfyUI frees memory.
+- A new take landed on the timeline. Tick **New Takes Start Muted**
+  (**Settings** ▸ **Render**) so a take changes nothing until you unmute it.
+- ComfyUI dropped the previous result: after a restart, after **Unload Models
+  and Execution Cache**, or when ComfyUI frees memory.
 - Every node that reads the frames or audio also takes the Editor's `project`.
   Connect at least one node to the frames or audio only.
-- A clip or audio item has a fractional position or trim. Move or trim it again
-  so it snaps to a whole frame.
+- A clip or audio item sits on a fractional frame. Move or trim it again so it
+  snaps to a whole frame.
 - The video files under the run add up to more than 160 MB (512 MB with the
   render cache off), or the audio files to more than 96 MB.
-- One of the conditions in the previous section applies, such as `--cache-none`
-  or more than one **Sonder Editor**.
+- A cause from the previous section applies, such as `--cache-none` or more
+  than one **Sonder Editor**.
 - The ComfyUI console shows `the Sonder Editor renders on every run on this
-  ComfyUI`. Update ComfyUI and Sonder Editor; the reason in brackets names what
-  differs.
+  ComfyUI`. Update ComfyUI and Sonder Editor.
 
 ### A run fails with "… changed while this run was reading it"
 
