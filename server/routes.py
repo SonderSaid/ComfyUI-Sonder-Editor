@@ -12683,10 +12683,16 @@ if routes is not None:
             # pairs one template's grid with another. A template switch sends no guard:
             # it sets the template and its grid in this same save.
             guard = body.get("audio_constraint_template_id", _AUDIO_GUARD_ABSENT)
+            heal_only = set(body) <= {"audio_constraint", "audio_constraint_template_id"}
+            raw = body.get("audio_constraint")
+            value = raw if isinstance(raw, dict) and raw else None
             if guard is _AUDIO_GUARD_ABSENT or str(guard or "free") == str(project.template_id or "free"):
-                raw = body.get("audio_constraint")
-                project.audio_constraint = raw if isinstance(raw, dict) and raw else None
-            elif set(body) <= {"audio_constraint", "audio_constraint_template_id"}:
+                if heal_only and guard is not _AUDIO_GUARD_ABSENT and value == project.audio_constraint:
+                    # A heal that changes nothing (another tab or the dormant node got there
+                    # first): no save, so no version bump and no refetch elsewhere.
+                    return web.json_response(project.to_dict())
+                project.audio_constraint = value
+            elif heal_only:
                 # An ignored heal changes nothing: answer without a save, so it does not
                 # bump the version and make every other tab refetch.
                 return web.json_response(project.to_dict())

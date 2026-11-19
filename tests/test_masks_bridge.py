@@ -11,6 +11,7 @@ import importlib
 import json
 import math
 import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -258,15 +259,42 @@ def test_video_downscale_fn_accepts_video_vae():
 # ── Audio geometry ───────────────────────────────────────────────────────────
 
 
-def test_audio_span_is_uniform_and_fps_free():
+def test_audio_span_is_by_time_from_the_window_start():
+    """Re-derives the old proportional cases: on a window-length axis they agree."""
     mb = _import_masks_bridge()
-    assert mb.resolve_audio_mask_span(241, 252, 73, 145) == (76, 152)
-    assert mb.resolve_audio_mask_span(241, 252, 0, 241) == (0, 252)
+    # 241 frames at 24 fps, LTX's 25 latents/s, a 252-latent axis.
+    assert mb.audio_mask_span(73, 145, 24, 25.0, 252) == (76, 152)       # 76.04 floors, 151.04 ceils
+    assert mb.audio_mask_span(0, 241, 24, 25.0, 252, reaches_end=True) == (0, 252)
+    # Not reaching the end, time decides: ceil(241 / 24 * 25) = 252 anyway; one frame short:
+    assert mb.audio_mask_span(0, 240, 24, 25.0, 252) == (0, 250)
+    # H3, 90 frames, 40 latents/s, 151-latent axis.
+    assert mb.audio_mask_span(5, 90, 24, 40.0, 151, reaches_end=True) == (8, 151)
+
+
+def test_audio_span_runs_past_a_padded_axis_only_at_the_end():
+    """A grid-padded latent is longer than the window: a proportional map would stretch."""
+    mb = _import_masks_bridge()
+    # 17 frames at 30 fps on LTX: the window is 14.2 latents, the padded axis 17.
+    assert mb.audio_mask_span(4, 12, 30, 25.0, 17) == (3, 10)
+    assert mb.audio_mask_span(4, 17, 30, 25.0, 17, reaches_end=True) == (3, 17)
+
+
+def test_audio_span_conventions():
+    mb = _import_masks_bridge()
+    # Uniform latent k covers [k, k+1); causal (LTX) [k - 3/4, k + 1/4), latent 0 from 0.
+    # 375 ms at 25 latents/s is 9.375 periods.
+    assert mb.audio_mask_span(0, 9, 24, 25.0, 40) == (0, 10)                      # ceil(9.375)
+    assert mb.audio_mask_span(0, 9, 24, 25.0, 40, "causal") == (0, 11)           # latent 10 starts at 9.25
+    assert mb.audio_mask_span(9, 18, 24, 25.0, 40) == (9, 19)
+    assert mb.audio_mask_span(9, 18, 24, 25.0, 40, "causal") == (10, 20)         # latent 9 ends at 9.25 < 9.375
+    # A window inside latent 0's causal interval [0, 1/4).
+    assert mb.audio_mask_span(0, 1, 100, 25.0, 40, "causal") == (0, 1)
 
 
 def test_audio_span_zero_width_is_empty():
     mb = _import_masks_bridge()
-    assert mb.resolve_audio_mask_span(241, 252, 73, 73) == (0, 0)
+    assert mb.audio_mask_span(73, 73, 24, 25.0, 252) == (0, 0)
+    assert mb.audio_mask_span(73, 73, 24, 25.0, 252, reaches_end=True) == (0, 0)
 
 
 def test_audio_time_axis_ltx_is_height():
@@ -750,3 +778,241 @@ def test_edit_channel_still_pins_padding_without_any_freeze():
     prov = reaching._execution_context["masks_bridge"]
     assert prov["video_pins_padding"] is True
     assert prov["audio_pins_padding"] is False
+
+
+# ── The Editor's audio grid (Audio Grid Padding plan, Phase 2) ───────────────
+
+class MiniMaxH3AudioVAE:  # the class name is what identifies H3's layout
+    latents_per_second = 40.0
+
+
+def _ltx_audio_vae(**attrs):
+    inner = types.SimpleNamespace(
+        latents_per_second=25.0, latent_frequency_bins=16,
+        autoencoder=types.SimpleNamespace(causality_axis="CausalityAxis.HEIGHT"))  # the real LTX value
+    return types.SimpleNamespace(first_stage_model=inner, **attrs)
+
+
+def _h3_audio_vae(**attrs):
+    return types.SimpleNamespace(first_stage_model=MiniMaxH3AudioVAE(), **attrs)
+
+
+def _grid_project(*, mask_start, mask_end, frame_count, sample_count, sample_rate, project_fps=24.0,
+                  constraint=None):
+    project, scene = _project(mask_start=mask_start, mask_end=mask_end, frame_count=frame_count,
+                              project_fps=project_fps)
+    project._execution_context.update({
+        "audio_sample_rate": sample_rate, "audio_sample_count": sample_count,
+        "audio_constraint": constraint or {"rate": sample_rate, "block": 4096},
+        "audio_grid_padding_samples": 1,
+    })
+    return project
+
+
+def test_known_layouts_come_from_the_vae_not_the_lengths():
+    mb = _import_masks_bridge()
+    assert mb.known_audio_layout(_ltx_audio_vae(), (1, 8, 17, 16)) == (-2, "causal", "ltx")
+    assert mb.known_audio_layout(_h3_audio_vae(), (1, 32, 2, 151)) == (-1, "uniform", "minimax_h3")
+    assert mb.known_audio_layout(_audio_vae(25.0), (1, 8, 17, 16)) is None       # unknown: length detection
+    assert mb.known_audio_layout(_ltx_audio_vae(), (1, 8, 17, 12)) is None       # bins do not match
+
+
+def test_a_padded_short_ltx_window_masks_time_not_frequency():
+    """Audit 2, blocker 1: 17 frames at 30 fps, expectations 14 (window) and 16 (padded).
+
+    The padded latent is `[1, 8, 17, 16]`: by length, 16 matches the frequency axis.
+    """
+    pytest.importorskip("torch")
+    mb = _import_masks_bridge()
+    project = _grid_project(mask_start=4, mask_end=17, frame_count=17, project_fps=30.0,
+                            sample_count=28672, sample_rate=44100)
+    out = mb.SonderMasksBridge().execute(project, audio_latent=_latent((1, 8, 17, 16)),
+                                         audio_vae=_ltx_audio_vae(audio_sample_rate=44100, downscale_ratio=4096,
+                                                                  crop_input=True))
+    prov = project._execution_context["masks_bridge"]["audio_latent_mask"]
+    assert prov["time_axis"] == -2 and prov["axis_source"] == "layout"
+    assert prov["time_convention"] == "causal"
+    assert prov["expected_length"] == 14 and prov["expected_padded_length"] == 16
+    assert prov["matched"] == ["padded"]
+    # Reaches the end, so the whole padded axis is regenerated.
+    assert prov["latent_span"][1] == 17
+    assert tuple(out[5].shape) == (1, 17, 16)
+
+
+def test_a_window_length_latent_still_passes_when_the_editor_padded_its_audio():
+    """A graph that encodes some other window-length AUDIO is not refused (no new refusal path)."""
+    pytest.importorskip("torch")
+    mb = _import_masks_bridge()
+    project = _grid_project(mask_start=73, mask_end=145, frame_count=241, sample_count=446464, sample_rate=44100)
+    mb.SonderMasksBridge().execute(project, audio_latent=_latent((1, 8, 249, 16)), audio_vae=_ltx_audio_vae())  # window 251, padded 253
+    prov = project._execution_context["masks_bridge"]["audio_latent_mask"]
+    assert prov["matched"] == ["window"] and prov["time_axis"] == -2
+
+
+def test_an_unknown_layout_matches_the_padded_length_before_refusing():
+    pytest.importorskip("torch")
+    mb = _import_masks_bridge()
+    # 17 frames at 24 fps: window 18 latents, padded 21 (4096-sample blocks).
+    project = _grid_project(mask_start=4, mask_end=12, frame_count=17, sample_count=36864, sample_rate=44100)
+    mb.SonderMasksBridge().execute(project, audio_latent=_latent((1, 8, 21, 40)), audio_vae=_audio_vae(25.0))
+    prov = project._execution_context["masks_bridge"]["audio_latent_mask"]
+    assert prov["time_axis"] == -2 and prov["axis_source"] == "length" and prov["matched"] == ["padded"]
+
+
+def test_an_edit_reaching_the_end_extends_the_audio_end_time_over_the_grid_tail():
+    mb = _import_masks_bridge()
+    project = _grid_project(mask_start=12, mask_end=241, frame_count=241, sample_count=446464, sample_rate=44100)
+    result = mb.resolve_mask_times(project, edit_audio=True)
+    assert result["audio_mask_end_time"] == pytest.approx(446464 / 44100)
+    assert result["video_mask_end_time"] == pytest.approx(241 / 24)
+    # Not reaching the end, or frozen, or without a grid: unchanged.
+    short = _grid_project(mask_start=12, mask_end=200, frame_count=241, sample_count=446464, sample_rate=44100)
+    assert mb.resolve_mask_times(short)["audio_mask_end_time"] == pytest.approx(200 / 24)
+    assert mb.resolve_mask_times(project, edit_audio=False)["audio_mask_end_time"] == pytest.approx(12 / 24)
+    plain, _ = _project(mask_start=12, mask_end=241, frame_count=241)
+    assert mb.resolve_mask_times(plain)["audio_mask_end_time"] == pytest.approx(241 / 24)
+
+
+@pytest.mark.parametrize("vae,declared,status", [
+    (dict(audio_sample_rate=44100, downscale_ratio=4096, crop_input=True), {"rate": 44100, "block": 4096}, "match"),
+    (dict(audio_sample_rate=32000, downscale_ratio=800, crop_input=True), {"rate": 44100, "block": 4096}, "mismatch"),
+    (dict(audio_sample_rate=44100, downscale_ratio=512.0, crop_input=False), {"rate": 44100, "block": 4096}, "no_crop"),
+    (dict(audio_sample_rate=44100, downscale_ratio=4096, crop_input=True), None, "no_grid"),
+    (dict(), {"rate": 44100, "block": 4096}, "unknown"),
+])
+def test_grid_check_statuses(vae, declared, status):
+    mb = _import_masks_bridge()
+    assert mb.audio_grid_check(declared, types.SimpleNamespace(**vae))["status"] == status
+    assert mb.audio_grid_check(declared, None) is None
+
+
+def test_grid_check_runs_on_freeze_warns_on_mismatch_and_never_raises(caplog):
+    pytest.importorskip("torch")
+    mb = _import_masks_bridge()
+    project = _grid_project(mask_start=73, mask_end=145, frame_count=241, sample_count=446464, sample_rate=44100)
+    vae = _h3_audio_vae(audio_sample_rate=32000, downscale_ratio=800, crop_input=True)
+    with caplog.at_level("WARNING"):
+        mb.SonderMasksBridge().execute(project, edit_audio=False, audio_latent=_latent((1, 32, 2, 402)), audio_vae=vae)
+    payload = project._execution_context["masks_bridge"]
+    assert payload["audio_grid_check"]["status"] == "mismatch"
+    assert payload["audio_latent_mask"]["frozen"] is True
+    assert payload["audio_grid_padding_pinned"] is True
+    assert any("does not match the wired audio VAE" in r.getMessage() for r in caplog.records)
+
+
+def test_repeated_runs_publish_identical_provenance():
+    pytest.importorskip("torch")
+    mb = _import_masks_bridge()
+    payloads = []
+    for _ in range(2):
+        project = _grid_project(mask_start=4, mask_end=17, frame_count=17, project_fps=30.0,
+                                sample_count=28672, sample_rate=44100)
+        mb.SonderMasksBridge().execute(project, audio_latent=_latent((1, 8, 17, 16)), audio_vae=_ltx_audio_vae(),
+                                       unique_id="7")
+        payloads.append(json.dumps(project._execution_context["masks_bridge"], sort_keys=True))
+    assert payloads[0] == payloads[1]
+
+
+@pytest.mark.parametrize("frames,fps,shape,vae,expected,padded,sample_count", [
+    # Shapes the real VAEs encode from the Editor's grid audio (Phase 2 audit probe
+    # `real_vae_probe.json`, real weights). LTX: 44100 Hz, blocks of 4096; H3: 32000 Hz, 800.
+    (121, 24, (1, 8, 128, 16), "ltx", 126, 128, 225280),   # 55 blocks
+    (17, 30, (1, 8, 17, 16), "ltx", 14, 16, 28672),        # 7 blocks; the real axis is one past padded
+    (121, 24, (1, 32, 2, 202), "h3", 202, 202, 161600),    # 202 blocks
+])
+def test_real_grid_latent_shapes_resolve_on_the_time_axis(frames, fps, shape, vae, expected, padded,
+                                                          sample_count):
+    pytest.importorskip("torch")
+    mb = _import_masks_bridge()
+    sample_rate, block = (44100, 4096) if vae == "ltx" else (32000, 800)
+    project = _grid_project(mask_start=0, mask_end=frames, frame_count=frames, project_fps=float(fps),
+                            sample_count=sample_count, sample_rate=sample_rate,
+                            constraint={"rate": sample_rate, "block": block})
+    audio_vae = _ltx_audio_vae() if vae == "ltx" else _h3_audio_vae()
+    mb.SonderMasksBridge().execute(project, audio_latent=_latent(shape), audio_vae=audio_vae)
+    prov = project._execution_context["masks_bridge"]["audio_latent_mask"]
+    axis = -2 if vae == "ltx" else -1
+    assert prov["time_axis"] == axis and prov["axis_source"] == "layout"
+    assert prov["expected_length"] == expected and prov["expected_padded_length"] == padded
+    assert prov["latent_span"] == [0, shape[axis]]  # reaches the end: the whole padded axis
+
+
+# ── The kjnodes LTX masker on grid audio (Phase 2 audit F4) ─────────────────
+
+_KJ_SCRIPT = r"""
+import importlib.util, json, os, sys, types
+comfy_root, kj_root, cases = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+sys.argv = [sys.argv[0], "--cpu"]
+sys.path.insert(0, comfy_root)
+import torch
+import server
+# The module registers preview routes at import; no server runs here.
+route = lambda *a, **k: (lambda f: f)
+server.PromptServer.instance = types.SimpleNamespace(
+    routes=types.SimpleNamespace(post=route, get=route), send_sync=lambda *a, **k: None)
+# By file path: ComfyUI's own `nodes.py` shadows the kjnodes `nodes` package.
+spec = importlib.util.spec_from_file_location("kj_ltxv_nodes", os.path.join(kj_root, "nodes", "ltxv_nodes.py"))
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+LTXVAudioVideoMask = module.LTXVAudioVideoMask
+out = []
+for case in cases:
+    for mode in ("partial", "truncate", "pad"):
+        latent = {"samples": torch.ones(1, 8, case["T"], 16)}
+        result = LTXVAudioVideoMask.execute(24.0, 0.0, 0.0, case["start"], case["end"], max_length=mode,
+                                            audio_latent=latent)
+        audio = result.args[1] if hasattr(result, "args") else result[1]
+        mask = audio["noise_mask"]
+        out.append({"T": case["T"], "mode": mode, "length": int(audio["samples"].shape[2]),
+                    "masked_to_end": bool(mask[:, :, case["first"]:].min() == 1.0),
+                    "added_zero": bool(audio["samples"][:, :, case["T"]:].abs().sum() == 0)})
+print("KJ_RESULT " + json.dumps(out))
+"""
+
+
+def _comfy_root():
+    candidates = []
+    if os.environ.get("SONDER_COMFYUI_ROOT"):
+        candidates.append(Path(os.environ["SONDER_COMFYUI_ROOT"]))
+    candidates.extend(Path(sys.executable).resolve().parents[:3])
+    for root in candidates:
+        if (root / "comfy" / "sd.py").is_file() and (root / "comfy_extras" / "nodes_lt.py").is_file():
+            return root
+    return None
+
+
+def test_kjnodes_ltx_masker_never_cuts_grid_audio_and_pad_adds_at_most_one_token():
+    """Each mode on the bridge's grid end time, with latent lengths the real LTX audio VAE
+    gives for whole-block audio (the Phase 2 audit's `kj_sweep` over real weights).
+    `partial` and `truncate` keep every latent and mask through the end; `pad` may add one
+    zeroed, masked token (stock already overshoots by one there)."""
+    pytest.importorskip("torch")
+    comfy_root = _comfy_root()
+    kj_root = comfy_root / "custom_nodes" / "comfyui-kjnodes" if comfy_root else None
+    if kj_root is None or not (kj_root / "nodes" / "ltxv_nodes.py").is_file():
+        pytest.skip("needs a ComfyUI install with comfyui-kjnodes (SONDER_COMFYUI_ROOT or the test venv)")
+    mb = _import_masks_bridge()
+    cases = []
+    # (samples, real latent length): 7, 30, 31, 55, 56 and 119 blocks of 4096 at 44100 Hz.
+    for samples, latents in ((28672, 17), (122880, 70), (126976, 72), (225280, 128), (229376, 131), (487424, 277)):
+        project = _grid_project(mask_start=12, mask_end=24, frame_count=24, sample_count=samples,
+                                sample_rate=44100, constraint={"rate": 44100, "block": 4096})
+        times = mb.resolve_mask_times(project)
+        assert times["audio_mask_end_time"] == pytest.approx(samples / 44100)
+        cases.append({"T": latents, "start": times["audio_mask_start_time"],
+                      "end": times["audio_mask_end_time"], "first": round(times["audio_mask_start_time"] * 25)})
+    completed = subprocess.run([sys.executable, "-c", _KJ_SCRIPT, str(comfy_root), str(kj_root), json.dumps(cases)],
+                               cwd=str(comfy_root), capture_output=True, text=True, timeout=600,
+                               env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    line = next((item for item in completed.stdout.splitlines() if item.startswith("KJ_RESULT ")), None)
+    assert line is not None, completed.stderr[-4000:]
+    rows = json.loads(line[len("KJ_RESULT "):])
+    assert len(rows) == 18
+    for row in rows:
+        assert row["masked_to_end"], row
+        if row["mode"] == "pad":
+            assert row["length"] in (row["T"], row["T"] + 1) and row["added_zero"], row
+        else:
+            assert row["length"] == row["T"], row
+    assert any(row["mode"] == "pad" and row["length"] == row["T"] + 1 for row in rows)
+

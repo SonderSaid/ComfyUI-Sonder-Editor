@@ -16,6 +16,7 @@ import {
     SAVE_PRESET_OPTIONS,
     getTemplateById,
     getEditorSettings,
+    audioGridSignature,
     notificationCoreConfig,
     subscribeEditorSettings,
 } from "./editor_settings.js";
@@ -1473,9 +1474,25 @@ app.registerExtension({
         // activation is a direct serialized-widget mirror, never session relay.
         configureNotifications(notificationCoreConfig());
         syncRenderCacheSettingToCanvas();
+        let lastAudioGridSignature = audioGridSignature(getEditorSettings());
         subscribeEditorSettings((settings) => {
             configureNotifications(notificationCoreConfig(settings));
             syncRenderCacheSettingToCanvas(settings);
+            // A template's audio grid was edited: re-project it onto every open project
+            // now, so a live run never uses the old grid while a queued one uses the new.
+            const signature = audioGridSignature(settings);
+            if (signature !== lastAudioGridSignature) {
+                lastAudioGridSignature = signature;
+                // Once per project; an open (mounted) editor re-heals itself.
+                const seen = new Set();
+                for (const node of getActiveEditorNodes()) {
+                    const controller = node._sonderController;
+                    const projectDir = controller?.state?.projectDir;
+                    if (!projectDir || seen.has(projectDir) || controller.fullscreenSession) continue;
+                    seen.add(projectDir);
+                    controller.reHealAudioConstraint?.(settings);
+                }
+            }
         });
         if (typeof api.addEventListener === "function") {
             api.addEventListener("status", (event) => {

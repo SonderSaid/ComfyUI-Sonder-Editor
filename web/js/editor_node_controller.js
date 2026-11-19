@@ -2454,6 +2454,19 @@ export class EditorNodeController {
         }
     }
 
+    // A template's audio grid changed in settings: project it again (one read; a write
+    // only when the stored value differs). The open-project heal runs once per open.
+    async reHealAudioConstraint(settings = getEditorSettings()) {
+        const projectDir = this.state?.projectDir;
+        if (!projectDir) return;
+        try {
+            await healProjectAudioConstraint(projectDir, null, settings);
+            this._audioConstraintHealedFor = projectDir;
+        } catch (error) {
+            console.warn("[Sonder] Failed to re-heal project audio constraint:", error);
+        }
+    }
+
     async updateProject(projectDir, projectName = "") {
         if (this._destroyed) return;
         const previousProjectDir = this.state.projectDir || "";

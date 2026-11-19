@@ -10928,6 +10928,7 @@ export class EditorWidget {
 
     _handleSettingsChange(settings) {
         const nextSettings = settings || getEditorSettings();
+        const previousSettings = this._settings;
         const prevTrackCollapseSignature = this._activeTrackCollapseSignature(this._settings);
         const nextTrackCollapseSignature = this._activeTrackCollapseSignature(nextSettings);
         const prevQueueBatchCollapseSignature = this._activeQueueBatchCollapseSignature(this._settings);
@@ -10992,6 +10993,13 @@ export class EditorWidget {
         }
         if (templateChanged && this.projectDir && resolvedTemplateId === "free") {
             this._updateProjectTemplateId("free");
+        } else if (this.projectDir && !audioConstraintsEqual(
+            resolveAudioConstraintForTemplate(this._projectTemplateIdRaw ?? this._templateId, previousSettings),
+            resolveAudioConstraintForTemplate(this._projectTemplateIdRaw ?? this._templateId, nextSettings))) {
+            // This project's template changed its audio grid: re-project it now, so live
+            // and queued runs from this tab use the same grid.
+            this._audioConstraintHealedFor = "";
+            this._fetchProjectSettings();
         }
         if (this.activeScene && prevTrackCollapseSignature !== nextTrackCollapseSignature) {
             const hadPromptConsumer = this._promptContextConsumersMounted();

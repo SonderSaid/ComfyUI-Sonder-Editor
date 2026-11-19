@@ -32,6 +32,9 @@ import {
     TIMECODE_MODE_OPTIONS,
     describeConstraintFormula,
     getAllModelTemplates,
+    getAudioConstraint,
+    normalizeAudioGrid,
+    AUDIO_GRID_RATES,
     getAllPromptChannelTemplates,
     getTemplateById,
     getTemplateFpsValues,
@@ -934,6 +937,8 @@ function showSettingsPanel() {
                 }
                 const fpsValues = getTemplateFpsValues(template);
                 if (fpsValues.length) summaryParts.push(`fps ${fpsValues.join("/")}`);
+                const audioGrid = getAudioConstraint(template);
+                if (audioGrid) summaryParts.push(`audio ${audioGrid.rate / 1000} kHz / ${audioGrid.block}`);
                 const minDim = template.soft?.minDimension;
                 if (minDim > 0) summaryParts.push(`min ${minDim}px`);
                 const recRes = template.soft?.recommendedRes;
@@ -1091,6 +1096,66 @@ function showSettingsPanel() {
         const fpsInput = textInput(Array.isArray(hard.fps) ? hard.fps.join(", ") : "", "24, 25, 48, 50");
         labeledRow("Allowed fps", fpsInput);
 
+        // Audio grid: one value — Inherit (a built-in's own), Off, or a rate and block.
+        // The form starts from the STORED value, never the effective one, so an
+        // untouched save keeps what was there (a built-in edit keeps inheriting).
+        const isBuiltinEdit = !!editingTemplate?.builtIn;
+        const builtinBase = isBuiltinEdit ? getAllModelTemplates({}).find((t) => t.id === editingTemplate.id) : null;
+        const builtinGrid = builtinBase ? getAudioConstraint(builtinBase) : null;
+        const storedAudioGrid = (isBuiltinEdit
+            ? this._settings?.modelTemplates?.builtinOverrides?.[editingTemplate.id]?.hard
+            : editingTemplate?.hard)?.audioGrid;
+        const audioModeSelect = document.createElement("select");
+        audioModeSelect.style.cssText = chromeInputCss({ width: "150px", fontSize: "10px", padding: "4px 6px", textAlign: "left" });
+        const audioModes = [
+            ...(isBuiltinEdit ? [["inherit", builtinGrid
+                ? `Built-in (${builtinGrid.rate / 1000} kHz / ${builtinGrid.block})` : "Built-in (none)"]] : []),
+            ["off", "Off"],
+            ["custom", "Custom"],
+        ];
+        for (const [value, label] of audioModes) {
+            const option = document.createElement("option");
+            option.value = value;
+            option.textContent = label;
+            audioModeSelect.appendChild(option);
+        }
+        const storedCustom = storedAudioGrid && typeof storedAudioGrid === "object" ? storedAudioGrid : null;
+        audioModeSelect.value = storedAudioGrid === undefined ? (isBuiltinEdit ? "inherit" : "off")
+            : storedCustom ? "custom" : "off";
+        const audioRateSelect = document.createElement("select");
+        audioRateSelect.style.cssText = chromeInputCss({ width: "96px", fontSize: "10px", padding: "4px 6px", textAlign: "right" });
+        for (const rate of AUDIO_GRID_RATES) {
+            const option = document.createElement("option");
+            option.value = String(rate);
+            option.textContent = `${rate} Hz`;
+            audioRateSelect.appendChild(option);
+        }
+        audioRateSelect.value = String(storedCustom?.rate ?? builtinGrid?.rate ?? 44100);
+        const audioBlockInput = numInput(storedCustom?.block ?? builtinGrid?.block, "block");
+        labeledRow("Audio grid", audioModeSelect);
+        labeledRow("Audio rate / block", audioRateSelect, audioBlockInput);
+        const audioHelp = document.createElement("div");
+        audioHelp.style.cssText = helpCss;
+        audioHelp.textContent = "The audio encoder's sample rate and block (its downscale ratio). The Editor serves its "
+            + "audio at this rate and pads it to whole blocks, so the encode keeps the first sample. "
+            + "Built-ins: LTX 2.3 / 2.5 44100 Hz / 4096, MiniMax H3 32000 Hz / 800.";
+        form.appendChild(audioHelp);
+        const refreshAudioGridInputs = () => {
+            const custom = audioModeSelect.value === "custom";
+            audioRateSelect.disabled = !custom;
+            audioBlockInput.disabled = !custom;
+        };
+        audioModeSelect.addEventListener("change", refreshAudioGridInputs);
+        refreshAudioGridInputs();
+        const draftAudioGrid = () => {
+            const mode = audioModeSelect.value;
+            // `undefined` is written explicitly for Inherit: the settings merge keeps a
+            // stored grid when the key is left out, and normalize drops an undefined one.
+            if (mode === "inherit") return undefined;
+            if (mode === "off") return "off";
+            return { rate: Number(audioRateSelect.value), block: parseDraftNumber(audioBlockInput.value) };
+        };
+
         // ── Soft recommendations ──
         sectionHeader("Soft Recommendations", "Advisory only — surfaced as hints; never clamps input.");
         const minDimInput = numInput(soft.minDimension, "64");
@@ -1134,12 +1199,10 @@ function showSettingsPanel() {
                 alert("Template name is required.");
                 return;
             }
-            // The form has no audio-grid control yet: carry the stored raw value unchanged.
-            // For a built-in that is its override's own value (absent = inherit), never the
-            // effective one, which would freeze today's default into the override.
-            const storedAudioGrid = (editingTemplate?.builtIn
-                ? this._settings?.modelTemplates?.builtinOverrides?.[editingTemplate.id]?.hard
-                : editingTemplate?.hard)?.audioGrid;
+            if (audioModeSelect.value === "custom" && normalizeAudioGrid(draftAudioGrid()) === "off") {
+                alert("Audio grid: enter a whole block size from 2 up to the sample rate.");
+                return;
+            }
             const nextTemplate = {
                 id: editingTemplate?.id || makeUniqueTemplateId(name),
                 name,
@@ -1150,7 +1213,7 @@ function showSettingsPanel() {
                     frameStep: parseDraftNumber(frameStepInput.value),
                     frameOffset: parseDraftNumber(frameOffsetInput.value),
                     fps: parseFpsList(fpsInput.value),
-                    ...(storedAudioGrid !== undefined ? { audioGrid: storedAudioGrid } : {}),
+                    audioGrid: draftAudioGrid(),
                 },
                 soft: {
                     minDimension: parseDraftNumber(minDimInput.value),

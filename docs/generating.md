@@ -88,7 +88,13 @@ A **model template** is a named set of constraints for a target model, chosen
 in the toolbar's scene-geometry group.
 
 - **Hard constraints snap**: dimension step/offset, the frame rule
-  (e.g. LTX's `8n+1`), and the allowed-FPS list.
+  (e.g. LTX's `8n+1`), the allowed-FPS list, and the **Audio grid**.
+- **Audio grid** (LTX 2.3 / 2.5 and MiniMax H3): the sample rate and block size
+  of the model's audio encoder. The editor sends its audio at that rate and
+  pads it to whole blocks, so the encoder keeps the start of the audio. In the
+  template editor choose **Built-in**, **Off**, or **Custom** with a rate and a
+  block. An existing project picks up its template's audio grid the next time
+  you open it in the Sonder Editor.
 - **Soft constraints only advise**: recommended/max resolution and a
   recommended duration band show a **⚠** hint when exceeded but never clamp
   your values.
@@ -105,9 +111,10 @@ were queued with.
 
 When your generation window does not land on the frame rule, the editor rounds
 **up** rather than trimming your selection, and fills the extra frames itself:
-video holds the last frame, audio mirrors the end of its own window. Those
-frames are left out of the take placed on the timeline, but they are inside the
-generated file.
+video holds the last frame, audio mirrors the end of its own window. With an
+**Audio grid**, the audio also runs on to the next whole block the same way.
+Those frames are left out of the take placed on the timeline, but they are
+inside the generated file.
 
 ## Prompts
 
@@ -177,7 +184,7 @@ its card, its widgets are set by the editor.
 | `project` | SONDER_PROJECT | A handle to the project. Every other Sonder node takes this. |
 | `rendered_frames` | IMAGE | The timeline's own frames for the generation window. |
 | `prompt` | STRING | The compiled prompt for that window, chips resolved. |
-| `audio` | AUDIO | The mixed timeline audio for that window. |
+| `audio` | AUDIO | The mixed timeline audio for that window. With an **Audio grid**, it is at the template's audio rate and may run up to one block past the window. |
 | `guide_images` | IMAGE | Every guide frame in the window, as one batch. |
 | `guide_idx` / `guide_strengths` | STRING | Comma-separated frame positions and strengths, aligned with that batch. |
 | `frame_count` · `fps` · `width` · `height` | INT · FLOAT · INT · INT | The window's geometry, for your sampler and latents. |
@@ -406,7 +413,7 @@ edits affect a queued job and which don't.
 | **References** | the winning Reference inputs, their fitting settings and H3 input order, when used |
 | **Drivers** | Driver clip snapshots and lane configuration |
 | **Scene geometry** | width, height, FPS at queue time |
-| **Model template** | the selected template and its frame rule |
+| **Model template** | the selected template, its frame rule and its **Audio grid** |
 | **Take placement mode** | trimmed/untrimmed, per job |
 | **Keep take padding** | on/off, per job |
 

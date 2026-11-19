@@ -61,7 +61,7 @@ from ..server.path_security import (
     resolve_existing_project_path,
     safe_route_token,
 )
-from ..server.audio_grid import valid_audio_grid as _valid_audio_grid
+from ..server.audio_grid import audio_grid_plan, valid_audio_grid as _valid_audio_grid
 from ..server.timeline_renderer import TimelineRenderCancelled, render_scene_frames
 
 logger = logging.getLogger("sonder_editor")
@@ -477,6 +477,28 @@ class SonderEditor:
         if not torch.is_tensor(waveform) or waveform.ndim < 1 or sample_rate <= 0:
             return audio
         target_samples = math.ceil((max(0, _coerce_int(target_frame_count, 0)) / fps) * sample_rate)
+        return SonderEditor._mirror_pad_audio(audio, target_samples)
+
+    @staticmethod
+    def _pad_audio_to_grid(audio: dict, grid: dict) -> dict:
+        """Mirror-pad the mix to exactly the grid plan's `total_len` (never a trim).
+
+        The mixer is deterministic, so a mix of any length but the plan's `mix_len` is a
+        fault: raise it as the Editor's failure rather than publish a length the run's
+        context does not describe.
+        """
+        waveform = audio.get("waveform") if isinstance(audio, dict) else None
+        if not torch.is_tensor(waveform) or waveform.ndim < 1:
+            raise RuntimeError("Sonder Editor: the audio mix returned no waveform.")
+        if int(audio.get("sample_rate") or 0) != int(grid["rate"]) or int(waveform.shape[-1]) != int(grid["mix_len"]):
+            raise RuntimeError(
+                "Sonder Editor: the audio mix returned {} samples at {} Hz; the audio grid expected {} at {} Hz."
+                .format(int(waveform.shape[-1]), audio.get("sample_rate"), grid["mix_len"], grid["rate"]))
+        return SonderEditor._mirror_pad_audio(audio, int(grid["total_len"]))
+
+    @staticmethod
+    def _mirror_pad_audio(audio: dict, target_samples: int) -> dict:
+        waveform = audio.get("waveform")
         current_samples = int(waveform.shape[-1])
         if current_samples >= target_samples:
             return audio
@@ -1627,21 +1649,38 @@ class SonderEditor:
                 _note_run_feedback("note_reference_sources_removed", prompt, unique_id,
                                    getattr(scene, "name", "") or "", prompt_warnings)
 
+            # --- Audio grid: the template's encoder rate and crop block. Served at that
+            # rate and padded to whole blocks, the stock VAE encode skips its resample and
+            # its centre crop removes nothing, so encoded audio starts on the window's
+            # first frame. Planned here, once, so the context can describe a deferred mix.
+            audio_grid = None
+            if audio_needed:
+                grid_value = self._execution_audio_constraint(proj, queue_job)
+                if grid_value is not None:
+                    audio_grid = audio_grid_plan(
+                        render_start, render_end, effective_scene_fps(proj, scene), grid_value,
+                        frame_target=frame_count if frame_count_padding > 0 else 0)
+
             # --- Load audio from scene's audio tracks for the render range ---
             def materialize_audio(request):
-                # As for the frames: the window and padding come from the request.
+                # As for the frames: the window, padding and grid come from the request.
                 if request is not None:
                     start, end = request["start"], request["end"]
                     padding, pad_fps = request["padding_target"], request["pad_fps"]
+                    grid = request.get("audio_grid")
                 else:
                     start, end = render_start, render_end
                     padding, pad_fps = (frame_count if frame_count_padding > 0 else 0), proj_fps
+                    grid = audio_grid
                 interrupt.raise_if_set()
                 try:
                     mixed = self._load_scene_audio(run_proj, run_scene, start, end,
-                                                   cancel_event=interrupt, request=request)
+                                                   cancel_event=interrupt, request=request,
+                                                   **({"rate": grid["rate"]} if grid else {}))
                 except MediaOperationCancelled as cancelled:
                     interrupt.raise_cancelled(cancelled)
+                if grid:
+                    return self._pad_audio_to_grid(mixed, grid)
                 if padding > 0:
                     mixed = self._pad_audio_to_frame_count(mixed, padding, pad_fps)
                 return mixed
@@ -1650,7 +1689,7 @@ class SonderEditor:
                 pending.add(audio_slot, editor_media.audio_plan(
                     proj, scene, render_start, render_end,
                     padding_target=frame_count if frame_count_padding > 0 else 0, pad_fps=proj_fps,
-                    materialize=materialize_audio))
+                    materialize=materialize_audio, audio_grid=audio_grid))
                 if defer and pending.can_defer(audio_slot):
                     audio = editor_media.DEFERRED
                 else:
@@ -1713,6 +1752,14 @@ class SonderEditor:
                 "source_frame_count": source_frame_count,
                 "frame_count": frame_count,
                 "frame_count_padding": frame_count_padding,
+                # The audio grid this run served Editor audio on (absent without one):
+                # the AUDIO is `audio_sample_count` samples at `audio_sample_rate`, a whole
+                # number of blocks, with `audio_grid_padding_samples` of mirrored tail
+                # beyond the window and frame padding.
+                **({"audio_constraint": {"rate": audio_grid["rate"], "block": audio_grid["block"]},
+                    "audio_sample_rate": audio_grid["rate"],
+                    "audio_sample_count": audio_grid["total_len"],
+                    "audio_grid_padding_samples": audio_grid["grid_padding"]} if audio_grid else {}),
                 "take_placement_mode": take_placement_mode,
                 "take_keep_padding": take_keep_padding,
                 "take_placement_linked": take_placement_linked,
@@ -1908,12 +1955,15 @@ class SonderEditor:
             return None
 
     def _load_scene_audio(self, proj: TimelineProject, scene: Scene,
-                          sel_start: int, sel_end: int, *, cancel_event=None, request=None) -> dict:
+                          sel_start: int, sel_end: int, *, cancel_event=None, request=None, rate=None) -> dict:
         """Use the same unbounded float mix and sample clock as timeline export.
 
         With ``request`` (resolved sources and rate) nothing is read from ``proj`` or ``scene``.
+        ``rate`` (the audio grid's) mixes at that rate instead of the highest source rate.
         """
         from ..server.audio_pipeline import scene_audio_samples
+        # `rate` only with a grid: a run without one calls the mixer exactly as before.
+        extra = {"rate": rate} if rate else {}
         samples, sample_rate = scene_audio_samples(proj, scene, sel_start, sel_end, cancel_event=cancel_event,
-                                                   request=request)
+                                                   request=request, **extra)
         return {"waveform": torch.from_numpy(samples).unsqueeze(0), "sample_rate": sample_rate}

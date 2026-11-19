@@ -1963,6 +1963,13 @@ export function resolveAudioConstraintForTemplate(templateId, settings) {
     return getAudioConstraint(getTemplateById(templateId, settings));
 }
 
+// A signature of every template's effective audio grid: it changes only when an audio
+// grid a project could resolve to changes, so a settings save that touches nothing else
+// never re-heals projects.
+export function audioGridSignature(settings) {
+    return JSON.stringify(getAllModelTemplates(settings).map((template) => [template.id, getAudioConstraint(template)]));
+}
+
 // Equality of two stored audio constraints by their effective grid; anything that is
 // not a valid `{rate, block}` (null, absent, `{off: true}`, garbage) counts as none.
 export function audioConstraintsEqual(a, b) {

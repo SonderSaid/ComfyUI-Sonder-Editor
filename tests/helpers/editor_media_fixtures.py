@@ -51,7 +51,7 @@ def write_wav(path: Path, rate: int, seconds: float, tone: float) -> Path:
 
 
 def build_project(m, root: Path, ffmpeg: str, *, name: str = PROJECT, corrupt_audio: bool = False,
-                  frame_constraint: dict | None = None, queue: str = ""):
+                  frame_constraint: dict | None = None, queue: str = "", audio_constraint: dict | None = None):
     """Write the fixture project under ``root/sonder-projects/name`` and return its folder name."""
     ts = m.timeline_state
     folder = media.project_dir(root, name)
@@ -117,6 +117,8 @@ def build_project(m, root: Path, ffmpeg: str, *, name: str = PROJECT, corrupt_au
                                  assets=assets)
     if frame_constraint is not None:
         project.frame_constraint = dict(frame_constraint)
+    if audio_constraint is not None:
+        project.audio_constraint = dict(audio_constraint)
     if queue:
         job = ts.GenerationJob(
             job_id="job-1", scene_id=SCENE, status="pending", selection_start=8, selection_end=28,

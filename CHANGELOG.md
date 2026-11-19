@@ -11,7 +11,15 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Fixed
+- Takes on LTX 2.3 / 2.5 and MiniMax H3 no longer lose up to 46 ms (LTX) or 12.5 ms (H3) from the start of the audio they encode, which made kept and frozen audio play early against the timeline. The **Sonder Editor** now serves its audio on the model template's **Audio grid**. LTX audio still plays about 22 ms early, a separate issue.
+
+### Added
+- Model templates have an **Audio grid** (the audio encoder's sample rate and block size): built in for LTX 2.3 / 2.5 and MiniMax H3, and settable as **Built-in**, **Off** or **Custom** in **Settings ▸ Model Templates**.
+
 ### Changed
+- With an **Audio grid**, the **Sonder Editor**'s `audio` output is at the template's audio rate (LTX 44.1 kHz, MiniMax H3 32 kHz) and can run up to one block past the window. Saved takes keep the video's length.
+- The **Sonder Masks Bridge** places audio mask edges by time, so an edge can move by one audio latent. An audio mask that reaches the end of the window now also covers the Editor's padded audio.
 - A workflow whose only save node is not a Sonder node now does nothing when you run it again with nothing changed, like any ComfyUI workflow, including when it takes the Editor's frames or audio.
 - A node that takes the Editor's text, numbers, frames, guide images or audio, or unchanged Driver or Reference media, and a fixed seed now returns its previous result when nothing changed, as ComfyUI does for any unchanged node. With a fixed seed, a second take with the same timeline can then reuse sampling too and save a new take with the same pixels almost at once; a sampler that takes a **Masks Bridge** mask still runs every take. To get a new result each take, set the seed to change after each run.
 - The Editor's `fps` output is always a decimal number, so an integer project frame rate shows as `24.0` in previews and saved metadata.

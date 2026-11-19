@@ -39,6 +39,8 @@ else `project.fps`) so the seconds reproduce the editor's outputs exactly.
 from __future__ import annotations
 
 import logging
+import math
+from fractions import Fraction
 
 try:
     import torch
@@ -156,6 +158,19 @@ def resolve_mask_times(project, edit_video: bool = True, edit_audio: bool = True
 
     video = (full_start, full_end) if edit_video else (full_start, full_start)
     audio = (full_start, full_end) if edit_audio else (full_start, full_start)
+    frame_count = _coerce_int(ctx.get("frame_count"), 0)
+    # The Editor's audio grid (absent without one): the AUDIO is `audio_sample_count`
+    # samples at `audio_sample_rate`, longer than the window by a mirrored tail.
+    sample_rate = _coerce_int(ctx.get("audio_sample_rate"), 0)
+    sample_count = _coerce_int(ctx.get("audio_sample_count"), 0)
+    audio_grid = ({"sample_rate": sample_rate, "sample_count": sample_count,
+                   "constraint": ctx.get("audio_constraint")}
+                  if sample_rate > 0 and sample_count > 0 else None)
+    if edit_audio and audio_grid is not None and frame_count > 0 and end_frame >= frame_count:
+        # An Edit reaching the tensor's end regenerates the tail, frame padding and grid
+        # padding alike, so a time-driven masker (kjnodes LTXVAudioVideoMask) covers the
+        # whole padded audio, never pinning a mirrored tail after generated audio.
+        audio = (full_start, sample_count / sample_rate)
     # Freeze is the same rule in frame space: collapse to a zero-width window.
     video_frames = (start_frame, end_frame) if edit_video else (start_frame, start_frame)
     audio_frames = (start_frame, end_frame) if edit_audio else (start_frame, start_frame)
@@ -169,7 +184,8 @@ def resolve_mask_times(project, edit_video: bool = True, edit_audio: bool = True
         "edit_audio": bool(edit_audio),
         "video_mask_frames": video_frames,
         "audio_mask_frames": audio_frames,
-        "frame_count": _coerce_int(ctx.get("frame_count"), 0),
+        "frame_count": frame_count,
+        "audio_grid": audio_grid,
         # Read tolerantly: an older execution context predates the key and must yield 0
         # rather than raising. This fabricated tail is often kept rather than regenerated,
         # so recording it here is what makes a take self-describing.
@@ -336,28 +352,86 @@ def detect_audio_time_axis(shape, expected_len: int) -> int:
     )
 
 
-def resolve_audio_mask_span(frame_count: int, axis_len: int, start_pixel: int,
-                            end_pixel: int) -> tuple:
-    """(lo, hi) audio latent indices for a window-local pixel span.
+def audio_mask_span(start_pixel: int, end_pixel: int, fps: float, latents_per_second: float,
+                    axis_len: int, convention: str = "uniform", reaches_end: bool = False) -> tuple:
+    """(lo, hi) audio latent indices covering the pixel-frame window ``[start_pixel, end_pixel)``.
 
-    Uniform map — an audio VAE has no standalone first sample. FPS cancels
-    algebraically (pixel/fps ÷ (frame_count/fps)), so this is exact integer
-    arithmetic. Start floors and end ceils, matching the editor's own outward
-    snapping of the pixel boundaries.
+    By time, from the window's first frame: the latent axis may run past the window
+    (the Editor's audio grid pads it), so a proportional map would stretch the mask.
+    ``convention`` says which interval latent ``k`` covers, in latent periods:
+    ``"uniform"`` ``[k, k + 1)``; ``"causal"`` (LTX: its decoder lays ``T`` latents out as
+    ``4T - 3`` mel frames) ``[k - 3/4, k + 1/4)``, latent 0 from 0. Every latent the
+    window touches is included. A window reaching the tensor's end (``reaches_end``)
+    covers the rest of the axis, the padded tail included. Exact rational arithmetic.
     """
-    if frame_count <= 0:
-        raise RuntimeError(
-            "SonderMasksBridge: the render context carries no `frame_count`, so "
-            "an audio latent mask cannot be sized."
-        )
-    if axis_len <= 0:
-        raise RuntimeError("SonderMasksBridge: the audio latent has no time steps.")
-    if end_pixel <= start_pixel:
+    if end_pixel <= start_pixel or axis_len <= 0:
         return (0, 0)
-    lo = (int(start_pixel) * axis_len) // frame_count
-    hi = -((-int(end_pixel) * axis_len) // frame_count)
+    fps_q = Fraction(str(fps))
+    rate_q = Fraction(str(latents_per_second))
+    if fps_q <= 0 or rate_q <= 0:
+        raise RuntimeError("SonderMasksBridge: the audio mask needs a positive fps and latent rate.")
+    x0 = Fraction(int(start_pixel)) / fps_q * rate_q
+    x1 = Fraction(int(end_pixel)) / fps_q * rate_q
+    if convention == "causal":
+        lo = math.floor(x0 - Fraction(1, 4)) + 1
+        hi = math.ceil(x1 + Fraction(3, 4))
+    else:
+        lo = math.floor(x0)
+        hi = math.ceil(x1)
+    if reaches_end:
+        hi = axis_len
     lo = max(0, min(lo, axis_len))
     return (lo, max(lo, min(hi, axis_len)))
+
+
+def known_audio_layout(vae, shape) -> tuple | None:
+    """``(time_axis, convention, name)`` for an audio VAE whose latent layout is known, else None.
+
+    LTX ``[B, C, T, F]`` (``F`` = ``latent_frequency_bins``), causal; MiniMax H3
+    ``[B, C, stereo 2, T]``, uniform. Read from the VAE, never inferred from the
+    lengths: on a short window the fixed axis can be as long as the time axis.
+    """
+    inner = getattr(vae, "first_stage_model", None)
+    bins = getattr(inner, "latent_frequency_bins", None)
+    if type(bins) is int and bins > 0 and int(shape[-1]) == bins:
+        causality = getattr(getattr(inner, "autoencoder", None), "causality_axis", None)
+        causal = causality is not None and "NONE" not in str(causality).upper()
+        return (-2, "causal" if causal else "uniform", "ltx")
+    if type(inner).__name__ == "MiniMaxH3AudioVAE" and int(shape[-2]) == 2:
+        return (-1, "uniform", "minimax_h3")
+    return None
+
+
+def audio_grid_check(declared, vae) -> dict | None:
+    """Compare the Editor's declared audio grid with the wired audio VAE (provenance only).
+
+    ``status``: ``match``; ``mismatch`` (the template's grid does not fit this VAE, so
+    the crop is not neutralised); ``no_crop`` (this VAE never crops); ``no_grid`` (the
+    run served no grid while this VAE crops); ``unknown`` (the VAE publishes no rate or
+    block). Never raises: a wrong grid only means today's crop.
+    """
+    if vae is None:
+        return None
+    rate = getattr(vae, "audio_sample_rate", None)
+    block = getattr(vae, "downscale_ratio", None)
+    crops = getattr(vae, "crop_input", None)
+    record = {
+        "declared": dict(declared) if isinstance(declared, dict) else None,
+        "vae_rate": rate if type(rate) is int else None,
+        "vae_block": block if type(block) is int else None,
+        "vae_crops": crops if isinstance(crops, bool) else None,
+    }
+    if record["vae_crops"] is False:
+        record["status"] = "no_crop"
+    elif record["vae_rate"] is None or record["vae_block"] is None:
+        record["status"] = "unknown"
+    elif not record["declared"]:
+        record["status"] = "no_grid"
+    elif (record["declared"].get("rate"), record["declared"].get("block")) == (record["vae_rate"], record["vae_block"]):
+        record["status"] = "match"
+    else:
+        record["status"] = "mismatch"
+    return record
 
 
 # ── Tensor emitters (the only torch in this module) ──────────────────────────
@@ -596,14 +670,46 @@ class SonderMasksBridge:
         rate = audio_latents_per_second(audio_vae)
         duration = (frame_count / fps) if fps > 0 else 0.0
         expected = int(round(duration * rate))
-        time_axis = detect_audio_time_axis(shape, expected)
+        grid = result.get("audio_grid")
+        expected_padded = (int(round(grid["sample_count"] / grid["sample_rate"] * rate))
+                           if grid else None)
+        layout = known_audio_layout(audio_vae, shape)
+        convention, axis_source = "uniform", "length"
+        time_axis = None
+        if layout is not None:
+            axis, layout_convention, _name = layout
+            length = int(shape[axis])
+            if any(value is not None and abs(length - value) <= AUDIO_AXIS_TOLERANCE
+                   for value in (expected, expected_padded)):
+                time_axis, convention, axis_source = axis, layout_convention, "layout"
+            else:
+                logger.warning(
+                    "masks bridge: the audio latent's time axis (%d) matches neither the window "
+                    "(%s) nor the Editor's padded audio (%s); falling back to length detection.",
+                    length, expected, expected_padded)
+        if time_axis is None:
+            try:
+                time_axis = detect_audio_time_axis(shape, expected)
+            except RuntimeError:
+                if expected_padded is None:
+                    raise
+                # A grid-padded latent can exceed the window's length by more than the
+                # tolerance; match it against the padded length before refusing.
+                time_axis = detect_audio_time_axis(shape, expected_padded)
         axis_len = shape[time_axis]
-        lo, hi = resolve_audio_mask_span(frame_count, axis_len, start_pixel, end_pixel)
+        matched = [name for name, value in (("window", expected), ("padded", expected_padded))
+                   if value is not None and abs(int(axis_len) - value) <= AUDIO_AXIS_TOLERANCE]
+        lo, hi = audio_mask_span(start_pixel, end_pixel, fps, rate, axis_len, convention,
+                                 reaches_end=end_pixel >= frame_count)
         return _audio_mask_tensor(shape[-2], shape[-1], time_axis, lo, hi), {
             "shape": [int(shape[-2]), int(shape[-1])],
             "time_axis": int(time_axis),
+            "axis_source": axis_source,
+            "time_convention": convention,
             "latents_per_second": round(float(rate), 4),
             "expected_length": expected,
+            "expected_padded_length": expected_padded,
+            "matched": matched,
             "pixel_span": [int(start_pixel), int(end_pixel)],
             "latent_span": [int(lo), int(hi)],
         }
@@ -612,6 +718,16 @@ class SonderMasksBridge:
                 audio_latent=None, video_vae=None, audio_vae=None, unique_id=None, spatial_mask=None):
         result = resolve_mask_times(project, edit_video, edit_audio)
 
+        # The grid check first, from the VAE and the context alone, so it is recorded even
+        # when compiling either mask returns early or refuses. A PREPARES bridge runs at
+        # preparation and again at execution, so a mismatch warns twice per prompt.
+        grid = result.get("audio_grid")
+        grid_check = audio_grid_check(grid.get("constraint") if grid else None, audio_vae)
+        if grid_check is not None and grid_check["status"] == "mismatch":
+            logger.warning(
+                "masks bridge: the Model Template's audio grid %s does not match the wired audio VAE "
+                "(rate %s, block %s); this take's encoded audio may start early. Check the template.",
+                grid_check["declared"], grid_check["vae_rate"], grid_check["vae_block"])
         video_mask, video_prov = self._compile_video(
             result, video_latent, video_vae, spatial_mask, project._execution_context.get("_render_raster_hw"),
         )
@@ -635,6 +751,11 @@ class SonderMasksBridge:
             "frame_count_padding": result["frame_count_padding"],
             "video_pins_padding": _pins_padding(result, result["video_mask_frames"]),
             "audio_pins_padding": _pins_padding(result, result["audio_mask_frames"]),
+            # The Editor's audio grid tail, separate from frame padding: kept (pinned) unless
+            # the audio mask reaches the tensor's end.
+            "audio_grid_padding_pinned": (bool(grid) and result["frame_count"] > 0
+                                          and result["audio_mask_frames"][1] < result["frame_count"]),
+            "audio_grid_check": grid_check,
         }
         ctx = getattr(project, "_execution_context", None)
         if isinstance(ctx, dict):

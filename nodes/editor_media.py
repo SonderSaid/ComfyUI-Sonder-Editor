@@ -296,8 +296,13 @@ class AudioRecord:
 
 
 def audio_plan(project: Any, scene: Any, start: int, end: int, *, padding_target: int, pad_fps: float,
-               materialize: Callable[[Any], Any]) -> MediaPlan:
-    """The mix of ``[start, end)``: its request, its recipe when every value is exact, its materializer."""
+               materialize: Callable[[Any], Any], audio_grid: dict | None = None) -> MediaPlan:
+    """The mix of ``[start, end)``: its request, its recipe when every value is exact, its materializer.
+
+    ``audio_grid`` (``server.audio_grid.audio_grid_plan``) mixes at the grid's rate and pads to its
+    ``total_len``. It enters the request and the recipe only when present, so a run without a grid
+    keeps today's recipe byte for byte, and a cached value must then be exactly that length and rate.
+    """
     from ..server import audio_pipeline, media_helpers
     from ..server.timeline_state import effective_scene_fps
 
@@ -307,6 +312,7 @@ def audio_plan(project: Any, scene: Any, start: int, end: int, *, padding_target
     except Exception as exc:
         logger.debug("Editor audio has no request: %s", type(exc).__name__)
         return MediaPlan("audio", None, None, "request_unavailable", materialize, lambda _value: False, 0)
+    grid = dict(audio_grid) if audio_grid else None
     records, reason = [], ""
     for track, path in sources:
         volume = audio_pipeline.effective_volume(track)
@@ -318,13 +324,21 @@ def audio_plan(project: Any, scene: Any, start: int, end: int, *, padding_target
             reason = "recipe_inexact"
             break
     placement = {"start": int(start), "end": int(end), "padding_target": int(padding_target or 0), "pad_fps": pad_fps}
+    if grid is not None:
+        placement["audio_grid"] = grid
     if reason:
         request = {"sources": list(sources), "fps": fps, **placement}
     else:
         request = {"sources": records, "fps": fps, **placement}
 
     def expect(value: Any) -> bool:
-        return _plain_audio(value)
+        if not _plain_audio(value):
+            return False
+        if grid is None:
+            return True
+        # A grid run's audio is exactly this: anything else ComfyUI kept is a miss.
+        return (value["sample_rate"] == grid["rate"]
+                and tuple(int(size) for size in value["waveform"].shape) == (1, 2, int(grid["total_len"])))
 
     recipe = None
     if not reason:
@@ -345,6 +359,8 @@ def audio_plan(project: Any, scene: Any, start: int, end: int, *, padding_target
                             record.source_in_frame] for record, path in records],
                 "sources": sorted(set(window) | set(vote)),
             }
+            if grid is not None:
+                recipe["audio_grid"] = grid
     return _finish(MediaPlan("audio", request, recipe, reason, materialize, expect, AUDIO_MAX_BYTES))
 
 
@@ -352,7 +368,8 @@ def _audio_request_from_recipe(recipe: dict) -> dict:
     return {"sources": [(AudioRecord(track[2], track[3], track[4], track[1]), track[0])
                         for track in recipe["tracks"]],
             "fps": recipe["fps"], "start": recipe["start"], "end": recipe["end"],
-            "padding_target": recipe["padding_target"], "pad_fps": recipe["pad_fps"]}
+            "padding_target": recipe["padding_target"], "pad_fps": recipe["pad_fps"],
+            **({"audio_grid": recipe["audio_grid"]} if recipe.get("audio_grid") else {})}
 
 
 def _plain_frames(value: Any, shape: tuple) -> bool:

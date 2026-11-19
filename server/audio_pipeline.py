@@ -42,10 +42,8 @@ def copy_audio_file(source, target, *, cancel_event=None):
     check_cancel(cancel_event)
 
 
-def frame_sample(frame, rate, fps):
-    """Half-up rounding on the clock whose origin is scene frame zero."""
-    value = Fraction(int(frame) * int(rate), 1) / Fraction(str(fps))
-    return (2 * value.numerator + value.denominator) // (2 * value.denominator)
+# The mixer's clock lives with the audio grid so a grid plan cannot drift from the mix.
+from .audio_grid import frame_sample  # noqa: E402,F401  (re-exported for existing callers)
 
 
 def effective_volume(track):
@@ -109,11 +107,13 @@ def audio_identity_sources(project, scene, start, end):
     return sources, window_paths, list(vote_paths)
 
 
-def scene_audio_spec(project, scene, start, end, *, sources=None, fps=None):
+def scene_audio_spec(project, scene, start, end, *, sources=None, fps=None, rate=None):
     """``(rate, length, contributors)`` for the mix of ``[start, end)``.
 
     ``sources`` (``(track, path)`` pairs already resolved) and ``fps`` replace the
     reads of ``project`` and ``scene`` when given, so a mix can run from a recipe.
+    ``rate`` (a template's audio grid rate) replaces the probed output rate; sources
+    are still probed, so an unreadable in-window source still fails the mix.
     """
     if sources is None:
         sources = list(audible_sources(project, scene))
@@ -130,7 +130,8 @@ def scene_audio_spec(project, scene, start, end, *, sources=None, fps=None):
             if path in window_paths:
                 raise media.MediaProbeError(f"Could not read audio source '{os.path.basename(path)}': {exc}") from exc
             logger.warning("Skipping unprobeable audio source outside output window: %s (%s)", path, exc)
-    rate = max(rates.values(), default=48000)
+    probed_rate = max(rates.values(), default=48000)
+    rate = int(rate) if rate else probed_rate
     if fps is None:
         fps = effective_scene_fps(project, scene)
     origin = frame_sample(start, rate, fps)
@@ -160,18 +161,20 @@ def active_contributors(contributors):
     return [entry for entry in contributors if entry["volume"] > 0 and entry["sample_count"] > 0]
 
 
-def mix_scene_audio_to_wav(project, scene, start_frame, end_frame, output_wav, *, cancel_event=None, request=None):
+def mix_scene_audio_to_wav(project, scene, start_frame, end_frame, output_wav, *, cancel_event=None, request=None,
+                           rate=None):
     """Stream the unbounded stereo float mix for [start_frame, end_frame).
 
     ``request`` (``{"sources": [(track, path), ...], "fps": float}``) replaces the
-    reads of ``project`` and ``scene``.
+    reads of ``project`` and ``scene``. ``rate`` mixes at that rate instead of the
+    highest source rate (the Editor's audio grid); timeline export passes none.
     """
     check_cancel(cancel_event)
     if request is not None:
         rate, length, contributors = scene_audio_spec(None, None, start_frame, end_frame,
-                                                      sources=request["sources"], fps=request["fps"])
+                                                      sources=request["sources"], fps=request["fps"], rate=rate)
     else:
-        rate, length, contributors = scene_audio_spec(project, scene, start_frame, end_frame)
+        rate, length, contributors = scene_audio_spec(project, scene, start_frame, end_frame, rate=rate)
     os.makedirs(os.path.dirname(os.path.abspath(output_wav)), exist_ok=True)
     if length == 0:
         write_float_wav(output_wav, np.empty((2, 0), np.float32), rate)
@@ -209,10 +212,10 @@ def mix_scene_audio_to_wav(project, scene, start_frame, end_frame, output_wav, *
     return contributors
 
 
-def scene_audio_samples(project, scene, start, end, *, work_dir=None, cancel_event=None, request=None):
+def scene_audio_samples(project, scene, start, end, *, work_dir=None, cancel_event=None, request=None, rate=None):
     with tempfile.TemporaryDirectory(prefix="sonder_audio_context_", dir=work_dir or media.transient_temp_dir()) as directory:
         path = os.path.join(directory, "mix.wav")
-        mix_scene_audio_to_wav(project, scene, start, end, path, cancel_event=cancel_event, request=request)
+        mix_scene_audio_to_wav(project, scene, start, end, path, cancel_event=cancel_event, request=request, rate=rate)
         with mapped_float_wav(path) as (rate, samples):
             # Copy before closing the Windows mapping, including mono/empty inputs.
             return np.array(samples.T, dtype=np.float32, order="C", copy=True), rate

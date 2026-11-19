@@ -566,3 +566,159 @@ def test_the_editors_materializer_renders_the_recipes_window_and_padding(tmp_pat
     assert audio["sample_rate"] == stock["sample_rate"]
     assert audio["waveform"].contiguous().numpy().tobytes() == stock["waveform"].contiguous().numpy().tobytes()
 
+
+# ── Audio grid (Audio Grid Padding plan, Phase 2) ───────────────────────────────
+
+LTX_GRID = {"rate": 44100, "block": 4096}
+
+
+def _grid_run(m, tmp_path, ffmpeg, monkeypatch, *, defer=True, frame_constraint=None, name="grid", **execute_kwargs):
+    import editor_media_fixtures as fixtures
+
+    folder = fixtures.build_project(m, tmp_path, ffmpeg, name=name, audio_constraint=LTX_GRID,
+                                    frame_constraint=frame_constraint)
+    kept = []
+    monkeypatch.setattr(m.editor_node.editor_media, "deferral_requested", lambda unique_id: defer)
+    monkeypatch.setattr(m.editor_node.sdk_runs, "remember_pending",
+                        lambda key, call_key, pending: kept.append(pending) or True)
+    result = m.editor_node.SonderEditor().execute(
+        project=folder, project_name="", fps=24.0, width=16, height=12, scene_id=fixtures.SCENE,
+        render_queue_active=False, **execute_kwargs)
+    project = m.project_manager.load_project(str(tmp_path / "sonder-projects" / folder))
+    return (kept[0] if kept else None), result, project
+
+
+def _check_grid_audio(m, audio, ctx, project, start, end):
+    rate, block = LTX_GRID["rate"], LTX_GRID["block"]
+    waveform = audio["waveform"]
+    assert audio["sample_rate"] == rate
+    assert tuple(waveform.shape) == (1, 2, ctx["audio_sample_count"])
+    assert ctx["audio_sample_count"] % block == 0
+    assert ctx["audio_constraint"] == LTX_GRID and ctx["audio_sample_rate"] == rate
+    # The mix itself is the stock mix at the grid's rate, sample for sample.
+    stock = m.editor_node.SonderEditor()._load_scene_audio(project, project.scenes[0], start, end, rate=rate)
+    mix_len = int(stock["waveform"].shape[-1])
+    assert waveform[..., :mix_len].contiguous().numpy().tobytes() == stock["waveform"].contiguous().numpy().tobytes()
+    # The rest is a mirror of the mix, never silence.
+    tail = waveform[..., mix_len:]
+    if tail.shape[-1]:
+        assert float(tail.abs().sum()) > 0
+        assert bool((tail[..., 0] == waveform[..., mix_len - 2]).all())
+    return mix_len
+
+
+def test_a_grid_run_serves_audio_on_the_grid_deferred_and_eager(tmp_path, monkeypatch):
+    m, ffmpeg = load(tmp_path, monkeypatch)
+    pending, result, project = _grid_run(m, tmp_path, ffmpeg, monkeypatch, selection_start=8, selection_end=20)
+    slot = m.editor_node.SonderEditor.OUTPUT_SLOTS["audio"]
+    ctx = result[0]._execution_context
+    assert m.editor_media.is_deferred(result[slot])
+    plan = pending.plans[slot]
+    assert plan.recipe["audio_grid"]["rate"] == 44100 and plan.render_request()["audio_grid"] == plan.recipe["audio_grid"]
+    deferred = pending.value(slot)
+    mix_len = _check_grid_audio(m, deferred, ctx, project, 8, 20)
+    assert ctx["audio_grid_padding_samples"] == ctx["audio_sample_count"] - mix_len
+
+    _pending, eager, _project = _grid_run(m, tmp_path, ffmpeg, monkeypatch, defer=False, name="grid-eager",
+                                          selection_start=8, selection_end=20)
+    assert eager[slot]["waveform"].contiguous().numpy().tobytes() == deferred["waveform"].contiguous().numpy().tobytes()
+
+
+def test_a_grid_run_with_frame_padding_pads_once_on_the_mixers_clock(tmp_path, monkeypatch):
+    m, ffmpeg = load(tmp_path, monkeypatch)
+    pending, result, project = _grid_run(m, tmp_path, ffmpeg, monkeypatch, frame_constraint={"step": 8, "offset": 1},
+                                         selection_start=8, selection_end=20)
+    ctx = result[0]._execution_context
+    assert ctx["frame_count_padding"] > 0
+    slot = m.editor_node.SonderEditor.OUTPUT_SLOTS["audio"]
+    audio = pending.value(slot)
+    _check_grid_audio(m, audio, ctx, project, ctx["context_start"], ctx["context_end"])
+    expected = m.editor_node.audio_grid_plan(ctx["context_start"], ctx["context_end"], 24.0, LTX_GRID,
+                                             frame_target=ctx["frame_count"])
+    assert expected["frame_len"] > expected["mix_len"]  # the frame pad is real here
+    assert ctx["audio_sample_count"] == expected["total_len"]
+    assert ctx["audio_grid_padding_samples"] == expected["grid_padding"]
+
+
+def test_grid_admission_refuses_a_cached_value_of_another_length_rate_or_layout(tmp_path, monkeypatch):
+    m, ffmpeg = load(tmp_path, monkeypatch)
+    pending, result, _project = _grid_run(m, tmp_path, ffmpeg, monkeypatch, selection_start=8, selection_end=20)
+    slot = m.editor_node.SonderEditor.OUTPUT_SLOTS["audio"]
+    good = pending.plans[slot].materialize(pending.plans[slot].render_request())
+    wave, rate = good["waveform"], good["sample_rate"]
+    assert pending.matches(slot, good)
+    assert not pending.matches(slot, {"waveform": wave[..., :-1].contiguous(), "sample_rate": rate})
+    assert not pending.matches(slot, {"waveform": wave, "sample_rate": 48000})
+    assert not pending.matches(slot, {"waveform": wave[:, :1].contiguous(), "sample_rate": rate})
+    # A refused value is a miss: the slot stays unsettled and materializes from its recipe.
+    assert pending.accept(slot, {"waveform": wave[..., :-1].contiguous(), "sample_rate": rate}) is False
+    assert pending.defers(slot)
+
+
+def test_an_inexact_recipe_still_serves_the_grid(tmp_path, monkeypatch):
+    m, ffmpeg = load(tmp_path, monkeypatch)
+    import editor_media_fixtures as fixtures
+
+    folder = fixtures.build_project(m, tmp_path, ffmpeg, name="grid-inexact", audio_constraint=LTX_GRID)
+    project = m.project_manager.load_project(str(tmp_path / "sonder-projects" / folder))
+    scene = project.scenes[0]
+    scene.audio_tracks[0].source_in_frame = None
+    grid = m.editor_node.audio_grid_plan(6, 30, 24.0, LTX_GRID)
+    plan = m.editor_media.audio_plan(project, scene, 6, 30, padding_target=0, pad_fps=24.0,
+                                     materialize=lambda request: request, audio_grid=grid)
+    assert (plan.recipe, plan.reason) == (None, "recipe_inexact")
+    assert plan.render_request()["audio_grid"] == grid
+
+
+def test_a_mix_of_the_wrong_length_is_the_editors_failure(tmp_path, monkeypatch):
+    m, ffmpeg = load(tmp_path, monkeypatch)
+    torch = pytest.importorskip("torch")
+    grid = m.editor_node.audio_grid_plan(6, 30, 24.0, LTX_GRID)
+    short = {"waveform": torch.zeros(1, 2, grid["mix_len"] - 1), "sample_rate": 44100}
+    with pytest.raises(RuntimeError, match="audio grid expected"):
+        m.editor_node.SonderEditor._pad_audio_to_grid(short, grid)
+    wrong_rate = {"waveform": torch.zeros(1, 2, grid["mix_len"]), "sample_rate": 48000}
+    with pytest.raises(RuntimeError, match="audio grid expected"):
+        m.editor_node.SonderEditor._pad_audio_to_grid(wrong_rate, grid)
+    ok = {"waveform": torch.arange(2 * grid["mix_len"], dtype=torch.float32).reshape(1, 2, -1), "sample_rate": 44100}
+    padded = m.editor_node.SonderEditor._pad_audio_to_grid(ok, grid)
+    assert padded["waveform"].shape[-1] == grid["total_len"]
+
+
+def test_a_run_without_a_grid_publishes_no_grid_keys(tmp_path, monkeypatch):
+    m, ffmpeg = load(tmp_path, monkeypatch)
+    _pending, result = _deferred_editor_run(m, tmp_path, ffmpeg, monkeypatch, selection_start=8, selection_end=20)
+    ctx = result[0]._execution_context
+    assert not {"audio_constraint", "audio_sample_rate", "audio_sample_count", "audio_grid_padding_samples"} & set(ctx)
+
+
+def test_a_grid_run_without_a_request_pads_from_the_editors_own_plan(tmp_path, monkeypatch):
+    """`request_unavailable`: the plan has no request, so the closure's own grid plan applies."""
+    m, ffmpeg = load(tmp_path, monkeypatch)
+    monkeypatch.setattr(m.audio, "audio_identity_sources",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no request")))
+    pending, result, project = _grid_run(m, tmp_path, ffmpeg, monkeypatch, defer=False, name="grid-norequest",
+                                         selection_start=8, selection_end=20)
+    slot = m.editor_node.SonderEditor.OUTPUT_SLOTS["audio"]
+    ctx = result[0]._execution_context
+    _check_grid_audio(m, result[slot], ctx, project, 8, 20)
+
+
+def test_an_inexact_recipe_run_still_pads_to_the_grid(tmp_path, monkeypatch):
+    m, ffmpeg = load(tmp_path, monkeypatch)
+    import editor_media_fixtures as fixtures
+
+    folder = fixtures.build_project(m, tmp_path, ffmpeg, name="grid-inexact-run", audio_constraint=LTX_GRID)
+    path = str(tmp_path / "sonder-projects" / folder)
+    project = m.project_manager.load_project(path)
+    project.scenes[0].audio_tracks[0].source_in_frame = 3.5  # a fractional value: no recipe
+    m.project_manager.save_project(project)
+    monkeypatch.setattr(m.editor_node.editor_media, "deferral_requested", lambda unique_id: True)
+    result = m.editor_node.SonderEditor().execute(
+        project=folder, project_name="", fps=24.0, width=16, height=12, scene_id=fixtures.SCENE,
+        render_queue_active=False, selection_start=8, selection_end=20)
+    slot = m.editor_node.SonderEditor.OUTPUT_SLOTS["audio"]
+    audio, ctx = result[slot], result[0]._execution_context
+    assert not m.editor_media.is_deferred(audio)  # no recipe, so it cannot defer
+    assert tuple(audio["waveform"].shape) == (1, 2, ctx["audio_sample_count"])
+    assert audio["sample_rate"] == 44100 and ctx["audio_sample_count"] % 4096 == 0
