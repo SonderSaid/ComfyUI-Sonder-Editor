@@ -1154,7 +1154,8 @@ function showSettingsPanel() {
             // stored grid when the key is left out, and normalize drops an undefined one.
             if (mode === "inherit") return undefined;
             if (mode === "off") return "off";
-            return { rate: Number(audioRateSelect.value), block: parseDraftNumber(audioBlockInput.value) };
+            // Unrounded: a fractional block is refused at save, never rounded into a different grid.
+            return { rate: Number(audioRateSelect.value), block: parseDraftNumber(audioBlockInput.value, false) };
         };
 
         // ── Soft recommendations ──

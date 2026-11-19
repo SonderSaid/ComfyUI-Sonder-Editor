@@ -686,6 +686,9 @@ def test_a_grid_edit_re_heals_each_project_once_and_leaves_open_editors_to_thems
     assert "seen.has(projectDir)" in loop and "controller.fullscreenSession" in loop
     panel = _source("editor_settings_panel.js")
     assert 'normalizeAudioGrid(draftAudioGrid()) === "off"' in panel  # an invalid Custom grid is refused
+    # The block is read unrounded, so a fractional one reaches that refusal (release check, 2026-11-19).
+    assert "block: parseDraftNumber(audioBlockInput.value, false)" in panel
+    assert _run_js('console.log(JSON.stringify(mod.normalizeAudioGrid({ rate: 48000, block: 1920.5 })));') == "off"
 
 
 _REHEAL_LOOP = r"""
