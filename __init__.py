@@ -154,6 +154,24 @@ try:
         NODE_CLASS_MAPPINGS[RELAY_NODE_ID] = SonderControlRelay
         NODE_DISPLAY_NAME_MAPPINGS[RELAY_NODE_ID] = RELAY_DISPLAY_NAME
 
+    try:
+        from .nodes.template_helper import DISPLAY_NAME as HELPER_DISPLAY_NAME, NODE_ID as HELPER_NODE_ID, SonderTemplateHelper
+        _helper_schema = SonderTemplateHelper.GET_SCHEMA()
+        if getattr(_helper_schema, "node_id", None) != HELPER_NODE_ID:
+            raise RuntimeError("Sonder Template Helper schema returned an unexpected node id")
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").startswith("comfy_api"):
+            logging.getLogger(__name__).warning(
+                "Sonder Template Helper import failed: %s", exc, exc_info=True
+            )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Sonder Template Helper unavailable: %s", exc, exc_info=True
+        )
+    else:
+        NODE_CLASS_MAPPINGS[HELPER_NODE_ID] = SonderTemplateHelper
+        NODE_DISPLAY_NAME_MAPPINGS[HELPER_NODE_ID] = HELPER_DISPLAY_NAME
+
     # Internal to the cache pipeline (never in a saved workflow). Without it the
     # pipeline plans no carriers and Editor media consumers rerun as before.
     try:

@@ -224,6 +224,7 @@ adapters, grouped under the `Sonder`, `Sonder/IO`, `Sonder/Logic`, and
 | **Sonder Reference Prompt Bridge** | Outputs the selected lanes' prompt text: `reference_prompt`, `reference_names`, and `p01`–`p16`. |
 | **Sonder Masks Bridge** | Outputs the generation window's picture and sound masks, each set to **Edit** or **Freeze**; see [Masking an audio-video latent](docs/generating.md#masking-an-audio-video-latent). An optional spatial mask limits the video edit to a moving region; see [Edit a moving region](docs/generating.md#edit-a-moving-region). |
 | **Sonder Prompt Relay Bridge** | Exports the generation window's prompt lanes as ComfyUI-PromptRelay payload strings (no model patching). |
+| **Sonder Template Helper** | Reads a model template's **Audio grid** (sample rate and block) from a model's audio VAE, for setting up a custom template; see [Model templates](docs/generating.md#model-templates). |
 
 ### Save & preview — `Sonder/IO`
 
@@ -250,7 +251,7 @@ adapters, grouped under the `Sonder`, `Sonder/IO`, `Sonder/Logic`, and
 | **Sonder Control Relay** | Shows the workflow settings you choose in the editor's **Controls** tab; see [Controls](docs/controls.md). |
 
 > **Sonder Switch**, **Sonder Cluster**, **Sonder Gate**, **Sonder Reference Selector**, the three
-> **Sonder Reference Bridges**, **Sonder Control Relay**, and
+> **Sonder Reference Bridges**, **Sonder Control Relay**, **Sonder Template Helper**, and
 > **Sonder Metadata Collector Nodes 2.0** use ComfyUI's
 > newer V3 node API and load only on recent ComfyUI builds. On older builds
 > the rest of the pack loads, with **Sonder Metadata Collector** under its

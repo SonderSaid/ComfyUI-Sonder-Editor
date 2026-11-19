@@ -873,12 +873,20 @@ def test_an_edit_reaching_the_end_extends_the_audio_end_time_over_the_grid_tail(
     assert mb.resolve_mask_times(plain)["audio_mask_end_time"] == pytest.approx(241 / 24)
 
 
+_STEREO = dict(output_channels=2)
+
+
 @pytest.mark.parametrize("vae,declared,status", [
-    (dict(audio_sample_rate=44100, downscale_ratio=4096, crop_input=True), {"rate": 44100, "block": 4096}, "match"),
-    (dict(audio_sample_rate=32000, downscale_ratio=800, crop_input=True), {"rate": 44100, "block": 4096}, "mismatch"),
-    (dict(audio_sample_rate=44100, downscale_ratio=512.0, crop_input=False), {"rate": 44100, "block": 4096}, "no_crop"),
-    (dict(audio_sample_rate=44100, downscale_ratio=4096, crop_input=True), None, "no_grid"),
-    (dict(), {"rate": 44100, "block": 4096}, "unknown"),
+    (dict(_STEREO, audio_sample_rate=44100, downscale_ratio=4096, crop_input=True), {"rate": 44100, "block": 4096}, "match"),
+    # An integral float block is a whole block (the Template Helper's reading).
+    (dict(_STEREO, audio_sample_rate=44100, downscale_ratio=4096.0, crop_input=True), {"rate": 44100, "block": 4096}, "match"),
+    (dict(_STEREO, audio_sample_rate=32000, downscale_ratio=800, crop_input=True), {"rate": 44100, "block": 4096}, "mismatch"),
+    (dict(_STEREO, audio_sample_rate=44100, downscale_ratio=512.0, crop_input=False), {"rate": 44100, "block": 4096}, "no_crop"),
+    (dict(_STEREO, audio_sample_rate=44100, downscale_ratio=4096, crop_input=True), None, "no_grid"),
+    (dict(_STEREO, downscale_ratio=1411.2, crop_input=True), {"rate": 44100, "block": 4096}, "unknown"),
+    # An image VAE (the core default: 44100 / 8, three channels) is not a mismatch but a wiring slip.
+    (dict(audio_sample_rate=44100, downscale_ratio=8, output_channels=3, crop_input=True), {"rate": 44100, "block": 4096}, "not_audio"),
+    (dict(), {"rate": 44100, "block": 4096}, "not_audio"),
 ])
 def test_grid_check_statuses(vae, declared, status):
     mb = _import_masks_bridge()
@@ -890,7 +898,7 @@ def test_grid_check_runs_on_freeze_warns_on_mismatch_and_never_raises(caplog):
     pytest.importorskip("torch")
     mb = _import_masks_bridge()
     project = _grid_project(mask_start=73, mask_end=145, frame_count=241, sample_count=446464, sample_rate=44100)
-    vae = _h3_audio_vae(audio_sample_rate=32000, downscale_ratio=800, crop_input=True)
+    vae = _h3_audio_vae(audio_sample_rate=32000, downscale_ratio=800, crop_input=True, output_channels=2)
     with caplog.at_level("WARNING"):
         mb.SonderMasksBridge().execute(project, edit_audio=False, audio_latent=_latent((1, 32, 2, 402)), audio_vae=vae)
     payload = project._execution_context["masks_bridge"]

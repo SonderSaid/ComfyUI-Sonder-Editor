@@ -1138,7 +1138,8 @@ function showSettingsPanel() {
         audioHelp.style.cssText = helpCss;
         audioHelp.textContent = "The audio encoder's sample rate and block (its downscale ratio). The Editor serves its "
             + "audio at this rate and pads it to whole blocks, so the encode keeps the first sample. "
-            + "Built-ins: LTX 2.3 / 2.5 44100 Hz / 4096, MiniMax H3 32000 Hz / 800.";
+            + "Built-ins: LTX 2.3 / 2.5 44100 Hz / 4096, MiniMax H3 32000 Hz / 800. For another model, "
+            + "wire its audio VAE to a Sonder Template Helper node and run it to read the values.";
         form.appendChild(audioHelp);
         const refreshAudioGridInputs = () => {
             const custom = audioModeSelect.value === "custom";

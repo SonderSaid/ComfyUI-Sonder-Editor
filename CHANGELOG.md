@@ -16,6 +16,7 @@ a fresh `[Unreleased]` block.
 
 ### Added
 - Model templates have an **Audio grid** (the audio encoder's sample rate and block size): built in for LTX 2.3 / 2.5 and MiniMax H3, and settable as **Built-in**, **Off** or **Custom** in **Settings ▸ Model Templates**.
+- **Sonder Template Helper** node: wire a model's audio VAE and run it to read the **Audio grid** to enter for a model without a built-in one (for example ACE-Step 1.5: 48000 Hz, block 1920).
 
 ### Changed
 - With an **Audio grid**, the **Sonder Editor**'s `audio` output is at the template's audio rate (LTX 44.1 kHz, MiniMax H3 32 kHz) and can run up to one block past the window. Saved takes keep the video's length.

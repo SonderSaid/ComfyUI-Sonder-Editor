@@ -392,6 +392,15 @@ if carrier is not None:
         "output_node": bool(getattr(schema, "is_output_node", False)),
     }
 
+helper = mapping.get("SonderTemplateHelper")
+out["helper"] = None if helper is None else {
+    "selected": selected.get("SonderTemplateHelper"),
+    "execution": type(policy.execution_policy(helper)).__name__,
+    "outputs": {name: type(policy.output_policy(helper, name)).__name__ for name in info["SonderTemplateHelper"]["names"]},
+    "fingerprint": first_real_override(helper, "fingerprint_inputs") is not None,
+    "hidden": info["SonderTemplateHelper"]["hidden"],
+}
+
 editor = info.get("SonderEditor")
 out["editor_hidden"] = editor["hidden"] if editor else None
 out["editor_exact"] = [slot for slot, name in enumerate(editor["names"])
@@ -484,6 +493,18 @@ def test_the_media_carrier_is_an_internal_dev_only_v3_node(registry):
         "inputs": [["token", "STRING"]], "outputs": [["media", "*"]],
         "hidden": [], "fingerprint": False, "own_lazy_status": False, "validate_refuses": True,
         "selected": False, "output_node": False,
+    }
+
+
+def test_the_template_helper_is_a_cacheable_output_node(registry):
+    # A pure function of its VAE: selected only as an output node, skipped on a cache
+    # hit, no per-run fingerprint, outputs left to ComfyUI's own cache. V3 gives every
+    # output node hidden PROMPT and EXTRA_PNGINFO; the helper reads neither, and hidden
+    # inputs are not part of ComfyUI's cache key.
+    assert registry["helper"] == {
+        "selected": "output node", "execution": "Cacheable",
+        "outputs": {"audio_rate": "Inherits", "audio_block": "Inherits", "report": "Inherits"},
+        "fingerprint": False, "hidden": ["EXTRA_PNGINFO", "PROMPT"],
     }
 
 

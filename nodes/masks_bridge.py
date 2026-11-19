@@ -52,6 +52,7 @@ except ImportError:  # pragma: no cover - ComfyUI always ships torch
     torch = None
 
 from .cache_policy import ALWAYS_RUNS, EXACT, INHERITS, PREPARES, TAKES_PROJECT, normalise_outputs
+from .template_rules import audio_encoder_facts
 
 logger = logging.getLogger(__name__)
 
@@ -406,22 +407,24 @@ def audio_grid_check(declared, vae) -> dict | None:
     """Compare the Editor's declared audio grid with the wired audio VAE (provenance only).
 
     ``status``: ``match``; ``mismatch`` (the template's grid does not fit this VAE, so
-    the crop is not neutralised); ``no_crop`` (this VAE never crops); ``no_grid`` (the
-    run served no grid while this VAE crops); ``unknown`` (the VAE publishes no rate or
-    block). Never raises: a wrong grid only means today's crop.
+    the crop is not neutralised); ``not_audio`` (the wired VAE is not a stereo audio
+    VAE); ``no_crop`` (this VAE never crops); ``no_grid`` (the run served no grid while
+    this VAE crops); ``unknown`` (the VAE publishes no whole rate or block). Never raises:
+    a wrong grid only means today's crop. The VAE is read by ``audio_encoder_facts``,
+    the Template Helper's own reading.
     """
     if vae is None:
         return None
-    rate = getattr(vae, "audio_sample_rate", None)
-    block = getattr(vae, "downscale_ratio", None)
-    crops = getattr(vae, "crop_input", None)
+    facts = audio_encoder_facts(vae)
     record = {
         "declared": dict(declared) if isinstance(declared, dict) else None,
-        "vae_rate": rate if type(rate) is int else None,
-        "vae_block": block if type(block) is int else None,
-        "vae_crops": crops if isinstance(crops, bool) else None,
+        "vae_rate": facts["rate"] if type(facts["rate"]) is int else None,
+        "vae_block": facts["block"] if type(facts["block"]) is int else None,
+        "vae_crops": facts["crops"],
     }
-    if record["vae_crops"] is False:
+    if not facts["audio"]:
+        record["status"] = "not_audio"
+    elif record["vae_crops"] is False:
         record["status"] = "no_crop"
     elif record["vae_rate"] is None or record["vae_block"] is None:
         record["status"] = "unknown"
@@ -723,7 +726,10 @@ class SonderMasksBridge:
         # preparation and again at execution, so a mismatch warns twice per prompt.
         grid = result.get("audio_grid")
         grid_check = audio_grid_check(grid.get("constraint") if grid else None, audio_vae)
-        if grid_check is not None and grid_check["status"] == "mismatch":
+        if grid_check is not None and grid_check["status"] == "not_audio":
+            logger.warning("masks bridge: the VAE wired to audio_vae is not an audio VAE; "
+                           "wire the model's audio VAE.")
+        elif grid_check is not None and grid_check["status"] == "mismatch":
             logger.warning(
                 "masks bridge: the Model Template's audio grid %s does not match the wired audio VAE "
                 "(rate %s, block %s); this take's encoded audio may start early. Check the template.",

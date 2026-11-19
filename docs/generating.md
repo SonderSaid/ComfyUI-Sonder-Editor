@@ -94,7 +94,10 @@ in the toolbar's scene-geometry group.
   pads it to whole blocks, so the encoder keeps the start of the audio. In the
   template editor choose **Built-in**, **Off**, or **Custom** with a rate and a
   block. An existing project picks up its template's audio grid the next time
-  you open it in the Sonder Editor.
+  you open it in the Sonder Editor. For a model without a built-in grid, add a
+  **Sonder Template Helper** node, wire the model's audio VAE into it and run
+  the workflow: the node shows the rate and block to enter, or says why the
+  model needs none.
 - **Soft constraints only advise**: recommended/max resolution and a
   recommended duration band show a **⚠** hint when exceeded but never clamp
   your values.
