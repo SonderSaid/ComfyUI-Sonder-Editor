@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-19
+
 ### Added
 - Model templates have an **Audio grid**: the sample rate and block size of the model's audio encoder. **LTX 2.3 / 2.5** and **MiniMax H3** have it built in; set it for other models in **Settings ▸ Model Templates** ([Model templates](docs/generating.md#model-templates)).
 - **Sonder Template Helper** node: wire a model's audio VAE into it and run the workflow to see the **Audio grid** to enter for a model without a built-in one (for example ACE-Step 1.5: 48000 Hz, block 1920).
