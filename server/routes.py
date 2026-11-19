@@ -6461,6 +6461,10 @@ def _apply_scene_mutation_batch(project: TimelineProject, scene_id: str,
     return committed, payload
 
 
+# `audio_constraint_template_id` absent from a project PUT (a template switch, not a heal).
+_AUDIO_GUARD_ABSENT = object()
+
+
 def _queue_job_from_body(body: dict) -> GenerationJob:
     raw_params = body.get("params", {}) or {}
     params = dict(raw_params) if isinstance(raw_params, dict) else {}
@@ -6526,6 +6530,8 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
     frame_constraint = raw_frame_constraint if isinstance(raw_frame_constraint, dict) and raw_frame_constraint else None
     raw_dimension_constraint = body.get("dimension_constraint")
     dimension_constraint = raw_dimension_constraint if isinstance(raw_dimension_constraint, dict) and raw_dimension_constraint else None
+    raw_audio_constraint = body.get("audio_constraint")
+    audio_constraint = raw_audio_constraint if isinstance(raw_audio_constraint, dict) and raw_audio_constraint else None
 
     return GenerationJob(
         scene_id=body.get("scene_id", ""),
@@ -6562,6 +6568,7 @@ def _queue_job_from_body(body: dict) -> GenerationJob:
         template_id=str(body.get("template_id", "free") or "free"),
         frame_constraint=frame_constraint,
         dimension_constraint=dimension_constraint,
+        audio_constraint=audio_constraint,
         take_placement_mode=take_placement_mode,
         take_keep_padding=take_keep_padding,
         params=params,
@@ -12530,6 +12537,8 @@ if routes is not None:
         template_id = body.get("template_id", "free") or "free"
         raw_frame_constraint = body.get("frame_constraint")
         frame_constraint = raw_frame_constraint if isinstance(raw_frame_constraint, dict) and raw_frame_constraint else None
+        raw_audio_constraint = body.get("audio_constraint")
+        audio_constraint = raw_audio_constraint if isinstance(raw_audio_constraint, dict) and raw_audio_constraint else None
         raw_channel_template = body.get(
             prompt_channel_templates.PROJECT_TEMPLATE_KEY,
             prompt_channel_templates.DEFAULT_NEW_PROJECT_CHANNEL_TEMPLATE_ID,
@@ -12561,6 +12570,10 @@ if routes is not None:
                 project.frame_constraint = frame_constraint
                 changed = True
             if was_created:
+                # Only a project this request created takes the creator's grid; an
+                # existing one keeps what it stored (create here also opens).
+                if audio_constraint is not None:
+                    project.audio_constraint = audio_constraint
                 if not isinstance(project.metadata, dict):
                     project.metadata = {}
                 project.metadata[prompt_channel_templates.PROJECT_TEMPLATE_KEY] = (
@@ -12664,6 +12677,19 @@ if routes is not None:
         if "dimension_constraint" in body:
             raw = body.get("dimension_constraint")
             project.dimension_constraint = raw if isinstance(raw, dict) and raw else None
+        if "audio_constraint" in body:
+            # A heal names the template it computed the grid for; it applies only while
+            # the project still uses that template, so a retried or cross-tab heal never
+            # pairs one template's grid with another. A template switch sends no guard:
+            # it sets the template and its grid in this same save.
+            guard = body.get("audio_constraint_template_id", _AUDIO_GUARD_ABSENT)
+            if guard is _AUDIO_GUARD_ABSENT or str(guard or "free") == str(project.template_id or "free"):
+                raw = body.get("audio_constraint")
+                project.audio_constraint = raw if isinstance(raw, dict) and raw else None
+            elif set(body) <= {"audio_constraint", "audio_constraint_template_id"}:
+                # An ignored heal changes nothing: answer without a save, so it does not
+                # bump the version and make every other tab refetch.
+                return web.json_response(project.to_dict())
         if normalized_profile_update is not None:
             project.prompt_context_profiles = normalized_profile_update
         if "prompt_semantic_units" in body:

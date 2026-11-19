@@ -1,9 +1,12 @@
 const { api } = window.comfyAPI.api;
 
 import {
+    audioConstraintsEqual,
     frameConstraintsEqual,
     getEditorSettings,
+    resolveAudioConstraintForTemplate,
     resolveFrameConstraintForTemplate,
+    templateIdResolves,
     updateEditorSettings,
 } from "./editor_settings.js";
 import { installProjectVersionFetchPatch, getProjectVersion } from "./api_client.js";
@@ -550,15 +553,20 @@ function buildProjectUrl(projectDir) {
     return api.apiURL(`/sonder-editor/project/${encodeURIComponent(projectIdFromDir(projectDir))}`);
 }
 
-async function healProjectFrameConstraint(projectDir, settings = getEditorSettings()) {
-    if (!projectDir) return;
+async function fetchProjectForHeal(projectDir) {
     const resp = await fetch(buildProjectUrl(projectDir));
     if (!resp.ok) {
         throw new Error(`Project fetch failed: ${resp.status}`);
     }
-    const project = await resp.json();
+    return resp.json();
+}
+
+// Returns the project it read, so a following heal reuses it instead of fetching again.
+async function healProjectFrameConstraint(projectDir, settings = getEditorSettings()) {
+    if (!projectDir) return null;
+    const project = await fetchProjectForHeal(projectDir);
     const expected = resolveFrameConstraintForTemplate(project?.template_id, settings);
-    if (frameConstraintsEqual(expected, project?.frame_constraint)) return;
+    if (frameConstraintsEqual(expected, project?.frame_constraint)) return project;
     const updateResp = await fetch(buildProjectUrl(projectDir), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -566,6 +574,29 @@ async function healProjectFrameConstraint(projectDir, settings = getEditorSettin
     });
     if (!updateResp.ok) {
         throw new Error(`Frame-constraint self-heal failed: ${updateResp.status}`);
+    }
+    return project;
+}
+
+// Projects the template's audio grid onto the project. Unlike the frame heal it never
+// writes from a template this browser does not know (that would store "No Model
+// Template"'s none over another browser's grid), and the server applies the value only
+// while the project still uses the template it was computed for, so a retried or
+// cross-tab heal cannot pair one template's grid with another template.
+async function healProjectAudioConstraint(projectDir, project = null, settings = getEditorSettings()) {
+    if (!projectDir) return;
+    const current = project || await fetchProjectForHeal(projectDir);
+    const templateId = current?.template_id;
+    if (!templateIdResolves(templateId, settings)) return;
+    const expected = resolveAudioConstraintForTemplate(templateId, settings);
+    if (audioConstraintsEqual(expected, current?.audio_constraint)) return;
+    const updateResp = await fetch(buildProjectUrl(projectDir), {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ audio_constraint: expected, audio_constraint_template_id: templateId ?? null }),
+    });
+    if (!updateResp.ok) {
+        throw new Error(`Audio-constraint self-heal failed: ${updateResp.status}`);
     }
 }
 
@@ -1393,6 +1424,7 @@ export class EditorNodeController {
         this._knownAssetIdsProjectDir = "";
         this._bridgeAssetSettleSession = null;
         this._frameConstraintHealedFor = "";
+        this._audioConstraintHealedFor = "";
         this._editorSessionId = newEditorSessionId("fullscreen");
         // This session as other pages see it; the server names it on a claim, a seed or a subscribe.
         this._editorSessionTag = "";
@@ -2441,6 +2473,7 @@ export class EditorNodeController {
             }
             this._resetBridgeAssetTracking({ clearKnown: true });
             this._frameConstraintHealedFor = "";
+            this._audioConstraintHealedFor = "";
             this.state.projectDir = "";
             this.state.dormantSummary = null;
             this.state.activeOwner = null;
@@ -2464,6 +2497,7 @@ export class EditorNodeController {
             }
             this._resetBridgeAssetTracking({ clearKnown: true });
             this._frameConstraintHealedFor = "";
+            this._audioConstraintHealedFor = "";
             this.state.projectDir = projectDir;
             this.state.dormantSummary = null;
             if (switchingExistingProject) {
@@ -2486,12 +2520,21 @@ export class EditorNodeController {
             this._setupProjectSync();
         }
 
+        let healedProject = null;
         if (this._frameConstraintHealedFor !== projectDir) {
             try {
-                await healProjectFrameConstraint(projectDir);
+                healedProject = await healProjectFrameConstraint(projectDir);
                 this._frameConstraintHealedFor = projectDir;
             } catch (error) {
                 console.warn("[Sonder] Failed to heal project frame constraint:", error);
+            }
+        }
+        if (this._audioConstraintHealedFor !== projectDir) {
+            try {
+                await healProjectAudioConstraint(projectDir, healedProject);
+                this._audioConstraintHealedFor = projectDir;
+            } catch (error) {
+                console.warn("[Sonder] Failed to heal project audio constraint:", error);
             }
         }
 

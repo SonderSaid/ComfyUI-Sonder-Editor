@@ -61,6 +61,7 @@ from ..server.path_security import (
     resolve_existing_project_path,
     safe_route_token,
 )
+from ..server.audio_grid import valid_audio_grid as _valid_audio_grid
 from ..server.timeline_renderer import TimelineRenderCancelled, render_scene_frames
 
 logger = logging.getLogger("sonder_editor")
@@ -407,6 +408,31 @@ class SonderEditor:
         if isinstance(proj_constraint, dict) and proj_constraint:
             return proj_constraint
         return None
+
+    @staticmethod
+    def _execution_audio_constraint(proj: TimelineProject, queue_job=None) -> dict | None:
+        """The audio grid `{rate, block}` this run serves Editor audio on, or None.
+
+        A queued job's own value wins: `{rate, block}`, or `{"off": True}` for a job made
+        for a template without a grid. A job without one (made before the grid existed,
+        or by a browser that did not know the project's template) uses the project's.
+        Stored values are kept raw; only the value used is validated here, and anything
+        that is not exactly a supported grid means no grid.
+        """
+        def checked(value, source):
+            grid = _valid_audio_grid(value)
+            if grid is None and isinstance(value, dict) and value:
+                logger.warning("Sonder Editor: the %s audio grid %r is not a supported {rate, block}; "
+                               "this run uses no audio grid.", source, value)
+            return grid
+
+        if queue_job:
+            job_value = getattr(queue_job, "audio_constraint", None)
+            if isinstance(job_value, dict) and job_value:
+                if job_value.get("off") is True:
+                    return None
+                return checked(job_value, "queued job's")
+        return checked(getattr(proj, "audio_constraint", None), "project's")
 
     @staticmethod
     def _snap_pixel_to_constraint(pixel: int, frame_constraint: dict | None, side: str) -> int:

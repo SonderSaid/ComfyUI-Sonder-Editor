@@ -2589,6 +2589,10 @@ class GenerationJob:
     template_id: str = "free"
     frame_constraint: dict | None = None
     dimension_constraint: dict | None = None
+    # The audio grid this job runs on: `{rate, block}`, `{off: true}`, or None for a job
+    # that predates it or whose template the enqueuing browser did not know (the Editor
+    # then uses the project's value). Stored raw; the Editor validates what it uses.
+    audio_constraint: dict | None = None
     take_placement_mode: str = "trimmed"
     take_keep_padding: bool = False
     take_placement_linked: bool = True
@@ -2642,6 +2646,7 @@ class GenerationJob:
             "template_id": self.template_id,
             "frame_constraint": self.frame_constraint,
             "dimension_constraint": self.dimension_constraint,
+            "audio_constraint": self.audio_constraint,
             "take_placement_mode": self.take_placement_mode,
             "take_keep_padding": self.take_keep_padding,
             "take_placement_linked": self.take_placement_linked,
@@ -2704,6 +2709,7 @@ class GenerationJob:
             template_id=data.get("template_id", "free"),
             frame_constraint=data.get("frame_constraint"),
             dimension_constraint=data.get("dimension_constraint"),
+            audio_constraint=data.get("audio_constraint"),
             take_placement_mode=take_placement_mode,
             take_keep_padding=data.get("take_keep_padding") is True,
             take_placement_linked=bool(data.get("take_placement_linked", data.get("take_linked", True))),
@@ -2729,6 +2735,9 @@ class TimelineProject:
     template_id: str = "free"
     frame_constraint: dict | None = None
     dimension_constraint: dict | None = None
+    # The template's audio grid `{rate, block}` (the encoder's sample rate and crop
+    # block), projected by the browser like `frame_constraint`; None means no grid.
+    audio_constraint: dict | None = None
     scenes: list = field(default_factory=list)           # list[Scene] — ordered compositions
     assets: list = field(default_factory=list)           # list[Asset] — project media registry
     references: list = field(default_factory=list)       # list[ReferenceEntity] — project Reference Library
@@ -2873,6 +2882,7 @@ class TimelineProject:
             "template_id": self.template_id,
             "frame_constraint": self.frame_constraint,
             "dimension_constraint": self.dimension_constraint,
+            "audio_constraint": self.audio_constraint,
             "scenes": [s.to_dict() for s in self.scenes],
             "assets": [a.to_dict(include_provenance=False) for a in self.assets],
             "references": [reference.to_dict() for reference in self.references],
@@ -2906,6 +2916,7 @@ class TimelineProject:
             template_id=data.get("template_id", "free"),
             frame_constraint=data.get("frame_constraint"),
             dimension_constraint=data.get("dimension_constraint"),
+            audio_constraint=data.get("audio_constraint"),
             metadata=data.get("metadata", {}),
             created_at=data.get("created_at", datetime.now().isoformat()),
             modified_at=data.get("modified_at", datetime.now().isoformat()),

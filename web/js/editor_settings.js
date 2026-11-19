@@ -178,6 +178,9 @@ export const BUILTIN_MODEL_TEMPLATES = [
             dimensionStep: 32, dimensionOffset: 0, evenLatentDimensions: true,
             frameStep: 8, frameOffset: 1,
             fps: [24, 25, 48, 50],
+            // The audio VAE's encode rate and crop block (ComfyUI `comfy/sd.py`,
+            // LTX audio branch; 2.3 and 2.5 share one audio VAE).
+            audioGrid: { rate: 44100, block: 4096 },
         },
         soft: {
             minDimension: 64,
@@ -196,6 +199,8 @@ export const BUILTIN_MODEL_TEMPLATES = [
             dimensionStep: 32, dimensionOffset: 0, evenLatentDimensions: false,
             frameStep: 17, frameOffset: 5,
             fps: [24],
+            // ComfyUI `comfy/sd.py`, MiniMax H3 audio VAE branch.
+            audioGrid: { rate: 32000, block: 800 },
         },
         soft: {
             minDimension: 64,
@@ -703,6 +708,23 @@ function normalizeDurationBand(raw) {
     return { minSec: Math.min(lo, hi), maxSec: Math.max(lo, hi) };
 }
 
+// Audio grid: the audio encoder's sample rate and crop block. ComfyUI's encode cuts a
+// waveform to whole blocks from both ends; audio served on this grid loses nothing at
+// the front. One atomic value: `"off"`, or exactly `{rate, block}`. A half or
+// invalid pair is off. `undefined` (absent) means "not stated": a built-in override
+// then inherits the built-in's grid, and any other template has none.
+export const AUDIO_GRID_RATES = Object.freeze([8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000]);
+
+export function normalizeAudioGrid(raw) {
+    if (raw === undefined) return undefined;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "off";
+    const rate = raw.rate;
+    const block = raw.block;
+    if (typeof rate !== "number" || !Number.isInteger(rate) || !AUDIO_GRID_RATES.includes(rate)) return "off";
+    if (typeof block !== "number" || !Number.isInteger(block) || block < 2 || block > rate) return "off";
+    return { rate, block };
+}
+
 // Accepts a templates-v2 template ({hard, soft}) OR a legacy v1 template
 // (flat `constraints` map) and normalizes to the v2 shape. Legacy width/height
 // step+offset collapse to the isotropic dimensionStep/dimensionOffset; frames
@@ -754,6 +776,9 @@ function normalizeCustomTemplate(template, index = 0) {
         frameOffset: frameOffset ?? 0,
         fps: normalizeTemplateFpsList(pick(hardSource.fps, legacy?.fps)),
     };
+    // Kept absent when absent, so a built-in override still inherits the built-in's grid.
+    const audioGrid = normalizeAudioGrid(hardSource.audioGrid);
+    if (audioGrid !== undefined) hard.audioGrid = audioGrid;
 
     const soft = {
         minDimension: coerceFiniteNumber(softSource.minDimension, { integer: true, min: 1 }) ?? 64,
@@ -1796,10 +1821,15 @@ export function getAllModelTemplates(settings) {
         if (!override) return template;
         // Built-in identity + builtIn flag are preserved; hard/soft (and name) are the edit.
         const savedName = override.name === PREVIOUS_BUILTIN_NAMES[template.id] ? "" : override.name;
+        // An override that does not state an audio grid inherits the built-in's, so an
+        // edit saved before the grid existed (or one that never touched it) keeps it.
+        const hard = override.hard && override.hard.audioGrid === undefined && template.hard?.audioGrid !== undefined
+            ? { ...override.hard, audioGrid: template.hard.audioGrid }
+            : override.hard;
         return {
             ...template,
             name: savedName || template.name,
-            hard: override.hard,
+            hard,
             soft: override.soft,
         };
     });
@@ -1837,6 +1867,31 @@ export function getFrameConstraint(template) {
     const step = Number(template?.hard?.frameStep);
     if (!Number.isFinite(step) || step <= 1) return null;
     return { step, offset: Number(template?.hard?.frameOffset) || 0 };
+}
+
+// The resolved audio grid `{rate, block}` a template declares, or null (off/none).
+// This is what the project stores as `audio_constraint`; the backend has no template
+// registry and receives only this value.
+export function getAudioConstraint(template) {
+    const grid = normalizeAudioGrid(template?.hard?.audioGrid);
+    return grid && grid !== "off" ? { rate: grid.rate, block: grid.block } : null;
+}
+
+// What a queued job freezes: the grid, or an explicit `{off: true}` so a job made for
+// an off template never falls back to the project's stored grid. Null only when the
+// template is unknown to this browser (the job then defers to the project's value).
+export function resolveAudioConstraintForJob(templateId, settings) {
+    if (!templateIdResolves(templateId, settings)) return null;
+    return resolveAudioConstraintForTemplate(templateId, settings) || { off: true };
+}
+
+// True when `id` names a template this browser knows. An unknown id (a custom
+// template from another browser) resolves to "No Model Template", whose values must
+// never overwrite what the project stored.
+export function templateIdResolves(id, settings) {
+    // An unset id is "free", as the server stores it.
+    const wanted = normalizeModelTemplateId(id || "free");
+    return getAllModelTemplates(settings).some((template) => template.id === wanted);
 }
 
 export function getTemplateFpsValues(template) {
@@ -1902,6 +1957,19 @@ export function getMaxRes(template) {
 // for all downstream consumers and the backend passthrough blob.
 export function resolveFrameConstraintForTemplate(templateId, settings) {
     return getFrameConstraint(getTemplateById(templateId, settings));
+}
+
+export function resolveAudioConstraintForTemplate(templateId, settings) {
+    return getAudioConstraint(getTemplateById(templateId, settings));
+}
+
+// Equality of two stored audio constraints by their effective grid; anything that is
+// not a valid `{rate, block}` (null, absent, `{off: true}`, garbage) counts as none.
+export function audioConstraintsEqual(a, b) {
+    const left = getAudioConstraint({ hard: { audioGrid: a ?? undefined } });
+    const right = getAudioConstraint({ hard: { audioGrid: b ?? undefined } });
+    if (!left || !right) return !left && !right;
+    return left.rate === right.rate && left.block === right.block;
 }
 
 export function frameConstraintsEqual(a, b) {

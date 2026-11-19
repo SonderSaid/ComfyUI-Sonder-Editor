@@ -126,7 +126,7 @@ const h={projectDir:'test',_referenceFramingAckSeq:0,_syncSettingsPanelControls(
  _projectDirName:()=> 'test',_currentSceneAssetIdsForGallery:()=>[],
  _clearPlaybackWarmOverlay(reason,opts){assert.equal(opts.render,false);},
  _renderTimeline(){this._timelineLayerCache.valid=false;},
- _hasPendingProjectMutations:()=>false,_maybeHealFrameConstraint:async()=>{},_maybeHealDimensionConstraint:async()=>{},
+ _hasPendingProjectMutations:()=>false,_maybeHealFrameConstraint:async()=>{},_maybeHealDimensionConstraint:async()=>{},_maybeHealAudioConstraint:async()=>{},
  _syncSceneResolutionControls(){},_updateViewportHeader(){},_resizeViewportCanvas(){}};
 assert.equal(asset.call(h,{assets:[{path:'a.mp4',asset_type:'video',name:'renamed'}]}),true);
 assert.equal(h._timelineLayerCache.valid,false);assert.equal(h._pathToAsset['a.mp4'].name,'renamed');

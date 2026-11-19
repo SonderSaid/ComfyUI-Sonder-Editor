@@ -84,6 +84,7 @@ console.log(JSON.stringify({ chosen: await post({ templateId: 'ltx-2.3', channel
     chosen, defaults = value["chosen"], value["defaults"]
     assert chosen["template_id"] == "ltx-2.3" and chosen["fps"] == 25  # snapped to LTX's allowed rates
     assert chosen["frame_constraint"] == {"step": 8, "offset": 1}
+    assert chosen["audio_constraint"] == {"rate": 44100, "block": 4096}
     assert defaults["template_id"] == value["defaultTemplate"] and defaults["fps"] == 30
 
 

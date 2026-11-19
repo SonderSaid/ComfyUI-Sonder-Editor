@@ -8,6 +8,7 @@ import {
     getEditorSettings,
     getPromptChannelTemplateById,
     getTemplateById,
+    resolveAudioConstraintForTemplate,
     resolveFrameConstraintForTemplate,
 } from "./editor_settings.js";
 import { snapFpsToTemplate } from "./project_format_controls.js";
@@ -89,6 +90,7 @@ export async function createSonderProject({
             height: Number(height || defaults.height),
             template_id: templateId,
             frame_constraint: resolveFrameConstraintForTemplate(templateId, settings),
+            audio_constraint: resolveAudioConstraintForTemplate(templateId, settings),
             prompt_channel_template: projectTemplateValue(channelTemplate),
         }),
     });

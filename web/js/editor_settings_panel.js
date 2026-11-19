@@ -1134,6 +1134,12 @@ function showSettingsPanel() {
                 alert("Template name is required.");
                 return;
             }
+            // The form has no audio-grid control yet: carry the stored raw value unchanged.
+            // For a built-in that is its override's own value (absent = inherit), never the
+            // effective one, which would freeze today's default into the override.
+            const storedAudioGrid = (editingTemplate?.builtIn
+                ? this._settings?.modelTemplates?.builtinOverrides?.[editingTemplate.id]?.hard
+                : editingTemplate?.hard)?.audioGrid;
             const nextTemplate = {
                 id: editingTemplate?.id || makeUniqueTemplateId(name),
                 name,
@@ -1144,6 +1150,7 @@ function showSettingsPanel() {
                     frameStep: parseDraftNumber(frameStepInput.value),
                     frameOffset: parseDraftNumber(frameOffsetInput.value),
                     fps: parseFpsList(fpsInput.value),
+                    ...(storedAudioGrid !== undefined ? { audioGrid: storedAudioGrid } : {}),
                 },
                 soft: {
                     minDimension: parseDraftNumber(minDimInput.value),

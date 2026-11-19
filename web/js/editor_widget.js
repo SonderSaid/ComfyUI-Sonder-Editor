@@ -566,6 +566,10 @@ import {
     getAllPromptChannelTemplates,
     getTemplateById,
     getDimensionConstraint,
+    audioConstraintsEqual,
+    resolveAudioConstraintForJob,
+    resolveAudioConstraintForTemplate,
+    templateIdResolves,
     getTemplateFpsValues,
     templateFpsIsFixed,
     getRecommendedDurationSec,
@@ -1044,6 +1048,11 @@ export class EditorWidget {
         this.projectId = "";
         this._frameConstraintHealedFor = "";
         this._dimensionConstraintHealedFor = "";
+        this._audioConstraintHealedFor = "";
+        // The template id as the project stores it. `_templateId` collapses an id this
+        // browser does not know to "free"; the audio grid must not, or it would freeze
+        // or heal "none" over the grid another browser stored.
+        this._projectTemplateIdRaw = null;
         this._destroyed = false;
         this._settings = getEditorSettings();
         this._settingsUnsubscribe = null;
@@ -9494,6 +9503,8 @@ export class EditorWidget {
         // Persisted beside the frame grid so a Reference recipe pegged to the
         // template resolves the same way on any machine and inside a frozen job.
         const dimensionConstraint = getDimensionConstraint(getTemplateById(templateId, this._settings));
+        // The audio grid travels with the template in the same save, so the two never disagree.
+        const audioConstraint = resolveAudioConstraintForTemplate(templateId, this._settings);
         try {
             await this._runVersionedProjectMutation(
                 `/sonder-editor/project/${encodeURIComponent(dirName)}`,
@@ -9505,10 +9516,14 @@ export class EditorWidget {
                         template_id: templateId,
                         frame_constraint: frameConstraint,
                         dimension_constraint: dimensionConstraint,
+                        audio_constraint: audioConstraint,
                     }),
                 },
                 { projectId: dirName }
             );
+            // Every successful template save (a pick, a deleted custom template, a
+            // settings change) moves the stored id the audio grid resolves from.
+            this._projectTemplateIdRaw = templateId;
             return true;
         } catch (error) {
             console.warn("[Sonder] Failed to update project template:", error);
@@ -25906,6 +25921,9 @@ export class EditorWidget {
             template_id: this._templateId || "free",
             frame_constraint: this._resolveFrameConstraintForTemplate(this._templateId),
             dimension_constraint: getDimensionConstraint(this._getActiveTemplate()),
+            // `{rate, block}`, `{off: true}`, or null when this browser does not know the
+            // project's template (the job then uses the project's stored grid).
+            audio_constraint: resolveAudioConstraintForJob(this._projectTemplateIdRaw ?? this._templateId, this._settings),
             take_placement_mode: this._settings?.render?.takePlacementMode ?? "trimmed",
             take_keep_padding: this._settings?.render?.keepTakePadding === true,
             // take_placement_linked / take_placement_muted intentionally NOT
@@ -28847,6 +28865,8 @@ export class EditorWidget {
         this._renderCacheSweepPending = false;
         this._frameConstraintHealedFor = "";
         this._dimensionConstraintHealedFor = "";
+        this._audioConstraintHealedFor = "";
+        this._projectTemplateIdRaw = null;
         this.activeSceneId = "";
         this.activeScene = null;
         this.scenes = [];
@@ -29034,6 +29054,7 @@ export class EditorWidget {
                     this.sceneHeight = data.resolution[1] || DEFAULT_EDITOR_SETTINGS.projectDefaults.height;
                 }
                 this._templateId = getTemplateById(data.template_id, this._settings).id;
+                this._projectTemplateIdRaw = data.template_id ?? null;
                 // Project-durable channel template (render-affecting; the channel
                 // SET determines the served prompt, so it is never a browser
                 // preference). May be a preset id or a project-owned fork dict.
@@ -29057,6 +29078,7 @@ export class EditorWidget {
                 }
                 await this._maybeHealFrameConstraint(this.projectDir, dirName, data.frame_constraint);
                 await this._maybeHealDimensionConstraint(this.projectDir, dirName, data.dimension_constraint);
+                await this._maybeHealAudioConstraint(this.projectDir, dirName, data.template_id, data.audio_constraint);
                 this._syncSceneResolutionControls({ detectSelections: false });
                 this._updateViewportHeader();
                 this._resizeViewportCanvas();
@@ -29119,6 +29141,40 @@ export class EditorWidget {
             this._dimensionConstraintHealedFor = projectDir;
         } catch (error) {
             console.warn("[Sonder] Dimension-constraint self-heal threw:", error);
+        }
+    }
+
+    // Projects the template's audio grid onto the project; see healProjectAudioConstraint
+    // in editor_node_controller.js for why it skips unknown templates and why the server
+    // checks `audio_constraint_template_id`.
+    async _maybeHealAudioConstraint(projectDir, dirName, templateId, persistedConstraint) {
+        if (!projectDir || this._audioConstraintHealedFor === projectDir) return;
+        if (!templateIdResolves(templateId, this._settings)) {
+            this._audioConstraintHealedFor = projectDir;
+            return;
+        }
+        const expected = resolveAudioConstraintForTemplate(templateId, this._settings);
+        if (audioConstraintsEqual(expected, persistedConstraint)) {
+            this._audioConstraintHealedFor = projectDir;
+            return;
+        }
+        if (this._hasPendingProjectMutations()) {
+            this._deferProjectBackedRefresh(["project"], "audio_constraint_heal");
+            return;
+        }
+        try {
+            await this._runVersionedProjectMutation(
+                `/sonder-editor/project/${encodeURIComponent(dirName)}`,
+                {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ audio_constraint: expected, audio_constraint_template_id: templateId ?? null }),
+                },
+                { projectId: dirName }
+            );
+            this._audioConstraintHealedFor = projectDir;
+        } catch (error) {
+            console.warn("[Sonder] Audio-constraint self-heal threw:", error);
         }
     }
 
