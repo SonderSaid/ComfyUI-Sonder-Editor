@@ -108,12 +108,12 @@ console.log(JSON.stringify({defaults,invalid,valid,problems,visible,searched,exi
     assert missing['failedCheck'] == ['warn', 'Missing node packs: KJNodes for ComfyUI (VAELoaderKJ). Install them, restart ComfyUI, then reload this page.']
     assert missing['checked'] == [
         ['bad', 'Missing nodes: VAELoaderKJ. Install the node packs that provide them, restart ComfyUI, then reload this page.'
-                ' Needed by Task → Edit With Words.'],
+                ' VAELoaderKJ is needed by Task → Edit With Words.'],
         ['dim', 'Some Modes of this workflow use nodes that aren’t installed: Other. The current Modes don’t need them.'],
         ['bad', 'routing']]
     # Only what the current Modes need sets the badge, and it no longer hides models.
     assert missing['checkedBadge'] == ['Ready', 'good'] and missing['neededBadge'] == ['Missing nodes', 'bad']
-    assert missing['hiddenNoMore'] == ['1 models missing', 'warn']
+    assert missing['hiddenNoMore'] == ['1 model missing', 'warn']
     # Never Ready in green above a line saying it can't generate.
     assert missing['runProblem'] == ['Can’t generate', 'bad']
     # Help installing comes only with a line that asks for an install, at both call sites.
@@ -198,7 +198,7 @@ console.log(JSON.stringify({states, badges, problems, nested, needed: m.launcher
     b = value['badges']
     assert b['notReady'] == b['unsupported'] == ['Generate unavailable', 'warn']
     assert b['ready'] == b['unknown'] == b['unreachable'] == ['Ready', 'good']
-    assert b['missingNodesWin'] == ['Select to check', ''] and b['modelsWin'] == ['1 models missing', 'warn']
+    assert b['missingNodesWin'] == ['Select to check', ''] and b['modelsWin'] == ['1 model missing', 'warn']
     assert b['unchecked'] == ['Select to check', '']
     # The notice says how to install; the Open bar points back to it.
     assert value['problems'] == [value['short']] and 'see the note at the top' in value['short']
@@ -328,3 +328,60 @@ console.log(JSON.stringify(out));
     assert value['newCall'] is True and value['noTimer'] is True
     assert value['last'] == ['apply', {'error': 'ComfyUI didn’t answer.', 'network': True}]
     assert value['noLateSlow'] is True
+
+
+def test_phase5_badge_order_needed_by_and_controls_off_line():
+    """An unchecked row says so before its notes; "Needed by" names its own node
+    inside a multi-pack sentence; Controls off for a missing node get one capped
+    dim line once the check answered (UX pass Phase 5)."""
+    value = _run_module_script(r'''
+const lw = m.launcher_workflows, badge = lw.workflowBadge;
+const mappings = {
+    'comfyui-ltxvideo': [['LTXVSetVideoLatentNoiseMasks'], {title_aux: 'ComfyUI-LTXVideo'}],
+    'comfyui-kjnodes': [['ModelPreviewOverrideKJ', 'VAELoaderKJ'], {title_aux: 'KJNodes for ComfyUI'}],
+};
+const run = [{class_type: 'LTXVSetVideoLatentNoiseMasks'}, {class_type: 'ModelPreviewOverrideKJ', needed_by: ['Passes → Refining Pass Only']},
+    {class_type: 'VAELoaderKJ'}];
+const off = Array.from({length: 10}, (_, i) => ({label: `C${i % 9}`, class_type: 'GrowMaskWithBlur'}));
+const badges = {
+    uncheckedWithNotes: badge({validation: {warnings: ['a', 'b', 'c']}}),
+    checkedWithNotes: badge({validation: {warnings: ['a', 'b', 'c']}, missing_models: []}),
+    oneNote: badge({validation: {warnings: ['a']}, missing_models: []}),
+    errorsWin: badge({validation: {errors: ['bad'], warnings: ['a']}}),
+    twoModels: badge({validation: {}, missing_models: [{}, {}]}),
+};
+const lines = {
+    twoPacks: lw.missingNodeLines({validation: {missing_nodes: run.map(r => r.class_type)}, run_missing_nodes: run}, mappings).map(l => [l.kind, l.text]),
+    offUnchecked: lw.missingNodeLines({validation: {missing_nodes: ['GrowMaskWithBlur'], controls_off_missing: off}}, null),
+    offChecked: lw.missingNodeLines({validation: {missing_nodes: [], controls_off_missing: off}, run_missing_nodes: []}, null).map(l => [l.kind, l.text]),
+    offFailedCheck: lw.missingNodeLines({validation: {controls_off_missing: off.slice(0, 2)}, requirements_error: 'x'}, null).map(l => [l.kind, l.text]),
+    offAbsent: lw.missingNodeLines({validation: {missing_nodes: []}, run_missing_nodes: []}, null),
+    offHelp: lw.asksForInstall(lw.missingNodeLines({validation: {controls_off_missing: off}, run_missing_nodes: []}, null)),
+};
+const bar = m.launcher_open_bar.pairProblems({}, {validation: {missing_nodes: [], controls_off_missing: off.slice(0, 1)}, run_missing_nodes: [], missing_models: []}, {}, {}, null).map(p => [p.kind, p.text]);
+const parity = lw.nodesNeededBy(['A', 'B', 'C'], [{class_type: 'A', needed_by: ['X → Y', 'Z → W']}, {class_type: 'C', needed_by: ['Q → R']}]);
+console.log(JSON.stringify({badges, lines, bar, parity, plural: [m.launcher_view.plural(1, 'note'), m.launcher_view.plural(0, 'note')]}));
+''')
+    b = value['badges']
+    assert b['uncheckedWithNotes'] == ['Select to check', '']
+    assert b['checkedWithNotes'] == ['3 notes', 'warn'] and b['oneNote'] == ['1 note', 'warn']
+    assert b['errorsWin'] == ['Can’t generate', 'bad'] and b['twoModels'] == ['2 models missing', 'warn']
+    assert value['plural'] == ['1 note', '0 notes']
+    lines = value['lines']
+    # The attribution names its own node, after the whole pack sentence.
+    assert lines['twoPacks'] == [['bad', 'Missing node packs: ComfyUI-LTXVideo (LTXVSetVideoLatentNoiseMasks), KJNodes for ComfyUI '
+                                         '(ModelPreviewOverrideKJ, VAELoaderKJ). Install them, restart ComfyUI, then reload this page.'
+                                         ' ModelPreviewOverrideKJ is needed by Passes → Refining Pass Only.']]
+    # Nothing before the check answers; deduped and capped after it, also with no
+    # missing-node line (a pack removed after import); never asks for an install.
+    assert lines['offUnchecked'] == [] and lines['offAbsent'] == [] and lines['offHelp'] is False
+    assert lines['offChecked'] == [['dim', 'Controls off until their nodes are installed: C0, C1, C2, C3, C4, C5, C6, C7 (+1 more).']]
+    assert lines['offFailedCheck'] == [['dim', 'Controls off until their nodes are installed: C0, C1.']]
+    assert value['bar'] == [['dim', 'Controls off until their nodes are installed: C0.']]
+    # The Generate refusal writes the same sentence (SdkRunner._missing_nodes_text).
+    from server.sdk_runner import SdkRunner
+    from server.sdk_templates import missing_nodes_message
+    readiness = {'missing_nodes': ['A', 'B', 'C'], 'needed_by_nodes': {'A': ['X → Y', 'Z → W'], 'C': ['Q → R']}}
+    server_text = SdkRunner._missing_nodes_text(readiness)
+    assert server_text.startswith(missing_nodes_message(['A', 'B', 'C']))
+    assert server_text[len(missing_nodes_message(['A', 'B', 'C'])):] == value['parity']

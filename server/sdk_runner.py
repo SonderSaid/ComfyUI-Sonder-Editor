@@ -45,7 +45,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import control_descriptors, controls_snapshot, launcher_state, prompt_graph, run_control, run_feedback, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry
+from . import control_descriptors, controls_snapshot, launcher_state, prompt_graph, run_control, run_feedback, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry, validation_refusal
 from .control_manifest import RELAY_CLASS_TYPE
 from .editor_inputs import clean_editor_value, clean_editor_values, editor_optional_inputs
 from .sdk_install import install_state, uninstall_running
@@ -1191,9 +1191,12 @@ class SdkRunner:
                 self._runs_by_token.pop(token, None)
                 error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
                 code = "prompt_no_outputs" if error.get("type") == "prompt_no_outputs" else "branch_refused"
-                node_errors = payload.get("node_errors") if isinstance(payload.get("node_errors"), dict) else {}
+                # Worded lines only: the raw node_errors and ComfyUI's details
+                # text can carry tracebacks and server paths (validation_refusal),
+                # and no client reads them. The server log keeps ComfyUI's report.
+                problems = _refusal_lines(payload.get("node_errors"), graph, build.get("view"))
                 raise SdkError(str(error.get("message") or "ComfyUI refused this output."), code, 409,
-                               detail=str(error.get("details") or "")[:2000], node_errors=node_errors)
+                               **({"problems": problems} if problems else {}))
             # A 5xx, a timeout or a dropped connection may follow an enqueue:
             # presence adopts the prompt by its token, or fails it after a grace.
             self._mark_unconfirmed(run)
@@ -1248,7 +1251,9 @@ class SdkRunner:
                         sdk_runs.forget_token(token)
                         session.runs.remove(run)
                         self._runs_by_token.pop(token, None)
-                        failure = SdkError(_submit_error_message(exc), "submit_failed", 502).payload()
+                        problems = _refusal_lines(_exception_node_errors(exc), graph, build.get("view"))
+                        failure = (SdkError("ComfyUI didn't accept the run.", "submit_invalid", 502, problems=problems)
+                                   if problems else SdkError(_submit_error_message(exc), "submit_failed", 502)).payload()
                         logger.warning("SDK submit refused: %s", exc)
                     else:
                         self._mark_unconfirmed(run)
@@ -1611,6 +1616,26 @@ class SdkRunner:
 
     def has_unfinished_runs(self) -> bool:
         return any(session.unfinished() for session in self._sessions.values())
+
+
+def _exception_node_errors(exc: Exception) -> Any:
+    """ComfyUI's ``node_errors`` from a refused SDK submit: comfy-api-proxy sends
+    them in its 422 ``invalid_workflow`` details, and comfy-sdk keeps those
+    details on the exception (``InvalidWorkflow.details``)."""
+    details = getattr(exc, "details", None)
+    return details.get("node_errors") if isinstance(details, dict) else None
+
+
+def _refusal_lines(node_errors: Any, graph: dict, view: dict | None) -> list[str]:
+    """``validation_refusal.describe_node_errors``, best-effort: a failure to
+    word them falls back to the plain refusal."""
+    if not node_errors:
+        return []
+    try:
+        return validation_refusal.describe_node_errors(node_errors, graph, view)
+    except Exception:
+        logger.warning("Wording ComfyUI's validation refusal failed", exc_info=True)
+        return []
 
 
 def _submit_error_message(exc: Exception) -> str:

@@ -439,7 +439,7 @@ def test_launcher_warns_about_switches_off_at_export():
     del prompt["8"]
     view = describe(prompt)
     ce.apply_sdk_state(view, prompt, {}, set())
-    _, warnings = sdk_templates.controls_summary_of(view)
+    warnings = sdk_templates.controls_summary_of(view)["warnings"]
     assert any("can't be switched here: Its nodes were off when this workflow was exported" in w for w in warnings)
 
 

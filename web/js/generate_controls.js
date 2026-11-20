@@ -43,17 +43,21 @@ export function generateButtonState(runs, { submitting = false, count = 1 } = {}
 export function generateResultNotice(result, requested) {
     const payload = result?.payload || {};
     const code = String(payload.code || "");
+    // ComfyUI's refusal worded per setting by the server (submit_invalid), one per line.
+    const failure = payload.error && typeof payload.error === "object" ? payload.error : null;
+    const refused = Array.isArray(failure?.problems) ? failure.problems.filter(p => typeof p === "string" && p) : [];
     if (result?.ok) {
         const submitted = Array.isArray(payload.run_ids) ? payload.run_ids.length : 0;
         if (payload.error && submitted < requested) {
             return {
                 tier: "warning",
                 message: `Only ${submitted} of ${requested} takes were sent.`,
-                detail: payload.error?.error || null,
+                detail: refused.length ? refused.join("\n") : payload.error?.error || null,
             };
         }
         return null;
     }
+    if (refused.length) return { tier: "error", message: "ComfyUI didn't accept the run.", detail: refused.join("\n") };
     if (code === "not_owner" || code === "session_ended") return null; // the page blocker says it
     if (code === "canceled_before_submit") return { tier: "info", message: "Canceled before it was sent." };
     if (code === "generate_refused") {

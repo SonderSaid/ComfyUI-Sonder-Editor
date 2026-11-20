@@ -236,7 +236,10 @@ export function normalizeOutcome(raw, mode) {
         if (raw.ok && runId) return { state: "queued", runId: String(runId) };
         if (raw.payload?.code === "branch_unconfirmed" || (Array.isArray(raw.payload?.run_ids) && raw.payload.run_ids.length))
             return { state: "unconfirmed", ...(raw.payload.run_ids?.[0] ? { runId: String(raw.payload.run_ids[0]) } : {}) };
-        return { state: "refused", code: String(raw.payload?.code || "refused"), ...(raw.payload?.error ? { message: String(raw.payload.error) } : {}) };
+        // ComfyUI's refusal worded per setting by the server, one line each.
+        const problems = Array.isArray(raw.payload?.problems) ? raw.payload.problems.filter(p => typeof p === "string" && p) : [];
+        return { state: "refused", code: String(raw.payload?.code || "refused"),
+            ...(raw.payload?.error ? { message: String(raw.payload.error) } : {}), ...(problems.length ? { problems } : {}) };
     }
     const state = raw.state;
     if (state === "queued") return raw.prompt_id ? { state, promptId: String(raw.prompt_id) } : { state: "unconfirmed" };
@@ -263,7 +266,20 @@ const REFUSALS = {
     canvas_host_disconnected: "The canvas is not connected.",
     queue_full: "Too many requests are waiting. Try again in a moment.",
 };
-export const refusalText = outcome => outcome?.message || REFUSALS[outcome?.code] || "The output did not run.";
+// The server's last line when it left some out: "+3 more. The ComfyUI console…".
+const MORE_LINE = /^\+(\d+) more\b/;
+// The first worded problem leads (the chip is one line, its hover shows the
+// rest through refusalDetail). The count covers what the server left out.
+export function refusalText(outcome) {
+    const problems = outcome?.problems || [];
+    if (problems.length) {
+        const more = MORE_LINE.exec(problems[problems.length - 1]);
+        const others = more ? problems.length - 2 + Number(more[1]) : problems.length - 1;
+        return others > 0 ? `${problems[0]} (+${others} more)` : problems[0];
+    }
+    return outcome?.message || REFUSALS[outcome?.code] || "The output did not run.";
+}
+export const refusalDetail = outcome => (outcome?.problems?.length > 1 ? outcome.problems.slice(1).join("\n") : "");
 
 // ── Status table ─────────────────────────────────────────────────────────────
 

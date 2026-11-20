@@ -24,6 +24,11 @@ export function input(placeholder, value, onInput, key) {
     node.addEventListener('input', () => onInput(node.value));
     return node;
 }
+// "1 note", "3 notes". proxy_actions.js and proxy_maintenance_dialog.js keep
+// local copies of the same helper.
+export function plural(count, one, many = `${one}s`) {
+    return `${count} ${count === 1 ? one : many}`;
+}
 export function component(element, dispose = () => {}) {
     return { element, cleanup() { dispose(); element.remove(); } };
 }

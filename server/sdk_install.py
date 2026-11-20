@@ -472,9 +472,33 @@ def uninstall_running() -> bool:
         return _job["action"] == "uninstall" and _job["state"] == "running"
 
 
-def installer_status() -> dict:
-    """What the Settings section shows: the job, the record, an unfinished install."""
-    job = job_snapshot()
+# install_state() keys of each package.
+_INSTALL_KEYS = {"comfy-sdk": "sdk", "comfy-api-proxy": "proxy"}
+
+
+def _loaded_note(names: list[str]) -> str:
+    return " and ".join(names) + " stays loaded until ComfyUI restarts."
+
+
+def _with_loaded_note(job: dict, install: dict) -> dict:
+    """The job with an uninstall's "stays loaded" note worded for now: only the
+    removed packages that are still loaded and still not installed. One put back
+    since (by Sonder or by hand) is on disk again, so the note no longer holds."""
+    result = job.get("result")
+    loaded = result.get("loaded") if isinstance(result, dict) else None
+    if not loaded:
+        return job
+    still = [name for name in loaded if not (install.get(_INSTALL_KEYS.get(name, "")) or {}).get("installed")]
+    notes = list(result.get("notes") or []) + ([_loaded_note(still)] if still else [])
+    return {**job, "result": {**result, "notes": notes}}
+
+
+def installer_status(install: dict | None = None) -> dict:
+    """What the Settings section shows: the job, the record, an unfinished install.
+
+    ``install`` is the caller's ``install_state()`` read, when it has one.
+    """
+    job = _with_loaded_note(job_snapshot(), install if install is not None else install_state())
     interrupted = None
     record = {"installed_by_sonder": [], "added_dependencies": []}
     try:
@@ -643,17 +667,18 @@ def uninstall(*, runner: Runner = default_runner, installed: Callable[[str], str
     _remove_state_file(INTENT_NAME)
     if elsewhere and "comfy-api-proxy" in removable:
         notes.append("A comfy-api-proxy that Sonder didn't start is still running; stop it yourself if you no longer need it.")
+    # Its note is worded on read (``installer_status``), so it goes once the
+    # package is back on disk, however it got there.
     loaded = [name for name in removable
               if any(module.split(".", 1)[0] in PACKAGE_MODULES.get(name, ()) for module in list(sys.modules))]
-    if loaded:
-        notes.append(" and ".join(loaded) + " stays loaded until ComfyUI restarts.")
     if removable and record["added_dependencies"]:
         notes.append("Packages added alongside it were left in place: "
                      + ", ".join(f"{d['name']} {d.get('version', '')}".strip() for d in record["added_dependencies"]) + ".")
     if not removable:
         return {"ok": True, "message": "Nothing to remove: Sonder didn't install these packages, or they changed since.",
                 "removed": [], "notes": notes}
-    return {"ok": True, "message": "Removed " + " and ".join(removable) + ".", "removed": removable, "notes": notes}
+    return {"ok": True, "message": "Removed " + " and ".join(removable) + ".", "removed": removable, "notes": notes,
+            "loaded": loaded}
 
 
 def start_install(**kwargs: Any) -> dict:

@@ -243,15 +243,16 @@ this same ComfyUI.
 
 ### Generate says "ComfyUI didn't accept the run"
 
-ComfyUI refused the workflow before running it, usually because a setting
-names a sampler or scheduler this ComfyUI doesn't have.
+ComfyUI refused the workflow before running it. The message names what it
+refused, usually a sampler or scheduler this ComfyUI doesn't have.
 
 - **LTX 2.5 Edit & VFX or Refine & Upscale:** install RES4LYF, even if the
   Launcher reads **Ready**
   ([Install Models and Node Packs](sonder-app-setup.md#ltx-25-edit--vfx)).
-- **Any other workflow:** look in the window where ComfyUI runs. A line with
-  `Value not in list` names the node and setting. Install the pack that
-  provides that value, or choose another value in **Controls**.
+- **Any other workflow:** install the node pack that provides that value, or
+  choose another value in **Controls**. If the message names nothing you can
+  change in **Controls**, the window where ComfyUI runs names the node and
+  setting.
 
 ### The Launcher says *Missing node packs*
 

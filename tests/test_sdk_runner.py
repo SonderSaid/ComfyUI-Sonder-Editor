@@ -72,11 +72,19 @@ class FakeJob:
 
 
 class Refused(Exception):
-    """Like comfy-sdk's errors: carries the proxy's HTTP status."""
+    """Like comfy-sdk's errors: carries the proxy's HTTP status, and its details."""
 
-    def __init__(self, message, http_status):
+    def __init__(self, message, http_status, details=None):
         super().__init__(message)
         self.http_status = http_status
+        self.details = details
+
+
+# ComfyUI's /prompt refusal as comfy-api-proxy forwards it (422 details).
+NODE_ERRORS = {"5": {"errors": [{"type": "value_bigger_than_max", "message": "Value 99 bigger than max of 50",
+                                 "details": "seed", "extra_info": {"input_name": "seed", "input_config": ["INT", {"max": 50}],
+                                                                   "received_value": 99}}],
+                     "dependent_outputs": ["2"], "class_type": "KSampler"}}
 
 
 class FakeClient:
@@ -302,6 +310,63 @@ def test_a_refused_submit_stops_the_batch_and_forgets_its_token(world):
     assert len(session.runs) == 1
     assert len(world.runner._runs_by_token) == 1
     assert len(sdk_runs._TOKENS) == 1  # only the accepted run's token remains
+
+
+def test_a_refusal_with_node_errors_names_the_setting_by_its_control(world):
+    world.client.fail_on = {1: Refused("Prompt outputs failed validation", 422, {"node_errors": NODE_ERRORS})}
+
+    async def go():
+        session = await world.open()
+        return await world.runner.generate(session, tab_session_id="tab-1", count=2)
+
+    result = asyncio.run(go())
+    assert result["ok"] is False and result["run_ids"] == []
+    error = result["error"]
+    assert error["code"] == "submit_invalid" and error["error"] == "ComfyUI didn't accept the run."
+    assert error["problems"] == ["“Seed”: 99 is above its maximum, 50."]
+    assert "node_errors" not in error
+
+
+def test_a_later_take_refused_with_node_errors_carries_the_lines(world):
+    world.client.fail_on = {2: Refused("Prompt outputs failed validation", 422, {"node_errors": NODE_ERRORS})}
+
+    async def go():
+        session = await world.open()
+        return await world.runner.generate(session, tab_session_id="tab-1", count=2)
+
+    result = asyncio.run(go())
+    assert result["ok"] is True and len(result["run_ids"]) == 1
+    assert result["error"]["code"] == "submit_invalid" and result["error"]["problems"]
+
+
+def test_a_refusal_the_formatter_cannot_word_stays_the_plain_refusal(world, monkeypatch):
+    from server import validation_refusal
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("bad shape")
+
+    monkeypatch.setattr(validation_refusal, "describe_node_errors", boom)
+    world.client.fail_on = {1: Refused("Prompt outputs failed validation", 422, {"node_errors": NODE_ERRORS})}
+
+    async def go():
+        session = await world.open()
+        return await world.runner.generate(session, tab_session_id="tab-1")
+
+    error = asyncio.run(go())["error"]
+    assert error["code"] == "submit_failed" and "problems" not in error
+    assert error["error"] == "ComfyUI did not accept the run: Prompt outputs failed validation"
+
+
+def test_comfy_sdk_carries_the_proxys_node_errors_where_the_runner_reads_them():
+    """The real exception chain: comfy-api-proxy's 422 envelope → comfy_low's
+    ApiError → comfy-sdk's InvalidWorkflow."""
+    errors = pytest.importorskip("comfy_low.errors")
+    exceptions = pytest.importorskip("comfy_sdk.exceptions")
+    envelope = {"error": {"code": "invalid_workflow", "message": "Prompt outputs failed validation",
+                          "details": {"node_errors": NODE_ERRORS}}}
+    exc = exceptions.to_sdk_error(errors.error_from_envelope(422, envelope))
+    assert type(exc).__name__ == "InvalidWorkflow" and sdk_runner._definitely_rejected(exc)
+    assert sdk_runner._exception_node_errors(exc) == NODE_ERRORS
 
 
 # ── Outcome authority ────────────────────────────────────────────────────────

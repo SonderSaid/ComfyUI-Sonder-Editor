@@ -83,6 +83,12 @@ out.outcomes = [
     M.normalizeOutcome({ok:true, payload:{run_ids:['run-1']}}, 'sdk'), M.normalizeOutcome({ok:false, payload:{run_ids:['run-2'], code:'x'}}, 'sdk'),
     M.normalizeOutcome({ok:false, payload:{code:'branch_not_output', error:'Only an output…'}}, 'sdk'), M.normalizeOutcome(null, 'canvas')];
 out.refusal = [M.refusalText({code:'controls_unsaved'}), M.refusalText({code:'zzz'}), M.refusalText({message:'Server said'})];
+// ComfyUI's refusal worded per setting by the server: the first line leads, all of them on hover.
+const worded = M.normalizeOutcome({ok:false, payload:{code:'branch_refused', error:'Prompt outputs failed validation', problems:['“A”: one.', '“B”: two.', 7]}}, 'sdk');
+out.worded = {outcome: worded, text: M.refusalText(worded), detail: M.refusalDetail(worded),
+    one: M.refusalText({problems:['“A”: one.'], message:'x'}), oneDetail: M.refusalDetail({problems:['“A”: one.']}),
+    capped: M.refusalText({problems:['“A”: one.', '“B”: two.', '+4 more. The ComfyUI console lists every one.']}),
+    cappedDetail: M.refusalDetail({problems:['“A”: one.', '“B”: two.', '+4 more. The ComfyUI console lists every one.']})};
 """)
     sections = out["sections"]
     assert [i["label"] for i in sections["editor"]] == ["Composite", "Guides", "Driver 1"]
@@ -94,6 +100,13 @@ out.refusal = [M.refusalText({code:'controls_unsaved'}), M.refusalText({code:'zz
         {"state": "unconfirmed", "runId": "run-2"}, {"state": "refused", "code": "branch_not_output", "message": "Only an output…"},
         {"state": "refused", "code": "no_answer"}]
     assert out["refusal"][0].startswith("A Controls edit") and out["refusal"][1] == "The output did not run." and out["refusal"][2] == "Server said"
+    worded = out["worded"]
+    assert worded["outcome"]["problems"] == ["“A”: one.", "“B”: two."]
+    # The chip's hover joins the chip and the rest (view_panes), so the rest starts at the second line.
+    assert worded["text"] == "“A”: one. (+1 more)" and worded["detail"] == "“B”: two."
+    assert worded["one"] == "“A”: one." and worded["oneDetail"] == ""
+    # The server's own "+N more" line counts what it left out, not itself.
+    assert worded["capped"] == "“A”: one. (+5 more)" and worded["cappedDetail"].endswith("+4 more. The ComfyUI console lists every one.")
 
 
 def test_status_table_rows():

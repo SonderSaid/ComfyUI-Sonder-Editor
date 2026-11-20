@@ -505,6 +505,8 @@ def test_the_launcher_summary_is_computed_on_read_from_curation(world, monkeypat
     labels = [c["label"] for c in listed["validation"]["controls"]]
     assert "Seed" not in labels and "Steps (app)" in labels
     assert any("No seed exposed" in w for w in listed["validation"]["warnings"])
+    # The recomputed summary carries its node-missing list too (empty here).
+    assert listed["validation"]["controls_off_missing"] == []
 
 
 # ── Mounted transport ────────────────────────────────────────────────────────

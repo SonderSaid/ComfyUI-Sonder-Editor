@@ -58,6 +58,9 @@ STATUS_UNSUPPORTED = "unsupported"
 STATUS_DENIED = "denied"
 # Sonder App only: an app-only binding whose input the workflow now exposes itself.
 STATUS_SHADOWED = "shadowed"
+# Why an ``unsupported`` binding is off, when that is its node's class missing
+# from this ComfyUI (the descriptor's ``reason_code``).
+REASON_NODE_MISSING = "node_missing"
 
 STATUS_REASONS = {
     STATUS_SHADOWED: "The workflow now exposes this setting itself, so this app-only Control is off. Remove it.",
@@ -524,7 +527,8 @@ def _read_target(prompt: dict, target_key: str, input_name: str, class_lookup: C
     target = {"key": target_key, "class_type": class_type, "input": input_name}
     class_def = class_lookup(class_type) if isinstance(class_type, str) else None
     if class_def is None:
-        target.update(status=STATUS_UNSUPPORTED, kind=None, reason=f"{class_type} is not installed.")
+        target.update(status=STATUS_UNSUPPORTED, kind=None, reason=f"{class_type} is not installed.",
+                      reason_code=REASON_NODE_MISSING)
         return target
     inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
     try:
@@ -719,6 +723,13 @@ def _check_targets(prompt: dict, targets: list[dict], class_lookup: Callable, ca
     return STATUS_OK, None, read
 
 
+def _selected_target(read: list[dict], status: str) -> dict | None:
+    """The read target ``_check_targets`` took its bad status from: the first
+    with that status (its priority loop's pick). None when the status came
+    from the targets together (a row group fan-out, mixed types)."""
+    return next((t for t in read if t.get("status") == status), None) if status != STATUS_OK else None
+
+
 def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Callable, cache: dict,
                   origin: str = "authored") -> dict:
     descriptor: dict[str, Any] = {
@@ -736,15 +747,29 @@ def _describe_one(prompt: dict, binding_id: str, entry: dict, class_lookup: Call
         "error": None,
     }
     exported = entry.get("status")
+    selected = None  # the read target whose status the binding takes
     if exported is not None and exported != STATUS_OK:
         status, reason, read = exported, None, []
         if exported == STATUS_UNSUPPORTED:
             # The canvas reports a bound row field as unsupported without a
             # reason; the server's read names the group to expose instead.
-            checked, checked_reason, _ = _check_targets(prompt, entry.get("targets") or [], class_lookup, cache)
+            checked, checked_reason, checked_read = _check_targets(prompt, entry.get("targets") or [], class_lookup, cache)
             reason = checked_reason if checked == STATUS_UNSUPPORTED else None
+            if checked == STATUS_UNSUPPORTED:
+                selected = _selected_target(checked_read, checked)
     else:
         status, reason, read = _check_targets(prompt, entry.get("targets") or [], class_lookup, cache)
+        selected = _selected_target(read, status)
+    if selected is not None and selected.get("reason_code") == REASON_NODE_MISSING:
+        # Off only because its node pack isn't installed (the Launcher lists
+        # these apart from its notes). Its kind is unknown without the class,
+        # so a seed is recognized by what the export recorded. ``seed_hint`` is
+        # read by the Launcher summary alone: ``seed_mode`` stays off an off
+        # descriptor, since preset matching keys on it.
+        descriptor["reason_code"] = REASON_NODE_MISSING
+        descriptor["missing_class"] = selected.get("class_type") or ""
+        if entry.get("seed_mode") is not None or selected.get("input") in _SEED_INPUT_NAMES:
+            descriptor["seed_hint"] = True
     descriptor["targets"] = [{"path": t["key"], "input": t["input"], "class_type": t.get("class_type"),
                               "status": t["status"]} for t in read] or [
         {"path": t["path"], "input": t["input"], "class_type": None, "status": status}

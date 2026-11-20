@@ -11,6 +11,17 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Changed
+- When ComfyUI refuses a Sonder App run, **Generate** (and an Output View's **Didn't run:**) names what it refused, for example a sampler this ComfyUI doesn't have, instead of only "ComfyUI didn't accept the run". An Output View that Sonder itself can't run yet also names the first reason.
+- The Launcher lists Controls that are off because their node isn't installed in one line, "Controls off until their nodes are installed", instead of one note each.
+
+### Fixed
+- Launcher workflows you haven't selected yet read **Select to check** instead of a count of notes.
+- A Launcher line naming missing node packs says which node each "is needed by" choice belongs to, instead of appearing to apply to every pack.
+- The Launcher no longer says "No seed exposed" for a workflow whose seed Control is off only because its node pack isn't installed.
+- Launcher badges read "1 note" and "1 model missing".
+- **Settings ▸ Sonder App** no longer says a package "stays loaded until ComfyUI restarts" once that package is installed again.
+
 ## [0.9.0] - 2026-11-19
 
 ### Added

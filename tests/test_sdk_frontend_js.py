@@ -416,6 +416,12 @@ out.notices = {
     network: gc.generateResultNotice({ ok: false, status: 0, payload: { code: "network", error: "Failed to fetch" } }, 1),
     missing_nodes: gc.generateResultNotice({ ok: false, status: 409, payload: { code: "missing_nodes", error: "This workflow needs nodes that aren't installed: X." } }, 1),
     submit_failed: gc.generateResultNotice({ ok: false, status: 502, payload: { ok: false, run_ids: [], error: { code: "submit_failed", error: "Invalid prompt." } } }, 1),
+    // ComfyUI's refusal worded per setting by the server (UX pass Phase 5).
+    submit_invalid: gc.generateResultNotice({ ok: false, status: 502, payload: { ok: false, run_ids: [], error: { code: "submit_invalid",
+        error: "ComfyUI didn't accept the run.", problems: ["“Sampler”: “res_2s” isn't one of its choices.", "“Latent · width”: 7 is below its minimum, 16."] } } }, 1),
+    partial_invalid: gc.generateResultNotice({ ok: true, status: 202, payload: { run_ids: ["a"], error: { code: "submit_invalid",
+        error: "ComfyUI didn't accept the run.", problems: ["“Seed”: 99 is above its maximum, 50."] } } }, 2),
+    empty_problems: gc.generateResultNotice({ ok: false, status: 502, payload: { ok: false, run_ids: [], error: { code: "submit_invalid", error: "x", problems: [] } } }, 1),
 };
 out.clamp = [gc.clampGenerateCount(0), gc.clampGenerateCount(3.4), gc.clampGenerateCount(99), gc.clampGenerateCount("x")];
 
@@ -832,6 +838,11 @@ def test_refusal_notices_put_the_sentence_in_message_and_the_reason_in_detail(re
     assert notices["proxy"] == {"tier": "error", "message": "The Sonder App couldn't connect to ComfyUI.", "detail": "No free port."}
     assert notices["network"]["message"] == "Couldn't reach ComfyUI to generate."
     assert notices["submit_failed"] == {"tier": "error", "message": "ComfyUI didn't accept the run.", "detail": "Invalid prompt."}
+    assert notices["submit_invalid"] == {"tier": "error", "message": "ComfyUI didn't accept the run.",
+                                         "detail": "“Sampler”: “res_2s” isn't one of its choices.\n“Latent · width”: 7 is below its minimum, 16."}
+    assert notices["partial_invalid"] == {"tier": "warning", "message": "Only 1 of 2 takes were sent.",
+                                          "detail": "“Seed”: 99 is above its maximum, 50."}
+    assert notices["empty_problems"] == {"tier": "error", "message": "ComfyUI didn't accept the run.", "detail": "x"}
 
 
 def test_generate_controls_drive_the_host(results):

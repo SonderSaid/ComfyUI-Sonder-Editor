@@ -31,7 +31,7 @@
 // fetch at a time; a 409 (a newer run took the node) reads once more, and a
 // refused preview is never asked for twice.
 import {
-    MAX_PANES, assignSource, cancelAvailability, mediaStatus, normalizeLayout, paneCount, refusalText,
+    MAX_PANES, assignSource, cancelAvailability, mediaStatus, normalizeLayout, paneCount, refusalDetail, refusalText,
     runAvailability, sameSource, samplingMediaStatus, samplingPaneStatus, viewPaneStatus,
 } from "./views_model.js";
 import { TIMELINE } from "./audio_ownership.js";
@@ -395,7 +395,8 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
             panes[index].outcome = { ...outcome, settled: false, at };
         } else {
             panes[index].outcome = { ...outcome, settled: true, at,
-                message: outcome.state === "busy" ? "Another output is waiting for ComfyUI" : refusalText(outcome) };
+                message: outcome.state === "busy" ? "Another output is waiting for ComfyUI" : refusalText(outcome),
+                detail: outcome.state === "busy" ? "" : refusalDetail(outcome) };
         }
         changed();
         scheduleRead();
@@ -490,9 +491,12 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         const itemIndex = Math.min(pane.item, Math.max(0, entries.length - 1));
         const entry = entries[status.result?.fixedIndex ? 0 : itemIndex] || null;
         const media = state.condition ? mediaStatus(state.condition, { takeSaved: !!status.result?.run?.saved_to_project }) : null;
-        let chip = media?.chip || status.chip;
+        let chip = media?.chip || status.chip, chipTitle = "";
         if (state.outcome?.canceling && !state.outcome.settled) chip = "Canceling…";
-        else if (state.outcome?.settled && state.outcome.message) chip = `Didn't run: ${state.outcome.message}`;
+        else if (state.outcome?.settled && state.outcome.message) {
+            chip = `Didn't run: ${state.outcome.message}`;
+            chipTitle = state.outcome.detail || "";  // the worded problems after the first, on hover
+        }
         else if (state.outcome && !state.outcome.settled && !chip) chip = "Running";
         if (state.released && !state.held) chip = chip || "Released";
         const adapter = current();
@@ -509,7 +513,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
             else if (linkChip) chip = chip ? `${linkChip} · ${chip}` : linkChip;
         }
         return {
-            ...model, view, read: item, status, entries, itemIndex, entry, chip,
+            ...model, view, read: item, status, entries, itemIndex, entry, chip, chipTitle,
             linkable: !!entry && isLinkable(entry), link, linked, outside,
             message: media?.message || status.message || (outside ? "Outside generated range" : linked && link.pending ? "Linking…" : null),
             unavailable: !!status.unavailable,

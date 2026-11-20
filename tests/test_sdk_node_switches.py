@@ -217,7 +217,7 @@ def test_switches_the_export_cannot_route_stay_read_only_with_the_fix(world, pro
     from server import control_descriptors as cd
     described = cd.describe_bindings(prompt(), class_lookup=CLASSES.get)
     ce.apply_sdk_state(described, prompt(), {}, set())
-    _, warnings = sdk_templates.controls_summary_of(described)
+    warnings = sdk_templates.controls_summary_of(described)["warnings"]
     assert any(reason in w for w in warnings)
 
 

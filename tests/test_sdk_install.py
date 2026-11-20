@@ -698,3 +698,57 @@ def test_the_ping_route_is_gone(user_dir, monkeypatch):
         assert resp.status == 404
 
     asyncio.run(run())
+
+
+# ── The "stays loaded" note is worded on read (UX pass Phase 5) ───────────────
+
+def test_an_uninstall_records_what_stays_loaded_and_words_no_note_itself(user_dir, monkeypatch):
+    pip = FakePip(installed={}, report=[("comfy-sdk", "0.4.0"), ("comfy-api-proxy", "0.1.6")])
+    sdk_install.install(runner=pip, installed=pip.version)
+    monkeypatch.setitem(sys.modules, "comfy_sdk", types.ModuleType("comfy_sdk"))
+    monkeypatch.delitem(sys.modules, "comfy_api_proxy", raising=False)
+    result = sdk_install.uninstall(runner=pip, installed=pip.version, required_by=lambda name, ignore: [])
+    assert result["loaded"] == ["comfy-sdk"]
+    assert not any("stays loaded" in note for note in result["notes"])
+
+
+def _installed(sdk=False, proxy=False):
+    return {"sdk": {"installed": sdk}, "proxy": {"installed": proxy}, "ready": False}
+
+
+def test_installer_status_keeps_the_note_only_while_the_package_is_still_missing(user_dir):
+    result = {"ok": True, "message": "Removed comfy-api-proxy and comfy-sdk.", "notes": ["Kept x."],
+              "loaded": ["comfy-api-proxy", "comfy-sdk"]}
+    sdk_install._set_job(action="uninstall", state="done", result=result)
+    try:
+        notes = lambda install: sdk_install.installer_status(install)["job"]["result"]["notes"]  # noqa: E731
+        assert notes(_installed()) == ["Kept x.", "comfy-api-proxy and comfy-sdk stays loaded until ComfyUI restarts."]
+        # comfy-sdk put back outside Sonder: only the other one is still named.
+        assert notes(_installed(sdk=True)) == ["Kept x.", "comfy-api-proxy stays loaded until ComfyUI restarts."]
+        assert notes(_installed(sdk=True, proxy=True)) == ["Kept x."]
+        # Worded on read: the stored job is never changed.
+        assert sdk_install.job_snapshot()["result"] == result
+    finally:
+        sdk_install.reset_jobs_for_tests()
+
+
+def test_the_status_route_drops_the_note_once_the_package_is_back(user_dir, monkeypatch):
+    async def run():
+        client, _ = _client(user_dir, monkeypatch)
+        sdk_install._set_job(action="uninstall", state="done",
+                             result={"ok": True, "message": "Removed comfy-sdk.", "notes": [], "loaded": ["comfy-sdk"]})
+        versions = {}
+        monkeypatch.setattr(sdk_install, "_version", lambda name: versions.get(name, ""))
+        async with client:
+            get = lambda host: client.get("/sonder-editor/sdk/status", headers={"Host": host})  # noqa: E731
+            for host in ("127.0.0.1:8888", "192.168.1.20:8888"):
+                notes = (await (await get(host)).json())["installer"]["job"]["result"]["notes"]
+                assert notes == ["comfy-sdk stays loaded until ComfyUI restarts."]
+            versions["comfy-sdk"] = "0.4.0"  # reinstalled by hand
+            for host in ("127.0.0.1:8888", "192.168.1.20:8888"):
+                assert (await (await get(host)).json())["installer"]["job"]["result"]["notes"] == []
+
+    try:
+        asyncio.run(run())
+    finally:
+        sdk_install.reset_jobs_for_tests()

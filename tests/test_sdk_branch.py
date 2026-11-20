@@ -1,6 +1,7 @@
 """Sonder App branch runs: one output node, posted to this ComfyUI with its own prompt id."""
 
 import asyncio
+import json
 import types
 
 import pytest
@@ -131,6 +132,32 @@ def test_a_refused_branch_forgets_its_token_and_keeps_no_run(world):
     assert error.code == "prompt_no_outputs" and session.runs == []
     token = world.branch.bodies[0]["prompt"]["1"]["_meta"]["sonder_run"]
     assert sdk_runs.token_state(token) is None
+
+
+def test_a_validation_refusal_carries_worded_lines_and_no_raw_errors(world):
+    secret = "C:/Users/someone/ComfyUI/custom_nodes/x.py"
+    world.branch.reply = (400, {
+        "error": {"type": "prompt_outputs_failed_validation", "message": "Prompt outputs failed validation",
+                  "details": f"Exception when validating inner node: {secret}", "extra_info": {}},
+        "node_errors": {"2": {"errors": [
+            {"type": "value_not_in_list", "message": "Value not in list", "details": "format: 'x' not in [...]",
+             "extra_info": {"input_name": "format", "input_config": None, "received_value": "x"}},
+            {"type": "exception_during_inner_validation", "message": "Exception when validating inner node",
+             "details": secret, "extra_info": {"input_name": "y", "exception_message": secret, "traceback": [secret]}},
+        ], "dependent_outputs": ["2"], "class_type": "PreviewAny"}}})
+
+    async def go():
+        session = await world.open()
+        with pytest.raises(SdkError) as raised:
+            await branch(world, session)
+        return raised.value.payload()
+
+    payload = asyncio.run(go())
+    assert payload["code"] == "branch_refused" and len(payload["problems"]) == 2
+    assert "isn't one of its choices" in payload["problems"][0] and "couldn't check" in payload["problems"][1]
+    # Neither the raw errors nor ComfyUI's details text reach a browser.
+    assert "node_errors" not in payload and "detail" not in payload
+    assert secret not in json.dumps(payload)
 
 
 def test_an_unknown_submit_outcome_waits_unconfirmed_and_is_never_retried(world):

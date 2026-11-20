@@ -60,7 +60,10 @@ out.views = {
         result: { ok: false, code: "manual", message: "pip isn't available.", commands: { pip: "py -m pip install x", uv: "uv pip install x" } } }, installed_by_sonder: [] } })),
     interrupted: setup.describeSdkSetup(status({ installer: { job: idleJob, installed_by_sonder: [],
         interrupted: { message: "An install didn't finish.", commands: { pip: "py -m pip install x" } } } })),
-    done_notes: setup.describeSdkSetup(status({ install: installed, installer: { job: { ...idleJob, state: "done", action: "uninstall",
+    // The server words the notes for the current install state (installer_status):
+    // the panel shows exactly what it sends, and comfy-sdk is still missing here.
+    done_notes: setup.describeSdkSetup(status({ install: { sdk: { installed: false, version: "", supported: false },
+        proxy: { installed: false, version: "", supported: false }, ready: false }, installer: { job: { ...idleJob, state: "done", action: "uninstall",
         result: { ok: true, notes: ["comfy-sdk stays loaded until ComfyUI restarts."] } }, installed_by_sonder: [] } })),
     stale: setup.describeSdkSetup(status({ installer: { job: { ...idleJob, state: "running", action: "install", elapsed_sec: 3 }, installed_by_sonder: [] } }),
         { error: "Couldn't read the Sonder App status." }),

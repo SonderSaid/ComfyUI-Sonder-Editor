@@ -402,3 +402,96 @@ def test_an_0_8_meta_whose_nodes_are_still_missing_is_revalidated_and_opens(user
     stored = json.loads(open(meta_path, encoding="utf-8").read())["validation"]
     assert stored["version"] == sdk_templates.VALIDATION_VERSION  # best-effort rewrite
     assert sdk_templates.list_templates()[0]["validation"]["ok"]
+
+
+# ── Controls off for a missing node (UX pass Phase 5, VALIDATION_VERSION 3) ───
+
+OFF_MISSING = dict(SEED_BINDING, binding_id="grow", label="Grow", kind=None, status="unsupported",
+                   reason="GrowMaskWithBlur is not installed.", reason_code="node_missing", missing_class="GrowMaskWithBlur",
+                   targets=[{"path": "6", "input": "expand", "class_type": "GrowMaskWithBlur", "status": "unsupported"}])
+
+
+def test_a_control_off_for_a_missing_node_is_not_a_note_and_is_stored_apart():
+    other_off = dict(SEED_BINDING, binding_id="s2", kind=None, status="unsupported", label="Mode",
+                     reason="It takes MODEL, not a value.")
+    result = validate(api_prompt(), bindings=[SEED_BINDING, OFF_MISSING, other_off])
+    assert result["controls_off_missing"] == [{"label": "Grow", "class_type": "GrowMaskWithBlur"}]
+    assert result["warnings"] == ["“Mode” is off: It takes MODEL, not a value."]
+    # A seed off for its missing node counts as exposed; one off for another reason does not.
+    hinted = dict(OFF_MISSING, binding_id="var", label="Variation Number", seed_hint=True)
+    assert not any("No seed exposed" in w for w in validate(api_prompt(), bindings=[hinted])["warnings"])
+    assert any("No seed exposed" in w for w in validate(api_prompt(), bindings=[OFF_MISSING])["warnings"])
+
+
+def _store_v2(template_id, missing):
+    _, meta_path, _ = sdk_templates._template_paths(template_id)
+    meta = json.loads(open(meta_path, encoding="utf-8").read())
+    meta["validation"] = {**meta["validation"], "version": 2, "missing_nodes": missing,
+                          "warnings": ["“Grow” is off: GrowMaskWithBlur is not installed."]}
+    meta["validation"].pop("controls_off_missing", None)
+    sdk_templates.write_json_atomic(meta_path, meta)
+    return meta_path
+
+
+def test_a_v2_meta_with_missing_nodes_is_revalidated_once_and_gains_the_list(user_dir, monkeypatch):
+    # Its node is one the workflow holds and this ComfyUI lacks, as describing reports it.
+    off = dict(OFF_MISSING, missing_class="VAELoaderKJ")
+    describe = describe_with([SEED_BINDING, off])
+    monkeypatch.setattr(sdk_templates.control_descriptors, "describe_bindings", lambda p, **kw: describe(p))
+    monkeypatch.setattr(sdk_templates.control_descriptors, "comfy_class_lookup", lookup)
+    template_id = sdk_templates.import_template(raw(missing_prompt()), validate=lambda p: validate(p, bindings=[SEED_BINDING, off]))["template_id"]
+    meta_path = _store_v2(template_id, ["VAELoaderKJ"])
+    monkeypatch.setattr(sdk_templates, "_revalidated", {})
+    loads = []
+    real_load = sdk_templates.load_template
+    monkeypatch.setattr(sdk_templates, "load_template", lambda tid: loads.append(tid) or real_load(tid))
+    for _ in range(2):
+        listed = sdk_templates.list_templates()[0]["validation"]
+        assert listed["version"] == sdk_templates.VALIDATION_VERSION
+        assert listed["controls_off_missing"] == [{"label": "Grow", "class_type": "VAELoaderKJ"}]
+        assert not any("is off" in w for w in listed["warnings"])
+    assert loads == [template_id]  # once per process
+    assert json.loads(open(meta_path, encoding="utf-8").read())["validation"]["version"] == sdk_templates.VALIDATION_VERSION
+
+
+def test_a_v2_meta_without_missing_nodes_is_left_as_it_is(user_dir, monkeypatch):
+    template_id = sdk_templates.import_template(raw(api_prompt()), validate=lambda p: validate(p))["template_id"]
+    _store_v2(template_id, [])
+    monkeypatch.setattr(sdk_templates, "_revalidated", {})
+    loads = []
+    real_load = sdk_templates.load_template
+    monkeypatch.setattr(sdk_templates, "load_template", lambda tid: loads.append(tid) or real_load(tid))
+    listed = sdk_templates.list_templates()[0]["validation"]
+    assert listed["version"] == 2 and "controls_off_missing" not in listed and not loads
+
+
+def test_a_pack_installed_since_leaves_the_off_list_before_the_full_revalidation(user_dir, monkeypatch):
+    installed = set(INSTALLED)
+    monkeypatch.setattr(sdk_templates.control_descriptors, "comfy_class_lookup",
+                        lambda name: object() if name in installed else None)
+    template_id = sdk_templates.import_template(raw(missing_prompt()), validate=lambda p: validate(p))["template_id"]
+    _, meta_path, _ = sdk_templates._template_paths(template_id)
+    meta = json.loads(open(meta_path, encoding="utf-8").read())
+    meta["validation"]["controls_off_missing"] = [{"label": "Video VAE", "class_type": "VAELoaderKJ"},
+                                                  {"label": "LoRAs", "class_type": "Power Lora Loader (rgthree)"}]
+    sdk_templates.write_json_atomic(meta_path, meta)
+    installed.add("VAELoaderKJ")
+    listed = sdk_templates.list_templates()[0]["validation"]
+    assert listed["missing_nodes"] == ["Power Lora Loader (rgthree)"]
+    assert listed["controls_off_missing"] == [{"label": "LoRAs", "class_type": "Power Lora Loader (rgthree)"}]
+
+
+def test_the_curated_summary_on_read_lists_off_controls_and_counts_their_seed(user_dir, monkeypatch):
+    template_id = sdk_templates.import_template(raw(api_prompt()), validate=lambda p: validate(p))["template_id"]
+    hinted = dict(OFF_MISSING, binding_id="var", label="Variation Number", seed_hint=True,
+                  missing_class="SeedGenerator")
+    view = {"bindings": [hinted, OFF_MISSING], "presets": []}
+    monkeypatch.setattr(sdk_templates, "read_control_values",
+                        lambda tid: {"seq": 1, "presentation_hash": "h", "labels": {"grow": "Grow"}})
+    monkeypatch.setattr(sdk_templates, "describe_stored", lambda prompt, stored: view)
+    monkeypatch.setattr(sdk_templates, "apply_stored_values", lambda prompt, described, stored: described)
+    monkeypatch.setattr(sdk_templates, "_summary_cache", {})
+    listed = sdk_templates.list_templates()[0]["validation"]
+    assert listed["controls_off_missing"] == [{"label": "Variation Number", "class_type": "SeedGenerator"},
+                                              {"label": "Grow", "class_type": "GrowMaskWithBlur"}]
+    assert listed["warnings"] == []  # no "is off" note, and the off seed counts as exposed

@@ -1,5 +1,5 @@
 import { renderPanelMarkdown } from './panel_markdown.js';
-import { el, button, component, badge, date, input, modelMessage, listState, listNotice } from './launcher_view.js';
+import { el, button, component, badge, date, input, modelMessage, listState, listNotice, plural } from './launcher_view.js';
 import { isUnfinishedRun } from './sdk_host.js';
 import { missingNodePacks } from './node_pack_mappings.js';
 import { SETUP_GUIDE_URL, namesAFile } from './docs_links.js';
@@ -11,22 +11,19 @@ export function missingNodes(template) { return template?.validation?.missing_no
 export function runMissingNodes(template) {
     return Array.isArray(template?.run_missing_nodes) ? template.run_missing_nodes : null;
 }
-// " Needed by Passes → Upscale Pass Only." when the server named the Mode choices.
-export function neededBy(item) {
-    return item?.needed_by?.length ? ` Needed by ${item.needed_by.join('; ')}.` : '';
-}
 // A row's badge. The workflow's own problems come first; a workflow with none is
 // Ready only while this ComfyUI can generate (the header pill's install state).
 // A missing node counts only when the current run needs it: what only other Modes
-// use is greyed out in the editor, and never stops an Open.
+// use is greyed out in the editor, and never stops an Open. A row not checked yet
+// says so before its notes, which are information only.
 export function workflowBadge(template, status = null) {
     const v = template.validation || {};
     if (runMissingNodes(template)?.length) return ['Missing nodes', 'bad'];
     if (v.errors?.length || v.blocking?.length || template.run_problems?.length) return ['Can’t generate', 'bad'];
-    if (template.missing_models?.length) return [`${template.missing_models.length} models missing`, 'warn'];
+    if (template.missing_models?.length) return [plural(template.missing_models.length, 'model missing', 'models missing'), 'warn'];
     if (template.requirements_error) return ['Check failed', 'warn'];
-    if (v.warnings?.length) return [`${v.warnings.length} notes`, 'warn'];
     if (!Array.isArray(template.missing_models)) return ['Select to check', ''];
+    if (v.warnings?.length) return [plural(v.warnings.length, 'note'), 'warn'];
     if (status?.install && !status.install.ready) return ['Generate unavailable', 'warn'];
     return ['Ready', 'good'];
 }
@@ -54,25 +51,49 @@ export function generatingWorkflows(runs, fallback = 'the workflow') {
     return names.length ? names.join(' and ') : fallback;
 }
 export { missingNodePacks };
-export function missingNodesMessage(classes, mappings) {
+// " VAELoaderKJ is needed by Passes → Full." for each class the check attributed
+// to Mode choices, after the pack sentence. The Generate refusal writes the same
+// sentence (server/sdk_runner.py, SdkRunner._missing_nodes_text).
+export function nodesNeededBy(classes, attributions = []) {
+    const labels = new Map((attributions || []).filter(item => item?.needed_by?.length).map(item => [item.class_type, item.needed_by]));
+    return (classes || []).filter(name => labels.has(name)).map(name => ` ${name} is needed by ${labels.get(name).join('; ')}.`).join('');
+}
+export function missingNodesMessage(classes, mappings, attributions = []) {
     const groups = missingNodePacks(classes, mappings);
+    const after = nodesNeededBy(classes, attributions);
     if (!groups.some(group => group.pack)) {
-        return `Missing nodes: ${(classes || []).join(', ')}. Install the node packs that provide them, restart ComfyUI, then reload this page.`;
+        return `Missing nodes: ${(classes || []).join(', ')}. Install the node packs that provide them, restart ComfyUI, then reload this page.${after}`;
     }
     const named = groups.map(group => group.pack ? `${group.pack} (${group.classes.join(', ')})` : `no known pack (${group.classes.join(', ')})`);
-    return `Missing node packs: ${named.join(', ')}. Install them, restart ComfyUI, then reload this page.`;
+    return `Missing node packs: ${named.join(', ')}. Install them, restart ComfyUI, then reload this page.${after}`;
+}
+// Controls off only because their node isn't installed (validation
+// controls_off_missing). A meta validated before VALIDATION_VERSION 3 has no such
+// list, and none to give: its missing nodes were none, or it was revalidated.
+export const OFF_CONTROLS_SHOWN = 8;
+export function offControlsLine(template) {
+    const labels = [...new Set((template?.validation?.controls_off_missing || []).map(item => item?.label).filter(Boolean))];
+    if (!labels.length) return null;
+    const shown = labels.slice(0, OFF_CONTROLS_SHOWN), more = labels.length - shown.length;
+    return { kind: 'dim', text: `Controls off until their nodes are installed: ${shown.join(', ')}${more ? ` (+${more} more)` : ''}.` };
 }
 // The lines about missing nodes, for the row's details and the Open bar: what the
-// current run needs (it can't generate), and what only other Modes use. Nothing
-// until the row's check answers, so nothing flashes; if it couldn't answer, the
-// list stands alone rather than being lost.
+// current run needs (it can't generate), what only other Modes use, and the
+// Controls off until their nodes are installed. Nothing until the row's check
+// answers, so nothing flashes; if it couldn't answer, the list stands alone
+// rather than being lost.
 export function missingNodeLines(template, mappings) {
     const all = missingNodes(template), run = runMissingNodes(template);
-    if (run === null) return all.length && template?.requirements_error ? [{ kind: 'warn', text: missingNodesMessage(all, mappings) }] : [];
+    const off = offControlsLine(template);
+    if (run === null) {
+        if (!template?.requirements_error) return [];
+        return [...(all.length ? [{ kind: 'warn', text: missingNodesMessage(all, mappings) }] : []), ...(off ? [off] : [])];
+    }
     const needed = run.map(item => item.class_type), lines = [];
-    if (needed.length) lines.push({ kind: 'bad', text: missingNodesMessage(needed, mappings) + run.map(neededBy).join('') });
+    if (needed.length) lines.push({ kind: 'bad', text: missingNodesMessage(needed, mappings, run) });
     const others = all.filter(name => !needed.includes(name));
     if (others.length) lines.push({ kind: 'dim', text: `Some Modes of this workflow use nodes that aren’t installed: ${others.join(', ')}. The current Modes don’t need them.` });
+    if (off) lines.push(off);
     return lines;
 }
 // Only a line that asks for an install offers help installing.

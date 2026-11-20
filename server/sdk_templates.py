@@ -51,7 +51,7 @@ MAX_TEMPLATE_BYTES = 8 * 1024 * 1024
 MAX_TEMPLATES = 200
 MAX_NAME_LENGTH = 120
 # 2: missing nodes no longer make ``ok`` false (Phase 3 of the 0.8 hardening).
-VALIDATION_VERSION = 2
+VALIDATION_VERSION = 3
 CONTROLS_VERSION = 1
 logger = logging.getLogger(__name__)
 STARTERS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sdk_starters")
@@ -200,13 +200,15 @@ def validate_template(
 
     description = control_descriptors.control_manifest.find_relay(prompt)["manifest"].get("description", "")
     controls_summary: list[dict] = []
+    off_missing: list[dict] = []
     if not errors:
         described = describe(prompt)
         # What the app can switch: an export's off nodes and its routing decide.
         control_execution.apply_sdk_state(described, prompt, {}, set())
         blocking.extend(generate_refusals(described))
-        controls_summary, control_warnings = controls_summary_of(described)
-        warnings.extend(control_warnings)
+        summarized = controls_summary_of(described)
+        controls_summary, off_missing = summarized["summary"], summarized["off_missing"]
+        warnings.extend(summarized["warnings"])
     return {
         "version": VALIDATION_VERSION,
         "ok": not errors,
@@ -214,6 +216,7 @@ def validate_template(
         "missing_nodes": missing,
         "blocking": blocking,
         "warnings": warnings,
+        "controls_off_missing": off_missing,
         "editor_key": editor_key,
         "editor_defaults": editor_defaults,
         "controls": controls_summary,
@@ -262,6 +265,11 @@ def _refresh_missing_nodes(template_id: str, meta: dict, prompt: dict | None = N
     nodes made ``ok`` false and skipped the Controls summary) is validated
     again once per process whether or not nodes are still missing. Expiry:
     drop that check once no 0.8.x meta can be read.
+
+    Any older version is revalidated only when it stored missing nodes, which
+    is what version 3 changed (Controls off for a missing node moved from
+    ``warnings`` to ``controls_off_missing``). An older meta with none keeps
+    its validation; readers default ``controls_off_missing`` to empty.
     """
     validation = meta.get("validation") or {}
     stored = validation.get("missing_nodes") or []
@@ -271,7 +279,11 @@ def _refresh_missing_nodes(template_id: str, meta: dict, prompt: dict | None = N
     class_lookup = class_lookup or control_descriptors.comfy_class_lookup
     live = [name for name in stored if class_lookup(name) is None]
     if live and up_to_date:
-        return {**meta, "validation": {**validation, "missing_nodes": live}}
+        # A pack installed since keeps its Controls off until the full
+        # revalidation; it no longer counts as missing.
+        off = [item for item in validation.get("controls_off_missing") or []
+               if not isinstance(item, dict) or item.get("class_type") in live or not item.get("class_type")]
+        return {**meta, "validation": {**validation, "missing_nodes": live, "controls_off_missing": off}}
     cached = _revalidated.get(template_id)
     if not cached or cached[0] != _meta_identity(meta):
         if prompt is None:
@@ -301,14 +313,23 @@ def runnable_template(template_id: str, class_lookup: Callable[[str], Any] | Non
     return prompt, meta
 
 
-def controls_summary_of(view: dict) -> tuple[list[dict], list[str]]:
-    """The Launcher's Controls line and warnings for one effective view.
+def _off_for_missing_node(binding: dict) -> bool:
+    return (binding.get("status") == control_descriptors.STATUS_UNSUPPORTED
+            and binding.get("reason_code") == control_descriptors.REASON_NODE_MISSING)
+
+
+def controls_summary_of(view: dict) -> dict:
+    """The Launcher's Controls line, warnings and node-missing Controls for one
+    effective view: ``{"summary", "warnings", "off_missing"}``.
 
     Hidden bindings are not exposed, so they are left out; app-only ones count.
     These are every warning ``validate_template`` gives, so the Launcher may
-    replace them wholesale when it recomputes them on read.
+    replace them wholesale when it recomputes them on read. A Control off only
+    because its node isn't installed is not a warning: the Launcher's
+    missing-node lines say what to install, and it lists these Controls apart
+    (``off_missing``). Such a Control that was a seed still counts as one.
     """
-    summary, warnings, has_seed = [], [], False
+    summary, warnings, off_missing, has_seed = [], [], [], False
     for binding in view.get("bindings", []):
         if binding.get("hidden"):
             continue
@@ -325,7 +346,10 @@ def controls_summary_of(view: dict) -> tuple[list[dict], list[str]]:
         })
         if binding.get("kind") == "SEED" and binding.get("status") == control_descriptors.STATUS_OK:
             has_seed = True
-        if binding.get("status") != control_descriptors.STATUS_OK:
+        if _off_for_missing_node(binding):
+            off_missing.append({"label": label, "class_type": binding.get("missing_class") or ""})
+            has_seed = has_seed or binding.get("seed_hint") is True
+        elif binding.get("status") != control_descriptors.STATUS_OK:
             warnings.append(f"“{label}” is off: {binding.get('reason') or 'it cannot be set.'}")
     for switch in view.get("execution", []) or []:
         # Off nodes are not in the file, and an export without routing can't
@@ -339,7 +363,7 @@ def controls_summary_of(view: dict) -> tuple[list[dict], list[str]]:
             "No seed exposed: every Generate of the same job uses the workflow's fixed seed. "
             "Expose the seed in Controls → Manage, or through the workflow's Sonder Control Relay, to get new takes."
         )
-    return summary, warnings
+    return {"summary": summary, "warnings": warnings, "off_missing": off_missing}
 
 
 def generate_refusals(view: dict) -> list[str]:
@@ -417,7 +441,8 @@ def list_templates() -> list[dict]:
     return result
 
 
-# (template_id) -> (sidecar seq, presentation hash, summary, warnings)
+# template_id -> ((sidecar seq, presentation hash), controls_summary_of's dict
+# plus "description" and "preset_count")
 _summary_cache: dict[str, tuple] = {}
 
 
@@ -448,13 +473,18 @@ def _overlay_summary(meta: dict) -> None:
             if not cached or cached[0] != key:
                 prompt, _ = load_template(template_id)
                 view = apply_stored_values(prompt, describe_stored(prompt, stored), stored)
-                cached = (key, *controls_summary_of(view), view.get("description", ""), len(view.get("presets", [])))
+                cached = (key, {**controls_summary_of(view), "description": view.get("description", ""),
+                                "preset_count": len(view.get("presets", []))})
                 _summary_cache[template_id] = cached
     except Exception:
         logger.warning("Controls summary failed for workflow %s", template_id, exc_info=True)
         return
-    meta["description"] = cached[3]
-    meta["validation"] = {**validation, "controls": copy.deepcopy(cached[1]), "warnings": list(cached[2]), "description": cached[3], "preset_count": cached[4]}
+    summarized = cached[1]
+    meta["description"] = summarized["description"]
+    meta["validation"] = {**validation, "controls": copy.deepcopy(summarized["summary"]),
+                          "warnings": list(summarized["warnings"]),
+                          "controls_off_missing": copy.deepcopy(summarized["off_missing"]),
+                          "description": summarized["description"], "preset_count": summarized["preset_count"]}
 
 
 def import_template(raw: bytes, *, source_name: str = "", name: str = "", validate=validate_template) -> dict:

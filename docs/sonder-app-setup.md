@@ -70,7 +70,8 @@ the optional one.
 
 Install RES4LYF even when the Launcher reads **Ready**: the workflow uses its
 sampling method, and the Launcher can't tell when it's missing. Without it,
-**Generate** stops with *ComfyUI didn't accept the run*.
+**Generate** stops with *ComfyUI didn't accept the run* and names the sampling
+method.
 
 ComfyUI-PromptRelay is needed only for **Controls → Modes → Prompt Method →
 Timed Prompts (Prompt Relay)**. It isn't in Nodes Manager, so install it with
@@ -119,7 +120,8 @@ Existing Video** need 47.6 GB of them):
 
 Install RES4LYF even when the Launcher reads **Ready**: the workflow uses its
 sampling method, and the Launcher can't tell when it's missing. Without it,
-**Generate** stops with *ComfyUI didn't accept the run*.
+**Generate** stops with *ComfyUI didn't accept the run* and names the sampling
+method.
 
 **Model files** (about 50.8 GB in all; **Refining Pass Only** needs 47.6 GB of
 them). The first six are the same files as in LTX 2.5 Edit & VFX, so download

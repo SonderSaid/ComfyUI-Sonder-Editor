@@ -1170,3 +1170,72 @@ def test_describe_route_validates_the_editor_key(monkeypatch):
     encode = lambda extra: json.dumps({"prompt": solo, "relay_census": {"active": 1}, **extra}).encode()
     assert routes._describe_controls_body(encode({"editor_key": None}))["bindings"][0]["picker"]["source"] == "unknown"
     assert routes._describe_controls_body(encode({}))["bindings"][0]["picker"]["source"] == "host"
+
+
+# ── A Control off because its node isn't installed (UX pass Phase 5) ──────────
+
+def _missing_class_prompt(**bindings):
+    return {
+        "3": _node("KSampler", {"seed": 5, "steps": 20, "model": ["9", 0]}, title="Sampler"),
+        "4": _node("SeedGenerator", {"seed": 0}, title="SeedGenerator"),
+        "6": _node("GrowMaskWithBlur", {"expand": 2}),
+        "8": _relay(bindings),
+    }
+
+
+def test_a_missing_node_class_marks_the_control_off_for_a_missing_node():
+    prompt = _missing_class_prompt(grow=_binding("6", "expand", label="Grow"), steps=_binding("3", "steps", label="Steps"))
+    grow = binding(prompt, "grow")
+    assert grow["status"] == cd.STATUS_UNSUPPORTED and grow["reason_code"] == cd.REASON_NODE_MISSING
+    assert grow["reason"] == "GrowMaskWithBlur is not installed." and "seed_hint" not in grow
+    assert "reason_code" not in binding(prompt, "steps")
+
+
+def test_a_seed_off_for_a_missing_node_gets_a_private_hint_never_a_seed_mode():
+    from server import control_presets
+
+    prompt = _missing_class_prompt(variation=_binding("4", "seed", label="Variation Number", seed_mode="fixed"),
+                                   moded=_binding("6", "expand", label="Odd", seed_mode="randomize"),
+                                   plain=_binding("6", "expand", label="Grow"))
+    variation, moded, plain = (binding(prompt, b) for b in ("variation", "moded", "plain"))
+    # By its input name or by the mode the export recorded.
+    assert variation["seed_hint"] is True and moded["seed_hint"] is True and "seed_hint" not in plain
+    # Preset matching keys on seed_mode: an off binding must keep matching nothing.
+    for desc in (variation, moded):
+        assert "seed_mode" not in desc
+        assert "seed_mode" not in control_presets.match_condition(desc, {"seed_mode": "randomize", "value": "7"}, "7")
+
+
+def test_the_selected_target_decides_the_reason_code():
+    # One target linked, one of a missing class: the binding is linked, as before.
+    prompt = _missing_class_prompt(mixed={"label": "Mixed", "status": "ok", "targets": [
+        {"path": "3", "input": "model"}, {"path": "6", "input": "expand"}]})
+    mixed = binding(prompt, "mixed")
+    assert mixed["status"] == cd.STATUS_LINKED and "reason_code" not in mixed
+    # One installed target and one of a missing class: the missing one names the class.
+    fan = binding(_missing_class_prompt(fan={"label": "Fan", "status": "ok", "targets": [
+        {"path": "3", "input": "steps"}, {"path": "6", "input": "expand"}]}), "fan")
+    assert fan["reason_code"] == cd.REASON_NODE_MISSING and fan["missing_class"] == "GrowMaskWithBlur"
+
+
+def test_an_exported_unsupported_control_whose_node_is_missing_takes_the_code():
+    prompt = _missing_class_prompt(grow=_binding("6", "expand", label="Grow", status="unsupported"))
+    grow = binding(prompt, "grow")
+    assert grow["status"] == cd.STATUS_UNSUPPORTED and grow["reason_code"] == cd.REASON_NODE_MISSING
+
+
+def test_the_launcher_summary_lists_controls_off_for_a_missing_node_apart():
+    from server import sdk_templates
+
+    prompt = _missing_class_prompt(variation=_binding("4", "seed", label="Variation Number", seed_mode="fixed"),
+                                   grow=_binding("6", "expand", label="Grow"),
+                                   gone=_binding("77", "x", label="Gone"))
+    summary = sdk_templates.controls_summary_of(describe(prompt))
+    assert sorted(summary["off_missing"], key=lambda item: item["label"]) == [
+        {"label": "Grow", "class_type": "GrowMaskWithBlur"}, {"label": "Variation Number", "class_type": "SeedGenerator"}]
+    # Another off reason still warns; the off seed still counts as exposed.
+    assert [w for w in summary["warnings"] if "is off" in w] == ["“Gone” is off: " + cd.STATUS_REASONS[cd.STATUS_MISSING]]
+    assert not any("No seed exposed" in w for w in summary["warnings"])
+    # A missing non-seed Control does not stand in for a seed.
+    plain = sdk_templates.controls_summary_of(describe(_missing_class_prompt(grow=_binding("6", "expand", label="Grow"))))
+    assert any("No seed exposed" in w for w in plain["warnings"])

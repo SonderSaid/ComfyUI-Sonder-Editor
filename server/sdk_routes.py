@@ -183,7 +183,7 @@ def register_sdk_routes(
     async def api_sdk_status(request: web.Request) -> web.Response:
         install = await asyncio.to_thread(install_state)
         proxy = await asyncio.to_thread(sdk_proxy.proxy_status)
-        installer = await asyncio.to_thread(sdk_install.installer_status)
+        installer = await asyncio.to_thread(sdk_install.installer_status, install)
         can_manage = is_loopback_request(request)
         return web.json_response({
             "ok": True,
