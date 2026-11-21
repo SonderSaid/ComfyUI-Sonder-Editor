@@ -82,6 +82,20 @@ async function run(driver) {
             oldSelection: oldSelection.selection.text, selectedAfterChipDrag: selected.selection,
             after: after.doc, attachments: after.data[1], focus: after.selection.active });
     }
+    // Phase 3 audit M2: an older range, then Tab moves focus to chip C and
+    // the author types. The range must not be replaced.
+    {
+        const before = await go(`setup(${JSON.stringify({ variant: "pills" })})`);
+        await drag(...STALE.old);
+        await driver.key("Tab"); await delay(60);
+        await driver.key("x"); await delay(80);
+        const after = await go("state()");
+        const failures = [];
+        if (after.doc !== before.doc) failures.push(`text ${JSON.stringify(after.doc)}`);
+        if (JSON.stringify(after.data[1]) !== JSON.stringify(before.data[1])) failures.push("chips changed");
+        samples.push({ kind: "stale", name: "older selection, Tab to a chip, then typing", op: "x",
+            pass: !failures.length, failures, after: after.doc, attachments: after.data[1], focus: after.selection.active });
+    }
     return samples;
 }
 

@@ -17008,6 +17008,8 @@ export class EditorWidget {
             columns[key] = column;
             installPromptContextMenu({
                 editor: input,
+                clipboardScope: () => ({ project: this._projectDirName(), scene: this.activeSceneId,
+                    promptId: consumerSection ? String(consumerSection.prompt_id || "") : "global" }),
                 // Global scope offers the same kinds as the Structured tool.
                 // Shot/Timestamp/Prompt Link/Vocal Event are section-scoped and
                 // the compiler rejects them globally, so offering them here only
@@ -17030,6 +17032,7 @@ export class EditorWidget {
                         || template.default_context_profile || "generic@1",
                     scope: consumerSection ? "section" : "global",
                     resolvedProfile: this._resolvedPromptContextProfile(),
+                    pendingSemanticUnitIds: [...(this._pendingPromptIdentityCreateIntents?.keys?.() || [])],
                 }),
                 onInserted: async ({ attachment, identityCreateIntent }) => {
                     if (identityCreateIntent) {

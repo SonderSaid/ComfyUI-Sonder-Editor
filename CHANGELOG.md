@@ -11,6 +11,9 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- Copy, cut and paste carry Context chips between prompt boxes of the same project and scene: the Prompt panel, Writing and the timeline bar. A pasted chip is an independent copy. A cut chip pasted once in the same tab stays linked to its group. A chip the target box can't take (for example a Shot outside the shot-marker channel, or a Prompt link to a later section) is left out with a notice, and the text still pastes. Anywhere else, the paste is plain text.
+
 ### Changed
 - When ComfyUI refuses a Sonder App run, **Generate** (and an Output View's **Didn't run:**) names what it refused, for example a sampler this ComfyUI doesn't have, instead of only "ComfyUI didn't accept the run". An Output View that Sonder itself can't run yet also names the first reason.
 - The Launcher lists Controls that are off because their node isn't installed in one line, "Controls off until their nodes are installed", instead of one note each.
@@ -29,6 +32,8 @@ a fresh `[Unreleased]` block.
 - The Prompt panel's save-failed bar says when a draft also changed other fields that **Use server's version** keeps.
 - **Ctrl+Z** in one prompt box no longer brings back a Context chip you deleted in another box of the same section, or removes one you added there. A Prompt link deleted that way used to come back with no place in the text and block the section from running.
 - A Context chip placed in two channel boxes of a section stays when you delete it from just one of them.
+- Pressing on a Context chip no longer leaves an older text selection active, so Delete, Backspace or Cut no longer removes text and chips you had selected earlier. In Firefox the editor also keeps focus, and **Ctrl+Z** brings the text back.
+- Chips a selection covers are outlined, so you can see they are part of it.
 - An edit to a prompt section that would leave a Prompt link or Vocal event with no place in its text is refused and kept as a draft, instead of saving a chip that blocks the section.
 
 ## [0.9.0] - 2026-11-19

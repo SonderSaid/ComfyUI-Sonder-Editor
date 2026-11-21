@@ -44,7 +44,7 @@ Results go to `results-<browser>.json`, which is ignored by git.
 | Firefox 160 | pass | **fail**: the older selection stays live, the old range is deleted, focus falls to BODY, and Ctrl+Z misses |
 | Chrome 157 | pass | **fail**: the older selection stays live and the old range is deleted; focus and Undo hold |
 
-So the runner exits 1 until Phase 3 lands.
+After Phase 3 (2026-11-21), both browsers pass every case, so the runner exits 0. A failure now is a regression.
 
 ## Clipboard qualification
 

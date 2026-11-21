@@ -959,7 +959,10 @@ def test_prompt_editor_sources_preserve_writing_state_and_prune_deleted_chips():
     widget = (root / "web" / "js" / "editor_widget.js").read_text(
         encoding="utf-8")
     assert "removedInline" in editor
-    assert "range.intersectsNode(value)" in editor
+    # A selected range (chips included) is deleted through the model, which
+    # prunes a chip record with its last anchor (Phase 3 replaced the DOM
+    # `range.deleteContents` path).
+    assert "const result = deleteModelSpan(span.from, span.to);" in editor
     assert "if (!composing) pushHistory()" in editor
     assert "global_channel_exceptions" in panel
     # The draft projection moved out of the Apply/preview closures into the

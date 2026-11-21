@@ -2664,6 +2664,8 @@ Server value: ${serverValue}` : ""}`;
         // produces.
         installPromptContextMenu({
             editor: draftArea,
+            clipboardScope: () => ({ project: host._projectDirName(), scene: host.activeSceneId,
+                promptId: "writing" }),
             // An accepted `@` mention is TEXT, so only the draft and its
             // document move; the attachment registry is untouched, unlike an
             // inserted chip.
@@ -2696,6 +2698,19 @@ Server value: ${serverValue}` : ""}`;
                 profileId: scene?.prompt_context_profile_id
                     || host._channelTemplate().default_context_profile || "generic@1",
                 scope: "global",
+                resolvedProfile: host._resolvedPromptContextProfile?.(),
+            }),
+            // A pasted chip is judged where it lands, as Writing's chip dialog
+            // judges it (`draftAttachmentContext`): that block's start and
+            // window, section scope, the draft's pending identities included
+            // (they are created at Apply, whatever the chip id).
+            pasteContext: (bookmark) => ({
+                scene: draftAttachmentContext(bookmark?.start?.node_id || "").scene,
+                references: offerableReferences(),
+                semanticUnits: writingSemanticUnits(),
+                profileId: scene?.prompt_context_profile_id
+                    || host._channelTemplate().default_context_profile || "generic@1",
+                scope: "section",
                 resolvedProfile: host._resolvedPromptContextProfile?.(),
             }),
             writingAids: host._promptContextWritingAids?.(
@@ -4151,6 +4166,8 @@ Server value: ${serverValue}` : ""}`;
             });
             installPromptContextMenu({
                 editor: input,
+                clipboardScope: () => ({ project: host._projectDirName(), scene: host.activeSceneId,
+                    promptId: "global" }),
                 allowedKinds: ["reference", "custom"],
                 onInserted: ({ type, attachment, identityCreateIntent }) => {
                     if (identityCreateIntent) acceptDurableConfiguration({
@@ -4170,6 +4187,9 @@ Server value: ${serverValue}` : ""}`;
                         || globalTemplate.default_context_profile || "generic@1",
                     scope: "global",
                     resolvedProfile: currentPromptProfile(),
+                    // A paste may not carry a chip whose identity create rides
+                    // with another chip id (`_pendingPromptIdentityCreateIntents`).
+                    pendingSemanticUnitIds: [...(host._pendingPromptIdentityCreateIntents?.keys?.() || [])],
                 }),
                 writingAids: host._promptContextWritingAids?.(
                     scene.prompt_context_profile_id
@@ -4542,6 +4562,8 @@ Server value: ${serverValue}` : ""}`;
                 input.dataset.sonderPromptDraftKey = sectionDraftKey;
                 installPromptContextMenu({
                     editor: input,
+                    clipboardScope: () => ({ project: host._projectDirName(), scene: host.activeSceneId,
+                        promptId: section.prompt_id || "" }),
                     onInserted: ({ type, attachment, identityCreateIntent }) => {
                         if (identityCreateIntent) acceptDurableConfiguration({
                             attachment, identityCreateIntent,
@@ -4565,6 +4587,9 @@ Server value: ${serverValue}` : ""}`;
                             || template.default_context_profile || "generic@1",
                         scope: "section",
                         resolvedProfile: currentPromptProfile(),
+                        // A paste may not carry a chip whose identity create rides
+                        // with another chip id (`_pendingPromptIdentityCreateIntents`).
+                        pendingSemanticUnitIds: [...(host._pendingPromptIdentityCreateIntents?.keys?.() || [])],
                     }),
                     writingAids: host._promptContextWritingAids?.(
                         scene.prompt_context_profile_id

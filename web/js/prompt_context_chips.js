@@ -270,6 +270,151 @@ export function promptShotDialogRole({ attachment, documents, attachments,
     });
 }
 
+// ── Chip clipboard ───────────────────────────────────────────────────────
+// A copy or cut of prose with chips carries, beside the authored text, a
+// fragment the same editor can paste back as chips. Chips travel only within
+// the same project folder and scene, and only where the target box's own
+// authoring checks would allow them; anywhere else the paste is plain text.
+export const PROMPT_FRAGMENT_TYPE = "application/x-sonder-prompt-fragment";
+export const PROMPT_FRAGMENT_FORMAT = "sonder-prompt-fragment@1";
+const FRAGMENT_LIMITS = Object.freeze({ bytes: 262144, nodes: 2000, attachments: 64,
+    text: 100000, id: 128, depth: 12 });
+// A cut moves its chips (same link group) only when pasted in the tab that cut
+// them, once; without this token a pasted fragment is a copy.
+let livePromptCut = null;
+
+function jsonDepth(value, depth = 0) {
+    if (depth > FRAGMENT_LIMITS.depth) return depth;
+    if (!value || typeof value !== "object") return depth;
+    let deepest = depth;
+    for (const child of Object.values(value)) deepest = Math.max(deepest, jsonDepth(child, depth + 1));
+    return deepest;
+}
+
+/**
+ * Parse a pasted fragment at the trust boundary: bounded size and depth, string
+ * ids, no duplicates, every chip node naming a record in the fragment and a
+ * capability that record declares, authoring kinds only. Anything else is null
+ * (the paste falls back to plain text). Records come back normalized.
+ */
+export function parsePromptFragment(raw) {
+    if (typeof raw !== "string" || !raw || raw.length > FRAGMENT_LIMITS.bytes) return null;
+    let value;
+    try { value = JSON.parse(raw); } catch (_error) { return null; }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    if (value.format !== PROMPT_FRAGMENT_FORMAT) return null;
+    if (jsonDepth(value) > FRAGMENT_LIMITS.depth) return null;
+    const text = (v) => typeof v === "string";
+    if (!text(value.project) || !text(value.scene) || !["copy", "cut"].includes(value.op)) return null;
+    if (!Array.isArray(value.nodes) || !Array.isArray(value.attachments)) return null;
+    if (value.nodes.length > FRAGMENT_LIMITS.nodes
+            || value.attachments.length > FRAGMENT_LIMITS.attachments) return null;
+    const records = new Map();
+    for (const record of value.attachments) {
+        if (!record || typeof record !== "object" || Array.isArray(record)) return null;
+        const id = record.attachment_id;
+        if (!text(id) || !id || id.length > FRAGMENT_LIMITS.id || records.has(id)) return null;
+        if (!AUTHORING_KINDS.includes(record.kind)) return null;
+        if (record.capabilities !== undefined && !Array.isArray(record.capabilities)) return null;
+        for (const field of ["source", "config"]) {
+            const value = record[field];
+            if (value !== undefined && (!value || typeof value !== "object" || Array.isArray(value))) return null;
+        }
+        // Id lists the checks and the compiler read as arrays of strings.
+        for (const field of ["subject_ids", "semantic_unit_ids", "picture_ids", "video_ids", "audio_ids"]) {
+            const value = record.source?.[field];
+            if (value !== undefined && (!Array.isArray(value) || value.some((item) => !text(item)))) return null;
+        }
+        records.set(id, record);
+    }
+    let characters = 0;
+    const nodes = [];
+    for (const node of value.nodes) {
+        if (!node || typeof node !== "object") return null;
+        if (node.type === "text") {
+            if (!text(node.text)) return null;
+            characters += node.text.length;
+            if (characters > FRAGMENT_LIMITS.text) return null;
+            nodes.push({ type: "text", text: node.text.split("​").join("") });
+        } else if (node.type === "attachment") {
+            const record = records.get(node.attachment_id);
+            if (!record) return null;
+            const capabilityId = node.capability_id;
+            if (capabilityId !== undefined) {
+                if (!text(capabilityId) || capabilityId.length > FRAGMENT_LIMITS.id) return null;
+                const declared = (record.capabilities || []).some((capability) =>
+                    String(capability?.capability_id || capability?.kind || "") === capabilityId);
+                if (!declared) return null;
+            }
+            nodes.push({ type: "attachment", attachment_id: node.attachment_id,
+                ...(capabilityId ? { capability_id: capabilityId } : {}) });
+        } else return null;
+    }
+    const used = new Set(nodes.filter((node) => node.type === "attachment")
+        .map((node) => node.attachment_id));
+    return { project: value.project, scene: value.scene, op: value.op,
+        cutToken: text(value.cut_token) ? value.cut_token : "",
+        nodes, attachments: [...records.values()].filter((record) => used.has(record.attachment_id))
+            .map((record) => normalizePromptAttachment(record)) };
+}
+
+/**
+ * Whether a target box would take this chip: the same checks its own insert
+ * menu applies (allowed kinds for the surface and format, Shot placement,
+ * earlier-only Prompt links, Reference eligibility for the window, identities
+ * that exist). Null when it may; otherwise the reason, in the author's words.
+ */
+export function promptPasteVerdict(attachment, { allowedKinds = AUTHORING_KINDS, profile = null,
+    referenceContext = null, shotPlacementAt = null, bookmark = null } = {}) {
+    const kind = String(attachment?.kind || "");
+    const label = LABELS[kind] || "Context";
+    if (!promptContextAuthoringKinds(allowedKinds, profile).includes(kind))
+        return `this box does not take ${label} chips`;
+    const context = (typeof referenceContext === "function" ? referenceContext() : referenceContext) || {};
+    const scene = context.scene || null;
+    if (kind === "shot" && typeof shotPlacementAt === "function"
+            && shotPlacementAt(bookmark)?.offered === false)
+        return "a Shot goes only in the shot-marker channel";
+    if (kind === "prompt_link") {
+        const sourceId = String(attachment?.source?.prompt_id || "");
+        const source = (scene?.prompt_sections || []).find((section) => section.prompt_id === sourceId);
+        if (!source) return "its source section is gone";
+        const start = Number(scene?._context_consumer_start ?? Infinity);
+        if (!(Number(source.start_frame || 0) < start)) return "a Prompt link must point to an earlier section";
+    }
+    const unitIds = new Set((context.semanticUnits || []).map((unit) => String(unit?.semantic_unit_id || "")));
+    // An identity the host is still creating is in its list optimistically,
+    // but its create rides with the ORIGINAL chip id, which a paste replaces.
+    const pending = new Set((context.pendingSemanticUnitIds || []).map(String));
+    const listed = (value) => (Array.isArray(value) ? value : []).map(String);
+    if (kind === "vocal_event") {
+        const speakers = listed(attachment?.source?.subject_ids);
+        if (speakers.some((id) => pending.has(id))) return "its speaker is still being created";
+        if (speakers.some((id) => !unitIds.has(id))) return "its speaker is not saved yet";
+    }
+    if (kind === "reference" && listed(attachment?.source?.semantic_unit_ids).some((id) => pending.has(id)))
+        return "its identity is still being created";
+    if (kind === "reference") {
+        const source = attachment?.source || {};
+        const physical = ["picture", "video", "audio"].find((name) =>
+            Array.isArray(source[`${name}_ids`]) && source[`${name}_ids`].length);
+        const selected = source.reference_item_id ? `item:${source.reference_item_id}`
+            : physical ? `physical:${physical}:${source[`${physical}_ids`][0]}`
+                : String(source.semantic_unit_ids?.[0] || "");
+        if (selected) {
+            if (!selected.startsWith("item:") && !selected.startsWith("physical:") && !unitIds.has(selected))
+                return "its identity is not saved yet";
+            // The host's own reference context, keys and all, as the mention
+            // menu passes it: a renamed key here once made every identity-bound
+            // Reference read as ineligible (Phase 3 audit H1).
+            const { options } = promptReferenceSourceOptions(context);
+            const option = (options || []).find((value) => value[0] === selected);
+            if (!option || option[2] === false) return "its Reference does not apply here";
+        }
+    }
+    return null;
+}
+
 /**
  * An attachment record in a comparable form: keys sorted, and capability
  * entries filled with the defaults the server's `normalize_capability` writes
@@ -2052,7 +2197,19 @@ export function createPromptDocumentEditor({
                 : `${refused.length} Prompt link or Vocal event chips were not restored: their place in the text is gone.`,
             { source: "prompt-undo-unanchored" });
         }
-        return [...next.values()];
+        // Order: records keep their current places, and a restored record goes
+        // back where the entry's own list had it (before the first record that
+        // followed it there), so an Undo returns the list it started from.
+        const ids = attachments.map((value) => value.attachment_id).filter((id) => next.has(id));
+        const toIds = [...to.keys()];
+        for (const id of toIds) {
+            if (!next.has(id) || ids.includes(id)) continue;
+            const followers = new Set(toIds.slice(toIds.indexOf(id) + 1));
+            const at = ids.findIndex((other) => followers.has(other));
+            ids.splice(at < 0 ? ids.length : at, 0, id);
+        }
+        for (const id of next.keys()) if (!ids.includes(id)) ids.push(id);
+        return ids.map((id) => next.get(id));
     };
 
     // Decorations are the host's read-only prose, painted BETWEEN model nodes
@@ -2494,6 +2651,73 @@ export function createPromptDocumentEditor({
     });
     editor.addEventListener("focus", refreshGuidance);
     editor.addEventListener("blur", refreshGuidance);
+    // A press on a chip collapses any older selection to the chip's nearer
+    // edge, so no range the author can no longer see stays live for the next
+    // Delete, Backspace or Cut. Never `preventDefault`: a cancelled mousedown
+    // on a chip breaks click-to-open and focus (durable rule, chip pointer
+    // mapping). Primary button, no modifiers, mouse or pen; right-click, touch,
+    // keyboard activation and the nested Remove button keep their own paths.
+    editor.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+        if (event.pointerType && !["mouse", "pen"].includes(event.pointerType)) return;
+        const chip = event.target?.closest?.('[data-node-type="attachment"]');
+        if (!chip || !editor.contains(chip) || event.target.closest?.("button")) return;
+        const selection = globalThis.getSelection?.();
+        if (!selection?.rangeCount || selection.isCollapsed) return;
+        const rect = chip.getBoundingClientRect?.();
+        const after = rect && Number.isFinite(event.clientX)
+            && event.clientX > rect.left + rect.width / 2;
+        if (after) setCaretAfter(chip); else setCaretBefore(chip);
+    });
+    // Chips a selection covers show it: `user-select:none` keeps the browser
+    // from painting them, so a range across a chip looked as if it left the
+    // chip alone. rAF-throttled; the listener leaves once the editor is gone.
+    let coverFrame = 0;
+    const paintCovered = () => {
+        coverFrame = 0;
+        if (!editor.isConnected) {
+            document.removeEventListener?.("selectionchange", onSelectionChange);
+            return;
+        }
+        const range = liveRange();
+        const active = range && !range.collapsed && inEditor(range.startContainer)
+            && inEditor(range.endContainer) ? range : null;
+        // The chips Delete, Cut and Copy would take: the span's own inclusion
+        // rule, not DOM intersection, which also counts a chip whose label
+        // the range merely starts inside (Phase 3 audit L2).
+        const span = active ? selectedSpan() : null;
+        const taken = new Set();
+        if (span) {
+            for (let i = span.from.index; i <= span.to.index && i < model.nodes.length; i += 1) {
+                const node = model.nodes[i];
+                if (node.type !== "attachment") continue;
+                const wholly = i > span.from.index && i < span.to.index;
+                if (wholly || (i === span.from.index && span.from.offset === 0)
+                        || (i === span.to.index && span.to.offset > 0)) taken.add(node.node_id);
+            }
+        }
+        for (const chip of editor.querySelectorAll?.('[data-node-type="attachment"]') || []) {
+            const covered = taken.has(chip.dataset.nodeId);
+            if (covered === (chip.dataset.sonderCovered === "1")) continue;
+            if (covered) {
+                chip.dataset.sonderCovered = "1";
+                chip.style.outline = `1px solid ${COLORS.selectionBorder}`;
+                chip.style.outlineOffset = "1px";
+                chip.style.backgroundImage = `linear-gradient(${COLORS.selection}, ${COLORS.selection})`;
+            } else {
+                delete chip.dataset.sonderCovered;
+                chip.style.outline = "";
+                chip.style.outlineOffset = "";
+                chip.style.backgroundImage = "";
+            }
+        }
+    };
+    function onSelectionChange() {
+        if (coverFrame) return;
+        coverFrame = typeof requestAnimationFrame === "function"
+            ? requestAnimationFrame(paintCovered) : setTimeout(paintCovered, 16);
+    }
+    document.addEventListener?.("selectionchange", onSelectionChange);
     editor.addEventListener("click", (event) => {
         if (editor.disabled || event.target !== editor || event.button !== 0
                 || event.detail !== 1 || composing || event.isComposing === true) return;
@@ -2598,35 +2822,235 @@ export function createPromptDocumentEditor({
         if (!String(event.inputType || "").startsWith("history")) pushHistory();
     });
     editor.addEventListener("input", readDom);
+
+    // ── Destructive selection ────────────────────────────────────────────
+    // The live selection, when this editor may act on it destructively: the
+    // editor itself holds focus (not one of its chips, and not the page), it is
+    // editable and not composing, and both ends lie inside it. A press on a chip
+    // can leave an OLDER range live while focus moves elsewhere; deleting that
+    // range removed prose and chips far outside what the author dragged
+    // (Firefox, bug tracker).
+    const liveRange = () => {
+        const selection = globalThis.getSelection?.();
+        return selection?.rangeCount ? selection.getRangeAt(0) : null;
+    };
+    const inEditor = (node) => Boolean(node) && (node === editor || editor.contains(node));
+    const ownedRange = () => {
+        if (!isEditable() || composing) return null;
+        if (document.activeElement !== editor) return null;
+        const range = liveRange();
+        if (!range || !inEditor(range.startContainer) || !inEditor(range.endContainer)) return null;
+        return range;
+    };
+    const focusedChip = () => {
+        const active = document.activeElement;
+        return active && active !== editor && editor.contains(active)
+            ? active.closest?.('[data-node-type="attachment"]') || null : null;
+    };
+    // The model span the live selection covers, or null.
+    const selectedSpan = () => {
+        const bookmark = selectionBookmark();
+        const from = bookmark && modelPositionFor(bookmark.start);
+        const to = bookmark && modelPositionFor(bookmark.end);
+        if (!from || !to) return null;
+        if (to.index < from.index || (to.index === from.index && to.offset <= from.offset)) return null;
+        return { from, to };
+    };
+    // Delete a span through the model: one undo entry, chip records pruned by
+    // the same rule as typing them away, the caret at the join, focus kept.
+    const deleteSpan = (span) => {
+        pushHistory();
+        const result = deleteModelSpan(span.from, span.to);
+        const join = model.nodes[result.index];
+        model = normalizePromptDocument(model);
+        render();
+        editor.focus({ preventScroll: true });
+        const caret = join && model.nodes.some((node) => node.node_id === join.node_id)
+            ? { node_id: join.node_id, offset: result.offset } : null;
+        if (!caret || !restoreSelection({ start: caret, end: caret })) editor.focusEnd?.();
+        emit(result.removedAttachment ? "attachment" : "document");
+        return true;
+    };
+    // Delete a focused chip only (Delete/Backspace/Cut while a chip holds
+    // focus), then give focus back to the editor beside where it was.
+    const deleteChipElement = (chip) => {
+        const nodeId = chip.dataset.nodeId;
+        const attachmentId = chip.dataset.attachmentId;
+        const index = model.nodes.findIndex((value) => value.node_id === nodeId);
+        if (index < 0) return false;
+        pushHistory();
+        model.nodes.splice(index, 1);
+        if (!model.nodes.some((value) => value.attachment_id === attachmentId)
+                && !anchoredElsewhere(attachmentId)) {
+            attachments = attachments.filter((value) => value.attachment_id !== attachmentId);
+        }
+        const before = model.nodes[index - 1];
+        const after = model.nodes[index];
+        model = normalizePromptDocument(model);
+        render();
+        editor.focus({ preventScroll: true });
+        // The caret goes where the chip was: after the text or chip before
+        // it, else before what followed it (never thrown to the end).
+        const element = (node) => node && editor.querySelector?.(`[data-node-id="${node.node_id}"]`);
+        let placed = false;
+        if (before?.type === "text" && model.nodes.some((node) => node.node_id === before.node_id)) {
+            placed = restoreSelection({ start: { node_id: before.node_id, offset: before.text.length },
+                end: { node_id: before.node_id, offset: before.text.length } });
+        } else if (before && element(before)) {
+            placed = setCaretAfter(element(before));
+        } else if (after && element(after)) {
+            placed = setCaretBefore(element(after));
+        }
+        if (!placed) editor.focusEnd?.();
+        emit("attachment");
+        return true;
+    };
+    const DESTRUCTIVE_INPUTS = /^(deleteContent|deleteWord|deleteSoftLine|deleteHardLine|deleteEntireSoftLine|deleteByCut)/;
+    editor.addEventListener("beforeinput", (event) => {
+        if (event.defaultPrevented) return;
+        const inputType = String(event.inputType || "");
+        // A composition owns its own (often selected) text; IME stays native.
+        if (composing || event.isComposing === true || inputType === "insertCompositionText") return;
+        const range = liveRange();
+        if (!range || range.collapsed) return;
+        // Typing, a line break or a drop over a range would replace it: the
+        // same ownership applies (Chrome typed over a range left live when
+        // Tab moved focus to a chip; Phase 3 audit M2).
+        if (inputType.startsWith("insert") && !inputType.startsWith("insertFromDrop")) {
+            if (!ownedRange()) event.preventDefault();
+            return;
+        }
+        if (!DESTRUCTIVE_INPUTS.test(inputType)) return;
+        // A range deletion goes through the model when this editor owns it;
+        // a range it does not own (focus on a chip or the page, an end
+        // outside) is never deleted.
+        event.preventDefault();
+        if (!ownedRange()) return;
+        const span = selectedSpan();
+        if (span) deleteSpan(span);
+    }, true);
+
+    // ── Chip clipboard ───────────────────────────────────────────────────
+    let clipboardScope = null;
+    let pasteVerdict = null;
+    editor.setClipboardScope = (fn) => { clipboardScope = typeof fn === "function" ? fn : null; };
+    editor.setPasteVerdict = (fn) => { pasteVerdict = typeof fn === "function" ? fn : null; };
+    // What a span holds: authored text and whole chips, by the same inclusion
+    // rule `deleteModelSpan` uses.
+    const spanContent = ({ from, to }) => {
+        const nodes = [];
+        for (let i = from.index; i <= to.index && i < model.nodes.length; i += 1) {
+            const node = model.nodes[i];
+            if (node.type === "text") {
+                const start = i === from.index ? from.offset : 0;
+                const end = i === to.index ? to.offset : node.text.length;
+                const value = node.text.slice(start, end).split(ZERO_WIDTH).join("");
+                if (value) nodes.push({ type: "text", text: value });
+                continue;
+            }
+            const wholly = i > from.index && i < to.index;
+            if (wholly || (i === from.index && from.offset === 0) || (i === to.index && to.offset > 0)) {
+                nodes.push({ type: "attachment", attachment_id: node.attachment_id,
+                    ...(node.capability_id ? { capability_id: node.capability_id } : {}) });
+            }
+        }
+        return nodes;
+    };
+    const writeClipboard = (event, nodes, op) => {
+        const plain = nodes.filter((node) => node.type === "text").map((node) => node.text).join("");
+        event.clipboardData.setData("text/plain", plain);
+        const scope = clipboardScope?.();
+        const ids = new Set(nodes.filter((node) => node.type === "attachment").map((node) => node.attachment_id));
+        if (!scope || !ids.size) return;
+        const records = attachments.filter((value) => ids.has(value.attachment_id));
+        const fragment = { format: PROMPT_FRAGMENT_FORMAT, project: String(scope.project || ""),
+            scene: String(scope.scene || ""), prompt_id: String(scope.promptId || ""), op,
+            nodes, attachments: structuredClone(records) };
+        if (op === "cut") {
+            fragment.cut_token = uid();
+            livePromptCut = { token: fragment.cut_token, source: new WeakRef(editor) };
+        }
+        try { event.clipboardData.setData(PROMPT_FRAGMENT_TYPE, JSON.stringify(fragment)); }
+        catch (_error) { /* a browser refusing the custom type leaves plain text */ }
+    };
+    const onCopyOrCut = (event, cut) => {
+        if (!event.clipboardData) return;
+        const chip = focusedChip();
+        if (chip) {
+            const node = model.nodes.find((value) => value.node_id === chip.dataset.nodeId);
+            if (!node) return;
+            event.preventDefault();
+            // A cut is a move only when it deletes: one that cannot (a locked
+            // box, a composition) is written as a copy, so its paste is not
+            // linked to the chip that stayed (Phase 3 audit M1).
+            const removes = cut && isEditable() && !composing;
+            writeClipboard(event, [{ type: "attachment", attachment_id: node.attachment_id,
+                ...(node.capability_id ? { capability_id: node.capability_id } : {}) }], removes ? "cut" : "copy");
+            if (removes) deleteChipElement(chip);
+            return;
+        }
+        const range = liveRange();
+        if (!range || range.collapsed) return;
+        if (!inEditor(range.startContainer) || !inEditor(range.endContainer)) {
+            // Not this editor's range: a copy stays native; a cut deletes nothing.
+            if (cut) event.preventDefault();
+            return;
+        }
+        const span = selectedSpan();
+        if (!span) return;
+        const content = spanContent(span);
+        if (!content.some((node) => node.type === "attachment")) {
+            // Prose only: native, unless it carries the trailing-break
+            // sentinel, which a native copy would take into other fields.
+            const text = String(globalThis.getSelection?.()?.toString?.() ?? "");
+            if (!text.includes(ZERO_WIDTH)) return;
+            event.preventDefault();
+            event.clipboardData.setData("text/plain", text.split(ZERO_WIDTH).join(""));
+            if (cut && ownedRange()) deleteSpan(span);
+            return;
+        }
+        event.preventDefault();
+        const removes = cut && Boolean(ownedRange());
+        writeClipboard(event, content, removes ? "cut" : "copy");
+        if (removes) deleteSpan(span);
+    };
+    // A copy or cut this editor handled stops here, as its paste does, so
+    // ComfyUI's graph clipboard handler cannot add its own data to it.
+    const ownClipboard = (event, cut) => {
+        onCopyOrCut(event, cut);
+        if (event.defaultPrevented) event.stopPropagation();
+    };
+    editor.addEventListener("copy", (event) => ownClipboard(event, false));
+    editor.addEventListener("cut", (event) => ownClipboard(event, true));
     editor.addEventListener("paste", (event) => {
         event.preventDefault();
         event.stopPropagation();
+        const plain = event.clipboardData?.getData("text/plain") || "";
+        let fragment = null;
+        try { fragment = parsePromptFragment(event.clipboardData?.getData(PROMPT_FRAGMENT_TYPE) || ""); }
+        catch (_error) { fragment = null; }
+        // A paste replaces the selection; never one this editor does not own.
+        // The event's target says who holds focus (the editor, or one of its
+        // chips, which pastes nothing over a range left live elsewhere).
+        const range = liveRange();
+        const chipTarget = event.target?.closest?.('[data-node-type="attachment"]');
+        if (range && !range.collapsed && (chipTarget || !inEditor(range.startContainer)
+                || !inEditor(range.endContainer))) return;
+        const scope = clipboardScope?.();
+        if (fragment && scope && fragment.project === String(scope.project || "")
+                && fragment.scene === String(scope.scene || "")
+                && fragment.attachments.length) {
+            // A fragment the checks choke on pastes as plain text, never as
+            // nothing (the paste default is already prevented).
+            try { if (editor.insertFragment(fragment)) return; }
+            catch (error) { console.warn("[Sonder] Chip paste fell back to plain text:", error); }
+        }
         // Through `insertText`, not `execCommand`: the same newline loss that
         // made "Split here" inert flattens a pasted draft. `insertText` pushes
         // its own history entry, so pasting stays ONE undo step, and it prunes
         // a chip record whose anchor the paste overwrote.
-        const plain = event.clipboardData?.getData("text/plain") || "";
         editor.insertText(plain, { replaceSelection: true });
     });
-    // A native copy carries the trailing-break sentinel into other fields and
-    // other apps. Only a selection that actually contains a zero-width
-    // character is taken over; every other copy and cut stays native.
-    const copyWithoutSentinel = (event, cut) => {
-        const range = selectionPoint(editor);
-        if (!range || range.collapsed || !event.clipboardData) return;
-        const text = String(globalThis.getSelection?.()?.toString?.() ?? "");
-        if (!text.includes(ZERO_WIDTH)) return;
-        event.preventDefault();
-        event.clipboardData.setData("text/plain", text.split(ZERO_WIDTH).join(""));
-        if (!cut || !isEditable()) return;
-        // The same deletion the Backspace-over-chips path uses; `readDom`
-        // prunes any chip record the cut removed.
-        pushHistory();
-        range.deleteContents();
-        readDom();
-    };
-    editor.addEventListener("copy", (event) => copyWithoutSentinel(event, false));
-    editor.addEventListener("cut", (event) => copyWithoutSentinel(event, true));
     const ownedKeyHandlers = [];
     const handleOwnedKeydown = (event) => {
         // While an IME composition is open, Enter/Escape/Backspace belong to the
@@ -2652,6 +3076,8 @@ export function createPromptDocumentEditor({
             event.preventDefault();
             const previous = history.pop();
             if (!previous) return true;
+            // A cut's chips are back (or re-cut): its paste is a copy now.
+            if (livePromptCut?.source?.deref?.() === editor) livePromptCut = null;
             const changedTo = previous.after ?? previous.attachments;
             // Redo replays the same registry change, not this moment's list.
             future.push({ ...snapshot(), attachments: previous.attachments, after: changedTo });
@@ -2668,6 +3094,8 @@ export function createPromptDocumentEditor({
             event.preventDefault();
             const next = future.pop();
             if (!next) return true;
+            // A cut's chips are back (or re-cut): its paste is a copy now.
+            if (livePromptCut?.source?.deref?.() === editor) livePromptCut = null;
             history.push({ ...snapshot(), attachments: next.attachments, after: next.after });
             const priorModel = model;
             model = next.document;
@@ -2679,21 +3107,24 @@ export function createPromptDocumentEditor({
             emit("history");
             return true;
         } else if (["Backspace", "Delete"].includes(event.key)) {
+            // A chip holding focus: the key acts on that chip only, never on
+            // an older range still live in the document.
+            const focused = event.target?.dataset?.nodeType === "attachment"
+                && editor.contains(event.target) ? event.target : null;
+            if (focused) {
+                event.preventDefault();
+                if (isEditable()) deleteChipElement(focused);
+                return true;
+            }
             const range = selectionPoint(editor);
             if (range && !range.collapsed) {
-                const selectedChips = [...editor.querySelectorAll(
-                    '[data-node-type="attachment"]')].filter((value) => {
-                    try { return range.intersectsNode(value); }
-                    catch (_error) { return false; }
-                });
-                if (selectedChips.length) {
-                    event.preventDefault();
-                    pushHistory();
-                    range.deleteContents();
-                    readDom();
-                    event.stopPropagation();
-                    return true;
-                }
+                // Every range deletion goes through the model, and only when
+                // this editor owns the range.
+                event.preventDefault();
+                event.stopPropagation?.();
+                const span = ownedRange() && selectedSpan();
+                if (span) deleteSpan(span);
+                return true;
             }
             // A caret beside the trailing-break sentinel, with nothing but the
             // sentinel on its side of the key, would have the browser delete
@@ -3080,6 +3511,91 @@ export function createPromptDocumentEditor({
         // scrolled box — a line break, a paste — left the caret off-screen.
         revealCaret();
         emit(removedAttachment ? "attachment" : "document");
+    };
+    /**
+     * Paste a parsed fragment (`parsePromptFragment`) at the selection: one
+     * undo step, one inline registry change. Each chip passes this box's own
+     * authoring checks (`setPasteVerdict`) or is left out with a notice; every
+     * pasted chip gets a fresh id. A cut pasted in the tab that cut it, once,
+     * keeps its link group; anything else is an independent copy. Returns
+     * false when the caret cannot be placed (the caller pastes plain text).
+     */
+    editor.insertFragment = (fragment) => {
+        if (!isEditable() || !fragment) return false;
+        editor.focus();
+        const bookmark = selectionBookmark();
+        const from = modelPositionFor(bookmark?.start);
+        const to = modelPositionFor(bookmark?.end);
+        if (!from) return false;
+        const moving = fragment.op === "cut" && Boolean(fragment.cutToken)
+            && livePromptCut?.token === fragment.cutToken;
+        const refused = [];
+        const fresh = new Map();
+        for (const record of fragment.attachments) {
+            const reason = pasteVerdict ? pasteVerdict(record, bookmark)
+                : "this box does not take pasted chips";
+            if (reason) { refused.push(reason); continue; }
+            const reused = reusePromptAttachment(record);
+            fresh.set(record.attachment_id, moving ? reused : unlinkPromptAttachment(reused));
+        }
+        const nodes = [];
+        for (const node of fragment.nodes) {
+            if (node.type === "text") {
+                if (node.text) nodes.push({ type: "text", node_id: uid(), text: node.text });
+                continue;
+            }
+            const record = fresh.get(node.attachment_id);
+            if (!record) continue;
+            nodes.push({ type: "attachment", node_id: uid(), attachment_id: record.attachment_id,
+                ...(node.capability_id ? { capability_id: node.capability_id } : {}) });
+        }
+        pushHistory();
+        let target = from;
+        let removedAttachment = false;
+        if (to && (to.index > from.index || to.offset > from.offset)) {
+            const result = deleteModelSpan(from, to);
+            target = { index: result.index, offset: result.offset };
+            removedAttachment = result.removedAttachment;
+        }
+        const current = model.nodes[target.index];
+        if (current?.type === "text") {
+            const head = current.text.slice(0, target.offset);
+            const tail = current.text.slice(target.offset);
+            const replacement = [];
+            if (head) replacement.push({ ...current, text: head });
+            replacement.push(...nodes);
+            if (tail) replacement.push({ type: "text", node_id: head ? uid() : current.node_id, text: tail });
+            model.nodes.splice(target.index, 1, ...replacement);
+        } else {
+            const index = current ? target.index + (target.offset > 0 ? 1 : 0) : model.nodes.length;
+            model.nodes.splice(index, 0, ...nodes);
+        }
+        const added = [...fresh.values()];
+        attachments = [...attachments, ...added];
+        model = normalizePromptDocument(model);
+        render();
+        const last = nodes[nodes.length - 1];
+        if (last?.type === "text") {
+            restoreSelection({ start: { node_id: last.node_id, offset: last.text.length },
+                end: { node_id: last.node_id, offset: last.text.length } });
+        } else if (last) {
+            const chip = editor.querySelector(`[data-node-id="${last.node_id}"]`);
+            if (chip) setCaretAfter(chip);
+        }
+        revealCaret();
+        if (refused.length) {
+            // The source box's Undo brings a refused cut chip back only while
+            // that box (and its history) is still mounted.
+            const source = moving ? livePromptCut?.source?.deref?.() : null;
+            const undoHint = source?.isConnected
+                ? " Ctrl+Z in the box you cut from brings it back." : "";
+            notifyWarning(`${refused.length === 1 ? "A chip was" : `${refused.length} chips were`} `
+                + `left out of the paste: ${[...new Set(refused)].join("; ")}.${undoHint}`,
+            { source: "prompt-paste-refused" });
+        }
+        if (moving && added.length) livePromptCut = null;
+        emit(added.length || removedAttachment ? "attachment" : "document");
+        return true;
     };
     // Lets a host that mutates the document through `promptState` still
     // enrol the change in this editor's undo stack.
@@ -4072,8 +4588,24 @@ export function installPromptMentionMenu(area, { sources, onAccepted } = {}) {
 export function installPromptContextMenu({ editor, allowedKinds = AUTHORING_KINDS,
     onCreate = null, writingAids = [], channelKey = "", profile = null,
     referenceContext = null, onInserted = null, onMentionAccepted = null,
-    shotPlacementAt = null } = {}) {
+    shotPlacementAt = null, clipboardScope = null, pasteContext = null } = {}) {
     if (!editor) return () => {};
+    // A pasted chip faces the same checks this box's insert menu applies.
+    // `clipboardScope` (`() => ({ project, scene, promptId })`) names where a
+    // copy comes from; without it chips paste as plain text. `pasteContext`
+    // (`(bookmark) => referenceContext`) is for a host whose dialogs judge a
+    // chip against where it lands (Writing's block), not the box as a whole.
+    editor.setPasteVerdict?.((attachment, bookmark) => {
+        try {
+            return promptPasteVerdict(attachment, { allowedKinds, profile, shotPlacementAt, bookmark,
+                referenceContext: typeof pasteContext === "function"
+                    ? () => pasteContext(bookmark) : referenceContext });
+        } catch (_error) {
+            // A shape the checks cannot read is not pasted as a chip.
+            return "its settings could not be read";
+        }
+    });
+    editor.setClipboardScope?.(clipboardScope);
     let closeMenu = null;
     const open = ({ x, y, pointCaret = false } = {}) => {
         if (editor.isPromptComposing?.()) return false;

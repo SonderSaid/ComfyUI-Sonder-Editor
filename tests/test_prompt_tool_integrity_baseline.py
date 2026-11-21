@@ -972,3 +972,317 @@ const storedForm = {{ ...sparse, capabilities: [storedCapability] }};
 console.log(JSON.stringify({{ same: c(sparse) === c(storedForm), differs: c(toggled) !== c(storedForm) }}));
 """)
     assert result == {"same": True, "differs": True}
+
+
+# --- Phase 3: destructive selection and the chip clipboard -----------------
+
+_P3 = r"""
+const clip = (data = {}) => ({ data, event: { prevented: false,
+    preventDefault() { this.prevented = true; }, stopPropagation() {},
+    clipboardData: { setData: (t, v) => { data[t] = v; }, getData: (t) => data[t] || "" } } });
+const custom = (id, group = id) => ({ attachment_id: id, emission_group_id: group, kind: "custom",
+    source: {}, config: { text: "fixed " + id } });
+const make = (nodes, atts, { scope = { project: "P", scene: "S", promptId: "p1" }, allowedKinds } = {}) => {
+    const e = mod.createPromptDocumentEditor({ document: { nodes }, attachments: atts, onChange: () => {} });
+    e.focus = function () { document.activeElement = this; };
+    mod.installPromptContextMenu({ editor: e, clipboardScope: () => scope,
+        ...(allowedKinds ? { allowedKinds } : {}),
+        referenceContext: () => ({ scene: { prompt_sections: [] }, semanticUnits: [] }) });
+    return e;
+};
+const fire = (editor, type, event) => { for (const h of editor._handlers[type] || []) h(event); return event; };
+const summary = (e) => ({ nodes: e.promptDocument.nodes.map((n) => n.type === "text" ? n.text : "[" + n.attachment_id + "]"),
+    atts: e.promptAttachments.map((a) => [a.attachment_id, a.emission_group_id]) });
+const source = () => make([{ type: "text", node_id: "t1", text: "one " },
+    { type: "attachment", node_id: "n1", attachment_id: "c1" },
+    { type: "text", node_id: "t2", text: " two" }], [custom("c1", "g1")]);
+const selectAll = (e) => { place(firstText(spanOf(e, "t1")), 0, firstText(spanOf(e, "t2")), 4);
+    document.activeElement = e; };
+const target = (opts) => { const e = make([{ type: "text", node_id: "x", text: "X" }], [], opts);
+    place(firstText(spanOf(e, "x")), 1); document.activeElement = e; return e; };
+"""
+
+
+def _run_p3(body):
+    return _run_l3(_P3 + body)
+
+
+def test_copy_and_paste_carry_chips_as_independent_copies():
+    result = _run_p3(r"""
+const a = source(); selectAll(a);
+const { data, event } = clip();
+fire(a, "copy", event);
+const b = target();
+fire(b, "paste", clip(data).event);
+const pasted = summary(b);
+console.log(JSON.stringify({ prevented: event.prevented, plain: data["text/plain"],
+    types: Object.keys(data), source: summary(a), pasted }));
+""")
+    assert result["prevented"] is True
+    assert result["plain"] == "one  two"                 # authored text only, no chip label
+    assert "application/x-sonder-prompt-fragment" in result["types"]
+    assert result["source"]["atts"] == [["c1", "g1"]]    # a copy leaves the source alone
+    [[pasted_id, pasted_group]] = result["pasted"]["atts"]
+    assert pasted_id != "c1" and pasted_group not in ("g1", "c1")
+    assert "".join(result["pasted"]["nodes"]) == f"Xone [{pasted_id}] two"
+
+
+def test_a_cut_moves_its_chips_once_then_pastes_copies():
+    result = _run_p3(r"""
+const a = source(); selectAll(a);
+const { data, event } = clip();
+fire(a, "cut", event);
+const afterCut = summary(a);
+const b = target();
+fire(b, "paste", clip(data).event);
+const first = summary(b);
+fire(b, "paste", clip(data).event);
+const second = summary(b);
+undo(a);                                     // the source box gets its chip back
+console.log(JSON.stringify({ afterCut, first, second, sourceUndone: summary(a) }));
+""")
+    assert result["afterCut"]["atts"] == []
+    moved = result["first"]["atts"][0]
+    assert moved[0] != "c1" and moved[1] == "g1"         # moved: fresh id, same link group
+    again = [row for row in result["second"]["atts"] if row != moved][0]
+    assert again[1] not in ("g1", moved[0])              # token consumed: now a copy
+    assert result["sourceUndone"]["atts"] == [["c1", "g1"]]
+
+
+@pytest.mark.parametrize("case", ["other-project", "other-scene", "no-fragment", "no-scope"])
+def test_a_chip_paste_falls_back_to_plain_text(case):
+    result = _run_p3(f"""
+const which = {json.dumps(case)};
+""" + r"""
+const a = source(); selectAll(a);
+const { data, event } = clip();
+fire(a, "copy", event);
+if (which === "no-fragment") delete data["application/x-sonder-prompt-fragment"];   // Ctrl+Shift+V
+const scope = which === "other-project" ? { project: "Q", scene: "S" }
+    : which === "other-scene" ? { project: "P", scene: "T" } : { project: "P", scene: "S" };
+const b = which === "no-scope"
+    ? (() => { const e = mod.createPromptDocumentEditor({ document: { nodes: [{ type: "text", node_id: "x", text: "X" }] },
+        onChange: () => {} }); place(firstText(spanOf(e, "x")), 1); return e; })()
+    : target({ scope });
+fire(b, "paste", clip(data).event);
+console.log(JSON.stringify(summary(b)));
+""")
+    assert "".join(result["nodes"]) == "Xone  two" and result["atts"] == []
+
+
+def test_a_chip_the_target_box_does_not_take_is_left_out_and_the_text_still_lands():
+    result = _run_p3(r"""
+const a = source(); selectAll(a);
+const { data, event } = clip();
+fire(a, "copy", event);
+const b = target({ allowedKinds: ["reference"] });
+fire(b, "paste", clip(data).event);
+console.log(JSON.stringify(summary(b)));
+""")
+    assert "".join(result["nodes"]) == "Xone  two" and result["atts"] == []
+
+
+def test_hostile_fragments_are_rejected_before_normalization():
+    result = _run_l3(r"""
+const ok = { format: "sonder-prompt-fragment@1", project: "P", scene: "S", op: "copy",
+    nodes: [{ type: "attachment", attachment_id: "c" }], attachments: [{ attachment_id: "c", kind: "custom" }] };
+const variants = {
+    valid: ok,
+    badJson: "{",
+    wrongFormat: { ...ok, format: "other" },
+    duplicateIds: { ...ok, attachments: [ok.attachments[0], ok.attachments[0]] },
+    danglingNode: { ...ok, nodes: [{ type: "attachment", attachment_id: "missing" }] },
+    badCapability: { ...ok, nodes: [{ type: "attachment", attachment_id: "c", capability_id: "nope" }] },
+    unknownKind: { ...ok, attachments: [{ attachment_id: "c", kind: "script" }] },
+    numericId: { ...ok, attachments: [{ attachment_id: 7, kind: "custom" }] },
+    unknownNode: { ...ok, nodes: [{ type: "html", text: "<b>" }] },
+    deep: { ...ok, attachments: [{ attachment_id: "c", kind: "custom",
+        config: JSON.parse("{\"a\":".repeat(20) + "1" + "}".repeat(20)) }] },
+    huge: { ...ok, nodes: [{ type: "text", text: "x".repeat(300000) }] },
+};
+const out = {};
+for (const [name, value] of Object.entries(variants))
+    out[name] = mod.parsePromptFragment(typeof value === "string" ? value : JSON.stringify(value)) !== null;
+console.log(JSON.stringify(out));
+""")
+    assert result.pop("valid") is True
+    assert not any(result.values()), result
+
+
+def test_the_paste_verdict_applies_each_surface_s_authoring_checks():
+    result = _run_l3(r"""
+const scene = { _context_consumer_start: 48, prompt_sections: [
+    { prompt_id: "early", start_frame: 0 }, { prompt_id: "late", start_frame: 96 }] };
+const ctx = { scene, semanticUnits: [{ semantic_unit_id: "u1" }] };
+const v = (attachment, extra = {}) => mod.promptPasteVerdict(attachment, { referenceContext: () => ctx, ...extra });
+console.log(JSON.stringify({
+    customGlobal: v({ kind: "custom" }, { allowedKinds: ["reference", "custom"] }),
+    linkGlobal: v({ kind: "prompt_link", source: { prompt_id: "early" } }, { allowedKinds: ["reference", "custom"] }),
+    scopeOnlyInline: v({ kind: "timestamp" }),
+    linkEarlier: v({ kind: "prompt_link", source: { prompt_id: "early" } }),
+    linkLater: v({ kind: "prompt_link", source: { prompt_id: "late" } }),
+    linkMissing: v({ kind: "prompt_link", source: { prompt_id: "gone" } }),
+    vocalKnown: v({ kind: "vocal_event", source: { subject_ids: ["u1"] } }),
+    vocalPending: v({ kind: "vocal_event", source: { subject_ids: ["pending"] } }),
+    shotElsewhere: v({ kind: "shot" }, { shotPlacementAt: () => ({ offered: false }) }),
+    shotMarker: v({ kind: "shot" }, { shotPlacementAt: () => ({ offered: true }) }),
+    referencePending: v({ kind: "reference", source: { semantic_unit_ids: ["pending"] } }),
+}));
+""")
+    assert result["customGlobal"] is None and result["linkEarlier"] is None
+    assert result["vocalKnown"] is None and result["shotMarker"] is None
+    for refused in ("linkGlobal", "scopeOnlyInline", "linkLater", "linkMissing",
+                    "vocalPending", "shotElsewhere", "referencePending"):
+        assert isinstance(result[refused], str) and result[refused], refused
+
+
+def test_delete_on_a_focused_chip_ignores_an_older_range():
+    """Phase 3.2: with focus on a chip, Delete/Backspace act on that chip only;
+    an older prose range still live is not deleted."""
+    result = _run_p3(r"""
+const a = make([{ type: "text", node_id: "t1", text: "keep left " },
+    { type: "attachment", node_id: "n1", attachment_id: "c1" },
+    { type: "text", node_id: "t2", text: " keep right" }], [custom("c1")]);
+place(firstText(spanOf(a, "t1")), 0, firstText(spanOf(a, "t2")), 6);   // the older range
+const chipEl = a.childNodes.find((n) => n.dataset?.attachmentId === "c1");
+document.activeElement = chipEl;
+a._sonderOwnedKeydown({ key: "Delete", target: chipEl, ctrlKey: false, metaKey: false, shiftKey: false,
+    isComposing: false, preventDefault() {}, stopPropagation() {} });
+console.log(JSON.stringify(summary(a)));
+""")
+    assert "".join(result["nodes"]) == "keep left  keep right" and result["atts"] == []
+
+
+@pytest.mark.parametrize("owner", ["chip", "page"])
+def test_a_range_this_editor_does_not_own_is_never_deleted(owner):
+    """Phase 3.2: a destructive input (here deleteByCut and deleteContent) on
+    a range while focus is on a chip or elsewhere deletes nothing."""
+    result = _run_p3(f"""
+const owner = {json.dumps(owner)};
+""" + r"""
+const a = make([{ type: "text", node_id: "t1", text: "keep left " },
+    { type: "attachment", node_id: "n1", attachment_id: "c1" },
+    { type: "text", node_id: "t2", text: " keep right" }], [custom("c1")]);
+place(firstText(spanOf(a, "t1")), 0, firstText(spanOf(a, "t2")), 6);
+document.activeElement = owner === "chip" ? a.childNodes.find((n) => n.dataset?.attachmentId === "c1") : document.body;
+const prevented = [];
+for (const inputType of ["deleteByCut", "deleteContentBackward"]) {
+    const event = { inputType, cancelable: true, defaultPrevented: false, isComposing: false,
+        preventDefault() { this.defaultPrevented = true; } };
+    fire(a, "beforeinput", event);
+    prevented.push(event.defaultPrevented);
+}
+console.log(JSON.stringify({ prevented, ...summary(a) }));
+""")
+    assert result["prevented"] == [True, True]
+    assert result["nodes"] == ["keep left ", "[c1]", " keep right"]
+
+
+# --- Phase 3 audit fixes ---------------------------------------------------
+
+def test_a_reference_bound_to_an_identity_pastes_with_a_host_shaped_context():
+    """Phase 3 audit H1: hosts name the profile `resolvedProfile`; the verdict
+    read `profile`, so every identity-bound Reference (MiniMax H3) was
+    refused. Pending identities (M3) are refused."""
+    result = _run_l3(r"""
+const resolvedProfile = { identity_kinds: [{ key: "subject", label: "Subject" }], physical_populations: ["pictures"] };
+const ctx = { scene: { prompt_sections: [] }, semanticUnits: [
+        { semantic_unit_id: "u1", kind: "subject", name: "Hero", sources: [] },
+        { semantic_unit_id: "u2", kind: "subject", name: "New", sources: [] }],
+    profileId: "minimax_h3@1", scope: "global", resolvedProfile, references: [],
+    pendingSemanticUnitIds: ["u2"] };
+const v = (attachment) => mod.promptPasteVerdict(attachment, { referenceContext: () => ctx });
+console.log(JSON.stringify({
+    bound: v({ kind: "reference", source: { semantic_unit_ids: ["u1"] } }),
+    pending: v({ kind: "reference", source: { semantic_unit_ids: ["u2"] } }),
+    pendingSpeaker: v({ kind: "vocal_event", source: { subject_ids: ["u2"] } }),
+}));
+""")
+    assert result["bound"] is None
+    assert "being created" in result["pending"]
+    assert "being created" in result["pendingSpeaker"]
+
+
+@pytest.mark.parametrize("case", ["locked-source", "undone-in-source"])
+def test_a_cut_that_did_not_remove_its_chip_pastes_a_copy(case):
+    """Phase 3 audit M1: a cut that deleted nothing (a locked box), or whose
+    source box undid it, must not paste a chip linked to the one that stayed."""
+    result = _run_p3(f"""
+const which = {json.dumps(case)};
+""" + r"""
+const a = source(); selectAll(a);
+if (which === "locked-source") a.contentEditable = "false";
+const { data, event } = clip();
+fire(a, "cut", event);
+if (which === "undone-in-source") undo(a);
+const b = target();
+fire(b, "paste", clip(data).event);
+console.log(JSON.stringify({ source: summary(a), pasted: summary(b), op: JSON.parse(data["application/x-sonder-prompt-fragment"]).op }));
+""")
+    assert result["source"]["atts"] == [["c1", "g1"]]
+    [[_pasted_id, pasted_group]] = result["pasted"]["atts"]
+    assert pasted_group != "g1"
+    if case == "locked-source":
+        assert result["op"] == "copy"
+
+
+def test_typing_or_pasting_over_a_range_the_editor_does_not_own_changes_nothing():
+    """Phase 3 audit M2: with focus moved to a chip (Tab) and an older range
+    still live, typing and paste must not replace that range."""
+    result = _run_p3(r"""
+const a = make([{ type: "text", node_id: "t1", text: "keep left " },
+    { type: "attachment", node_id: "n1", attachment_id: "c1" },
+    { type: "text", node_id: "t2", text: " keep right" }], [custom("c1")]);
+place(firstText(spanOf(a, "t1")), 0, firstText(spanOf(a, "t2")), 6);
+const chipEl = a.childNodes.find((n) => n.dataset?.attachmentId === "c1");
+document.activeElement = chipEl;
+const typed = { inputType: "insertText", data: "x", cancelable: true, defaultPrevented: false,
+    isComposing: false, preventDefault() { this.defaultPrevented = true; } };
+fire(a, "beforeinput", typed);
+const { event } = clip({ "text/plain": "PASTED" });
+event.target = chipEl;
+fire(a, "paste", event);
+console.log(JSON.stringify({ typedPrevented: typed.defaultPrevented, ...summary(a) }));
+""")
+    assert result["typedPrevented"] is True
+    assert result["nodes"] == ["keep left ", "[c1]", " keep right"]
+
+
+def test_writing_judges_a_pasted_chip_against_the_block_it_lands_in():
+    """Phase 3 audit M4: a host's `pasteContext` (Writing's block context)
+    decides, not the box-wide reference context."""
+    result = _run_p3(r"""
+const a = make([{ type: "text", node_id: "t1", text: "one " },
+    { type: "attachment", node_id: "n1", attachment_id: "c1" },
+    { type: "text", node_id: "t2", text: " two" }],
+    [{ attachment_id: "c1", kind: "prompt_link", source: { prompt_id: "late", channel_key: "visual" }, config: {} }]);
+selectAll(a);
+const { data, event } = clip();
+fire(a, "copy", event);
+const b = mod.createPromptDocumentEditor({ document: { nodes: [{ type: "text", node_id: "x", text: "X" }] }, onChange: () => {} });
+b.focus = function () { document.activeElement = this; };
+const scene = { prompt_sections: [{ prompt_id: "late", start_frame: 96 }] };
+mod.installPromptContextMenu({ editor: b, clipboardScope: () => ({ project: "P", scene: "S" }),
+    referenceContext: () => ({ scene: { ...scene }, semanticUnits: [], scope: "global" }),
+    pasteContext: () => ({ scene: { ...scene, _context_consumer_start: 48 }, semanticUnits: [], scope: "section" }) });
+place(firstText(spanOf(b, "x")), 1); document.activeElement = b;
+fire(b, "paste", clip(data).event);
+console.log(JSON.stringify(summary(b)));
+""")
+    assert result["atts"] == []                       # a link to a later block is refused
+    assert "".join(result["nodes"]) == "Xone  two"
+
+
+def test_a_fragment_with_a_non_array_id_list_is_rejected_and_pastes_text():
+    """Phase 3 audit L1: a crafted `subject_ids` used to throw inside the
+    verdict after the paste was prevented, so nothing pasted at all."""
+    result = _run_p3(r"""
+const bad = { format: "sonder-prompt-fragment@1", project: "P", scene: "S", op: "copy",
+    nodes: [{ type: "text", text: "hello " }, { type: "attachment", attachment_id: "v" }],
+    attachments: [{ attachment_id: "v", kind: "vocal_event", source: { subject_ids: "u1" } }] };
+const b = target();
+fire(b, "paste", clip({ "text/plain": "hello ", "application/x-sonder-prompt-fragment": JSON.stringify(bad) }).event);
+console.log(JSON.stringify({ parsed: mod.parsePromptFragment(JSON.stringify(bad)), ...summary(b) }));
+""")
+    assert result["parsed"] is None
+    assert "".join(result["nodes"]) == "Xhello " and result["atts"] == []

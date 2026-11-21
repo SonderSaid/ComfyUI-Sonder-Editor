@@ -22,7 +22,7 @@ function findPlaywright() {
     return null;
 }
 
-const BIDI_KEYS = { Delete: "\ue017", Backspace: "\ue003", Control: "\ue009", Shift: "\ue008" };
+const BIDI_KEYS = { Delete: "\ue017", Backspace: "\ue003", Tab: "\ue004", Control: "\ue009", Shift: "\ue008" };
 
 export async function firefoxDriver(url, { headed = false } = {}) {
     if (!existsSync(FIREFOX)) return { skip: `Firefox not found at ${FIREFOX} (set FIREFOX_BIN)` };
