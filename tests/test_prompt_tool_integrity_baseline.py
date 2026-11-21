@@ -281,9 +281,25 @@ def test_panel_and_bar_models_still_mirror_the_source():
         "liveMounts.get(event.key)?.acknowledge(event);",
         "liveMounts.set(sectionDraftKey, {",
         "const live = mounted ? liveMounts.get(draftKey) : null;",
-        # `_L3_HARNESS` mirrors the sibling glue.
-        "sibling.recordSharedAttachmentTransaction?.(sectionAttachments);",
+        # `_L3_HARNESS` mirrors the sibling glue: only a registry transaction
+        # is recorded in siblings, and a box asks its siblings before pruning.
+        "if (reason === \"attachment\" && origin === \"registry\") {\n"
+        "                                sibling.recordSharedAttachmentTransaction?.(sectionAttachments);",
         "sibling.syncPromptAttachments?.(sectionAttachments);",
+        "isAnchoredElsewhere: (attachmentId) => promptAttachmentAnchoredChannels(\n"
+        "                        Object.fromEntries(Object.entries(channelInputs)\n"
+        "                            .filter(([channelKey]) => channelKey !== key)",
+        # The global host carries the same glue.
+        "if (reason === \"attachment\" && origin === \"registry\") {\n"
+        "                            sibling.recordSharedAttachmentTransaction?.(globalAttachments);",
+        "isAnchoredElsewhere: (attachmentId) => promptAttachmentAnchoredChannels(\n"
+        "                    Object.fromEntries(Object.entries(globalInputs)\n"
+        "                        .filter(([channelKey]) => channelKey !== key)",
+        # A chip dialog's result is the box's inline change; a scope-row
+        # dialog is a registry transaction (Phase 2 audit L-a).
+        "live.transactAttachments(build, channelKey, channelKey ? \"inline\" : \"registry\");",
+        "?.transactPromptAttachments?.(build(sectionAttachments), null, { origin }),",
+        "?.transactPromptAttachments?.(build(globalAttachments), null, { origin }),",
     ):
         assert line in panel, line
     widget = _source("web/js/editor_widget.js").replace("\r\n", "\n")
@@ -292,6 +308,11 @@ def test_panel_and_bar_models_still_mirror_the_source():
         "const row = mount.record({ documents: channelInputs.readDocuments(),",
         "const stopListening = addPromptDraftListener(drafts, (event) => {",
         "sibling.recordSharedAttachmentTransaction?.(sharedAttachments);",
+        "if (reason === \"attachment\" && origin === \"registry\") {\n"
+        "                            sibling.recordSharedAttachmentTransaction?.(sharedAttachments);",
+        "isAnchoredElsewhere: (attachmentId) => promptAttachmentAnchoredChannels(\n"
+        "                    Object.fromEntries(Object.entries(inputs)\n"
+        "                        .filter(([channelKey]) => channelKey !== key)",
         # The refusal render the fake runner's refetch follows.
         "if (this._promptEditRevisions.get(key) === revision) Object.assign(section, previous);\n"
         "            this._refreshPromptContextDependencyConsumers();",
@@ -586,11 +607,14 @@ const boxes = {};
 const mount = (name, nodes) => {
     const editor = mod.createPromptDocumentEditor({ document: { nodes },
         attachments: shared,
-        onChange: ({ attachments, reason }) => {
+        isAnchoredElsewhere: (id) => mod.promptAttachmentAnchoredChannels(
+            Object.fromEntries(Object.entries(boxes).filter(([other]) => other !== name)
+                .map(([other, box]) => [other, box.promptDocument])), id).length > 0,
+        onChange: ({ attachments, reason, origin }) => {
             shared = attachments;
             for (const [other, sibling] of Object.entries(boxes)) {
                 if (other === name) continue;
-                if (reason === "attachment") sibling.recordSharedAttachmentTransaction(shared);
+                if (reason === "attachment" && origin === "registry") sibling.recordSharedAttachmentTransaction(shared);
                 else sibling.syncPromptAttachments(shared);
             }
         } });
@@ -609,9 +633,9 @@ def _run_l3(body):
     return _run_chip_dom_script(_SELECTION + _L3_HARNESS + body)
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="L3; Phase 2 (sibling history restores the whole shared list)")
 def test_undo_in_a_sibling_with_prior_typing_does_not_restore_a_removed_inline_chip():
+    """L3 (strict-xfail until Phase 2): the sibling's older entry restored the
+    whole shared list, resurrecting the removed chip's record as an orphan."""
     result = _run_l3(r"""
 shared = [link("c1")];
 const a = mount("a", [{ type: "text", node_id: "ta", text: "before " },
@@ -628,9 +652,9 @@ console.log(JSON.stringify({ afterRemove, afterUndo: shared.map((x) => x.attachm
     assert result["orphans"] == []
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="L3; Phase 2 (sibling history drops later additions)")
 def test_undo_in_a_sibling_keeps_a_chip_added_later_in_another_box():
+    """L3 (strict-xfail until Phase 2): the sibling's older entry dropped a
+    record another box had added since."""
     result = _run_l3(r"""
 shared = [link("c1")];
 const a = mount("a", [{ type: "text", node_id: "ta", text: "a " },
@@ -662,6 +686,201 @@ undo(a);
 console.log(JSON.stringify({ configured, restored: shared[0]?.config?.note }));
 """)
     assert result == {"configured": "second", "restored": "first"}
+
+
+_L3_MORE = r"""
+const redo = (editor) => editor._sonderOwnedKeydown({ key: "y", ctrlKey: true,
+    metaKey: false, shiftKey: false, target: editor, isComposing: false,
+    preventDefault() {}, stopPropagation() {} });
+const backspaceChip = (editor, attachmentId) => {
+    const span = editor.childNodes.find((child) => child.dataset?.attachmentId === attachmentId);
+    return editor._sonderOwnedKeydown({ key: "Backspace", ctrlKey: false, metaKey: false,
+        shiftKey: false, target: span, isComposing: false,
+        preventDefault() {}, stopPropagation() {} });
+};
+const ids = () => shared.map((x) => x.attachment_id);
+const anchorsIn = (editor) => editor.promptDocument.nodes
+    .filter((n) => n.type === "attachment").map((n) => n.attachment_id);
+"""
+
+
+def test_undo_and_redo_of_an_inline_insert_and_removal_in_its_own_box():
+    """Phase 2.1: the box that made an inline change undoes and redoes exactly
+    that record, with its anchor, and siblings only follow."""
+    result = _run_l3(_L3_MORE + r"""
+shared = [link("c1")];
+const a = mount("a", [{ type: "text", node_id: "ta", text: "a " },
+    { type: "attachment", node_id: "na", attachment_id: "c1" }]);
+const b = mount("b", [{ type: "text", node_id: "tb", text: "b" }]);
+backspaceChip(a, "c1");
+const removed = { ids: ids(), a: anchorsIn(a) };
+undo(a);
+const undone = { ids: ids(), a: anchorsIn(a) };
+redo(a);
+const redone = { ids: ids(), a: anchorsIn(a) };
+undo(b);                                     // B holds no entry for it
+console.log(JSON.stringify({ removed, undone, redone, afterB: ids(), orphans: orphans() }));
+""")
+    assert result["removed"] == {"ids": [], "a": []}
+    assert result["undone"] == {"ids": ["c1"], "a": ["c1"]}
+    assert result["redone"] == {"ids": [], "a": []}
+    assert result["afterB"] == []
+    assert result["orphans"] == []
+
+
+def test_a_configuration_undo_leaves_a_record_someone_changed_since():
+    """Phase 2.1: an inverse applies only to a record still as its entry left
+    it; a later registry change from another box is not reverted."""
+    result = _run_l3(_L3_MORE + r"""
+shared = [{ ...link("c1"), config: { note: "first" } }];
+const a = mount("a", [{ type: "text", node_id: "ta", text: "a " },
+    { type: "attachment", node_id: "na", attachment_id: "c1" }]);
+const b = mount("b", [{ type: "text", node_id: "tb", text: "b" }]);
+a.replaceAttachment({ ...link("c1"), config: { note: "second" } });
+// An inline configuration from B reaches A as a sync, with no entry there.
+b.replaceAttachment({ ...link("c1"), config: { note: "third" } });
+undo(a);
+console.log(JSON.stringify({ note: shared[0]?.config?.note }));
+""")
+    assert result["note"] == "third"
+
+
+def test_a_scope_transaction_is_undoable_from_any_box_once():
+    """Phase 2.2: a registry (scope-row) change is recorded in every box; the
+    first Undo reverses it and a second box's Undo finds nothing to reverse."""
+    result = _run_l3(_L3_MORE + r"""
+shared = [];
+const scope = { attachment_id: "s1", kind: "custom", source: {}, config: {} };
+const a = mount("a", [{ type: "text", node_id: "ta", text: "a" }]);
+const b = mount("b", [{ type: "text", node_id: "tb", text: "b" }]);
+a.transactPromptAttachments([scope]);
+const added = ids();
+undo(b);
+const afterB = ids();
+undo(a);
+const afterA = ids();
+redo(b);
+console.log(JSON.stringify({ added, afterB, afterA, redone: ids() }));
+""")
+    assert result == {"added": ["s1"], "afterB": [], "afterA": [], "redone": ["s1"]}
+
+
+@pytest.mark.parametrize("removal", ["button", "backspace"])
+def test_a_chip_anchored_in_two_boxes_keeps_its_record_while_one_still_holds_it(removal):
+    """Phase 2.3: removing one of two anchors leaves the record; removing the
+    last one takes it."""
+    result = _run_l3(_L3_MORE + f"""
+const removal = {json.dumps(removal)};
+""" + r"""
+shared = [link("c1")];
+const a = mount("a", [{ type: "text", node_id: "ta", text: "a " },
+    { type: "attachment", node_id: "na", attachment_id: "c1" }]);
+const b = mount("b", [{ type: "text", node_id: "tb", text: "b " },
+    { type: "attachment", node_id: "nb", attachment_id: "c1" }]);
+const drop = (editor) => removal === "button" ? editor.removeAttachment("c1") : backspaceChip(editor, "c1");
+drop(a);
+const oneLeft = { ids: ids(), a: anchorsIn(a), b: anchorsIn(b) };
+drop(b);
+console.log(JSON.stringify({ oneLeft, none: ids(), orphans: orphans() }));
+""")
+    assert result["oneLeft"] == {"ids": ["c1"], "a": [], "b": ["c1"]}
+    assert result["none"] == []
+    assert result["orphans"] == []
+
+
+def test_undo_does_not_restore_an_inline_only_record_with_no_anchor():
+    """Phase 2.4: Undo of a scope-row removal of a legacy orphan Prompt link
+    would bring the orphan back; it is left out with a notice."""
+    result = _run_l3(_L3_MORE + r"""
+shared = [link("orphan")];
+const a = mount("a", [{ type: "text", node_id: "ta", text: "a" }]);
+mount("b", [{ type: "text", node_id: "tb", text: "b" }]);
+a.transactPromptAttachments([]);
+undo(a);
+console.log(JSON.stringify({ ids: ids() }));
+""")
+    assert result["ids"] == []
+
+
+def test_undo_reverts_a_capability_toggle_after_the_server_stored_form_lands():
+    """Phase 2 audit M1: the server fills sparse capability entries in and the
+    acknowledgement repaints that stored form; Undo must still revert the
+    author's own toggle."""
+    result = _run_l3(_L3_MORE + r"""
+const ref = (caps) => ({ attachment_id: "r1", kind: "reference", source: {}, config: {}, capabilities: caps });
+shared = [ref([])];
+const a = mount("a", [{ type: "text", node_id: "ta", text: "a " },
+    { type: "attachment", node_id: "na", attachment_id: "r1" }]);
+mount("b", [{ type: "text", node_id: "tb", text: "b" }]);
+a.replaceAttachment(ref([{ capability_id: "text", kind: "text", enabled: false }]));
+// The acknowledgement repaints every box with the stored (filled-in) record.
+const stored = [ref([{ capability_id: "text", kind: "text", channel_key: "", placement: "",
+    config: {}, enabled: false }])];
+for (const box of Object.values(boxes)) box.syncPromptAttachments(stored);
+shared = stored;
+undo(a);
+console.log(JSON.stringify({ caps: shared[0].capabilities }));
+""")
+    assert result["caps"] == []
+
+
+def test_undo_brings_back_the_record_for_an_anchor_it_restores():
+    """Phase 2 audit M2: an id anchored in two boxes, removed from both;
+    Undo in the first box restores its anchor and must restore the record."""
+    result = _run_l3(_L3_MORE + r"""
+shared = [link("c1")];
+const a = mount("a", [{ type: "text", node_id: "ta", text: "a " },
+    { type: "attachment", node_id: "na", attachment_id: "c1" }]);
+const b = mount("b", [{ type: "text", node_id: "tb", text: "b " },
+    { type: "attachment", node_id: "nb", attachment_id: "c1" }]);
+backspaceChip(a, "c1");
+backspaceChip(b, "c1");
+undo(a);
+console.log(JSON.stringify({ ids: ids(), a: anchorsIn(a), b: anchorsIn(b) }));
+""")
+    assert result == {"ids": ["c1"], "a": ["c1"], "b": []}
+
+
+def test_an_open_entry_does_not_take_a_sibling_change_as_its_own():
+    """Phase 2 audit L-b: while A composes, a sibling's removal reaches A as a
+    sync; Undo in A must not bring the removed chip back."""
+    result = _run_l3(_L3_MORE + r"""
+const custom = (id) => ({ attachment_id: id, kind: "custom", source: {}, config: {} });
+shared = [custom("c2")];
+const a = mount("a", [{ type: "text", node_id: "ta", text: "a" }]);
+const b = mount("b", [{ type: "text", node_id: "tb", text: "b " },
+    { type: "attachment", node_id: "nb", attachment_id: "c2" }]);
+for (const handler of a._handlers.compositionstart || []) handler({});
+backspaceChip(b, "c2");
+for (const handler of a._handlers.compositionend || []) handler({});
+undo(a);
+console.log(JSON.stringify({ ids: ids(), orphans: orphans() }));
+""")
+    assert result == {"ids": [], "orphans": []}
+
+
+def test_writing_host_state_round_trips_through_undo_and_redo():
+    """Phase 2.1: Writing's `blockMeta` host snapshot still travels with each
+    entry alongside the inverse registry change."""
+    result = _run_l3(r"""
+let blockMeta = [{ id: "one" }];
+const restored = [];
+const editor = mod.createPromptDocumentEditor({
+    document: { nodes: [{ type: "text", node_id: "t", text: "x" }] }, attachments: [],
+    getHostSnapshot: () => blockMeta,
+    onRestoreHostSnapshot: (value) => { restored.push(value); blockMeta = value; },
+    onChange: () => {} });
+editor.transactPromptAttachments([{ attachment_id: "s1", kind: "custom", source: {}, config: {} }],
+    () => { blockMeta = [{ id: "one" }, { id: "two" }]; });
+undo(editor);
+const afterUndo = { meta: blockMeta, ids: editor.promptAttachments.map((x) => x.attachment_id) };
+editor._sonderOwnedKeydown({ key: "y", ctrlKey: true, metaKey: false, shiftKey: false,
+    target: editor, isComposing: false, preventDefault() {}, stopPropagation() {} });
+console.log(JSON.stringify({ afterUndo, afterRedo: { meta: blockMeta,
+    ids: editor.promptAttachments.map((x) => x.attachment_id) } }));
+""")
+    assert result["afterUndo"] == {"meta": [{"id": "one"}], "ids": []}
+    assert result["afterRedo"] == {"meta": [{"id": "one"}, {"id": "two"}], "ids": ["s1"]}
 
 
 # --- L1: Customize with no automatic task types ----------------------------
@@ -726,3 +945,30 @@ console.log(JSON.stringify(pairs.map(([a, b]) => promptRecordsEquivalent("docume
 """)
     server = [routes._prompt_edit_agrees("documents", a, b) for a, b in _DOC_PAIRS]
     assert client == server == [True, True, True, False, False]
+
+
+def test_canonical_record_matches_the_servers_capability_defaults():
+    """`canonicalPromptRecord` (browser, Undo's comparison) fills capability
+    entries the way `normalize_attachment` stores them: a sparse record and its
+    stored form compare equal, an authored difference does not (Phase 2 audit
+    M1). A mirror of the server's defaults, so it owes this parity test."""
+    from server import prompt_context
+
+    sparse = {"attachment_id": "r1", "kind": "reference", "source": {}, "config": {},
+              "capabilities": [{"capability_id": "text", "kind": "text", "enabled": False}]}
+    stored = prompt_context.normalize_attachment(sparse)
+    toggled = json.loads(json.dumps(sparse))
+    toggled["capabilities"][0]["enabled"] = True
+    stored_capability = stored["capabilities"][0]
+    url = _url("web/js/prompt_context_chips.js")
+    result = _run_chip_dom_script(f"""
+const {{ canonicalPromptRecord }} = await import({url});
+const c = (value) => JSON.stringify(canonicalPromptRecord(value));
+const sparse = {json.dumps(sparse)}, toggled = {json.dumps(toggled)};
+const storedCapability = {json.dumps(stored_capability)};
+// The record-level fields the browser also fills are compared as the browser
+// holds them; the capability entry is what the server fills in.
+const storedForm = {{ ...sparse, capabilities: [storedCapability] }};
+console.log(JSON.stringify({{ same: c(sparse) === c(storedForm), differs: c(toggled) !== c(storedForm) }}));
+""")
+    assert result == {"same": True, "differs": True}

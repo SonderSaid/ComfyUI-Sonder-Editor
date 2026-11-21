@@ -5263,3 +5263,117 @@ def test_a_stage_without_an_id_still_gets_a_server_minted_one(monkeypatch, tmp_p
             [_stage_op(candidate)], saves)
         assert response.status == 200, (candidate, _response_json(response))
         assert len(scene.reference_items[0].reference_item_id) == 32, candidate
+
+
+# --- Phase 2 (Prompt Tool Integrity Pass): the server anchor guard ---------
+
+def _anchor_doc(text, *anchors):
+    nodes = [{"type": "text", "node_id": "t-" + text, "text": text}]
+    nodes += [{"type": "attachment", "node_id": "a-" + anchor, "attachment_id": anchor}
+              for anchor in anchors]
+    return {"schema": "prompt_document_v1", "nodes": nodes}
+
+
+def _linked_scene(visual_anchors=("c1",), speech_anchors=("c1",), chips=("c1",)):
+    source = PromptSection(0, 24, channels={"visual": "earlier"})
+    target = PromptSection(
+        24, 48, channels={"visual": "v", "speech": "s"},
+        channel_docs={"visual": _anchor_doc("v", *visual_anchors),
+                      "speech": _anchor_doc("s", *speech_anchors)},
+        attachments=[{"attachment_id": chip, "kind": "prompt_link",
+                      "source": {"prompt_id": source.prompt_id, "channel_key": "visual"},
+                      "config": {}} for chip in chips])
+    scene = Scene(scene_id="s", duration_frames=48, prompt_sections=[source, target])
+    return scene, target
+
+
+def _identity(section):
+    return {"prompt_id": section.prompt_id, "start_frame": section.start_frame,
+            "end_frame": section.end_frame}
+
+
+def test_anchor_guard_refuses_the_second_of_two_hosts_removing_one_anchor_each():
+    scene, target = _linked_scene()
+    stored_visual = copy.deepcopy(target.channel_docs["visual"])
+    # Host 1 removes the visual anchor; the record stays placed in speech.
+    routes._apply_update_prompt_section(scene, 1, {"prompt_edit": {"documents": {"visual": {
+        "expected": stored_visual, "value": _anchor_doc("v")}}}}, _identity(target))
+    stored_speech = copy.deepcopy(target.channel_docs["speech"])
+    before = target.to_dict()
+    # Host 2, which still saw the visual anchor, removes the speech one.
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._apply_update_prompt_section(scene, 1, {"prompt_edit": {"documents": {"speech": {
+            "expected": stored_speech, "value": _anchor_doc("s")}}}}, _identity(target))
+    assert raised.value.code == "prompt_edit_conflict"
+    assert raised.value.details["record_kind"] == "document"
+    assert raised.value.details["record_key"] == "speech"
+    # The actual stored state, which still holds the anchor.
+    assert raised.value.details["current"] == stored_speech
+    assert target.to_dict() == before
+
+
+def test_anchor_guard_passes_removing_an_anchor_with_its_record_and_untouched_orphans():
+    scene, target = _linked_scene(visual_anchors=("c1",), speech_anchors=(), chips=("c1", "legacy"))
+    record = copy.deepcopy(next(a for a in target.attachments if a["attachment_id"] == "c1"))
+    routes._apply_update_prompt_section(scene, 1, {"prompt_edit": {
+        "documents": {"visual": {"expected": copy.deepcopy(target.channel_docs["visual"]),
+                                 "value": _anchor_doc("v edited")}},
+        "attachments": {"c1": {"expected": record, "value": None}}}}, _identity(target))
+    assert [a["attachment_id"] for a in target.attachments] == ["legacy"]
+    # An edit elsewhere in a section that already holds a legacy orphan passes.
+    routes._apply_update_prompt_section(scene, 1, {"prompt_edit": {"documents": {"speech": {
+        "expected": copy.deepcopy(target.channel_docs["speech"]),
+        "value": _anchor_doc("s edited")}}}}, _identity(target))
+    assert prompt_context.prompt_document_text(target.channel_docs["speech"]) == "s edited"
+
+
+def test_anchor_guard_refuses_a_new_inline_only_record_with_no_anchor():
+    scene, target = _linked_scene()
+    source_id = scene.prompt_sections[0].prompt_id
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._apply_update_prompt_section(scene, 1, {"prompt_edit": {"attachments": {"c2": {
+            "expected": None, "value": {
+                "attachment_id": "c2", "kind": "prompt_link", "config": {},
+                "source": {"prompt_id": source_id, "channel_key": "visual"}}}}}},
+            _identity(target))
+    assert raised.value.code == "prompt_edit_conflict"
+    assert raised.value.details["record_kind"] == "attachment"
+    assert raised.value.details["record_key"] == "c2"
+    assert raised.value.details["current"] is None
+
+
+def test_creating_a_section_refuses_an_unanchored_inline_only_record():
+    scene, _target = _linked_scene()
+    source_id = scene.prompt_sections[0].prompt_id
+    link = {"attachment_id": "c9", "kind": "prompt_link", "config": {},
+            "source": {"prompt_id": source_id, "channel_key": "visual"}}
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._apply_create_prompt_section(scene, {
+            "start_frame": 48, "end_frame": 60, "channels": {"visual": "x"},
+            "channel_docs": {"visual": _anchor_doc("x")}, "attachments": [link]})
+    assert raised.value.code == "unanchored_inline_attachment"
+    scene.duration_frames = 60
+    created = routes._apply_create_prompt_section(scene, {
+        "start_frame": 48, "end_frame": 60, "channels": {"visual": "x"},
+        "channel_docs": {"visual": _anchor_doc("x", "c9")}, "attachments": [link]})
+    assert [a["attachment_id"] for a in created.attachments] == ["c9"]
+
+
+def test_writing_apply_refuses_a_new_orphan_but_keeps_a_section_s_legacy_one():
+    scene, target = _linked_scene(visual_anchors=("c1",), speech_anchors=(), chips=("c1", "legacy"))
+    values = [section.to_dict() for section in scene.prompt_sections]
+    unchanged = copy.deepcopy(values)
+    routes._apply_replace_prompt_sections(scene, unchanged)   # the legacy orphan passes
+    values[1]["channel_docs"]["visual"] = _anchor_doc("v")    # drop c1's only anchor
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._apply_replace_prompt_sections(scene, values)
+    assert raised.value.code == "unanchored_inline_attachment"
+
+
+def test_split_does_not_copy_an_unanchored_inline_only_record():
+    _scene, target = _linked_scene(visual_anchors=("c1",), speech_anchors=(), chips=("c1", "legacy"))
+    documents, clones = prompt_context.clone_for_split(target.channel_docs, target.attachments)
+    assert [clone["kind"] for clone in clones] == ["prompt_link"]
+    anchored = {node["attachment_id"] for document in documents.values()
+                for node in document["nodes"] if node["type"] == "attachment"}
+    assert anchored == {clones[0]["attachment_id"]}

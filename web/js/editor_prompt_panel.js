@@ -1154,7 +1154,9 @@ export function mountPromptManagementPanel(host) {
         if (!current) return refuse("That prompt section was deleted while the dialog was open, so the change was not applied.");
         const live = mounted ? liveMounts.get(draftKey) : null;
         if (live) {
-            live.transactAttachments(build, channelKey);
+            // A dialog that configured a chip inside a box is that box's
+            // inline change; a scope-row dialog is a registry transaction.
+            live.transactAttachments(build, channelKey, channelKey ? "inline" : "registry");
         } else {
             const docsKey = global ? "global_channel_docs" : "channel_docs";
             const attsKey = global ? "global_attachments" : "attachments";
@@ -4073,14 +4075,19 @@ Server value: ${serverValue}` : ""}`;
                 disabled: globalLocked,
                 placeholder: channel.description || "",
                 ariaLabel: channel.description || `Global ${key}`,
-                onChange: ({ document: nextDocument, attachments, reason }) => {
+                isAnchoredElsewhere: (attachmentId) => promptAttachmentAnchoredChannels(
+                    Object.fromEntries(Object.entries(globalInputs)
+                        .filter(([channelKey]) => channelKey !== key)
+                        .map(([channelKey, box]) => [channelKey, box.promptDocument])),
+                    attachmentId).length > 0,
+                onChange: ({ document: nextDocument, attachments, reason, origin }) => {
                     globalDocuments[key] = nextDocument;
                     globalAttachments = attachments;
                     const snapshot = draftGlobalSceneSnapshot();
                     keepGlobalDraft(snapshot);
                     for (const sibling of Object.values(globalInputs)) {
                         if (sibling === input) continue;
-                        if (reason === "attachment") {
+                        if (reason === "attachment" && origin === "registry") {
                             sibling.recordSharedAttachmentTransaction?.(globalAttachments);
                         } else {
                             sibling.syncPromptAttachments?.(globalAttachments);
@@ -4303,9 +4310,9 @@ Server value: ${serverValue}` : ""}`;
                 }
                 renderDraftRecovery();
             },
-            transactAttachments: (build, channelKey) =>
+            transactAttachments: (build, channelKey, origin) =>
                 (globalInputs[channelKey] || globalInputs[globalKeys[0]])
-                    ?.transactPromptAttachments?.(build(globalAttachments)),
+                    ?.transactPromptAttachments?.(build(globalAttachments), null, { origin }),
         });
         body.appendChild(globalScopeHost);
         body.appendChild(makeHeightGrip(host, body, "panelGlobalBoxHeight", { label: "Drag to resize the global prompt box (persists)" }));
@@ -4476,14 +4483,21 @@ Server value: ${serverValue}` : ""}`;
                     disabled: sectionsLocked,
                     placeholder: channel.description || "",
                     ariaLabel: channel.description || `${key} channel`,
-                    onChange: ({ document: nextDocument, attachments, reason }) => {
+                    isAnchoredElsewhere: (attachmentId) => promptAttachmentAnchoredChannels(
+                        Object.fromEntries(Object.entries(channelInputs)
+                            .filter(([channelKey]) => channelKey !== key)
+                            .map(([channelKey, box]) => [channelKey, box.promptDocument])),
+                        attachmentId).length > 0,
+                    onChange: ({ document: nextDocument, attachments, reason, origin }) => {
                         channelDocuments[key] = nextDocument;
                         sectionAttachments = attachments;
                         const snapshot = draftSceneSnapshot();
                         keepSectionDraft(snapshot);
                         for (const sibling of Object.values(channelInputs)) {
                             if (sibling === input) continue;
-                            if (reason === "attachment") {
+                            // Only a registry transaction is undoable from a
+                            // sibling; an inline change is this box's to undo.
+                            if (reason === "attachment" && origin === "registry") {
                                 sibling.recordSharedAttachmentTransaction?.(sectionAttachments);
                             } else {
                                 sibling.syncPromptAttachments?.(sectionAttachments);
@@ -4813,9 +4827,9 @@ Server value: ${serverValue}` : ""}`;
                     }
                     renderDraftRecovery();
                 },
-                transactAttachments: (build, channelKey) =>
+                transactAttachments: (build, channelKey, origin) =>
                     (channelInputs[channelKey] || channelInputs[wideKey])
-                        ?.transactPromptAttachments?.(build(sectionAttachments)),
+                        ?.transactPromptAttachments?.(build(sectionAttachments), null, { origin }),
             });
             const onEnterBlur = (input, commit) => {
                 const handler = (e) => {

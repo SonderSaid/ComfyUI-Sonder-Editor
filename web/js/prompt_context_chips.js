@@ -270,6 +270,29 @@ export function promptShotDialogRole({ attachment, documents, attachments,
     });
 }
 
+/**
+ * An attachment record in a comparable form: keys sorted, and capability
+ * entries filled with the defaults the server's `normalize_capability` writes
+ * (`channel_key`, `placement`, `config`). A sparse browser record and its
+ * stored form compare equal; any authored difference still differs. For
+ * comparison only, never written.
+ */
+export function canonicalPromptRecord(record) {
+    const sorted = (value) => {
+        if (Array.isArray(value)) return value.map(sorted);
+        if (!value || typeof value !== "object") return value;
+        return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sorted(value[key])]));
+    };
+    if (!record || typeof record !== "object") return record ?? null;
+    const filled = { ...record };
+    if (Array.isArray(record.capabilities)) {
+        filled.capabilities = record.capabilities.map((capability) =>
+            capability && typeof capability === "object"
+                ? { channel_key: "", placement: "", config: {}, ...capability } : capability);
+    }
+    return sorted(filled);
+}
+
 export function promptAttachmentAnchoredChannels(documents, attachmentId) {
     const target = String(attachmentId || "");
     return Object.entries(documents || {}).filter(([, documentValue]) =>
@@ -1695,6 +1718,10 @@ export function createPromptDocumentEditor({
     onActivateAttachment = null,
     getHostSnapshot = null,
     onRestoreHostSnapshot = null,
+    // `(attachmentId) => boolean`: whether a sibling box of the same host
+    // anchors the record. The boxes of a section share one registry, so a
+    // record whose last anchor left THIS box may still be placed in another.
+    isAnchoredElsewhere = null,
     // `(model) => [{ afterIndex, element }]`, re-run on every render.
     // Decorations are NOT document content: they are read-only prose the
     // host paints between model nodes, and `readDom` is built to look
@@ -1708,6 +1735,11 @@ export function createPromptDocumentEditor({
     let history = [];
     let future = [];
     const attachmentById = () => new Map(attachments.map((value) => [value.attachment_id, value]));
+    const anchoredElsewhere = (attachmentId) => {
+        try { return Boolean(isAnchoredElsewhere?.(attachmentId)); } catch (_error) { return false; }
+    };
+    const anchoredIn = (documentValue) => new Set((documentValue?.nodes || [])
+        .filter((node) => node.type === "attachment").map((node) => node.attachment_id));
 
     const editor = document.createElement("div");
     editor.contentEditable = disabled ? "false" : "true";
@@ -1934,18 +1966,93 @@ export function createPromptDocumentEditor({
         }
     };
 
+    // A history entry restores this box's DOCUMENT whole, but the attachment
+    // registry is shared by every box of the host: an entry records only the
+    // registry change its own action made (`attachments` before, `after`
+    // after), and Undo/Redo invert exactly that change against the registry
+    // as it is now. Restoring the whole list from an older entry resurrected
+    // records other boxes had since removed and dropped ones they had added
+    // (bug tracker L3).
     const snapshot = () => ({ document: structuredClone(model), attachments: structuredClone(attachments),
+        after: null,
         selection: selectionBookmark(),
         host_state: typeof getHostSnapshot === "function"
             ? structuredClone(getHostSnapshot()) : undefined });
-    const emit = (reason = "document") => onChange?.({
-        document: structuredClone(model), attachments: structuredClone(attachments),
-        text: promptDocumentText(model), reason,
-    });
+    // The action that pushed the newest entry is complete: its registry
+    // change is now known.
+    const closeHistoryEntry = () => {
+        const entry = history[history.length - 1];
+        if (entry && entry.after === null) entry.after = structuredClone(attachments);
+    };
+    // `origin`: "inline" for a change this box's own text made (insert, prune,
+    // configure a chip it holds); "registry" for a host transaction such as a
+    // scope-row add or remove, which every box may undo.
+    const emit = (reason = "document", origin = "inline") => {
+        closeHistoryEntry();
+        onChange?.({
+            document: structuredClone(model), attachments: structuredClone(attachments),
+            text: promptDocumentText(model), reason, origin,
+        });
+    };
     const pushHistory = () => {
+        // An entry whose action never reported a change made none to the
+        // registry.
+        const open = history[history.length - 1];
+        if (open && open.after === null) open.after = open.attachments;
         history.push(snapshot());
         if (history.length > 100) history.shift();
         future = [];
+    };
+    /**
+     * Apply one entry's registry change (`from` -> `to`) to the registry as it
+     * is now. A record someone else changed since is left as it is. Records
+     * whose last anchor this step removed from this box go with it unless
+     * another box anchors them, and an inline-only record this step brought
+     * back without any anchor is not restored.
+     */
+    const applyRegistryChange = (fromList, toList, priorModel) => {
+        const from = new Map((fromList || []).map((value) => [value.attachment_id, value]));
+        const to = new Map((toList || []).map((value) => [value.attachment_id, value]));
+        const next = new Map(attachments.map((value) => [value.attachment_id, value]));
+        // The server's durable write fills sparse capability entries in, and an
+        // acknowledgement repaints that stored form: compare canonically, or
+        // the author's own saved change would read as someone else's.
+        const same = (a, b) => JSON.stringify(canonicalPromptRecord(a))
+            === JSON.stringify(canonicalPromptRecord(b));
+        const restored = [];
+        for (const id of new Set([...from.keys(), ...to.keys()])) {
+            const before = from.get(id) ?? null;
+            const after = to.get(id) ?? null;
+            if (same(before, after) || !same(next.get(id), before)) continue;
+            if (after === null) next.delete(id);
+            else {
+                if (!next.has(id)) restored.push(id);
+                next.set(id, structuredClone(after));
+            }
+        }
+        const nowAnchored = anchoredIn(model);
+        // An anchor the restored document brings back needs its record: the
+        // entry's own target state has it even when this step's change did
+        // not touch it (removed meanwhile through a sibling box's anchor).
+        for (const id of nowAnchored) {
+            if (!next.has(id) && to.has(id)) {
+                next.set(id, structuredClone(to.get(id)));
+                restored.push(id);
+            }
+        }
+        for (const id of anchoredIn(priorModel)) {
+            if (!nowAnchored.has(id) && next.has(id) && !anchoredElsewhere(id)) next.delete(id);
+        }
+        const refused = restored.filter((id) => INLINE_ONLY_KINDS.includes(next.get(id)?.kind)
+            && !nowAnchored.has(id) && !anchoredElsewhere(id));
+        for (const id of refused) next.delete(id);
+        if (refused.length) {
+            notifyWarning(refused.length === 1
+                ? "A Prompt link or Vocal event chip was not restored: its place in the text is gone."
+                : `${refused.length} Prompt link or Vocal event chips were not restored: their place in the text is gone.`,
+            { source: "prompt-undo-unanchored" });
+        }
+        return [...next.values()];
     };
 
     // Decorations are the host's read-only prose, painted BETWEEN model nodes
@@ -2352,7 +2459,8 @@ export function createPromptDocumentEditor({
             .filter((node) => node.type === "attachment")
             .map((node) => node.attachment_id));
         const removedInline = new Set([...previouslyAnchored]
-            .filter((attachmentId) => !stillAnchored.has(attachmentId)));
+            .filter((attachmentId) => !stillAnchored.has(attachmentId)
+                && !anchoredElsewhere(attachmentId)));
         if (removedInline.size) attachments = attachments.filter((attachment) =>
             !removedInline.has(attachment.attachment_id));
         emit(removedInline.size ? "attachment" : "document");
@@ -2544,9 +2652,12 @@ export function createPromptDocumentEditor({
             event.preventDefault();
             const previous = history.pop();
             if (!previous) return true;
-            future.push(snapshot());
+            const changedTo = previous.after ?? previous.attachments;
+            // Redo replays the same registry change, not this moment's list.
+            future.push({ ...snapshot(), attachments: previous.attachments, after: changedTo });
+            const priorModel = model;
             model = previous.document;
-            attachments = previous.attachments;
+            attachments = applyRegistryChange(changedTo, previous.attachments, priorModel);
             if (previous.host_state !== undefined) {
                 onRestoreHostSnapshot?.(structuredClone(previous.host_state));
             }
@@ -2557,9 +2668,10 @@ export function createPromptDocumentEditor({
             event.preventDefault();
             const next = future.pop();
             if (!next) return true;
-            history.push(snapshot());
+            history.push({ ...snapshot(), attachments: next.attachments, after: next.after });
+            const priorModel = model;
             model = next.document;
-            attachments = next.attachments;
+            attachments = applyRegistryChange(next.attachments, next.after, priorModel);
             if (next.host_state !== undefined) {
                 onRestoreHostSnapshot?.(structuredClone(next.host_state));
             }
@@ -2640,7 +2752,8 @@ export function createPromptDocumentEditor({
                 const attachmentId = chip.dataset.attachmentId;
                 pushHistory();
                 model.nodes = model.nodes.filter((value) => value.node_id !== nodeId);
-                if (!model.nodes.some((value) => value.attachment_id === attachmentId)) {
+                if (!model.nodes.some((value) => value.attachment_id === attachmentId)
+                        && !anchoredElsewhere(attachmentId)) {
                     attachments = attachments.filter((value) => value.attachment_id !== attachmentId);
                 }
                 model = normalizePromptDocument(model);
@@ -2708,7 +2821,11 @@ export function createPromptDocumentEditor({
     const removeAttachment = (attachmentId) => {
         pushHistory();
         model.nodes = model.nodes.filter((value) => value.attachment_id !== attachmentId);
-        attachments = attachments.filter((value) => value.attachment_id !== attachmentId);
+        // The chip leaves this box; its record stays while another box
+        // still places it.
+        if (!anchoredElsewhere(attachmentId)) {
+            attachments = attachments.filter((value) => value.attachment_id !== attachmentId);
+        }
         model = normalizePromptDocument(model);
         render();
         emit("attachment");
@@ -2863,7 +2980,8 @@ export function createPromptDocumentEditor({
                 .map((node) => node.attachment_id));
             attachments = attachments.filter((value) =>
                 stillAnchored.has(value.attachment_id)
-                || !removedIds.includes(value.attachment_id));
+                || !removedIds.includes(value.attachment_id)
+                || anchoredElsewhere(value.attachment_id));
         }
         return { index: from.index + (keepHead ? 1 : 0), offset: headText.length,
             removedAttachment: removedIds.length > 0 };
@@ -2982,6 +3100,9 @@ export function createPromptDocumentEditor({
         const nextAttachments = normalizePromptAttachments(raw);
         if (JSON.stringify(nextModel) === JSON.stringify(model)
                 && JSON.stringify(nextAttachments) === JSON.stringify(attachments)) return false;
+        // An open entry (a composition in progress) must not take a sibling's
+        // registry change in as its own: its change so far ends here.
+        if (JSON.stringify(nextAttachments) !== JSON.stringify(attachments)) closeHistoryEntry();
         const bookmark = selectionBookmark();
         model = nextModel;
         attachments = nextAttachments;
@@ -2995,16 +3116,24 @@ export function createPromptDocumentEditor({
     editor.syncPromptAttachments = (raw) => editor.syncPromptState({
         document: model, attachments: raw,
     });
-    editor.transactPromptAttachments = (raw, mutateHostState = null) => {
+    // `origin`: "registry" (default) for a scope-row transaction; a host
+    // applying a dialog's configuration of a chip this box holds passes
+    // "inline", so only this box can undo it.
+    editor.transactPromptAttachments = (raw, mutateHostState = null, { origin = "registry" } = {}) => {
         pushHistory();
         if (typeof mutateHostState === "function") mutateHostState();
         attachments = normalizePromptAttachments(raw);
         render();
-        emit("attachment");
+        emit("attachment", origin === "inline" ? "inline" : "registry");
     };
+    // A sibling's REGISTRY transaction (scope row), undoable from this box
+    // too. Inline changes in a sibling are synced without an entry
+    // (`syncPromptAttachments`): undoing them belongs to the box whose text
+    // made them.
     editor.recordSharedAttachmentTransaction = (raw) => {
         pushHistory();
         attachments = normalizePromptAttachments(raw);
+        closeHistoryEntry();
         render();
     };
     editor.addOwnedKeyHandler = (handler) => {

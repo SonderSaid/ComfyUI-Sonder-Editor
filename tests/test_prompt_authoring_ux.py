@@ -2455,14 +2455,14 @@ def test_prompt_panel_writing_and_global_views_use_bound_shared_overlays():
 
 def test_prompt_panel_reuses_one_draft_overlay_per_global_and_section_change():
     panel = _source("web/js/editor_prompt_panel.js")
-    global_start = panel.index("onChange: ({ document: nextDocument, attachments, reason }) => {",
+    global_start = panel.index("onChange: ({ document: nextDocument, attachments, reason, origin }) => {",
                                panel.index("const draftGlobalSceneSnapshot"))
     global_change = panel[global_start:panel.index("onActivateAttachment:", global_start)]
     assert global_change.count("draftGlobalSceneSnapshot()") == 1
     assert "const snapshot = draftGlobalSceneSnapshot();" in global_change
     assert "keepGlobalDraft(snapshot);" in global_change
 
-    section_start = panel.index("onChange: ({ document: nextDocument, attachments, reason }) => {",
+    section_start = panel.index("onChange: ({ document: nextDocument, attachments, reason, origin }) => {",
                                 panel.index("const draftSceneSnapshot"))
     section_change = panel[section_start:panel.index("onActivateAttachment:", section_start)]
     assert section_change.count("draftSceneSnapshot()") == 1

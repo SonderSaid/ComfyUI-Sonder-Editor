@@ -27,6 +27,9 @@ a fresh `[Unreleased]` block.
 - A Context chip added through **+ Attach** shows in the open Prompt panel right away, instead of only after reopening it. If the section was deleted or the scene changed while the dialog was open, nothing is attached and a notice says why.
 - **Convert to copy** on a section Prompt link now works (it used to fail without changing anything), and it changes only the fields it fills in.
 - The Prompt panel's save-failed bar says when a draft also changed other fields that **Use server's version** keeps.
+- **Ctrl+Z** in one prompt box no longer brings back a Context chip you deleted in another box of the same section, or removes one you added there. A Prompt link deleted that way used to come back with no place in the text and block the section from running.
+- A Context chip placed in two channel boxes of a section stays when you delete it from just one of them.
+- An edit to a prompt section that would leave a Prompt link or Vocal event with no place in its text is refused and kept as a draft, instead of saving a chip that blocks the section.
 
 ## [0.9.0] - 2026-11-19
 

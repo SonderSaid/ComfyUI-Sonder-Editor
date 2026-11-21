@@ -16950,11 +16950,18 @@ export class EditorWidget {
                 compact: true,
                 placeholder: entry.description || "",
                 ariaLabel: entry.description || `${this._channelPlaceholder(key).slice(0, -1)} channel`,
-                onChange: ({ attachments, reason }) => {
+                isAnchoredElsewhere: (attachmentId) => promptAttachmentAnchoredChannels(
+                    Object.fromEntries(Object.entries(inputs)
+                        .filter(([channelKey]) => channelKey !== key)
+                        .map(([channelKey, box]) => [channelKey, box.promptDocument])),
+                    attachmentId).length > 0,
+                onChange: ({ attachments, reason, origin }) => {
                     sharedAttachments = attachments;
                     for (const sibling of Object.values(inputs)) {
                         if (sibling === input) continue;
-                        if (reason === "attachment") {
+                        // Only a registry transaction is undoable from a
+                        // sibling; an inline change is this box's to undo.
+                        if (reason === "attachment" && origin === "registry") {
                             sibling.recordSharedAttachmentTransaction?.(sharedAttachments);
                         } else {
                             sibling.syncPromptAttachments?.(sharedAttachments);

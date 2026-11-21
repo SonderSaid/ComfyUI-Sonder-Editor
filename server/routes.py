@@ -2384,6 +2384,51 @@ def _prompt_document_shape(document):
     return shape
 
 
+def _prompt_anchor_ids(documents) -> set:
+    """Attachment ids anchored inline anywhere in a channel-document map."""
+    anchored = set()
+    for document in (documents or {}).values():
+        if not isinstance(document, dict):
+            continue
+        for node in document.get("nodes") or []:
+            if isinstance(node, dict) and node.get("type") == "attachment":
+                anchored.add(str(node.get("attachment_id") or ""))
+    return anchored
+
+
+def _newly_unanchored_inline(before_documents, before_attachments,
+                             after_documents, after_attachments, *, created=True) -> list:
+    """Inline-only records a write would leave with no inline anchor.
+
+    A Prompt link or Vocal event lives only through its anchor in the text;
+    without one it compiles as the blocking `unanchored_inline_attachment`
+    (bug tracker L3). A record counts when the write removed its last anchor,
+    or (`created`) when an authoring write created it unanchored. Legacy
+    orphans the write did not touch pass, so old projects stay editable; the
+    scope row's remove action is their way out. Section scope only: these kinds
+    are invalid in global scope whatever their anchors, and the compiler says so.
+    """
+    before_anchored = _prompt_anchor_ids(before_documents)
+    after_anchored = _prompt_anchor_ids(after_documents)
+    before_ids = {str((row or {}).get("attachment_id") or "")
+                  for row in before_attachments or [] if isinstance(row, dict)}
+    result = []
+    for row in after_attachments or []:
+        if not isinstance(row, dict) or row.get("kind") not in prompt_context.INLINE_ONLY_KINDS:
+            continue
+        attachment_id = str(row.get("attachment_id") or "")
+        if attachment_id in after_anchored:
+            continue
+        if attachment_id in before_anchored or (created and attachment_id not in before_ids):
+            result.append(attachment_id)
+    return result
+
+
+_UNANCHORED_INLINE_MESSAGE = (
+    "This change would leave a Prompt link or Vocal event chip with no place in the "
+    "text. Your draft was not saved.")
+
+
 def _merge_prompt_edit_fields(fields, documents, attachments, *, global_scope=False):
     """Compare touched records, then merge into current state under the write lock.
 
@@ -2443,6 +2488,25 @@ def _merge_prompt_edit_fields(fields, documents, attachments, *, global_scope=Fa
                 target.pop(key, None)
             else:
                 target[key] = copy.deepcopy(value)
+    orphaned = [] if global_scope else _newly_unanchored_inline(
+        documents, attachments, docs, list(chips.values()))
+    if orphaned:
+        # Name the record the author can resolve: the touched document that
+        # held the last anchor (its stored text keeps it), else the record
+        # this edit created without one (nothing stored).
+        attachment_id = orphaned[0]
+        stored_documents = documents or {}
+        culprit = next((key for key in (edit.get("documents") or {})
+                        if attachment_id in _prompt_anchor_ids({key: stored_documents.get(key)})
+                        and attachment_id not in _prompt_anchor_ids({key: docs.get(key)})), None)
+        _mutation_error(
+            _UNANCHORED_INLINE_MESSAGE, 409, "prompt_edit_conflict",
+            {"record_kind": "document", "record_key": str(culprit),
+             "current": copy.deepcopy(stored_documents.get(culprit))}
+            if culprit is not None else
+            {"record_kind": "attachment", "record_key": attachment_id,
+             "current": copy.deepcopy(next((row for row in attachments or []
+                                             if row.get("attachment_id") == attachment_id), None))})
     prefix = "global_" if global_scope else ""
     result = {key: value for key, value in fields.items() if key != "prompt_edit"}
     if edit.get("documents"):
@@ -4141,6 +4205,11 @@ def _apply_create_prompt_section(scene: Scene, fields: dict) -> PromptSection:
     start_frame = _mutation_int(fields.get("start_frame", 0), "start_frame", 0)
     end_frame = _mutation_int(fields.get("end_frame", 0), "end_frame", 0)
     _require_no_prompt_overlap(scene, start_frame, end_frame)
+    # Both the mutation op and the legacy POST route create through here.
+    if _newly_unanchored_inline(
+            {}, [], fields.get("channel_docs") if isinstance(fields.get("channel_docs"), dict) else {},
+            fields.get("attachments") if isinstance(fields.get("attachments"), list) else []):
+        _mutation_error(_UNANCHORED_INLINE_MESSAGE, 400, "unanchored_inline_attachment")
     section = PromptSection(
         start_frame=start_frame,
         end_frame=end_frame,
@@ -4232,6 +4301,19 @@ def _apply_replace_prompt_sections(scene: Scene, values) -> list[PromptSection]:
         seen_ids.add(prompt_id)
         previous_end = section.end_frame
         sections.append(section)
+    # Judged per prompt id: a section may not lose an inline-only record's
+    # last anchor and keep the record. Records arriving unanchored are not
+    # refused here, because this op also replays carried sections (browser
+    # templates, prompt history) whose legacy orphans are tolerated at rest.
+    before_by_id = {str(getattr(value, "prompt_id", "") or ""): value
+                    for value in getattr(scene, "prompt_sections", []) or []}
+    for section in sections:
+        previous = before_by_id.get(str(section.prompt_id or ""))
+        if _newly_unanchored_inline(
+                getattr(previous, "channel_docs", None) or {},
+                getattr(previous, "attachments", None) or [],
+                section.channel_docs or {}, section.attachments or [], created=False):
+            _mutation_error(_UNANCHORED_INLINE_MESSAGE, 409, "unanchored_inline_attachment")
     # Writing-mode Apply replaces every section at once, so the scene cap is
     # checked against the incoming set as a whole rather than section by
     # section. This is the highest-volume attachment write in the product.

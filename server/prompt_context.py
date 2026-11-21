@@ -1867,8 +1867,17 @@ def clone_for_split(channel_documents, attachments) -> tuple[dict, list]:
     deduplicate their semantic output.
     """
     clones, id_map = [], {}
+    anchored = {node["attachment_id"]
+                for raw in (channel_documents or {}).values()
+                for node in normalize_prompt_document(raw)["nodes"]
+                if node["type"] == "attachment"}
     for attachment in normalize_attachments(attachments):
         if attachment["kind"] in {"shot", "timestamp"}:
+            continue
+        # An inline-only record with no anchor (a legacy orphan) stays where it
+        # is; a copy in the right half would be a new orphan.
+        if (attachment["kind"] in INLINE_ONLY_KINDS
+                and attachment["attachment_id"] not in anchored):
             continue
         clone = copy.deepcopy(attachment)
         clone_id = _new_id()
