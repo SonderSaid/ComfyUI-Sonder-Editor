@@ -18832,6 +18832,11 @@ export class EditorWidget {
                 return;
             }
             const { response, payload } = value;
+            if (response?.ok === false && payload?.code === "project_version_conflict"
+                    && spec.onVersionConflict?.() === true) {
+                // Kept, stale, while the one follow-up runs (bug tracker L5).
+                return;
+            }
             if (!response.ok || !payload) {
                 this._promptContextScenePayloadCache = null;
                 this._clearPromptStaleVisualTimerIfSettled(sceneId);
@@ -19098,6 +19103,49 @@ export class EditorWidget {
                 dirName, sceneId, candidate, windowStart, windowEnd, body,
                 token: sceneToken }) : null;
             if (!windowedLive && !scene) return;
+            // An exhausted version conflict (the bounded retry also raced a
+            // newer save) is not a failure of the author's prompt: each branch
+            // keeps the result it already has, marked stale at intent time,
+            // adds no error, and this intent asks for ONE follow-up with the
+            // same draft overlay, only while nothing newer has superseded it.
+            // The follow-up's own conflict falls through to the ordinary
+            // failure, so this can never loop (bug tracker L5).
+            // Each branch answers to its own token (windowed: `token`; scene:
+            // `sceneToken`): a windowed-only newer intent joins the scene work
+            // in flight, so gating the scene's follow-up on the windowed token
+            // left a conflicted scene payload stale with nothing re-requesting
+            // it (Phase 4 audit M1).
+            const followUps = (this._promptConflictFollowUps ||= { windowed: null, scene: null });
+            // One follow-up per intent, whichever branches conflicted: it
+            // re-plans both, and runs while any of them is still the latest.
+            const wanting = new Set();
+            let followUpTimer = null;
+            const conflictFollowUp = (branch) => {
+                const mine = branch === "scene" ? sceneToken : token;
+                if (followUps[branch] === mine) return false;
+                wanting.add(branch);
+                if (followUpTimer) return true;
+                followUpTimer = setTimeout(() => {
+                    const live = [...wanting].some((name) => (name === "scene"
+                        ? sceneToken === this._promptContextScenePayloadToken
+                        : token === this._promptContextPreviewToken));
+                    if (this._destroyed || dirName !== this._projectDirName()
+                            || sceneId !== this.activeSceneId || !live) return;
+                    const before = { windowed: this._promptContextPreviewToken,
+                        scene: this._promptContextScenePayloadToken };
+                    this._previewPromptContextCandidate(scenePatch, 0, promptSemanticUnitCreates);
+                    // Only a branch the follow-up re-ran (a new token) is a
+                    // follow-up; one it found current or joined is not.
+                    if (this._promptContextPreviewToken !== before.windowed)
+                        followUps.windowed = this._promptContextPreviewToken;
+                    if (this._promptContextScenePayloadToken !== before.scene)
+                        followUps.scene = this._promptContextScenePayloadToken;
+                }, 0);
+                return true;
+            };
+            const versionConflict = (result) => result?.response?.ok === false
+                && result?.payload?.code === "project_version_conflict";
+            if (scene) scene.onVersionConflict = () => conflictFollowUp("scene");
             const windowedKey = windowedLive ? (this._promptCompileKey?.(body) || "") : "";
             const windowedEntry = windowedLive ? { state: "inflight", key: windowedKey,
                 sceneId, token, version: String(body.base_modified_at || "") } : null;
@@ -19142,6 +19190,15 @@ export class EditorWidget {
                     return;
                 }
                 const { response, payload } = result;
+                if (versionConflict(result) && conflictFollowUp("windowed")) {
+                    // The held candidate stays, already marked stale; its
+                    // warnings are its own. Nothing is reported as an error.
+                    if (this._promptContextCandidateCache?._candidate_scene_id === sceneId) {
+                        this._promptPanelHandle?.refreshDiagnostics?.(
+                            this._promptContextCandidateCache);
+                    }
+                    return;
+                }
                 const failed = !response.ok || !payload;
                 const diagnostic = failed ? {
                     code: payload?.code || (response.ok

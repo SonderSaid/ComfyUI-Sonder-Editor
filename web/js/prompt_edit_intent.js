@@ -546,5 +546,8 @@ export async function savePromptDraft(drafts, key, save) {
         return await row.pending;
     } finally {
         row.pending = null;
+        // A refusal published during the drain was drawn while the save was
+        // still pending (Discard disabled); say it again now that it is not.
+        if (row.error && drafts.get(key) === row) publish(drafts, { key, global: row.global, refused: true });
     }
 }

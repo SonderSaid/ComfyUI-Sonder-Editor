@@ -35,7 +35,9 @@ def _node(script: str) -> dict:
     node = shutil.which("node")
     if not node:
         pytest.skip("node is required for prompt preview freshness coverage")
-    result = subprocess.run([node, "--input-type=module", "-e", script],
+    # On stdin, not `-e`: lifted production methods make these scripts long,
+    # and Windows caps a command line at 32,767 characters (WinError 206).
+    result = subprocess.run([node, "--input-type=module"], input=script,
                             capture_output=True, text=True, encoding="utf-8")
     assert result.returncode == 0, result.stderr or result.stdout
     return json.loads(result.stdout.strip().splitlines()[-1])

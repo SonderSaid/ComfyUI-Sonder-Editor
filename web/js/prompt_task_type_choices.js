@@ -69,7 +69,7 @@ export function captureTaskTypePreview(candidate) {
  */
 export function resolveTaskTypeDisplay({ rolesDefault = false, local = null,
     inherited = null, preview = null, automaticLabel = TASK_TYPE_AUTOMATIC_LABEL,
-    localLabel = "this attachment" } = {}) {
+    localLabel = "this attachment", customizing = false } = {}) {
     const localPresent = Boolean(local?.present);
     const localValue = normalizedList(local?.value);
     const inheritedValue = normalizedList(inherited?.value);
@@ -92,7 +92,11 @@ export function resolveTaskTypeDisplay({ rolesDefault = false, local = null,
             detail: details.join(" "),
         };
     };
-    if (localPresent && (localValue.length || !rolesDefault)) {
+    // `customizing`: the author pressed Customize in this dialog. Until Reset,
+    // their list is shown as theirs and stays editable even while empty;
+    // otherwise Customize with no automatic choice left every box locked
+    // (bug tracker L1). It is dialog state, never stored.
+    if (localPresent && (localValue.length || !rolesDefault || customizing)) {
         return { mode: "customized", stored: true, checks: localValue,
             label: "Customized", detail: "" };
     }
@@ -150,6 +154,7 @@ export function createTaskTypeChoiceControl({
     // `touched` is the whole sparseness contract: until the author presses
     // Customize or Reset, `value()` returns `original` verbatim.
     let touched = false;
+    let customizing = false;
     let localState = { present: original.present, value: [...original.value] };
     let display = null;
 
@@ -248,7 +253,7 @@ export function createTaskTypeChoiceControl({
     const render = () => {
         display = resolveTaskTypeDisplay({
             rolesDefault, local: localState, inherited: inherited?.() || null,
-            preview, automaticLabel, localLabel,
+            preview, automaticLabel, localLabel, customizing,
         });
         const customized = display.mode === "customized";
         state.textContent = display.label;
@@ -287,6 +292,7 @@ export function createTaskTypeChoiceControl({
         localState = { present: true,
             value: [...new Set((display?.checks || []).map(asDeclared))] };
         touched = true;
+        customizing = true;
         render();
         onChange?.();
         [...boxes.values()].find((box) => !box.disabled)?.focus?.();
@@ -294,6 +300,7 @@ export function createTaskTypeChoiceControl({
     reset.addEventListener("click", () => {
         localState = { present: false, value: [] };
         touched = true;
+        customizing = false;
         error.style.display = "none";
         render();
         // Focus first: the host may hide this row in `onChange` (a collapsed

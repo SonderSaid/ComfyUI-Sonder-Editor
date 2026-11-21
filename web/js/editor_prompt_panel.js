@@ -1206,6 +1206,7 @@ export function mountPromptManagementPanel(host) {
             guard.focusedBox.el.blur();
         }
         mounted = false;
+        discardConfirm?.teardown();
         stopDraftListener();
         liveMounts.clear();
         identityRefreshGate.clear();
@@ -1603,6 +1604,9 @@ export function mountPromptManagementPanel(host) {
         + "align-items:center;gap:6px;";
     diagnosticsRegion.appendChild(draftRecovery);
     let recoverySignature = "", selectedRecoveryKey = "";
+    // The open Discard confirm, if any: torn down whenever the bar redraws or
+    // the panel closes, since it is bound to the row it was opened for.
+    let discardConfirm = null;
     const failedDraftRows = () => {
         const projectId = host._projectDirName(), sceneId = host.activeSceneId;
         return [...drafts].filter(([key, row]) => {
@@ -1620,6 +1624,7 @@ export function mountPromptManagementPanel(host) {
         const rows = failedDraftRows();
         if (!rows.length) {
             recoverySignature = "";
+            discardConfirm?.teardown();
             draftRecovery.replaceChildren();
             draftRecovery.style.display = "none";
             diagnostics.style.paddingTop = "7px";
@@ -1628,9 +1633,10 @@ export function mountPromptManagementPanel(host) {
         if (!rows.some(([key]) => key === selectedRecoveryKey)) selectedRecoveryKey = rows[0][0];
         const signature = JSON.stringify(rows.map(([key, row]) => [key, row.error,
             row.conflict?.record_kind, row.conflict?.record_key, row.conflict?.current,
-            promptDraftRecordLabels(row), key === selectedRecoveryKey]));
+            promptDraftRecordLabels(row), key === selectedRecoveryKey, Boolean(row.pending)]));
         if (signature === recoverySignature) return;
         recoverySignature = signature;
+        discardConfirm?.teardown();
         draftRecovery.replaceChildren();
         draftRecovery.style.display = "flex";
         diagnostics.style.paddingTop = "40px";
@@ -1689,16 +1695,110 @@ Server value: ${serverValue}` : ""}`;
         });
         const discard = keepRecoveryFocus(makeBtn("Discard", "Discard only this draft"));
         discard.disabled = Boolean(row.pending);
-        discard.addEventListener("click", async () => {
-            if (row.pending || !globalThis.confirm?.("Discard this unsaved Prompt draft and reload server text?")) return;
-            guard.suppressBlurCommit = true;
-            try {
-                document.activeElement?.blur?.();
+        // An in-editor confirm, not `confirm()`: hosts that suppress native
+        // dialogs answered it `false`, so Discard did nothing. It is bound to
+        // this row, its revision, the project and the scene; it owns Escape
+        // (Keep) above the panel's own Escape; and the draft goes only once the
+        // server's text has actually been reloaded.
+        discard.addEventListener("click", () => {
+            if (row.pending || discardConfirm) return;
+            const revision = row.revision;
+            const projectId = host._projectDirName(), sceneId = host.activeSceneId;
+            const returnFocus = document.activeElement;
+            const question = document.createElement("span");
+            question.textContent = "Discard this draft and reload the server's text?";
+            question.style.cssText = `font-weight:600;color:${COLORS.text};`;
+            const confirmButton = keepRecoveryFocus(makeBtn("Discard draft",
+                "Drop this draft and show the server's text"));
+            setButtonVariant(confirmButton, "danger");
+            const keep = keepRecoveryFocus(makeBtn("Keep", "Keep the draft (Escape)"));
+            const buttons = [retry, useServer, dismiss, discard];
+            let releaseEscape = () => {};
+            let busy = false;
+            const teardown = () => {
+                if (discardConfirm !== state) return;
+                discardConfirm = null;
+                releaseEscape();
+                // Focus on the confirm would fall to the page when it goes, and
+                // the next Escape would close the panel: give it back.
+                const hadFocus = [confirmButton, keep].includes(document.activeElement);
+                question.remove(); confirmButton.remove(); keep.remove();
+                for (const button of buttons) button.style.display = "";
+                if (hadFocus && returnFocus?.isConnected) returnFocus.focus?.({ preventScroll: true });
+            };
+            const state = { teardown };
+            discardConfirm = state;
+            const cancel = () => {
+                if (busy) return;
+                teardown();
+            };
+            releaseEscape = registerKeyboardConsumer({
+                id: `sonder-prompt-discard-${Date.now().toString(36)}`,
+                priority: KEY_PRIORITY.OVERLAY,
+                keydown: (event) => {
+                    if (event.isComposing === true || event.keyCode === 229) return false;
+                    if (event.key !== "Escape") return false;
+                    // Only while the author is on the confirm: Escape in a box
+                    // keeps its own meaning (revert it) (Phase 4 audit M2).
+                    if (!draftRecovery.contains(document.activeElement)) return false;
+                    cancel();
+                    return true;
+                },
+            });
+            keep.addEventListener("click", cancel);
+            confirmButton.addEventListener("click", async () => {
+                if (busy) return;
+                const stillBound = () => drafts.get(key) === row && row.revision === revision
+                    && !row.pending && host._projectDirName() === projectId
+                    && host.activeSceneId === sceneId;
+                if (!stillBound()) {
+                    teardown();
+                    notifyWarning("The draft changed while you were confirming, so nothing was discarded.",
+                        { source: "prompt-draft-discard" });
+                    recoverySignature = ""; renderDraftRecovery();
+                    return;
+                }
+                busy = true;
+                setButtonDisabled(confirmButton, true); setButtonDisabled(keep, true);
+                let reloaded = false;
+                try {
+                    // A box still holding focus must not commit the draft
+                    // being discarded on this blur.
+                    guard.suppressBlurCommit = true;
+                    try { document.activeElement?.blur?.(); }
+                    finally { guard.suppressBlurCommit = false; }
+                    reloaded = (await host._fetchScenes?.({ ignoreMutationGate: true,
+                        reason: "prompt_draft_discard" })) !== false;
+                } catch (_error) {
+                    reloaded = false;
+                } finally {
+                    busy = false;
+                }
+                teardown();
+                if (!reloaded) {
+                    // The recovery stays until the server's text is in hand.
+                    notifyWarning("The server's text was not reloaded yet, so the draft is kept. Try Discard again.",
+                        { source: "prompt-draft-discard" });
+                    recoverySignature = ""; renderDraftRecovery();
+                    return;
+                }
+                if (!stillBound()) {
+                    notifyWarning("The draft changed while the server's text was reloading, so it was kept.",
+                        { source: "prompt-draft-discard" });
+                    recoverySignature = ""; renderDraftRecovery();
+                    return;
+                }
                 drafts.delete(key);
-                await host._fetchScenes?.({ ignoreMutationGate: true,
-                    reason: "prompt_draft_discard" });
                 recoverySignature = ""; render(); renderDraftRecovery();
-            } finally { guard.suppressBlurCommit = false; }
+            });
+            for (const button of buttons) button.style.display = "none";
+            draftRecovery.append(question, confirmButton, keep);
+            // Only this focus move is shielded: the box it leaves must not
+            // commit the refused draft. While the confirm is open the author
+            // may still edit, and blur commits work as ever (audit M2).
+            guard.suppressBlurCommit = true;
+            try { confirmButton.focus?.({ preventScroll: true }); }
+            finally { guard.suppressBlurCommit = false; }
         });
         draftRecovery.append(retry, useServer, dismiss, discard);
     };

@@ -885,9 +885,9 @@ console.log(JSON.stringify({ afterUndo, afterRedo: { meta: blockMeta,
 
 # --- L1: Customize with no automatic task types ----------------------------
 
-@pytest.mark.xfail(strict=True, raises=AssertionError,
-                   reason="L1; Phase 4 (an empty customized list displays as automatic)")
 def test_customize_unlocks_the_task_types_when_no_role_derives_one():
+    """L1 (strict-xfail until Phase 4): with no automatic task types, Customize
+    left every box locked because an empty list displayed as automatic."""
     candidate = json.loads(json.dumps(CANDIDATE))
     candidate["h3_task_type_preview"]["role_derived"] = []
     candidate["h3_task_type_preview"]["scene_effective"] = []
@@ -1080,6 +1080,36 @@ fire(b, "paste", clip(data).event);
 console.log(JSON.stringify(summary(b)));
 """)
     assert "".join(result["nodes"]) == "Xone  two" and result["atts"] == []
+
+
+def test_an_empty_customize_with_nothing_automatic_is_refused_and_reset_restores_automatic():
+    """Phase 4.1: Customize with no automatic types shows an editable,
+    customized empty list; saving it is still refused (a roles-derived field
+    would read empty as automatic), and Reset ends the customizing state."""
+    candidate = json.loads(json.dumps(CANDIDATE))
+    candidate["h3_task_type_preview"]["role_derived"] = []
+    candidate["h3_task_type_preview"]["scene_effective"] = []
+    candidate["h3_task_type_preview"]["scene_source"] = "none"
+    result = _chip_script(f"""
+        const steps = async ({{ press, read }}) => {{
+            press("Customize");
+            globalThis.__customized = read();
+        }};
+        steps.afterRefusal = async ({{ press, read }}) => {{
+            press("Reset to inherited");
+            globalThis.__afterReset = read();
+        }};
+        const r = await openChip({json.dumps(_chip())}, {json.dumps(candidate)}, steps);
+        console.log(JSON.stringify({{ ...r, customized: globalThis.__customized,
+            afterReset: globalThis.__afterReset }}));
+    """)
+    assert result["customized"]["mode"] == "customized"
+    assert result["customized"]["disabled"] is False
+    assert result["refused"] is True
+    assert "at least one supported task type" in result["refusal"]["error"]
+    assert result["afterReset"]["mode"] == "automatic"
+    assert result["afterReset"]["disabled"] is True
+    assert "task_types" not in result["saved"]["config"]["overrides"]
 
 
 def test_hostile_fragments_are_rejected_before_normalization():
@@ -1286,3 +1316,43 @@ console.log(JSON.stringify({ parsed: mod.parsePromptFragment(JSON.stringify(bad)
 """)
     assert result["parsed"] is None
     assert "".join(result["nodes"]) == "Xhello " and result["atts"] == []
+
+
+# --- Phase 4 -----------------------------------------------------------------
+
+def test_a_refusal_is_published_again_once_the_save_stops_pending():
+    """Phase 4: the recovery bar is first drawn from the refusal published
+    during the drain (save still pending, Discard disabled); the drain says it
+    again once nothing is pending, so the bar redraws with Discard enabled."""
+    url = _url("web/js/prompt_edit_intent.js")
+    result = _run_node(f"""
+const I = await import({url});
+const drafts = new Map();
+const events = [];
+I.addPromptDraftListener(drafts, (event) => {{
+    if (event.refused) events.push({{ pending: Boolean(drafts.get(event.key)?.pending) }});
+}});
+const doc = (t) => ({{ nodes: [{{ type: "text", node_id: "n", text: t }}] }});
+const mount = I.createPromptDraftMount({{ drafts, key: "k", shown: {{ documents: {{ v: doc("A") }} }},
+    displayed: {{ documents: {{ v: doc("A") }} }} }});
+mount.record({{ documents: {{ v: doc("B") }} }});
+await I.savePromptDraft(drafts, "k", async () => ({{ status: "refused", message: "no" }}));
+console.log(JSON.stringify({{ events, pendingAfter: Boolean(drafts.get("k")?.pending) }}));
+""")
+    assert result["events"][0]["pending"] is True
+    assert result["events"][-1]["pending"] is False
+    assert result["pendingAfter"] is False
+
+
+def test_discard_confirms_in_the_panel_never_with_a_native_dialog():
+    """Phase 4: `confirm()` answered `false` in hosts that suppress dialogs,
+    so Discard did nothing. Pinned by source: the panel cannot mount in node;
+    the behaviour was checked live (plan record)."""
+    panel = _source("web/js/editor_prompt_panel.js")
+    start = panel.index('const discard = keepRecoveryFocus(makeBtn("Discard"')
+    handler = panel[start:panel.index("draftRecovery.append(retry, useServer, dismiss, discard);", start)]
+    for native in ("globalThis.confirm", "window.confirm", "confirm?.("):
+        assert native not in handler, native
+    assert "Discard this draft and reload the server's text?" in handler
+    assert "registerKeyboardConsumer({" in handler
+    assert "draftRecovery.contains(document.activeElement)" in handler

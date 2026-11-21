@@ -1847,6 +1847,10 @@ class Subject {
        payload: {code: "project_version_conflict", error: "project_version_conflict"}},
       {response: {ok: true, status: 200}, payload: {prompt: "fresh"}},
     ];
+    // This request IS the one follow-up (L5): its conflict takes the ordinary
+    // failure path this test is about. A first conflict would keep the held
+    // candidate instead (test_exhausted_preview_conflict_...).
+    this._promptConflictFollowUps = {windowed: 1, scene: null};
   }
   _projectDirName() { return "project"; }
   _selectionContextRange() { return {contextStart: 0, contextEnd: 100}; }
@@ -1930,16 +1934,26 @@ class Subject {
   _renderTimeline() {}
 }
 const subject = new Subject();
+const runNext = async () => {
+  const timer = timers.find((t) => t.ms === 0 && !t.cancelled && !t.ran);
+  if (!timer) return false;
+  timer.ran = true; await timer.fn();
+  for (let index = 0; index < 20; index++) await Promise.resolve();
+  return true;
+};
 subject._previewPromptContextCandidate({}, 0);
-await timers.find((timer) => timer.ms === 0 && !timer.cancelled).fn();
+await runNext();
 const first = structuredClone(subject._promptContextCandidateCache);
-subject._previewPromptContextCandidate({}, 0);
-await timers.filter((timer) => timer.ms === 0 && !timer.cancelled).at(-1).fn();
+await runNext();                                   // the one follow-up intent
+await runNext();                                   // which conflicts again
 const second = structuredClone(subject._promptContextCandidateCache);
 console.log(JSON.stringify({first, second}));
 """
     result = _run_node(script)
-    for state in (result["first"], result["second"]):
+    # L5: a first exhausted conflict on first load shows nothing yet and asks
+    # for one follow-up; the follow-up's conflict reports, with this message.
+    assert result["first"] is None
+    for state in (result["second"],):
         assert state["_failed"] is True
         message = state["errors"][0]["message"]
         assert "preview could not refresh" in message
@@ -8947,6 +8961,139 @@ console.log(JSON.stringify(rows));
         assert row["version"] == "v2"
 
 
+def test_a_preview_conflict_follow_up_yields_to_a_newer_intent():
+    """L5: the one follow-up runs only while its intent is still the latest;
+    typing that supersedes it sends its own request instead."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for preview-conflict coverage")
+    widget = _source("web/js/editor_widget.js")
+    preview = _method_body(
+        widget[widget.index("\n    _previewPromptContextCandidate("):],
+        "_previewPromptContextCandidate", marker="Math.max(0, Number(delay) || 0)")
+    failed = _method_body(
+        widget[widget.index("\n    _failedPromptContextCandidate("):],
+        "_failedPromptContextCandidate")
+    settle = _method_body(
+        widget[widget.index("\n    _clearPromptStaleVisualTimerIfSettled("):],
+        "_clearPromptStaleVisualTimerIfSettled", marker="return true;")
+    result = _run_node("""
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const resolvePromptCandidateSelection = () => ({selectionStart: 0, selectionEnd: 100});
+const timers = [];
+globalThis.setTimeout = (fn, ms) => { const t = {fn, ms, cancelled: false}; timers.push(t); return t; };
+globalThis.clearTimeout = (t) => { if (t) t.cancelled = true; };
+let requests = 0;
+class Subject {
+""" + failed + settle + preview + """
+  constructor() { this.activeSceneId = "scene"; this.activeScene = {duration_frames: 100};
+    this.totalFrames = 100; this._promptContextPreviewToken = 0;
+    this._promptContextCandidateCache = {_candidate_scene_id: "scene", prompt: "held", _stale: false};
+    this._promptContextScenePayloadCache = null; }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return {contextStart: 0, contextEnd: 100}; }
+  _promptScenePayload() { return null; }
+  _beginPromptScenePayload() { return null; }
+  _promptCompileRequestBody() { return {}; }
+  _queuePromptPreviewPair() { requests += 1;
+    return {windowed: Promise.resolve({response: {ok: false, status: 409},
+      payload: {code: "project_version_conflict", error: "project_version_conflict"}})}; }
+  _renderTimeline() {}
+}
+const subject = new Subject();
+let intents = 0;
+const original = subject._previewPromptContextCandidate.bind(subject);
+subject._previewPromptContextCandidate = (...args) => { intents += 1; return original(...args); };
+const run = async (timer) => { timer.ran = true; await timer.fn();
+  for (let i = 0; i < 20; i++) await Promise.resolve(); };
+subject._previewPromptContextCandidate({}, 0);
+await run(timers.find((t) => t.ms === 0 && !t.ran && !t.cancelled));
+const followUp = timers.find((t) => t.ms === 0 && !t.ran && !t.cancelled);
+subject._previewPromptContextCandidate({}, 0);       // newer typing before the follow-up fires
+const before = requests;
+await run(followUp);                                // superseded: sends nothing
+const afterFollowUp = requests;
+await run(timers.find((t) => t.ms === 0 && !t.ran && !t.cancelled));  // the newer intent's own request
+console.log(JSON.stringify({before, afterFollowUp, afterNewer: requests, intents, held: subject._promptContextCandidateCache.prompt}));
+""")
+    assert result["before"] == 1
+    assert result["afterFollowUp"] == 1
+    assert result["intents"] == 2                    # the follow-up made no intent of its own
+    assert result["afterNewer"] == 2                 # the newer intent sends its own request
+    assert result["held"] == "held"
+
+
+def test_a_scene_conflict_follows_up_even_after_a_windowed_only_intent():
+    """Phase 4 audit M1: a windowed-only newer intent (a selection change)
+    joins the scene work in flight and bumps only the windowed token. The
+    scene branch's exhausted conflict must still get its own follow-up, which
+    re-requests the scene projection alone."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for preview-conflict coverage")
+    widget = _source("web/js/editor_widget.js")
+    preview = _method_body(widget[widget.index("\n    _previewPromptContextCandidate("):],
+        "_previewPromptContextCandidate", marker="Math.max(0, Number(delay) || 0)")
+    failed = _method_body(widget[widget.index("\n    _failedPromptContextCandidate("):],
+        "_failedPromptContextCandidate")
+    settle = _method_body(widget[widget.index("\n    _clearPromptStaleVisualTimerIfSettled("):],
+        "_clearPromptStaleVisualTimerIfSettled", marker="return true;")
+    land = _method_body(widget[widget.index("\n    async _landPromptScenePayload("):],
+        "_landPromptScenePayload")
+    scene_payload = _method_body(widget[widget.index("\n    _promptScenePayload("):],
+        "_promptScenePayload")
+    result = _run_node("""
+const PROMPT_STALE_VISUAL_DELAY_MS = 300;
+const resolvePromptCandidateSelection = () => ({selectionStart: 0, selectionEnd: 50});
+const timers = [];
+globalThis.setTimeout = (fn, ms) => { const t = {fn, ms, cancelled: false}; timers.push(t); return t; };
+globalThis.clearTimeout = (t) => { if (t) t.cancelled = true; };
+const deferred = () => { let resolve; const p = new Promise((r) => { resolve = r; }); return {p, resolve}; };
+const requests = [];
+const plans = [];
+class Subject {
+""" + failed + settle + preview + "\nasync " + land + "\n" + scene_payload + """
+  constructor() { this.activeSceneId = "scene"; this.activeScene = {duration_frames: 100};
+    this.totalFrames = 100; this._promptContextPreviewToken = 0; this._promptContextScenePayloadToken = 0;
+    this._promptContextCandidateCache = {_candidate_scene_id: "scene", prompt: "held", _stale: false};
+    this._promptContextScenePayloadCache = {_candidate_scene_id: "scene", attachment_previews: {d: "old"}, _stale: false}; }
+  _projectDirName() { return "project"; }
+  _selectionContextRange() { return {contextStart: 0, contextEnd: 50}; }
+  _planPromptPreviewBranches() { return plans.shift(); }
+  _beginPromptScenePayload({token}) { return {key: "S", token, entry: {}}; }
+  _promptCompileRequestBody() { return {}; }
+  _queuePromptPreviewPair(d, s, b, branches) {
+    const out = {}; const rec = {branches: Object.keys(branches).filter((k) => branches[k])};
+    for (const name of rec.branches) { const x = deferred(); rec[name] = x; out[name] = x.p; }
+    requests.push(rec); return out; }
+  _renderTimeline() {}
+}
+const subject = new Subject();
+const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+const runZero = async () => { for (;;) { const t = timers.find((t) => t.ms === 0 && !t.ran && !t.cancelled);
+  if (!t) return; t.ran = true; t.fn(); await flush(); } };
+const W = (state, extra = {}) => ({state, key: "K", revoke: false, carry: false, ...extra});
+plans.push({windowed: W("work"), scene: W("work", {key: "S"})});            // intent A: both
+subject._previewPromptContextCandidate({prompt_sections: ["A"]}, 0);
+await runZero();
+plans.push({windowed: W("work", {key: "K2"}), scene: W("joined", {key: "S"})}); // B: selection
+subject._previewPromptContextCandidate({prompt_sections: ["A"]}, 0);
+await runZero();
+requests[0].windowed.resolve(null);
+requests[0].scene.resolve({response: {ok: false, status: 409}, payload: {code: "project_version_conflict"}});
+await flush();
+requests[1].windowed.resolve({response: {ok: true, status: 200}, payload: {prompt: "fresh"}});
+await flush();
+plans.push({windowed: W("current", {key: "K2"}), scene: W("work", {key: "S"})}); // the follow-up
+await runZero();
+console.log(JSON.stringify({requests: requests.map((r) => r.branches),
+  kept: subject._promptContextScenePayloadCache.attachment_previews}));
+""")
+    assert result["requests"][-1] == ["scene"]          # the scene's own follow-up
+    assert len(result["requests"]) == 3
+    assert result["kept"] == {"d": "old"}               # held, stale, until it answers
+
+
 def test_exhausted_preview_conflict_fails_window_and_settles_scene_sibling():
     """One paired request, retried once, answers both branches with the conflict."""
     node = shutil.which("node")
@@ -9008,19 +9155,40 @@ class Subject extends CompileSupport {
   _renderTimeline() {}
 }
 const subject = new Subject();
+const runNext = async () => {
+  const timer = timers.find((t) => t.ms === 0 && !t.cancelled && !t.ran);
+  if (!timer) return false;
+  timer.ran = true; await timer.fn();
+  for (let index = 0; index < 40; index++) await Promise.resolve();
+  return true;
+};
 subject._previewPromptContextCandidate({}, 0);
-await timers.find((timer) => timer.ms === 0 && !timer.cancelled).fn();
-for (let index = 0; index < 40; index++) await Promise.resolve();
+await runNext();                                   // the request and its one retry
+const afterFirst = {candidate: structuredClone(subject._promptContextCandidateCache),
+  scene: structuredClone(subject._promptContextScenePayloadCache), sent: bodies.length};
+await runNext();                                   // the one follow-up intent
+await runNext();                                   // its request, which conflicts again
+const extra = await runNext();                     // nothing more: no loop
 const grace = timers.find((timer) => timer.ms === 300);
-console.log(JSON.stringify({bodies, candidate: subject._promptContextCandidateCache,
+console.log(JSON.stringify({bodies, afterFirst, extra, candidate: subject._promptContextCandidateCache,
   scene: subject._promptContextScenePayloadCache, graceCancelled: grace.cancelled}));
 """)
     # One physical request and its one bounded retry, not one per branch.
-    assert len(result["bodies"]) == 2
+    assert result["afterFirst"]["sent"] == 2
     for body in result["bodies"]:
         assert body["preview_response"] == "stream-v1"
         assert body["projections"] == ["windowed", "scene"]
-    assert [body["base_modified_at"] for body in result["bodies"]] == ["v1", "v2"]
+    assert [body["base_modified_at"] for body in result["bodies"][:2]] == ["v1", "v2"]
+    # L5: the first exhausted conflict keeps both results, stale, with no error,
+    # and asks for one follow-up; only the follow-up's conflict reports.
+    first = result["afterFirst"]
+    assert first["candidate"]["prompt"] == "last good"
+    assert first["candidate"]["_stale"] is True
+    assert not first["candidate"].get("_failed") and not first["candidate"].get("errors")
+    assert first["scene"]["attachment_previews"] == {"dormant": "old"}
+    assert first["scene"]["_stale"] is True
+    assert len(result["bodies"]) == 4
+    assert result["extra"] is False
     assert result["scene"] is None
     assert result["graceCancelled"] is True
     assert result["candidate"]["_failed"] is True

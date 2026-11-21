@@ -34,6 +34,9 @@ a fresh `[Unreleased]` block.
 - A Context chip placed in two channel boxes of a section stays when you delete it from just one of them.
 - Pressing on a Context chip no longer leaves an older text selection active, so Delete, Backspace or Cut no longer removes text and chips you had selected earlier. In Firefox the editor also keeps focus, and **Ctrl+Z** brings the text back.
 - Chips a selection covers are outlined, so you can see they are part of it.
+- **Customize** on a Reference chip's Summary task types now unlocks the checkboxes even when no task type is chosen automatically.
+- Typing in the Prompt panel while saves are slow rarely shows `Error project_version_conflict` in its diagnostics any more. The preview keeps its last result, marked out of date, and refreshes once; the error appears only if that refresh conflicts too.
+- **Discard** on a failed Prompt draft now asks in the panel itself, so it works where browser dialogs are suppressed. Escape keeps the draft, and the draft is kept if the server's text can't be reloaded.
 - An edit to a prompt section that would leave a Prompt link or Vocal event with no place in its text is refused and kept as a draft, instead of saving a chip that blocks the section.
 
 ## [0.9.0] - 2026-11-19
