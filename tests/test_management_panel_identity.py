@@ -343,13 +343,13 @@ def test_every_prompt_panel_section_action_passes_the_drawn_prompt_id():
     source = (ROOT / "web/js/editor_prompt_panel.js").read_text(encoding="utf-8")
     calls = {
         "range commit": "host._updatePromptSection(idx, { start_frame: start, end_frame: end },\n"
-                        "                    { promptId: sectionBase.prompt_id || \"\" })",
+                        "                    { promptId: drawnSection.prompt_id || \"\" })",
         "add after": "host._addPromptSectionAfter(idx,\n"
-                     "                    { promptId: sectionBase.prompt_id || \"\" })",
-        "delete": "host._deletePromptSection(idx, { promptId: sectionBase.prompt_id || \"\" })",
+                     "                    { promptId: drawnSection.prompt_id || \"\" })",
+        "delete": "host._deletePromptSection(idx, { promptId: drawnSection.prompt_id || \"\" })",
         "global inherit": "host._setSectionGlobalInherit(idx, key, box.checked,\n"
-                          "                            { promptId: sectionBase.prompt_id || \"\" })",
-        "convert link copy": "}, { promptId: sectionBase.prompt_id || \"\" });",
+                          "                            { promptId: drawnSection.prompt_id || \"\" })",
+        "save by prompt id": "sectionSaver({ promptId: drawnSection.prompt_id || \"\",",
     }
     normalized = source.replace("\r\n", "\n")
     missing = [name for name, call in calls.items() if call not in normalized]

@@ -9251,48 +9251,49 @@ console.log(JSON.stringify({requests,version:getProjectVersion("project"),
 def test_prompt_draft_revisions_and_targeted_intents_survive_rapid_edits():
     url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
     result = _run_node(f"""
-const {{promptEditFields, promptDraftKey, updatePromptDraft, savePromptDraft, rebasePromptDraft}} = await import({json.dumps(url)});
-const base = {{prompt_id:"section", channel_docs:{{visual:{{text:"old"}},speech:{{text:"old speech"}}}}, attachments:[]}};
-const first = structuredClone(base); first.channel_docs.visual.text="A";
-const second = structuredClone(first); second.channel_docs.visual.text="B";
+const {{promptDraftKey, touchPromptDraft, savePromptDraft, rebasePromptDraft, promptDraftEdit}} = await import({json.dumps(url)});
+const doc=(text)=>({{text}});
+const base={{prompt_id:"section", channel_docs:{{visual:doc("old"),speech:doc("old speech")}}, attachments:[]}};
 const drafts=new Map(), key=promptDraftKey("p","s","section"), calls=[];
-updatePromptDraft(drafts,key,base,first);
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:doc("old"),value:doc("A")}}}}}});
 let finish;
-const save = async (value,before) => {{ calls.push([value,before]); if(calls.length===1) return await new Promise(r=>finish=r); return true; }};
+const save = async (edit) => {{ calls.push(edit); if(calls.length===1) return await new Promise(r=>finish=r); return true; }};
 const pending=savePromptDraft(drafts,key,save);
-updatePromptDraft(drafts,key,base,second);
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:doc("old"),value:doc("B")}}}}}});
 const later=savePromptDraft(drafts,key,save);
 finish(true); await pending; await later;
 const clean=!drafts.has(key);
-updatePromptDraft(drafts,key,second,first);
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:doc("B"),value:doc("C")}}}}}});
 await savePromptDraft(drafts,key,async()=>false);
-const current=structuredClone(second); current.channel_docs.speech.text="external";
-const restored=rebasePromptDraft(drafts.get(key),current);
-const intent=promptEditFields(drafts.get(key).base,{{channel_docs:restored.channel_docs,attachments:restored.attachments}});
-console.log(JSON.stringify({{clean,calls,refused:drafts.get(key).error,restored,intent,
+const current=structuredClone(base); current.channel_docs.speech=doc("external");
+const view=rebasePromptDraft(drafts.get(key),current);
+console.log(JSON.stringify({{clean,calls,refused:drafts.get(key).error,view,edit:promptDraftEdit(drafts.get(key)),
  distinct:key!==promptDraftKey("p2","s","section") && key!==promptDraftKey("p","s2","section")}}));
 """)
     assert result["clean"] and result["distinct"]
     assert len(result["calls"]) == 2
-    assert result["calls"][1][1]["channel_docs"]["visual"]["text"] == "A"
-    assert result["calls"][1][0]["channel_docs"]["visual"]["text"] == "B"
+    assert result["calls"][1]["documents"]["visual"] == {"expected": {"text": "A"}, "value": {"text": "B"}}
     assert result["refused"]
-    assert result["restored"]["channel_docs"]["visual"]["text"] == "A"
-    assert result["restored"]["channel_docs"]["speech"]["text"] == "external"
-    assert list(result["intent"]["prompt_edit"]["documents"]) == ["visual"]
+    # The view lays the touched record over a refresh and adopts the rest.
+    assert result["view"]["channel_docs"]["visual"]["text"] == "C"
+    assert result["view"]["channel_docs"]["speech"]["text"] == "external"
+    # A refresh never moves a touched base; untouched records are never sent.
+    assert result["edit"] == {"documents": {"visual": {"expected": {"text": "B"}, "value": {"text": "C"}}},
+                              "attachments": {}}
 
 
 def test_newer_prompt_draft_retries_even_when_the_pending_save_is_refused():
     url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
     result = _run_node(f"""
-const {{updatePromptDraft,savePromptDraft}}=await import({json.dumps(url)});
+const {{touchPromptDraft,savePromptDraft}}=await import({json.dumps(url)});
 const drafts=new Map(), key="draft", calls=[];
-updatePromptDraft(drafts,key,{{text:"base"}},{{text:"A"}});
+const doc=(text)=>({{text}});
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:doc("base"),value:doc("A")}}}}}});
 let finish;
-const save=async(value,base)=>{{calls.push([value.text,base.text]);
+const save=async(edit)=>{{calls.push([edit.documents.visual.value.text,edit.documents.visual.expected.text]);
   if(calls.length===1)return await new Promise(resolve=>finish=resolve);return true;}};
 const first=savePromptDraft(drafts,key,save);
-updatePromptDraft(drafts,key,{{text:"base"}},{{text:"B"}});
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:doc("base"),value:doc("B")}}}}}});
 const second=savePromptDraft(drafts,key,save);
 finish(false);
 const outcomes=await Promise.all([first,second]);
@@ -9302,129 +9303,125 @@ console.log(JSON.stringify({{calls,outcomes,clean:!drafts.has(key)}}));
                       "outcomes": [True, True], "clean": True}
 
 
-
 def test_prompt_draft_adopts_authoritative_ack_without_losing_newer_text():
     url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
     result = _run_node(f"""
-const {{updatePromptDraft,savePromptDraft}}=await import({json.dumps(url)});
+const {{touchPromptDraft,savePromptDraft}}=await import({json.dumps(url)});
 const drafts=new Map(), key="draft";
-const base={{channel_docs:{{visual:{{text:"old"}}}},attachments:[]}};
-const submitted={{channel_docs:{{visual:{{text:"A"}}}},attachments:[{{attachment_id:"chip",capabilities:[{{capability_id:"summary",kind:"summary",enabled:false}}]}}]}};
-const acknowledged={{channel_docs:{{visual:{{text:"A",nodes:[]}}}},attachments:[{{attachment_id:"chip",capabilities:[{{capability_id:"summary",kind:"summary",channel_key:"",placement:"",config:{{}},enabled:false}}]}}]}};
-const newer=structuredClone(submitted); newer.channel_docs.visual.text="B";
-updatePromptDraft(drafts,key,base,submitted);
+const chip={{attachment_id:"chip",capabilities:[{{capability_id:"summary",kind:"summary",enabled:false}}]}};
+const stored={{attachment_id:"chip",capabilities:[{{capability_id:"summary",kind:"summary",channel_key:"",placement:"",config:{{}},enabled:false}}]}};
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:{{text:"old"}},value:{{text:"A"}}}}}},
+  attachments:{{chip:{{shown:null,value:chip}}}}}});
 let finish;
 const pending=savePromptDraft(drafts,key,async()=>await new Promise(resolve=>finish=resolve));
-updatePromptDraft(drafts,key,base,newer);
-finish({{status:"acknowledged",value:acknowledged}});
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:{{text:"old"}},value:{{text:"B"}}}}}}}});
+finish({{status:"acknowledged",value:{{channel_docs:{{visual:{{text:"A",nodes:[]}}}},attachments:[stored]}}}});
 await pending;
 const row=drafts.get(key);
 console.log(JSON.stringify({{base:row.base,value:row.value,error:row.error}}));
 """)
-    assert result["base"] == {
-        "channel_docs": {"visual": {"text": "A", "nodes": []}},
-        "attachments": [{"attachment_id": "chip", "capabilities": [{
-            "capability_id": "summary", "kind": "summary", "channel_key": "",
-            "placement": "", "config": {}, "enabled": False,
-        }]}],
-    }
-    assert result["value"]["channel_docs"]["visual"]["text"] == "B"
-    assert result["value"]["attachments"] == result["base"]["attachments"]
+    # The acknowledged record is the stored one, not the submitted shape.
+    assert result["base"] == {"documents": {"visual": {"text": "A", "nodes": []}}, "attachments": {}}
+    assert result["value"] == {"documents": {"visual": {"text": "B"}}, "attachments": {}}
     assert result["error"] == ""
 
 
-
-def test_prompt_ack_callback_identifies_the_submitted_snapshot_for_live_settlement():
+def test_prompt_ack_is_published_with_the_submitted_records_for_live_settlement():
     url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
     result = _run_node(f"""
-const {{updatePromptDraft,savePromptDraft}}=await import({json.dumps(url)});
+const {{touchPromptDraft,savePromptDraft,addPromptDraftListener}}=await import({json.dumps(url)});
+const drafts=new Map(),key="draft",events=[];
+const stop=addPromptDraftListener(drafts,(event)=>events.push(event));
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:{{text:"old"}},value:{{text:"A"}}}}}}}});
+await savePromptDraft(drafts,key,async()=>({{status:"acknowledged",value:{{channel_docs:{{visual:{{text:"A",nodes:[]}}}},attachments:[]}}}}));
+stop();
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:{{text:"A"}},value:{{text:"B"}}}}}}}});
+await savePromptDraft(drafts,key,async()=>true);
+console.log(JSON.stringify(events));
+""")
+    assert len(result) == 1  # the listener was removed before the second save
+    event = result[0]
+    assert event["key"] == "draft"
+    assert event["submitted"]["documents"] == {"visual": {"text": "A"}}
+    assert event["records"]["documents"] == {"visual": {"text": "A", "nodes": []}}
+    assert event["settled"] == {"documents": ["visual"], "attachments": []}
+
+
+def test_prompt_draft_returning_to_its_base_leaves_the_registry_without_a_save():
+    url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
+    result = _run_node(f"""
+const {{touchPromptDraft,savePromptDraft}}=await import({json.dumps(url)});
 const drafts=new Map(),key="draft";
-const base={{channel_docs:{{visual:{{text:"old"}}}},attachments:[]}};
-const submitted={{channel_docs:{{visual:{{text:"A"}}}},attachments:[]}};
-const acknowledged={{channel_docs:{{visual:{{text:"A",nodes:[]}}}},attachments:[]}};
-updatePromptDraft(drafts,key,base,submitted);
-let callback;
-await savePromptDraft(drafts,key,async()=>({{status:"acknowledged",value:acknowledged}}),{{
-  onAcknowledge:(value)=>callback=value,
-}});
-console.log(JSON.stringify(callback));
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:{{text:"A"}},value:{{text:"B"}}}}}}}});
+const dirty=drafts.has(key);
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:{{text:"A"}},value:{{text:"A"}}}}}}}});
+let saves=0;
+const ok=await savePromptDraft(drafts,key,async()=>{{saves+=1;return true;}});
+console.log(JSON.stringify({{dirty,ok,saves,clean:!drafts.has(key)}}));
 """)
-    assert result["submitted"] == {
-        "channel_docs": {"visual": {"text": "A"}}, "attachments": [],
-    }
-    assert result["baseline"] == result["value"] == {
-        "channel_docs": {"visual": {"text": "A", "nodes": []}},
-        "attachments": [],
-    }
-
-def test_prompt_draft_no_op_settles_an_a_to_b_to_a_revision():
-    url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
-    result = _run_node(f"""
-const {{updatePromptDraft,savePromptDraft}}=await import({json.dumps(url)});
-const drafts=new Map(),key="draft",base={{channel_docs:{{visual:{{text:"A"}}}},attachments:[]}};
-updatePromptDraft(drafts,key,base,{{channel_docs:{{visual:{{text:"B"}}}},attachments:[]}});
-updatePromptDraft(drafts,key,base,structuredClone(base));
-const ok=await savePromptDraft(drafts,key,async()=>({{status:"no-op"}}));
-console.log(JSON.stringify({{ok,clean:!drafts.has(key)}}));
-""")
-    assert result == {"ok": True, "clean": True}
-
+    assert result == {"dirty": True, "ok": True, "saves": 0, "clean": True}
 
 
 def test_prompt_recovery_resolves_only_the_contested_record_and_can_dismiss():
     url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
     result = _run_node(f"""
-const {{dismissPromptDraftError,resolvePromptDraftRecord,updatePromptDraft}}=await import({json.dumps(url)});
-const drafts=new Map(),key="draft";
-const base={{channel_docs:{{visual:{{text:"old"}},speech:{{text:"old speech"}}}},attachments:[{{attachment_id:"a",config:{{text:"old"}}}}]}};
-const local={{channel_docs:{{visual:{{text:"mine"}},speech:{{text:"local speech"}}}},attachments:[{{attachment_id:"a",config:{{text:"mine"}}}},{{attachment_id:"b",config:{{text:"local chip"}}}}]}};
-const row=updatePromptDraft(drafts,key,base,local);
+const {{dismissPromptDraftError,resolvePromptDraftRecord,touchPromptDraft,addPromptDraftListener}}=await import({json.dumps(url)});
+const drafts=new Map(),key="draft",events=[];
+addPromptDraftListener(drafts,(event)=>events.push(event));
+const row=touchPromptDraft(drafts,key,{{
+  documents:{{visual:{{shown:{{text:"old"}},value:{{text:"mine"}}}},speech:{{shown:{{text:"old speech"}},value:{{text:"local speech"}}}}}},
+  attachments:{{a:{{shown:{{attachment_id:"a",config:{{text:"old"}}}},value:{{attachment_id:"a",config:{{text:"mine"}}}}}},
+    b:{{shown:null,value:{{attachment_id:"b",config:{{text:"local chip"}}}}}}}}}});
 row.error="conflict"; row.conflict={{record_kind:"attachment",record_key:"a",current:{{attachment_id:"a",config:{{text:"server"}}}}}};
 const resolved=resolvePromptDraftRecord(drafts,key);
-const afterResolve=structuredClone(drafts.get(key));
+const afterResolve=structuredClone({{base:row.base,value:row.value}});
 row.error="network"; row.conflict={{record_kind:"document",record_key:"visual",current:{{text:"server visual"}}}};
 const dismissed=dismissPromptDraftError(drafts,key);
-console.log(JSON.stringify({{resolved,dismissed,afterResolve,afterDismiss:row}}));
+console.log(JSON.stringify({{resolved,dismissed,afterResolve,error:row.error,conflict:row.conflict,events}}));
 """)
-    resolved = result["afterResolve"]
-    assert result["resolved"] and result["dismissed"]
-    assert resolved["base"]["attachments"][0]["config"]["text"] == "server"
-    assert resolved["value"]["attachments"] == [
-        {"attachment_id": "a", "config": {"text": "server"}},
-        {"attachment_id": "b", "config": {"text": "local chip"}},
-    ]
-    assert resolved["value"]["channel_docs"]["visual"]["text"] == "mine"
-    assert resolved["value"]["channel_docs"]["speech"]["text"] == "local speech"
-    assert result["afterDismiss"]["error"] == ""
-    assert result["afterDismiss"]["conflict"] is None
+    assert result["resolved"] == {"resolved": "attachment a",
+                                  "remaining": ["document visual", "document speech", "attachment b"]}
+    assert result["dismissed"]
+    # The contested record left the draft; everything else kept its base.
+    assert "a" not in result["afterResolve"]["value"]["attachments"]
+    assert result["afterResolve"]["value"]["attachments"]["b"]["config"]["text"] == "local chip"
+    assert result["afterResolve"]["value"]["documents"]["visual"]["text"] == "mine"
+    assert result["afterResolve"]["base"]["documents"]["speech"]["text"] == "old speech"
+    # Live surfaces hear the resolution so they adopt the server record.
+    assert result["events"] == [{"key": "draft", "global": False, "resolution": {
+        "kind": "attachments", "recordKey": "a",
+        "value": {"attachment_id": "a", "config": {"text": "server"}}}}]
+    assert result["error"] == ""
+    assert result["conflict"] is None
 
 
 def test_prompt_recovery_retry_does_not_choose_a_conflict_winner():
     url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
     result = _run_node(f"""
-const {{retryPromptDraft,savePromptDraft,updatePromptDraft}}=await import({json.dumps(url)});
+const {{retryPromptDraft,savePromptDraft,touchPromptDraft,rebasePromptDraft}}=await import({json.dumps(url)});
 const drafts=new Map(),key="draft",calls=[];
-updatePromptDraft(drafts,key,{{channel_docs:{{visual:{{text:"old"}}}},attachments:[]}},
-  {{channel_docs:{{visual:{{text:"mine"}}}},attachments:[]}});
-const save=async()=>{{calls.push("save");return {{status:"refused",message:"conflict",conflict:{{record_kind:"document",record_key:"visual",current:{{text:"server"}}}}}};}};
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:{{text:"old"}},value:{{text:"mine"}}}}}}}});
+const save=async(edit)=>{{calls.push(edit.documents.visual.expected.text);return {{status:"refused",message:"conflict",conflict:{{record_kind:"document",record_key:"visual",current:{{text:"server"}}}}}};}};
 await savePromptDraft(drafts,key,save);
+// A refresh after the refusal: the view shows the draft, the base does not move.
+const view=rebasePromptDraft(drafts.get(key),{{channel_docs:{{visual:{{text:"server"}}}},attachments:[]}});
 const retried=await retryPromptDraft(drafts,key);
-console.log(JSON.stringify({{retried,calls,row:drafts.get(key)}}));
+const row=drafts.get(key);
+console.log(JSON.stringify({{retried,calls,view:view.channel_docs.visual.text,value:row.value.documents.visual.text,conflict:row.conflict}}));
 """)
     assert result["retried"] is False
-    assert result["calls"] == ["save", "save"]
-    assert result["row"]["value"]["channel_docs"]["visual"]["text"] == "mine"
-    assert result["row"]["conflict"]["current"]["text"] == "server"
-
+    assert result["calls"] == ["old", "old"]
+    assert result["view"] == "mine"
+    assert result["value"] == "mine"
+    assert result["conflict"]["current"]["text"] == "server"
 
 
 def test_prompt_retry_keeps_failure_visible_until_the_attempt_settles():
     url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
     result = _run_node(f"""
-const {{retryPromptDraft,savePromptDraft,updatePromptDraft}}=await import({json.dumps(url)});
+const {{retryPromptDraft,savePromptDraft,touchPromptDraft}}=await import({json.dumps(url)});
 const drafts=new Map(),key="draft";
-updatePromptDraft(drafts,key,{{channel_docs:{{visual:{{text:"old"}}}},attachments:[]}},
-  {{channel_docs:{{visual:{{text:"mine"}}}},attachments:[]}});
+touchPromptDraft(drafts,key,{{documents:{{visual:{{shown:{{text:"old"}},value:{{text:"mine"}}}}}}}});
 let attempt=0,finish;
 const save=async()=>{{attempt+=1;if(attempt===1)return {{status:"refused",message:"conflict",conflict:{{record_kind:"document",record_key:"visual",current:{{text:"server"}}}}}};return await new Promise(resolve=>finish=resolve);}};
 await savePromptDraft(drafts,key,save);
@@ -9438,6 +9435,46 @@ console.log(JSON.stringify({{during,ok,clean:!drafts.has(key)}}));
     assert result["during"]["error"] == "conflict"
     assert result["during"]["conflict"]["record_key"] == "visual"
     assert result["ok"] and result["clean"]
+
+
+def test_a_surface_records_only_what_it_changed_and_repaints_only_what_it_still_shows():
+    url = (ROOT / "web/js/prompt_edit_intent.js").as_uri()
+    result = _run_node(f"""
+const {{createPromptDraftMount,touchPromptDraft}}=await import({json.dumps(url)});
+const drafts=new Map(),key="draft";
+const n=(text,id="x")=>({{schema:"prompt_document_v1",nodes:[{{type:"text",node_id:id,text}}]}});
+const shown={{documents:{{visual:n("v0"),speech:n("s0")}},attachments:[]}};
+// Another surface already touched speech.
+touchPromptDraft(drafts,key,{{documents:{{speech:{{shown:n("s0"),value:n("panel")}}}}}});
+const bar=createPromptDraftMount({{drafts,key,shown,displayed:{{documents:{{visual:n("v0"),speech:n("panel")}},attachments:[]}}}});
+// Re-normalized ids are not an edit; the bar's stale speech is not re-sent.
+const row=bar.record({{documents:{{visual:n("v0","fresh-id"),speech:n("panel")}},attachments:[]}});
+const untouched=structuredClone(row.value.documents);
+bar.record({{documents:{{visual:n("bar"),speech:n("panel")}},attachments:[]}});
+const touched=structuredClone(drafts.get(key).value.documents);
+const event={{key,records:{{documents:{{visual:n("bar stored")}},attachments:{{}}}},
+  submitted:{{documents:{{visual:n("bar")}},attachments:{{}}}},settled:{{documents:["visual"],attachments:[]}}}};
+const repaint=bar.acknowledge(event,{{documents:{{visual:n("bar")}},attachments:[]}});
+const kept=bar.acknowledge(event,{{documents:{{visual:n("typed after")}},attachments:[]}});
+// Another surface saved `sounds`, which this bar never changed: it repaints;
+// with unrecorded typing of its own in that box, it keeps the typing.
+const soundsEvent={{key,records:{{documents:{{sounds:n("panel sounds")}},attachments:{{}}}},
+  submitted:{{documents:{{sounds:n("panel sounds")}},attachments:{{}}}},settled:{{documents:["sounds"],attachments:[]}}}};
+const other2=createPromptDraftMount({{drafts,key,shown,displayed:{{documents:{{sounds:n("z0")}},attachments:[]}}}});
+const otherSurface=other2.acknowledge(soundsEvent,{{documents:{{sounds:n("z0")}},attachments:[]}});
+const other3=createPromptDraftMount({{drafts,key,shown,displayed:{{documents:{{sounds:n("z0")}},attachments:[]}}}});
+const ownTyping=other3.acknowledge(soundsEvent,{{documents:{{sounds:n("z0 typing")}},attachments:[]}});
+console.log(JSON.stringify({{untouched,touched,repaint,kept,otherSurface,ownTyping,other:bar.acknowledge({{...event,key:"other"}})}}));
+""")
+    assert list(result["untouched"]) == ["speech"]
+    assert result["otherSurface"]["documents"]["sounds"]["nodes"][0]["text"] == "panel sounds"
+    assert result["ownTyping"]["documents"] == {}
+    assert result["touched"]["visual"]["nodes"][0]["text"] == "bar"
+    assert result["touched"]["speech"]["nodes"][0]["text"] == "panel"
+    assert result["repaint"]["documents"]["visual"]["nodes"][0]["text"] == "bar stored"
+    assert result["kept"]["documents"] == {}
+    assert result["other"] is None
+
 
 def test_prompt_panel_uses_zero_height_recovery_chrome_and_commits_user_close():
     panel = _source("web/js/editor_prompt_panel.js")
@@ -9462,7 +9499,8 @@ def test_prompt_panel_uses_zero_height_recovery_chrome_and_commits_user_close():
     assert "cleanup: () => close({ commitFocused: false })" in panel
     assert "focused.el.promptState = focused.revert" in panel
     assert "guard.suppressBlurCommit = true;\n                focused.el.blur();" in panel
-    assert panel.count("guard.focusedBox.revert = sibling.promptState") == 2
+    # Acknowledgement repaints refresh the Esc baseline of a focused box.
+    assert panel.count("guard.focusedBox.revert = box.promptState") == 2
 
 
 def test_prompt_recovery_actions_preserve_focus_and_discard_one_key():

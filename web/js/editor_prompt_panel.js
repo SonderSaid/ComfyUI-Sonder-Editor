@@ -1,4 +1,6 @@
-import { dismissPromptDraftError, promptEditFields, promptDraftKey, resolvePromptDraftRecord, retryPromptDraft, updatePromptDraft, savePromptDraft, rebasePromptDraft } from "./prompt_edit_intent.js";
+import { addPromptDraftListener, createPromptDraftMount, dismissPromptDraftError, promptEditFields, promptDraftKey,
+    promptDraftRecordLabels, resolvePromptDraftRecord, retryPromptDraft, savePromptDraft,
+    rebasePromptDraft } from "./prompt_edit_intent.js";
 // Prompt Management panel — centered overlay for editing the scene-global
 // prompt, the segment lane's sections (ranges + channels), the project-durable
 // channel-template-aware prompt state and a PromptRelay payload preview.
@@ -1071,6 +1073,18 @@ export function mountPromptManagementPanel(host) {
     }, true);
 
     const drafts = host._promptToolDrafts ||= new Map();
+    // The surfaces drawn by the CURRENT render, by draft key. Acknowledgements
+    // and dialog results go here, never to the render that issued a save or
+    // opened a dialog (bug tracker L4, L6).
+    const liveMounts = new Map();
+    const stopDraftListener = addPromptDraftListener(drafts, (event) => {
+        if (!mounted) return;
+        liveMounts.get(event.key)?.acknowledge(event);
+        // A refusal from any surface (a timeline bar included) shows in the
+        // recovery bar now; the refusal's own panel refresh is deferred while
+        // its mutation is still pending.
+        if (event.refused) renderDraftRecovery();
+    });
     const draftSceneIdentity = () => JSON.stringify([host._projectDirName(), host.activeSceneId]);
     let renderedDraftScene = "";
     let deferredDraftRender = false;
@@ -1100,6 +1114,66 @@ export function mountPromptManagementPanel(host) {
         String(left?.[key] ?? "").trim() === String(right?.[key] ?? "").trim());
     const identityRefreshGate = createModalRefreshGate(() => renderNow());
     const render = () => identityRefreshGate.request();
+    // An Attach dialog or insert menu opened from this panel lives outside it
+    // and writes back when it closes; rebuilding underneath it would leave the
+    // result to a dead render. Each editor keeps its menu mounted and hidden,
+    // so only a visible one counts.
+    const promptContextDialogOpen = () => typeof document !== "undefined"
+        && [...(document.querySelectorAll?.(
+            "[data-sonder-prompt-context-modal='1'],[data-sonder-prompt-context-menu='1']") || [])]
+            .some((element) => (element.getClientRects?.().length ?? 0) > 0);
+    // Save paths resolve the target at call time from the prompt id, so a
+    // Retry from any render goes through the same host gesture.
+    const sectionSaver = ({ promptId, projectId, sceneId, template }) => (edit) =>
+        host._updatePromptSection(-1, {}, { edit, promptId, projectId, sceneId, template });
+    const globalSaver = ({ projectId, sceneId, template }) => (edit) =>
+        host._updateSceneGlobalContext(null, null, null, { edit, projectId, sceneId, template });
+    /**
+     * Apply what a dialog produced to the CURRENT surface for `draftKey`. After
+     * the await, recheck what the dialog was opened against: a project or scene
+     * switch, a lock or a template change drops the result with a notice; a
+     * deleted section is told apart from one that is merely not drawn (Writing
+     * mode, a closed panel), which takes a narrow record change instead.
+     */
+    const applyAfterDialog = ({ draftKey, promptId = "", global = false, template,
+        channelKey = "", build }) => {
+        const [projectId, sceneId] = JSON.parse(draftKey);
+        const refuse = (message) => {
+            notifyWarning(message, { source: "prompt-dialog-stale" });
+            if (deferredDraftRender) render();
+            return false;
+        };
+        if (host._projectDirName() !== projectId || host.activeSceneId !== sceneId)
+            return refuse("The project or scene changed while the dialog was open, so the change was not applied.");
+        if (global ? host._isGlobalPromptTrackLocked() : host._isPromptTrackLocked())
+            return refuse("The prompt track was locked while the dialog was open, so the change was not applied.");
+        if (JSON.stringify(projectTemplateValue(host._channelTemplate())) !== JSON.stringify(template))
+            return refuse("The prompt template changed while the dialog was open, so the change was not applied.");
+        const current = global ? host.activeScene
+            : (host.activeScene?.prompt_sections || []).find((row) => row.prompt_id === promptId);
+        if (!current) return refuse("That prompt section was deleted while the dialog was open, so the change was not applied.");
+        const live = mounted ? liveMounts.get(draftKey) : null;
+        if (live) {
+            live.transactAttachments(build, channelKey);
+        } else {
+            const docsKey = global ? "global_channel_docs" : "channel_docs";
+            const attsKey = global ? "global_attachments" : "attachments";
+            const view = rebasePromptDraft(drafts.get(draftKey), current, { global });
+            const surface = createPromptDraftMount({ drafts, key: draftKey, global,
+                shown: { documents: current[docsKey], attachments: current[attsKey] },
+                displayed: { documents: view[docsKey], attachments: view[attsKey] } });
+            const row = surface.record({
+                attachments: build(normalizePromptAttachments(view[attsKey] || [])) });
+            if (row) {
+                void savePromptDraft(drafts, draftKey, global
+                    ? globalSaver({ projectId, sceneId, template })
+                    : sectionSaver({ promptId, projectId, sceneId, template }))
+                    .then(() => renderDraftRecovery());
+            }
+        }
+        if (deferredDraftRender) render();
+        return true;
+    };
     // Esc/blur-commit guard (audit F1): the OVERLAY consumer fires on the
     // window-CAPTURE root BEFORE textarea handlers, and closing removes
     // focused boxes whose blur would otherwise COMMIT a cancelled edit.
@@ -1130,6 +1204,8 @@ export function mountPromptManagementPanel(host) {
             guard.focusedBox.el.blur();
         }
         mounted = false;
+        stopDraftListener();
+        liveMounts.clear();
         identityRefreshGate.clear();
         guard.suppressBlurCommit = true;
         identityPanelCleanup();
@@ -1538,28 +1614,6 @@ export function mountPromptManagementPanel(host) {
         control.addEventListener("mousedown", (event) => event.preventDefault());
         return control;
     };
-    const syncResolvedRecord = (key, conflict) => {
-        const boxes = [...body.querySelectorAll("[data-sonder-prompt-box='1']")]
-            .filter((box) => box.dataset.sonderPromptDraftKey === key);
-        for (const box of boxes) {
-            const state = box.promptState;
-            if (!state) continue;
-            if (conflict.record_kind === "document"
-                    && box.dataset.sonderPromptChannel === conflict.record_key) {
-                box.syncPromptState?.({ document: conflict.current,
-                    attachments: state.attachments });
-                box._sonderSyncDraft?.();
-            } else if (conflict.record_kind === "attachment") {
-                const records = new Map((state.attachments || [])
-                    .map((value) => [value.attachment_id, value]));
-                if (conflict.current == null) records.delete(conflict.record_key);
-                else records.set(conflict.record_key, conflict.current);
-                box.syncPromptState?.({ document: state.document,
-                    attachments: [...records.values()] });
-                box._sonderSyncDraft?.();
-            }
-        }
-    };
     renderDraftRecovery = () => {
         const rows = failedDraftRows();
         if (!rows.length) {
@@ -1572,7 +1626,7 @@ export function mountPromptManagementPanel(host) {
         if (!rows.some(([key]) => key === selectedRecoveryKey)) selectedRecoveryKey = rows[0][0];
         const signature = JSON.stringify(rows.map(([key, row]) => [key, row.error,
             row.conflict?.record_kind, row.conflict?.record_key, row.conflict?.current,
-            key === selectedRecoveryKey]));
+            promptDraftRecordLabels(row), key === selectedRecoveryKey]));
         if (signature === recoverySignature) return;
         recoverySignature = signature;
         draftRecovery.replaceChildren();
@@ -1600,8 +1654,14 @@ export function mountPromptManagementPanel(host) {
         message.style.cssText = "min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
         const target = conflict ? `${conflict.record_kind} ${conflict.record_key}` : "draft";
         const serverValue = conflict ? JSON.stringify(conflict.current) : "";
+        // A move across records (cut in one field, paste in another) is one
+        // intent; resolving one record keeps the other half. Say so first.
+        const alsoChanged = conflict ? promptDraftRecordLabels(row).filter((label) => label !== target) : [];
+        const alsoText = alsoChanged.length
+            ? ` This draft also changed ${alsoChanged.join(", ")}; Use server's version keeps ${alsoChanged.length === 1 ? "that change" : "those changes"}.`
+            : "";
         message.textContent = `${rows.length} Prompt draft save${rows.length === 1 ? "" : "s"} failed — ${target}.`
-            + (serverValue ? ` Server has: ${serverValue}` : "");
+            + alsoText + (serverValue ? ` Server has: ${serverValue}` : "");
         message.title = `${row.error}${serverValue ? `
 Server value: ${serverValue}` : ""}`;
         draftRecovery.appendChild(message);
@@ -1610,11 +1670,14 @@ Server value: ${serverValue}` : ""}`;
             await retryPromptDraft(drafts, key); recoverySignature = ""; renderDraftRecovery();
         });
         const useServer = keepRecoveryFocus(makeBtn("Use server's version",
-            "Resolve only the contested record with the server's value"));
+            alsoChanged.length
+                ? `Resolve only ${target} with the server's value; ${alsoChanged.join(", ")} ${alsoChanged.length === 1 ? "keeps" : "keep"} your draft`
+                : "Resolve only the contested record with the server's value"));
         useServer.disabled = !conflict;
         useServer.addEventListener("click", async () => {
+            // Live surfaces adopt the server's record through the published
+            // resolution; nothing here touches the record again.
             if (!conflict || !resolvePromptDraftRecord(drafts, key)) return;
-            syncResolvedRecord(key, conflict);
             await retryPromptDraft(drafts, key);
             recoverySignature = ""; renderDraftRecovery();
         });
@@ -3883,7 +3946,8 @@ Server value: ${serverValue}` : ""}`;
         // to erase what was being typed into the next field — and the host
         // replays the render once the author leaves the panel.
         if (renderedDraftScene === draftSceneIdentity()
-                && (host._managementPanelBusy?.(body, { selects: false })
+                && (promptContextDialogOpen()
+                    || host._managementPanelBusy?.(body, { selects: false })
                     || (body.contains(document.activeElement)
                         && document.activeElement?.closest?.("[data-sonder-prompt-box='1']")))) {
             deferredDraftRender = true;
@@ -3892,6 +3956,7 @@ Server value: ${serverValue}` : ""}`;
         }
         deferredDraftRender = false;
         renderedDraftScene = draftSceneIdentity();
+        liveMounts.clear();
         textStaleChecks = [];
         host._stampManagementPanel?.("prompt");
         identityPanelCleanup();
@@ -3925,17 +3990,21 @@ Server value: ${serverValue}` : ""}`;
         // per-channel globals off.
         const globalKeys = globalChannelKeys(globalTemplate);
         const globalDraftKey = promptDraftKey(draftProjectId, draftSceneId);
-        let globalBase = structuredClone(scene);
+        // What this render drew from (text-stale checks only); saves never
+        // read it. The draft row holds each touched record's base.
+        const drawnGlobal = structuredClone({ global_channels: scene.global_channels, prompt: scene.prompt });
         const globalView = rebasePromptDraft(drafts.get(globalDraftKey), scene, { global: true });
         const globalChannels = normalizeChannels(globalView.global_channels, globalView.prompt, globalKeys);
         let globalDocuments = { ...(globalView.global_channel_docs || {}) };
         let globalAttachments = normalizePromptAttachments(globalView.global_attachments);
-        const keepGlobalDraft = (snapshot = draftGlobalSceneSnapshot()) => {
-            updatePromptDraft(drafts, globalDraftKey, globalBase, {
-                global_channels: snapshot.global_channels,
-                global_channel_docs: snapshot.global_channel_docs,
-                global_attachments: snapshot.global_attachments,
-            });
+        const globalMount = createPromptDraftMount({ drafts, key: globalDraftKey, global: true,
+            shown: { documents: scene.global_channel_docs, attachments: scene.global_attachments },
+            displayed: { documents: globalDocuments, attachments: globalAttachments } });
+        const saveGlobal = globalSaver({ projectId: draftProjectId, sceneId: draftSceneId,
+            template: draftTemplate });
+        // Records only: the global boxes touch the records they changed.
+        const keepGlobalDraft = (_snapshot = null) => {
+            globalMount.record({ documents: globalDocuments, attachments: globalAttachments });
             renderDraftRecovery();
         };
         const draftGlobalSceneSnapshot = () => sceneWithDraftGlobal(scene, {
@@ -3952,7 +4021,7 @@ Server value: ${serverValue}` : ""}`;
             const current = host.activeScene;
             if (!current || current !== scene && current.scene_id !== scene.scene_id) return false;
             const now = normalizeChannels(current.global_channels, current.prompt, globalKeys);
-            const base = normalizeChannels(globalBase.global_channels, globalBase.prompt, globalKeys);
+            const base = normalizeChannels(drawnGlobal.global_channels, drawnGlobal.prompt, globalKeys);
             const shown = Object.fromEntries(globalKeys.map((key) =>
                 [key, globalInputs[key]?.value ?? ""]));
             return !sameChannelText(now, base, globalKeys)
@@ -4032,7 +4101,11 @@ Server value: ${serverValue}` : ""}`;
                 onActivateAttachment: async (attachment) => {
                     const configured = acceptDurableConfiguration(
                         await configureGlobalAttachment(attachment));
-                    if (configured) input.replaceAttachment(configured);
+                    if (!configured) return;
+                    applyAfterDialog({ draftKey: globalDraftKey, global: true,
+                        template: draftTemplate, channelKey: key,
+                        build: (list) => list.map((value) =>
+                            value.attachment_id === configured.attachment_id ? configured : value) });
                 },
             });
             globalInputs[key] = input;
@@ -4050,27 +4123,10 @@ Server value: ${serverValue}` : ""}`;
             const commitGlobal = async () => {
                 if (globalLocked || guard.suppressBlurCommit) return;
                 globalChannels[key] = input.value;
+                for (const [channelKey, box] of Object.entries(globalInputs))
+                    globalDocuments[channelKey] = box.promptDocument;
                 keepGlobalDraft();
-                await savePromptDraft(drafts, globalDraftKey, async (value, baseline) =>
-                    await host._updateSceneGlobalContext(value.global_channels, value.global_channel_docs,
-                        value.global_attachments, { baseline, projectId: draftProjectId,
-                            sceneId: draftSceneId, template: draftTemplate }), {
-                    global: true,
-                    onAcknowledge: ({ baseline: nextBaseline, value: nextValue }) => {
-                        globalBase = structuredClone(nextBaseline);
-                        globalDocuments = structuredClone(nextValue.global_channel_docs || {});
-                        globalAttachments = normalizePromptAttachments(
-                            nextValue.global_attachments || []);
-                        for (const [channelKey, sibling] of Object.entries(globalInputs)) {
-                            sibling.syncPromptState?.({
-                                document: globalDocuments[channelKey],
-                                attachments: globalAttachments,
-                            });
-                            if (guard.focusedBox?.el === sibling)
-                                guard.focusedBox.revert = sibling.promptState;
-                        }
-                    },
-                });
+                if (drafts.get(globalDraftKey)) await savePromptDraft(drafts, globalDraftKey, saveGlobal);
                 renderDraftRecovery();
                 if (deferredDraftRender) render();
             };
@@ -4203,16 +4259,16 @@ Server value: ${serverValue}` : ""}`;
                     const configured = acceptDurableConfiguration(
                         await configureGlobalScope({ kind }));
                     if (!configured) return;
-                    globalInputs[globalKeys[0]]?.transactPromptAttachments?.(
-                        [...globalAttachments, configured]);
+                    applyAfterDialog({ draftKey: globalDraftKey, global: true,
+                        template: draftTemplate, build: (list) => [...list, configured] });
                 },
                 onActivate: async (attachment) => {
                     const configured = acceptDurableConfiguration(
                         await configureGlobalScope(attachment));
                     if (!configured) return;
-                    globalInputs[globalKeys[0]]?.transactPromptAttachments?.(
-                        globalAttachments.map((value) =>
-                            value.attachment_id === configured.attachment_id ? configured : value));
+                    applyAfterDialog({ draftKey: globalDraftKey, global: true,
+                        template: draftTemplate, build: (list) => list.map((value) =>
+                            value.attachment_id === configured.attachment_id ? configured : value) });
                 },
                 onRemove: async (attachment) => {
                     globalInputs[globalKeys[0]]?.transactPromptAttachments?.(
@@ -4222,6 +4278,35 @@ Server value: ${serverValue}` : ""}`;
             }));
         };
         renderGlobalScope();
+        liveMounts.set(globalDraftKey, {
+            // Any surface's acknowledgement: a box still showing exactly what
+            // was submitted repaints to what the server stored.
+            acknowledge: (event) => {
+                const repaint = globalMount.acknowledge(event, {
+                    documents: Object.fromEntries(Object.entries(globalInputs)
+                        .map(([channelKey, box]) => [channelKey, box.promptDocument])),
+                    attachments: globalAttachments });
+                if (repaint && (Object.keys(repaint.documents).length || repaint.attachments)) {
+                    for (const [channelKey, doc] of Object.entries(repaint.documents))
+                        globalDocuments[channelKey] = structuredClone(doc);
+                    if (repaint.attachments) globalAttachments = normalizePromptAttachments(repaint.attachments);
+                    for (const [channelKey, box] of Object.entries(globalInputs)) {
+                        if (Object.hasOwn(repaint.documents, channelKey)) {
+                            box.syncPromptState?.({ document: repaint.documents[channelKey],
+                                attachments: globalAttachments });
+                        } else {
+                            box.syncPromptAttachments?.(globalAttachments);
+                        }
+                        if (guard.focusedBox?.el === box) guard.focusedBox.revert = box.promptState;
+                    }
+                    renderGlobalScope();
+                }
+                renderDraftRecovery();
+            },
+            transactAttachments: (build, channelKey) =>
+                (globalInputs[channelKey] || globalInputs[globalKeys[0]])
+                    ?.transactPromptAttachments?.(build(globalAttachments)),
+        });
         body.appendChild(globalScopeHost);
         body.appendChild(makeHeightGrip(host, body, "panelGlobalBoxHeight", { label: "Drag to resize the global prompt box (persists)" }));
 
@@ -4303,15 +4388,24 @@ Server value: ${serverValue}` : ""}`;
             startInput.title = "Start frame";
             endInput.title = "End frame (exclusive)";
             const sectionDraftKey = promptDraftKey(draftProjectId, draftSceneId, section.prompt_id);
-            let sectionBase = structuredClone(section);
+            // The section this card drew: its identity for every action, and
+            // the text-stale check. Saves never read it: the draft row keeps
+            // each touched record's base, and acknowledgements reach whichever
+            // card is live (bug tracker L6).
+            const drawnSection = structuredClone(section);
             const sectionView = rebasePromptDraft(drafts.get(sectionDraftKey), section);
             const channels = normalizeChannels(sectionView.channels, sectionView.prompt, channelKeys);
             const channelInputs = {};
             let channelDocuments = { ...(sectionView.channel_docs || {}) };
             let sectionAttachments = normalizePromptAttachments(sectionView.attachments);
-            const keepSectionDraft = (sceneSnapshot = draftSceneSnapshot()) => {
-                const snapshot = sceneSnapshot.prompt_sections[idx];
-                updatePromptDraft(drafts, sectionDraftKey, sectionBase, snapshot);
+            const sectionMount = createPromptDraftMount({ drafts, key: sectionDraftKey,
+                shown: { documents: section.channel_docs, attachments: section.attachments },
+                displayed: { documents: channelDocuments, attachments: sectionAttachments } });
+            const saveSection = sectionSaver({ promptId: drawnSection.prompt_id || "",
+                projectId: draftProjectId, sceneId: draftSceneId, template: draftTemplate });
+            // Records only: this card touches the records it changed.
+            const keepSectionDraft = (_snapshot = null) => {
+                sectionMount.record({ documents: channelDocuments, attachments: sectionAttachments });
                 renderDraftRecovery();
             };
             const draftSceneSnapshot = () => sceneWithDraftSection(scene, {
@@ -4415,7 +4509,10 @@ Server value: ${serverValue}` : ""}`;
                             render();
                             return;
                         }
-                        input.replaceAttachment(configured);
+                        applyAfterDialog({ draftKey: sectionDraftKey,
+                            promptId: drawnSection.prompt_id || "", template: draftTemplate,
+                            channelKey: key, build: (list) => list.map((value) =>
+                                value.attachment_id === configured.attachment_id ? configured : value) });
                     },
                 });
                 applyBoxHeight(host, input, "panelChannelBoxHeight", 72);
@@ -4489,7 +4586,10 @@ Server value: ${serverValue}` : ""}`;
                                 render();
                                 return;
                             }
-                            input.replaceAttachment(configured);
+                            applyAfterDialog({ draftKey: sectionDraftKey,
+                                promptId: drawnSection.prompt_id || "", template: draftTemplate,
+                                channelKey: key, build: (list) => list.map((value) =>
+                                    value.attachment_id === configured.attachment_id ? configured : value) });
                         },
                         onSetCapabilityEnabled: (attachment, projection, enabled) => {
                             input.replaceAttachment(setPromptAttachmentCapabilityEnabled(
@@ -4520,7 +4620,7 @@ Server value: ${serverValue}` : ""}`;
                 // signature already covers it.
                 if (!row) return false;
                 const now = normalizeChannels(row.channels, row.prompt, channelKeys);
-                const base = normalizeChannels(sectionBase.channels, sectionBase.prompt, channelKeys);
+                const base = normalizeChannels(drawnSection.channels, drawnSection.prompt, channelKeys);
                 const shown = Object.fromEntries(channelKeys.map((key) =>
                     [key, channelInputs[key]?.value ?? ""]));
                 return !sameChannelText(now, base, channelKeys)
@@ -4540,37 +4640,16 @@ Server value: ${serverValue}` : ""}`;
                 // End commit made before the panel repaints do not refuse each
                 // other.
                 await host._updatePromptSection(idx, { start_frame: start, end_frame: end },
-                    { promptId: sectionBase.prompt_id || "" });
+                    { promptId: drawnSection.prompt_id || "" });
                 render(); // indices may have re-sorted — rebuild rows
             };
             const commitChannels = async () => {
                 if (guard.suppressBlurCommit) return;
-                const next = {};
-                for (const key of channelKeys) {
-                    next[key] = channelInputs[key].value.trim();
-                }
                 const nextDocuments = Object.fromEntries(
                     channelKeys.map((key) => [key, channelInputs[key].promptDocument]));
                 Object.assign(channelDocuments, nextDocuments);
                 keepSectionDraft();
-                await savePromptDraft(drafts, sectionDraftKey, async (value, baseline) =>
-                    await host._updatePromptSection(idx, { channels: value.channels,
-                        channel_docs: value.channel_docs, attachments: value.attachments },
-                        { baseline, projectId: draftProjectId, sceneId: draftSceneId, template: draftTemplate }), {
-                    onAcknowledge: ({ baseline: nextBaseline, value: nextValue }) => {
-                        sectionBase = structuredClone(nextBaseline);
-                        channelDocuments = structuredClone(nextValue.channel_docs || {});
-                        sectionAttachments = normalizePromptAttachments(nextValue.attachments || []);
-                        for (const [channelKey, sibling] of Object.entries(channelInputs)) {
-                            sibling.syncPromptState?.({
-                                document: channelDocuments[channelKey],
-                                attachments: sectionAttachments,
-                            });
-                            if (guard.focusedBox?.el === sibling)
-                                guard.focusedBox.revert = sibling.promptState;
-                        }
-                    },
-                });
+                if (drafts.get(sectionDraftKey)) await savePromptDraft(drafts, sectionDraftKey, saveSection);
                 renderDraftRecovery();
                 if (deferredDraftRender) render();
                 // A channel-only save cannot reorder rows. Keep these mounted
@@ -4618,15 +4697,17 @@ Server value: ${serverValue}` : ""}`;
                     allSceneAttachments: allSectionAttachments(),
                     reuseContext: { scene: draftSceneSnapshot(), template },
                     onReuse: async (configured) => {
-                        channelInputs[wideKey]?.transactPromptAttachments?.(
-                            [...sectionAttachments, configured]);
+                        applyAfterDialog({ draftKey: sectionDraftKey,
+                            promptId: drawnSection.prompt_id || "", template: draftTemplate,
+                            build: (list) => [...list, configured] });
                     },
                     onAdd: async (kind) => {
                         const configured = acceptDurableConfiguration(
                             await configureScope({ kind }));
                         if (!configured) return;
-                        channelInputs[wideKey]?.transactPromptAttachments?.(
-                            [...sectionAttachments, configured]);
+                        applyAfterDialog({ draftKey: sectionDraftKey,
+                            promptId: drawnSection.prompt_id || "", template: draftTemplate,
+                            build: (list) => [...list, configured] });
                     },
                     onActivate: async (attachment) => {
                         const configured = acceptDurableConfiguration(
@@ -4638,9 +4719,10 @@ Server value: ${serverValue}` : ""}`;
                             render();
                             return;
                         }
-                        channelInputs[wideKey]?.transactPromptAttachments?.(
-                            sectionAttachments.map((value) =>
-                                value.attachment_id === configured.attachment_id ? configured : value));
+                        applyAfterDialog({ draftKey: sectionDraftKey,
+                            promptId: drawnSection.prompt_id || "", template: draftTemplate,
+                            build: (list) => list.map((value) =>
+                                value.attachment_id === configured.attachment_id ? configured : value) });
                     },
                     onUnlink: async (configured) => {
                         channelInputs[wideKey]?.transactPromptAttachments?.(
@@ -4661,6 +4743,7 @@ Server value: ${serverValue}` : ""}`;
                         const copyChannels = selectedChannels.length
                             ? selectedChannels : channelKeys;
                         const nextDocuments = structuredClone(channelDocuments);
+                        const prepended = [];
                         for (const channelKey of copyChannels) {
                             if (!channelKeys.includes(channelKey)) continue;
                             const sourceDocument = normalizePromptDocument(
@@ -4670,25 +4753,30 @@ Server value: ${serverValue}` : ""}`;
                             if (!text) continue;
                             const targetDocument = normalizePromptDocument(
                                 nextDocuments[channelKey], channels[channelKey] || "");
+                            // A fresh node id. `uid` was never in scope here,
+                            // so Convert to copy threw before it wrote anything.
+                            const nodeId = globalThis.crypto?.randomUUID?.().replaceAll("-", "")
+                                || `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
                             targetDocument.nodes.unshift({
-                                type: "text", node_id: uid(), text: `${text} `,
+                                type: "text", node_id: nodeId, text: `${text} `,
                             });
                             nextDocuments[channelKey] = targetDocument;
+                            prepended.push(channelKey);
                         }
                         const nextAttachments = sectionAttachments.filter((value) =>
                             value.attachment_id !== attachment.attachment_id);
-                        // Identity from the card, before-values from the current
-                        // row — like a range commit, NOT the draft baseline: the
-                        // card's own range save or an in-flight channel save
-                        // leaves `sectionBase` behind until the next repaint,
-                        // and a baseline would then refuse against them.
-                        await host._updatePromptSection(idx, {
-                            channel_docs: nextDocuments,
-                            channels: Object.fromEntries(channelKeys.map((channelKey) => [
-                                channelKey, promptDocumentText(nextDocuments[channelKey]).trim(),
-                            ])),
-                            attachments: nextAttachments,
-                        }, { promptId: sectionBase.prompt_id || "" });
+                        // A narrow change: only the channels the copy prepends
+                        // to and the converted link are touched, each against
+                        // what this card showed. The whole-document write it
+                        // replaces would also have removed records this card
+                        // never drew (bug tracker L4).
+                        const changedDocuments = Object.fromEntries(prepended
+                            .map((channelKey) => [channelKey, nextDocuments[channelKey]]));
+                        Object.assign(channelDocuments, changedDocuments);
+                        sectionAttachments = nextAttachments;
+                        sectionMount.record({ documents: changedDocuments, attachments: nextAttachments });
+                        if (drafts.get(sectionDraftKey))
+                            await savePromptDraft(drafts, sectionDraftKey, saveSection);
                         render();
                     },
                     onRemove: async (attachment) => {
@@ -4699,6 +4787,36 @@ Server value: ${serverValue}` : ""}`;
                 }));
             };
             renderScope();
+            liveMounts.set(sectionDraftKey, {
+                // Any surface's acknowledgement for this section: a box still
+                // showing exactly what was submitted repaints to what was stored.
+                acknowledge: (event) => {
+                    const repaint = sectionMount.acknowledge(event, {
+                        documents: Object.fromEntries(Object.entries(channelInputs)
+                            .map(([channelKey, box]) => [channelKey, box.promptDocument])),
+                        attachments: sectionAttachments });
+                    if (repaint && (Object.keys(repaint.documents).length || repaint.attachments)) {
+                        for (const [channelKey, doc] of Object.entries(repaint.documents))
+                            channelDocuments[channelKey] = structuredClone(doc);
+                        if (repaint.attachments)
+                            sectionAttachments = normalizePromptAttachments(repaint.attachments);
+                        for (const [channelKey, box] of Object.entries(channelInputs)) {
+                            if (Object.hasOwn(repaint.documents, channelKey)) {
+                                box.syncPromptState?.({ document: repaint.documents[channelKey],
+                                    attachments: sectionAttachments });
+                            } else {
+                                box.syncPromptAttachments?.(sectionAttachments);
+                            }
+                            if (guard.focusedBox?.el === box) guard.focusedBox.revert = box.promptState;
+                        }
+                        renderScope();
+                    }
+                    renderDraftRecovery();
+                },
+                transactAttachments: (build, channelKey) =>
+                    (channelInputs[channelKey] || channelInputs[wideKey])
+                        ?.transactPromptAttachments?.(build(sectionAttachments)),
+            });
             const onEnterBlur = (input, commit) => {
                 const handler = (e) => {
                     if (e.key === "Enter" && !e.shiftKey) {
@@ -4739,7 +4857,7 @@ Server value: ${serverValue}` : ""}`;
             addAfterBtn.addEventListener("click", async () => {
                 if (sectionsLocked) return;
                 const created = await host._addPromptSectionAfter(idx,
-                    { promptId: sectionBase.prompt_id || "" }).catch(() => false);
+                    { promptId: drawnSection.prompt_id || "" }).catch(() => false);
                 if (created) render();
             });
             const deleteBtn = makeBtn("✕", "Delete this section", "danger",
@@ -4754,7 +4872,7 @@ Server value: ${serverValue}` : ""}`;
             deleteBtn.addEventListener("click", async () => {
                 if (sectionsLocked) return;
                 if (!confirm("Delete this prompt section?")) return;
-                await host._deletePromptSection(idx, { promptId: sectionBase.prompt_id || "" });
+                await host._deletePromptSection(idx, { promptId: drawnSection.prompt_id || "" });
                 render();
             });
 
@@ -4796,7 +4914,7 @@ Server value: ${serverValue}` : ""}`;
                     box.addEventListener("keydown", (e) => e.stopPropagation());
                     box.addEventListener("change", () => {
                         host._setSectionGlobalInherit(idx, key, box.checked,
-                            { promptId: sectionBase.prompt_id || "" })
+                            { promptId: drawnSection.prompt_id || "" })
                             .then(() => render())
                             .catch(() => render());
                     });

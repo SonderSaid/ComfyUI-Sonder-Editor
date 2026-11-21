@@ -75,7 +75,8 @@
  * @mutation-obligation field.history-write-set -- MERGED_WRITE_FIELDS and Scene field classification
  */
 import { shouldJoinSweep } from "./render_cache_activation.js";
-import { promptEditFields, promptDraftKey, updatePromptDraft, savePromptDraft, rebasePromptDraft } from "./prompt_edit_intent.js";
+import { addPromptDraftListener, createPromptDraftMount, promptEditBody, promptEditFields,
+    promptEditPaint, promptDraftKey, savePromptDraft, rebasePromptDraft } from "./prompt_edit_intent.js";
 
 const { api } = window.comfyAPI.api;
 
@@ -17490,8 +17491,15 @@ export class EditorWidget {
         const draftTemplate = projectTemplateValue(this._channelTemplate());
         const drafts = this._promptToolDrafts ||= new Map();
         const draftKey = promptDraftKey(draftProjectId, draftSceneId, section.prompt_id);
-        let baseline = structuredClone(section);
+        // The bar records only what it changes: `shown` is the section as the
+        // server-side view had it (a first touch's base), the draft view is what
+        // the bar displays. A whole-snapshot draft would revert records another
+        // surface saved meanwhile (bug tracker: "A timeline-bar commit reverts").
+        const shownSection = structuredClone(section);
         section = rebasePromptDraft(drafts.get(draftKey), section);
+        const mount = createPromptDraftMount({ drafts, key: draftKey,
+            shown: { documents: shownSection.channel_docs, attachments: shownSection.attachments },
+            displayed: { documents: section.channel_docs, attachments: section.attachments } });
 
         const editor = document.createElement("div");
         editor.style.cssText = `
@@ -17504,63 +17512,19 @@ export class EditorWidget {
         label.style.cssText = `font-size: 10px; color: ${COLORS.promptBorder}; white-space: nowrap;`;
         label.textContent = `Prompt [${section.start_frame}-${section.end_frame}]:`;
 
-        // Last durably-written channels. Focus loss and every close path commit
-        // through here, so the comparison is what keeps repeated focus changes
-        // from stacking no-op mutations and undo entries.
-        let committed = normalizeChannels(section.channels, section.prompt, this._channelKeys());
-        let committedDocuments = JSON.stringify(section.channel_docs || {});
-        let committedAttachments = JSON.stringify(section.attachments || []);
+        const committed = normalizeChannels(section.channels, section.prompt, this._channelKeys());
         let discard = false;
+        const save = (edit) => this._updatePromptSection(idx, {}, { edit,
+            promptId: shownSection.prompt_id || "", projectId: draftProjectId,
+            sceneId: draftSceneId, template: draftTemplate });
         const commit = ({ close = true } = {}) => {
             // Teardown fires a final focusout; only the mounted bar may write,
             // so Esc and Delete cannot be reversed by their own removal.
             if (this._promptEditorEl !== editor) return;
-            const next = channelInputs.read();
-            const nextDocuments = channelInputs.readDocuments();
-            const nextAttachments = channelInputs.readAttachments();
-            const documentsChanged = JSON.stringify(nextDocuments) !== committedDocuments;
-            const attachmentsChanged = JSON.stringify(nextAttachments) !== committedAttachments;
-            if (drafts.get(draftKey)?.error || documentsChanged || attachmentsChanged
-                || Object.keys(next).some((key) => next[key] !== (committed[key] ?? ""))) {
-                committed = next;
-                committedDocuments = JSON.stringify(nextDocuments);
-                committedAttachments = JSON.stringify(nextAttachments);
-                updatePromptDraft(drafts, draftKey, baseline, { ...baseline,
-                    channels: next, channel_docs: nextDocuments, attachments: nextAttachments });
-                savePromptDraft(drafts, draftKey, async (value, expected) =>
-                    await this._updatePromptSection(idx, {
-                        channels: value.channels, channel_docs: value.channel_docs,
-                        attachments: value.attachments,
-                    }, { baseline: expected, projectId: draftProjectId,
-                        sceneId: draftSceneId, template: draftTemplate }), {
-                    onAcknowledge: ({ submitted, baseline: nextBaseline, value: nextValue }) => {
-                        baseline = structuredClone(nextBaseline);
-                        const live = { channels: channelInputs.read(),
-                            channel_docs: channelInputs.readDocuments(),
-                            attachments: channelInputs.readAttachments() };
-                        const submittedContext = { channels: submitted.channels || {},
-                            channel_docs: submitted.channel_docs || {},
-                            attachments: submitted.attachments || [] };
-                        const liveChanged = JSON.stringify(live) !== JSON.stringify(submittedContext);
-                        committed = normalizeChannels(
-                            nextBaseline.channels, nextBaseline.prompt, this._channelKeys());
-                        committedDocuments = JSON.stringify(nextBaseline.channel_docs || {});
-                        committedAttachments = JSON.stringify(nextBaseline.attachments || []);
-                        if (liveChanged) {
-                            const row = updatePromptDraft(drafts, draftKey, nextBaseline,
-                                { ...nextBaseline, ...live });
-                            row.saveAgain = true;
-                        } else {
-                            committed = normalizeChannels(
-                                nextValue.channels, nextValue.prompt, this._channelKeys());
-                            committedDocuments = JSON.stringify(nextValue.channel_docs || {});
-                            committedAttachments = JSON.stringify(nextValue.attachments || []);
-                            channelInputs.syncAcknowledged({ channels: committed,
-                                documents: nextValue.channel_docs,
-                                attachments: nextValue.attachments });
-                        }
-                    },
-                });
+            const row = mount.record({ documents: channelInputs.readDocuments(),
+                attachments: channelInputs.readAttachments() });
+            if (row) {
+                savePromptDraft(drafts, draftKey, save);
                 // The mutation clears the lane highlight; an open bar should
                 // keep pointing at the section its Save/Delete still target.
                 if (!close) {
@@ -17570,6 +17534,17 @@ export class EditorWidget {
             }
             if (close) this._hidePromptEditor();
         };
+        // Any surface's acknowledgement for this section reaches the bar: a
+        // record it still shows as submitted repaints to what was stored.
+        const stopListening = addPromptDraftListener(drafts, (event) => {
+            if (this._promptEditorEl !== editor) return;
+            const repaint = mount.acknowledge(event, { documents: channelInputs.readDocuments(),
+                attachments: channelInputs.readAttachments() });
+            if (!repaint || (!Object.keys(repaint.documents).length && !repaint.attachments)) return;
+            channelInputs.syncAcknowledged({ documents: repaint.documents,
+                attachments: repaint.attachments || channelInputs.readAttachments() });
+        });
+        editor._sonderPromptBarCleanup = stopListening;
         const channelInputs = this._buildChannelInputs(
             committed,
             commit,
@@ -17647,8 +17622,13 @@ export class EditorWidget {
         const draftTemplate = projectTemplateValue(this._channelTemplate());
         const drafts = this._promptToolDrafts ||= new Map();
         const draftKey = promptDraftKey(draftProjectId, draftSceneId);
-        let baseline = structuredClone(this.activeScene);
-        const view = rebasePromptDraft(drafts.get(draftKey), this.activeScene, { global: true });
+        // Records only, as in the section bar: `shown` is the scene's global
+        // records as drawn, the draft view is what the bar displays.
+        const shownScene = this.activeScene;
+        const view = rebasePromptDraft(drafts.get(draftKey), shownScene, { global: true });
+        const mount = createPromptDraftMount({ drafts, key: draftKey, global: true,
+            shown: { documents: shownScene.global_channel_docs, attachments: shownScene.global_attachments },
+            displayed: { documents: view.global_channel_docs, attachments: view.global_attachments } });
 
         const editor = document.createElement("div");
         editor.style.cssText = `
@@ -17662,59 +17642,26 @@ export class EditorWidget {
         label.textContent = "Global:";
 
         const keys = this._globalChannelKeys();
-        let committed = normalizeChannels(
+        const committed = normalizeChannels(
             view.global_channels, view.prompt, keys);
-        let committedDocuments = JSON.stringify(view.global_channel_docs || {});
-        let committedAttachments = JSON.stringify(view.global_attachments || []);
         let suppressBlurCommit = false;
+        const save = (edit) => this._updateSceneGlobalContext(null, null, null, { edit,
+            projectId: draftProjectId, sceneId: draftSceneId, template: draftTemplate });
         const commit = () => {
             if (suppressBlurCommit) return;
             if (this._promptEditorEl !== editor) return;
-            const next = channelInputs.read();
-            const nextDocuments = channelInputs.readDocuments();
-            const nextAttachments = channelInputs.readAttachments();
-            if (!drafts.get(draftKey)?.error && Object.keys(next).every((key) => next[key] === (committed[key] ?? ""))
-                && JSON.stringify(nextDocuments) === committedDocuments
-                && JSON.stringify(nextAttachments) === committedAttachments) return;
-            committed = next;
-            committedDocuments = JSON.stringify(nextDocuments);
-            committedAttachments = JSON.stringify(nextAttachments);
-            updatePromptDraft(drafts, draftKey, baseline, { global_channels: next,
-                global_channel_docs: nextDocuments, global_attachments: nextAttachments });
-            savePromptDraft(drafts, draftKey, async (value, expected) =>
-                await this._updateSceneGlobalContext(value.global_channels,
-                    value.global_channel_docs, value.global_attachments, { baseline: expected,
-                        projectId: draftProjectId, sceneId: draftSceneId, template: draftTemplate }), {
-                global: true,
-                onAcknowledge: ({ submitted, baseline: nextBaseline, value: nextValue }) => {
-                    baseline = structuredClone(nextBaseline);
-                    const live = { global_channels: channelInputs.read(),
-                        global_channel_docs: channelInputs.readDocuments(),
-                        global_attachments: channelInputs.readAttachments() };
-                    const submittedContext = {
-                        global_channels: submitted.global_channels || {},
-                        global_channel_docs: submitted.global_channel_docs || {},
-                        global_attachments: submitted.global_attachments || [],
-                    };
-                    const liveChanged = JSON.stringify(live) !== JSON.stringify(submittedContext);
-                    committed = normalizeChannels(nextBaseline.global_channels, "", keys);
-                    committedDocuments = JSON.stringify(nextBaseline.global_channel_docs || {});
-                    committedAttachments = JSON.stringify(nextBaseline.global_attachments || []);
-                    if (liveChanged) {
-                        const row = updatePromptDraft(drafts, draftKey, nextBaseline,
-                            { ...nextBaseline, ...live });
-                        row.saveAgain = true;
-                    } else {
-                        committed = normalizeChannels(nextValue.global_channels, "", keys);
-                        committedDocuments = JSON.stringify(nextValue.global_channel_docs || {});
-                        committedAttachments = JSON.stringify(nextValue.global_attachments || []);
-                        channelInputs.syncAcknowledged({ channels: committed,
-                            documents: nextValue.global_channel_docs,
-                            attachments: nextValue.global_attachments });
-                    }
-                },
-            });
+            const row = mount.record({ documents: channelInputs.readDocuments(),
+                attachments: channelInputs.readAttachments() });
+            if (row) savePromptDraft(drafts, draftKey, save);
         };
+        const stopListening = addPromptDraftListener(drafts, (event) => {
+            if (this._promptEditorEl !== editor) return;
+            const repaint = mount.acknowledge(event, { documents: channelInputs.readDocuments(),
+                attachments: channelInputs.readAttachments() });
+            if (!repaint || (!Object.keys(repaint.documents).length && !repaint.attachments)) return;
+            channelInputs.syncAcknowledged({ documents: repaint.documents,
+                attachments: repaint.attachments || channelInputs.readAttachments() });
+        });
         const channelInputs = this._buildChannelInputs(committed, ({ close = true } = {}) => {
             commit();
             if (close) this._hidePromptEditor();
@@ -17740,6 +17687,7 @@ export class EditorWidget {
 
         editor.append(label, channelInputs.wrap);
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
+        editor._sonderPromptBarCleanup = stopListening;
         this._promptEditorEl = editor;
         // Close paths flush too: browsers disagree on whether removing a
         // focused element fires blur, and the commit above already no-ops on
@@ -17758,7 +17706,7 @@ export class EditorWidget {
 
     async _updateSceneGlobalContextWithinGesture(channels, channelDocs, attachments, {
         baseline = null, projectId = this._projectDirName(), sceneId = this.activeSceneId,
-        template = projectTemplateValue(this._channelTemplate()),
+        template = projectTemplateValue(this._channelTemplate()), edit = null,
     } = {}) {
         if (!this.activeScene || !this.projectDir || this._isGlobalPromptTrackLocked()
                 || projectId !== this._projectDirName() || sceneId !== this.activeSceneId) return false;
@@ -17768,10 +17716,20 @@ export class EditorWidget {
             global_channel_docs: structuredClone(sceneRef.global_channel_docs || {}),
             global_attachments: structuredClone(sceneRef.global_attachments || []),
         };
+        if (edit) {
+            // A draft's record edit: only its records are sent and painted.
+            const painted = promptEditPaint(previous, edit, { global: true });
+            channelDocs = painted.global_channel_docs;
+            attachments = painted.global_attachments;
+            channels = { ...previous.global_channels, ...Object.fromEntries(
+                Object.keys(edit.documents || {}).map((key) =>
+                    [key, promptDocumentText(channelDocs[key] || null).trim()])) };
+        }
         const next = { global_channels: normalizeChannels(channels),
             global_channel_docs: structuredClone(channelDocs || {}),
             global_attachments: structuredClone(attachments || []) };
-        const fields = promptEditFields(baseline || previous, next, { global: true });
+        const fields = edit ? promptEditBody(edit)
+            : promptEditFields(baseline || previous, next, { global: true });
         if (!Object.keys(fields).length) return { status: "no-op" };
         const undoLabel = "edit global prompt context";
         const key = JSON.stringify([projectId, sceneId, "global"]);
@@ -19928,6 +19886,7 @@ export class EditorWidget {
         if (commit && pendingCommit) pendingCommit();
         const editorEl = this._promptEditorEl;
         this._promptEditorEl = null;
+        editorEl?._sonderPromptBarCleanup?.();
         this._refreshInlinePromptProjections = null;
         this._disconnectInlinePromptEditorObserver();
         if (editorEl) {
@@ -19985,6 +19944,7 @@ export class EditorWidget {
         baseline = null, promptId = "", projectId = this._projectDirName(),
         sceneId = this.activeSceneId,
         template = projectTemplateValue(this._channelTemplate()),
+        edit = null,
     } = {}) {
         if (!this.activeScene || !this.projectDir || this._isPromptTrackLocked()
                 || projectId !== this._projectDirName() || sceneId !== this.activeSceneId) return false;
@@ -19993,7 +19953,15 @@ export class EditorWidget {
         if (!section) return false;
         const previous = structuredClone(section);
         const before = baseline || previous;
-        const fields = promptEditFields(before, updates);
+        // A draft's record edit (`edit`) names exactly the records an author
+        // touched with the values they saw; it is sent as is. The local paint
+        // lays those records over the current row.
+        if (edit) {
+            updates = promptEditPaint(previous, edit);
+            updates.channels = Object.fromEntries(Object.keys(edit.documents || {}).map((key) =>
+                [key, promptDocumentText(updates.channel_docs[key] || null).trim()]));
+        }
+        const fields = edit ? promptEditBody(edit) : promptEditFields(before, updates);
         if (!Object.keys(fields).length) return { status: "no-op" };
         const expected = { prompt_id: before.prompt_id,
             start_frame: before.start_frame, end_frame: before.end_frame };

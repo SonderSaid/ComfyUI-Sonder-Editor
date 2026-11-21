@@ -54,11 +54,12 @@ def test_section_bar_commits_on_focus_loss_and_dedupes_unchanged_channels():
     assert "if (e.relatedTarget && editor.contains(e.relatedTarget)) return;" in editor
     assert "commit({ close: false })" in editor
     assert "this._promptEditorCommit = () => commit({ close: false });" in editor
-    # Only a real text change reaches the mutation pipeline, so repeated focus
-    # changes cannot stack no-op writes or undo entries. The comparison is over
-    # whatever channels the active template names, not a fixed three.
-    assert "Object.keys(next).some((key) => next[key] !== (committed[key] ?? \"\"))" in editor
-    assert "committed = next;" in editor
+    # Only a real change reaches the mutation pipeline, so repeated focus
+    # changes cannot stack no-op writes or undo entries. The bar records the
+    # records it changed (any template's channels) and saves only when the
+    # draft holds one; behavior is covered in test_prompt_tool_integrity_baseline.
+    assert "const row = mount.record({ documents: channelInputs.readDocuments()," in editor
+    assert "if (row) {" in editor
     # Esc discards; Delete arms before the blur it causes.
     assert "this._hidePromptEditor({ commit: false });" in editor
     assert 'deleteBtn.addEventListener("mousedown", () => { discard = true; });' in editor
@@ -107,27 +108,23 @@ def test_discarding_close_paths_do_not_write_stale_edits():
     assert flush_at < drain_at
 
 
-def test_timeline_acknowledgements_enrol_live_edits_before_repainting():
+def test_timeline_bars_hear_every_acknowledgement_and_stop_when_hidden():
     widget = _source("web/js/editor_widget.js")
     section = _method(widget, "_showPromptEditor", "_showGlobalPromptEditor")
     global_bar = _method(widget, "_showGlobalPromptEditor", "_updateSceneGlobalContext")
 
-    for editor, docs_key, attachments_key in (
-        (section, "channel_docs", "attachments"),
-        (global_bar, "global_channel_docs", "global_attachments"),
-    ):
-        assert "onAcknowledge: ({ submitted," in editor
-        assert "channelInputs.readDocuments()" in editor
-        assert "channelInputs.readAttachments()" in editor
-        assert f"{docs_key}: submitted.{docs_key} || {{}}" in editor
-        assert f"{attachments_key}: submitted.{attachments_key} || []" in editor
-        assert "const liveChanged = JSON.stringify(live) !== JSON.stringify(submittedContext);" in editor
-        update_at = editor.index("const row = updatePromptDraft(")
-        retry_at = editor.index("row.saveAgain = true;")
-        repaint_at = editor.index("channelInputs.syncAcknowledged(")
-        assert update_at < retry_at < repaint_at
-        assert "if (liveChanged)" in editor[update_at - 200:update_at]
-        assert "} else {" in editor[retry_at:repaint_at]
+    for editor in (section, global_bar):
+        # Any surface's acknowledgement reaches the bar (not only its own
+        # save's), and only records it still shows as submitted repaint.
+        listen_at = editor.index("const stopListening = addPromptDraftListener(drafts, (event) => {")
+        ack_at = editor.index("mount.acknowledge(event, { documents: channelInputs.readDocuments(),", listen_at)
+        repaint_at = editor.index("channelInputs.syncAcknowledged(", ack_at)
+        assert listen_at < ack_at < repaint_at
+        assert "editor._sonderPromptBarCleanup = stopListening;" in editor
+        # No whole-snapshot draft from a bar (bug tracker: bar reverts panel).
+        assert "updatePromptDraft(" not in editor
+    hide = _method(widget, "_hidePromptEditor", "_observeInlinePromptEditor")
+    assert "editorEl?._sonderPromptBarCleanup?.();" in hide
 
 
 def test_server_settlement_sync_is_history_free_and_reseeds_panel_documents():
@@ -141,6 +138,5 @@ def test_server_settlement_sync_is_history_free_and_reseeds_panel_documents():
     assert "restoreSelection(bookmark)" in sync
 
     panel = _source("web/js/editor_prompt_panel.js")
-    assert "document: globalDocuments[channelKey]" in panel
-    assert "document: channelDocuments[channelKey]" in panel
-    assert panel.count("sibling.syncPromptState?.({") >= 2
+    # Acknowledgement repaints go through history-free settlement sync.
+    assert panel.count("box.syncPromptState?.({ document: repaint.documents[channelKey],") == 2

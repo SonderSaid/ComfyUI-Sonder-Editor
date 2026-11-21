@@ -3671,6 +3671,12 @@ def test_prompt_edit_merges_unrelated_changes_and_refuses_same_field(global_scop
     apply()
     assert getattr(target, channels_key)["visual"] == "mine"
     assert getattr(target, channels_key)["speech"] == "someone else"
+    # An identical replay agrees with what is stored: it settles, writes nothing.
+    settled = target.to_dict()
+    apply()
+    assert target.to_dict() == settled
+    # A divergent replay against the same stale `expected` still refuses.
+    fields["prompt_edit"]["documents"]["visual"]["value"] = prompt_context.text_document("theirs")
     before_refusal = target.to_dict()
     with pytest.raises(routes.ProjectMutationRequestError) as raised:
         apply()
@@ -3808,6 +3814,65 @@ def test_prompt_edit_normalized_comparison_still_refuses_real_capability_change(
 
     assert raised.value.code == "prompt_edit_conflict"
     assert scene.global_attachments == [stored]
+
+
+def test_prompt_edit_agreement_settles_a_stale_attachment_only_on_raw_equality():
+    """Phase 1.6: a refused attachment that already holds the author's value
+    settles and keeps the stored record; a normalized-only match does not."""
+    stored = prompt_context.normalize_attachment({
+        "attachment_id": "chip", "kind": "reference",
+        "capabilities": [{"capability_id": "summary", "kind": "summary", "enabled": False}],
+    })
+    old = copy.deepcopy(stored); old["config"]["text"] = "before someone else"
+    scene = Scene(scene_id="s", duration_frames=24, global_attachments=[copy.deepcopy(stored)])
+    project = TimelineProject(project_dir="", scenes=[scene])
+
+    routes._apply_scene_fields(project, scene, {"prompt_edit": {"documents": {}, "attachments": {
+        "chip": {"expected": old, "value": copy.deepcopy(stored)}}}})
+    assert scene.global_attachments == [stored]
+
+    # The same chip sent sparse (defaults left out) equals the stored one only
+    # after normalization: atomic records do not settle on that.
+    sparse = {"attachment_id": "chip", "kind": "reference",
+              "capabilities": [{"capability_id": "summary", "kind": "summary", "enabled": False}]}
+    # Discriminating only while a normalized match exists (Phase 1 audit).
+    assert (prompt_context.content_hash(prompt_context.normalize_attachment(sparse))
+            == prompt_context.content_hash(stored))
+    assert prompt_context.content_hash(sparse) != prompt_context.content_hash(stored)
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._apply_scene_fields(project, scene, {"prompt_edit": {"documents": {}, "attachments": {
+            "chip": {"expected": old, "value": sparse}}}})
+    assert raised.value.code == "prompt_edit_conflict"
+    assert scene.global_attachments == [stored]
+
+
+def test_prompt_edit_agreement_settles_a_stale_document_by_content():
+    section = PromptSection(0, 24, channels={"visual": "stored"})
+    scene = Scene(scene_id="s", duration_frames=24, prompt_sections=[section])
+    stored = copy.deepcopy(section.channel_docs["visual"])
+    # Same content, different node ids: settles; the stored ids are kept.
+    same_text = prompt_context.text_document("stored")
+    routes._apply_update_prompt_section(scene, 0, {"prompt_edit": {"documents": {"visual": {
+        "expected": prompt_context.text_document("what the browser last saw"),
+        "value": same_text}}}},
+        {"prompt_id": section.prompt_id, "start_frame": 0, "end_frame": 24})
+    assert section.channel_docs["visual"] == stored
+
+
+def test_prompt_edit_batch_mixing_agreement_and_conflict_refuses_whole():
+    section = PromptSection(0, 24, channels={"visual": "stored", "speech": "theirs"})
+    scene = Scene(scene_id="s", duration_frames=24, prompt_sections=[section])
+    before = section.to_dict()
+    with pytest.raises(routes.ProjectMutationRequestError) as raised:
+        routes._apply_update_prompt_section(scene, 0, {"prompt_edit": {"documents": {
+            "visual": {"expected": prompt_context.text_document("stale"),
+                       "value": copy.deepcopy(section.channel_docs["visual"])},
+            "speech": {"expected": prompt_context.text_document("stale"),
+                       "value": prompt_context.text_document("mine")},
+        }}}, {"prompt_id": section.prompt_id, "start_frame": 0, "end_frame": 24})
+    assert raised.value.code == "prompt_edit_conflict"
+    assert raised.value.details["record_key"] == "speech"
+    assert section.to_dict() == before
 
 
 def test_generic_prompt_mutations_require_compare_state_and_reject_mixed_intents():

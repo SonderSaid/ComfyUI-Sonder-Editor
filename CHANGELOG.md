@@ -21,6 +21,12 @@ a fresh `[Unreleased]` block.
 - The Launcher no longer says "No seed exposed" for a workflow whose seed Control is off only because its node pack isn't installed.
 - Launcher badges read "1 note" and "1 model missing".
 - **Settings ▸ Sonder App** no longer says a package "stays loaded until ComfyUI restarts" once that package is installed again.
+- A Prompt section no longer gets stuck refusing every save ("This prompt field changed elsewhere") after a **Retry** or **Use server's version**, and a save no longer drags along fields you didn't touch.
+- Text typed into a Prompt box is no longer lost when its save is refused while the Prompt panel redraws. **Retry** after a refused save no longer overwrites what someone else saved; choose **Use server's version** or **Discard** instead.
+- Saving from the timeline prompt bar no longer undoes a field you just saved in the Prompt panel for the same section. If you edited that same field in both, the later save is refused and kept as a draft, with **Use server's version** and **Discard**, instead of silently replacing the other.
+- A Context chip added through **+ Attach** shows in the open Prompt panel right away, instead of only after reopening it. If the section was deleted or the scene changed while the dialog was open, nothing is attached and a notice says why.
+- **Convert to copy** on a section Prompt link now works (it used to fail without changing anything), and it changes only the fields it fills in.
+- The Prompt panel's save-failed bar says when a draft also changed other fields that **Use server's version** keeps.
 
 ## [0.9.0] - 2026-11-19
 

@@ -2345,6 +2345,45 @@ def _apply_split_linked(scene: Scene, anchor_ref: dict, split_frame: int,
     }
 
 
+def _prompt_edit_agrees(part, current, value):
+    """Whether a refused prompt record already holds the author's value.
+
+    A document agrees by content: raw, then normalized. An attachment agrees
+    only on raw equality (identity is checked by the caller): it is atomic, the
+    stored record is kept as is (tri-state `enabled`, unknown capability
+    fields), and a normalized match would let a sparse value stand in for a
+    richer stored record.
+    """
+    if prompt_context.content_hash(current) == prompt_context.content_hash(value):
+        return True
+    if part != "documents" or current is None or value is None:
+        return False
+    return (_prompt_document_shape(prompt_context.normalize_prompt_document(current))
+            == _prompt_document_shape(prompt_context.normalize_prompt_document(value)))
+
+
+def _prompt_document_shape(document):
+    """A document's content without node ids: adjacent text runs merged, empty
+    runs dropped, attachment anchors by id. Mirrors `documentShape` in
+    `web/js/prompt_edit_intent.js`, which the browser uses for the same call."""
+    shape = []
+    for node in (document or {}).get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        if node.get("type") == "text":
+            text = str(node.get("text") or "")
+            if not text:
+                continue
+            if shape and shape[-1][0] == "text":
+                shape[-1] = ("text", shape[-1][1] + text)
+            else:
+                shape.append(("text", text))
+        else:
+            shape.append((str(node.get("type") or ""), str(node.get("attachment_id") or ""),
+                          str(node.get("capability_id") or "")))
+    return shape
+
+
 def _merge_prompt_edit_fields(fields, documents, attachments, *, global_scope=False):
     """Compare touched records, then merge into current state under the write lock.
 
@@ -2369,6 +2408,9 @@ def _merge_prompt_edit_fields(fields, documents, attachments, *, global_scope=Fa
                 _mutation_error("Prompt edit values must be objects or null", 400)
             current = target.get(key)
             expected = change["expected"]
+            value = change["value"]
+            if part == "attachments" and value is not None and value.get("attachment_id") != key:
+                _mutation_error("Prompt attachment identity mismatch", 400)
             matches = (prompt_context.content_hash(current)
                        == prompt_context.content_hash(expected))
             if not matches and current is not None and expected is not None:
@@ -2382,6 +2424,13 @@ def _merge_prompt_edit_fields(fields, documents, attachments, *, global_scope=Fa
                               else prompt_context.normalize_attachment)
                 matches = (prompt_context.content_hash(normalizer(current))
                            == prompt_context.content_hash(normalizer(expected)))
+            if not matches and _prompt_edit_agrees(part, current, value):
+                # Agreement: what the author sends is already stored, so the
+                # record settles whatever its `expected`, with no write. A
+                # browser whose base fell behind its own acknowledged save
+                # stops being refused for text the server already holds (bug
+                # tracker L6). Any other difference still refuses below.
+                continue
             if not matches:
                 _mutation_error(
                     "This prompt field changed elsewhere. Your draft was not saved.",
@@ -2390,9 +2439,6 @@ def _merge_prompt_edit_fields(fields, documents, attachments, *, global_scope=Fa
                         "record_key": str(key),
                         "current": copy.deepcopy(current),
                     })
-            value = change["value"]
-            if part == "attachments" and value is not None and value.get("attachment_id") != key:
-                _mutation_error("Prompt attachment identity mismatch", 400)
             if value is None:
                 target.pop(key, None)
             else:
