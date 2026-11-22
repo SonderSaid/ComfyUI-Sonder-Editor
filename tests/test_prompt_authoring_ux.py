@@ -9548,7 +9548,8 @@ const dismissed=dismissPromptDraftError(drafts,key);
 console.log(JSON.stringify({{resolved,dismissed,afterResolve,error:row.error,conflict:row.conflict,events}}));
 """)
     assert result["resolved"] == {"resolved": "attachment a",
-                                  "remaining": ["document visual", "document speech", "attachment b"]}
+                                  "remaining": ["document visual", "document speech", "attachment b"],
+                                  "followers": [], "settled": []}
     assert result["dismissed"]
     # The contested record left the draft; everything else kept its base.
     assert "a" not in result["afterResolve"]["value"]["attachments"]

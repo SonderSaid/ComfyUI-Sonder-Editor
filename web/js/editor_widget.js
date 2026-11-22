@@ -6741,10 +6741,30 @@ export class EditorWidget {
     }
 
     _takePromptIdentityCreateIntents(attachments = []) {
-        const committedAttachmentIds = new Set((attachments || [])
-            .filter((value) => value && typeof value === "object")
+        const committed = (attachments || []).filter((value) => value && typeof value === "object");
+        const committedAttachmentIds = new Set(committed
             .map((value) => String(value.attachment_id || ""))
             .filter(Boolean));
+        // A create parked by "Use server's version" comes back when its chip
+        // does (Ctrl+Z) or when another committed chip names its identity, so
+        // no save stores a chip naming an identity that is never created.
+        const parked = this._parkedPromptIdentityCreateIntents;
+        if (parked?.size) {
+            const names = (value, unitId) => ["semantic_unit_ids", "subject_ids"].some((field) =>
+                (Array.isArray(value?.source?.[field]) ? value.source[field] : []).map(String).includes(unitId));
+            for (const [unitId, entry] of [...parked.entries()]) {
+                const back = committed.find((value) =>
+                    String(value.attachment_id || "") === String(entry?.attachmentId || "")
+                    || names(value, unitId));
+                if (!back) continue;
+                parked.delete(unitId);
+                this._pendingPromptIdentityCreateIntents ||= new Map();
+                if (!this._pendingPromptIdentityCreateIntents.has(unitId)) {
+                    this._pendingPromptIdentityCreateIntents.set(unitId, {
+                        attachmentId: String(back.attachment_id || ""), intent: structuredClone(entry.intent) });
+                }
+            }
+        }
         const intents = [];
         for (const [unitId, pending] of
                 (this._pendingPromptIdentityCreateIntents?.entries?.() || [])) {
@@ -6790,6 +6810,61 @@ export class EditorWidget {
         // draft's copy would otherwise put the create back (follow-up audit F6).
         if (drop && draft?.identityCreates)
             draft.identityCreates = draft.identityCreates.filter(([id]) => !ids.has(id));
+    }
+
+    /** "Use server's version" dropped these chips (their only place was the
+     * discarded text). An identity create that rode only with one of them is
+     * not sent now, so it stops being pending: a paste no longer refuses its
+     * identity, the draft's copy stops putting it back, and its optimistic
+     * identity (one the server never answered for) leaves the lists. It is
+     * PARKED, not deleted: `_takePromptIdentityCreateIntents` revives it if
+     * the chip comes back (Ctrl+Z) or another committed chip names it. A chip
+     * still in the draft that names the identity takes the create over
+     * instead, and an entry being sent is left to its save. */
+    _parkPromptIdentityCreatesForAttachments(attachmentIds = [], draft = null) {
+        const dropped = new Set((attachmentIds || []).map((id) => String(id || "")).filter(Boolean));
+        if (!dropped.size) return [];
+        const names = (value, unitId) => ["semantic_unit_ids", "subject_ids"].some((field) =>
+            (Array.isArray(value?.source?.[field]) ? value.source[field] : []).map(String).includes(unitId));
+        const remaining = Object.values(draft?.value?.attachments || {}).filter((value) =>
+            value && typeof value === "object" && !dropped.has(String(value.attachment_id || "")));
+        const store = this._pendingPromptIdentityCreateIntents;
+        const parked = this._parkedPromptIdentityCreateIntents ||= new Map();
+        const candidates = new Map();
+        for (const [unitId, pending] of [...(store?.entries?.() || [])]) {
+            if (!pending?.sending && dropped.has(String(pending?.attachmentId || "")))
+                candidates.set(unitId, pending);
+        }
+        for (const [unitId, pending] of draft?.identityCreates || []) {
+            if (!candidates.has(unitId) && !store?.get?.(unitId)?.sending
+                    && dropped.has(String(pending?.attachmentId || ""))) candidates.set(unitId, pending);
+        }
+        const units = new Set();
+        for (const [unitId, pending] of candidates) {
+            const heir = remaining.find((value) => names(value, unitId));
+            if (heir) {
+                // Another chip of this draft names the identity: the create
+                // rides with it.
+                const heirId = String(heir.attachment_id || "");
+                const entry = store?.get?.(unitId);
+                if (entry) entry.attachmentId = heirId;
+                for (const pair of draft?.identityCreates || []) {
+                    if (pair[0] === unitId && pair[1]) pair[1] = { ...pair[1], attachmentId: heirId };
+                }
+                continue;
+            }
+            store?.delete?.(unitId);
+            parked.set(unitId, { attachmentId: String(pending?.attachmentId || ""),
+                intent: structuredClone(pending?.intent) });
+            units.add(unitId);
+        }
+        if (!units.size) return [];
+        if (draft?.identityCreates)
+            draft.identityCreates = draft.identityCreates.filter(([unitId]) => !units.has(unitId));
+        // Only the optimistic projection: a stored identity carries a handle.
+        this._promptSemanticUnits = (this._promptSemanticUnits || []).filter((unit) =>
+            !(units.has(String(unit?.semantic_unit_id || "")) && !unit?.handle));
+        return [...units];
     }
 
     _adoptPromptIdentitiesFromMutation(result) {
@@ -28963,6 +29038,7 @@ export class EditorWidget {
         this._promptContextProfiles = [];
         this._promptSemanticUnits = [];
         this._pendingPromptIdentityCreateIntents?.clear?.();
+        this._parkedPromptIdentityCreateIntents?.clear?.();
         this._referenceRecipeFieldSchema = [];
         this._promptContextCatalog = {};
         this._referencesLoaded = false;

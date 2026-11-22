@@ -439,7 +439,8 @@ await retryPromptDraft(drafts, key);
 console.log(JSON.stringify({ resolved, retry: requests.slice(before), liveShows: panel.shown(live),
     row: rowText(), server: serverText() }));
 """)
-    assert result["resolved"] == {"resolved": "document visual", "remaining": ["document speech"]}
+    assert result["resolved"] == {"resolved": "document visual", "remaining": ["document speech"],
+                                  "followers": [], "settled": []}
     assert result["retry"] == [{"speech": {"expected": "s0", "value": "moved in"}}]
     assert result["liveShows"]["visual"] == "other writer"
     assert result["row"] is None

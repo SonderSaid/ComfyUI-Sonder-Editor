@@ -1,6 +1,6 @@
 import { addPromptDraftListener, createPromptDraftMount, dismissPromptDraftError, promptEditFields, promptDraftKey,
-    promptDraftRecordLabels, resolvePromptDraftRecord, retryPromptDraft, savePromptDraft,
-    rebasePromptDraft } from "./prompt_edit_intent.js";
+    promptDraftRecordLabels, promptResolutionFollowers, resolvePromptDraftRecord, retryPromptDraft,
+    savePromptDraft, rebasePromptDraft } from "./prompt_edit_intent.js";
 // Prompt Management panel — centered overlay for editing the scene-global
 // prompt, the segment lane's sections (ranges + channels), the project-durable
 // channel-template-aware prompt state and a PromptRelay payload preview.
@@ -1745,10 +1745,17 @@ export function mountPromptManagementPanel(host) {
         const serverValue = conflict ? JSON.stringify(conflict.current) : "";
         // A move across records (cut in one field, paste in another) is one
         // intent; resolving one record keeps the other half. Say so first.
-        const alsoChanged = conflict ? promptDraftRecordLabels(row).filter((label) => label !== target) : [];
-        const alsoText = alsoChanged.length
+        // Chips the contested text decided go with it, so they are not
+        // among the changes Use server's version keeps.
+        const followers = conflict
+            ? promptResolutionFollowers(row, conflict).map((follower) => `attachment ${follower.id}`) : [];
+        const alsoChanged = conflict
+            ? promptDraftRecordLabels(row).filter((label) => label !== target && !followers.includes(label)) : [];
+        const alsoText = (alsoChanged.length
             ? ` This draft also changed ${alsoChanged.join(", ")}; Use server's version keeps ${alsoChanged.length === 1 ? "that change" : "those changes"}.`
-            : "";
+            : "")
+            + (followers.length
+                ? ` Use server's version also undoes the chips you added or removed only in that text.` : "");
         message.textContent = `${rows.length} Prompt draft save${rows.length === 1 ? "" : "s"} failed — ${target}.`
             + alsoText + (serverValue ? ` Server has: ${serverValue}` : "");
         message.title = `${row.error}${serverValue ? `
@@ -1758,15 +1765,25 @@ Server value: ${serverValue}` : ""}`;
         retry.addEventListener("click", async () => {
             await retryPromptDraft(drafts, key); recoverySignature = ""; renderDraftRecovery();
         });
+        const resolves = followers.length ? `${target} and ${followers.join(", ")}` : target;
         const useServer = keepRecoveryFocus(makeBtn("Use server's version",
             alsoChanged.length
-                ? `Resolve only ${target} with the server's value; ${alsoChanged.join(", ")} ${alsoChanged.length === 1 ? "keeps" : "keep"} your draft`
-                : "Resolve only the contested record with the server's value"));
-        useServer.disabled = !conflict;
+                ? `Resolve only ${resolves} with the server's value; ${alsoChanged.join(", ")} ${alsoChanged.length === 1 ? "keeps" : "keep"} your draft`
+                : followers.length ? `Resolve ${resolves} with the server's value`
+                    : "Resolve only the contested record with the server's value"));
+        // Not while a save of the row is in flight: the creates it carries
+        // are its own to settle (like Discard).
+        useServer.disabled = !conflict || Boolean(row.pending);
         useServer.addEventListener("click", async () => {
-            // Live surfaces adopt the server's record through the published
-            // resolution; nothing here touches the record again.
-            if (!conflict || !resolvePromptDraftRecord(drafts, key)) return;
+            // Live surfaces adopt the server's records through the published
+            // resolutions; nothing here touches them again. A chip that left
+            // with the text parks its unsent identity create.
+            if (!conflict || row.pending) return;
+            const resolved = resolvePromptDraftRecord(drafts, key);
+            if (!resolved) return;
+            host._parkPromptIdentityCreatesForAttachments?.((resolved.settled || [])
+                .filter((follower) => follower.value == null).map((follower) => follower.id),
+            drafts.get(key));
             await retryPromptDraft(drafts, key);
             recoverySignature = ""; renderDraftRecovery();
         });

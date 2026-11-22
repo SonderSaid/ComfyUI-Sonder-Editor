@@ -37,6 +37,7 @@ a fresh `[Unreleased]` block.
 - **Customize** on a Reference chip's Summary task types now unlocks the checkboxes even when no task type is chosen automatically.
 - Typing in the Prompt panel while saves are slow rarely shows `Error project_version_conflict` in its diagnostics any more. The preview keeps its last result, marked out of date, and refreshes once; the error appears only if that refresh conflicts too.
 - **Discard** on a failed Prompt draft now asks in the panel itself, so it works where browser dialogs are suppressed. Escape keeps the draft, and the draft is kept if the server's text can't be reloaded.
+- **Use server's version** on a Prompt field now also takes the server's version of the chips in that text. A chip you had just added there no longer makes the next save fail ("…would leave a Prompt link or Vocal event chip with no place in the text"), and a chip you had deleted there is no longer saved as gone while the text still shows it.
 - **Ctrl+Z** in a Prompt panel box still undoes after the panel refreshes (for example when a save lands or References reload right after your edit). It used to do nothing.
 - Splitting a block in Writing no longer copies its Prompt links and Vocal events into the new block, where they had no place in the text.
 - An edit to a prompt section that would leave a Prompt link or Vocal event with no place in its text is refused and kept as a draft, instead of saving a chip that blocks the section.

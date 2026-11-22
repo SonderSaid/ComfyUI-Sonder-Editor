@@ -251,11 +251,63 @@ export function dismissPromptDraftError(drafts, key) {
     return true;
 }
 
+// The attachment ids a document places, read without normalizing; the same
+// test as the server's anchor guard (`_prompt_anchor_ids`).
+function anchoredIds(doc) {
+    const ids = new Set();
+    for (const node of Array.isArray(doc?.nodes) ? doc.nodes : []) {
+        if (node?.type === "attachment" && node.attachment_id != null)
+            ids.add(String(node.attachment_id));
+    }
+    return ids;
+}
+
 /**
- * "Use server's version" for the contested record only: base and value both
- * become the server's record, so it leaves the draft. Returns the labels of
+ * The chip records a "Use server's version" on a document also settles,
+ * because the discarded text decided them. Each is `{ id, value }`, `value`
+ * being what surfaces adopt:
+ *
+ * - a chip this draft created whose only place was the discarded text (not
+ *   the server's text, not another document the draft holds) leaves the draft
+ *   (`null`); kept, it would be saved with no place in the text;
+ * - a chip this draft deletes that the server's text still places keeps the
+ *   record the author saw; deleted, the server's text would keep an anchor
+ *   with no record.
+ *
+ * Anything else stays: a chip created through + Attach (never placed), one
+ * also placed in another document, a deletion the server's text agrees with.
+ * An attachment conflict settles only the attachment.
+ */
+export function promptResolutionFollowers(row, conflict = row?.conflict) {
+    if (!row || conflict?.record_kind !== "document") return [];
+    const documents = row.value?.documents || {};
+    const docKey = conflict.record_key;
+    if (!Object.hasOwn(documents, docKey)) return [];
+    const discarded = anchoredIds(documents[docKey]);
+    const serverText = anchoredIds(conflict.current);
+    const elsewhere = new Set();
+    for (const [key, doc] of Object.entries(documents)) {
+        if (key !== docKey) for (const id of anchoredIds(doc)) elsewhere.add(id);
+    }
+    const followers = [];
+    for (const [id, value] of Object.entries(row.value?.attachments || {})) {
+        const base = row.base?.attachments?.[id] ?? null;
+        if (value != null && base == null && discarded.has(id)
+                && !serverText.has(id) && !elsewhere.has(id)) {
+            followers.push({ id, value: null });
+        } else if (value == null && base != null && serverText.has(id)) {
+            followers.push({ id, value: clone(base) });
+        }
+    }
+    return followers;
+}
+
+/**
+ * "Use server's version" for the contested record, and for the chips a
+ * contested document decided (`promptResolutionFollowers`): base and value
+ * both become the server's, so they leave the draft. Returns the labels of
  * the records the draft still holds, so the surface can say that a move
- * across records is now split.
+ * across records is now split, and of the chips that went with the text.
  */
 export function resolvePromptDraftRecord(drafts, key) {
     const row = drafts.get(key);
@@ -263,16 +315,26 @@ export function resolvePromptDraftRecord(drafts, key) {
     if (!row || !conflict || !["document", "attachment"].includes(conflict.record_kind))
         return false;
     const kind = conflict.record_kind === "document" ? "documents" : "attachments";
+    const followers = promptResolutionFollowers(row, conflict);
     forgetRecord(row, kind, conflict.record_key);
+    for (const follower of followers) forgetRecord(row, "attachments", follower.id);
     row.revision += 1;
     row.error = "";
     row.conflict = null;
     const remaining = promptDraftRecordLabels(row);
     if (!remaining.length && !row.pending) drafts.delete(key);
-    // Every live surface adopts the server's record as shown, without a touch.
+    // Every live surface adopts the server's record as shown, without a touch:
+    // the document first, then the chips it decided.
     publish(drafts, { key, global: row.global, resolution: {
         kind, recordKey: conflict.record_key, value: clone(conflict.current ?? null) } });
-    return { resolved: `${conflict.record_kind} ${conflict.record_key}`, remaining };
+    for (const follower of followers) {
+        publish(drafts, { key, global: row.global, resolution: {
+            kind: "attachments", recordKey: follower.id, value: clone(follower.value) } });
+    }
+    return { resolved: `${conflict.record_kind} ${conflict.record_key}`, remaining,
+        followers: followers.map((follower) => `attachment ${follower.id}`),
+        // What each follower became, for the host's own bookkeeping.
+        settled: followers.map((follower) => ({ id: follower.id, value: clone(follower.value) })) };
 }
 
 export async function retryPromptDraft(drafts, key) {
