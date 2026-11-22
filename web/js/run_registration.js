@@ -15,6 +15,7 @@
 // another queue is processing it defers the request and returns false.
 
 import { controlsDescribeInputs, declaresModes } from "./controls_host_canvas.js";
+import { describeBranchRefusal } from "./branch_refusal.js";
 
 const EDITOR_CLASS = "SonderEditor";
 const REGISTER_PATH = "/sonder-editor/runs/register";
@@ -144,13 +145,17 @@ function sameTargets(targets, intent) {
     return Array.isArray(targets) && targets.length === 1 && String(targets[0]) === intent.target;
 }
 
-function refusalOf(error) {
+function refusalOf(error, prompt) {
     const response = error?.response || {};
-    return {
-        state: "refused",
-        code: String(response.error?.type || error?.code || "rejected"),
-        ...(response.node_errors && typeof response.node_errors === "object" ? { node_errors: response.node_errors } : {}),
-    };
+    const code = response.error?.type || error?.code;
+    const outcome = { state: "refused", code: typeof code === "string" ? code : "rejected" };
+    try {
+        const problems = describeBranchRefusal(response.node_errors, prompt);
+        if (problems.length) outcome.problems = problems;
+    } catch (_error) {
+        // The refusal still settles if an extension sends unexpected error data.
+    }
+    return outcome;
 }
 
 async function branchCapability() {
@@ -170,7 +175,7 @@ function defaultIsOutputNode(classType) {
     return !!(type?.nodeData?.output_node ?? type?.prototype?.constructor?.nodeData?.output_node);
 }
 
-// Resolves to {state: "queued", prompt_id} | {state: "refused", code, node_errors?} |
+// Resolves to {state: "queued", prompt_id} | {state: "refused", code, problems?} |
 // {state: "unconfirmed"} | {state: "busy"} | {state: "unsupported", code}.
 export async function runBranch(target, { receipt = "", hostId = "" } = {}) {
     if (!installed) return { state: "unsupported", code: "not_installed" };
@@ -273,7 +278,7 @@ export function installRunRegistration({
             if (response?.prompt_id) for (const body of registrations) void register(body, controls, String(response.prompt_id));
             intent?.settle(response?.prompt_id ? { state: "queued", prompt_id: String(response.prompt_id) }
                 : { state: "refused", code: "no_prompt_id" });
-        }, (error) => intent?.settle(refusalOf(error)));
+        }, (error) => intent?.settle(refusalOf(error, request?.output)));
         return result;
     };
     api.__sonderRunRegistration = true;

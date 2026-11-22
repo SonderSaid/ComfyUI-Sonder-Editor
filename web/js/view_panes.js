@@ -353,6 +353,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         entry.sourceButton.textContent = `${sourceLabel(model, { driverLabel: sourceHost.driverLabel })} ▾`;
         entry.sourceButton.setAttribute("aria-expanded", String(picker?.index === index));
         entry.chip.textContent = model.chip || "";
+        entry.chip.style.flexBasis = model.runMessage ? "min(14ch, 40%)" : "0";
         // "Matched through the model chain" for a reattributed KJ preview.
         entry.chip.title = [model.chip, model.chipTitle].filter(Boolean).join(" · ");
         const signature = actionSignature(model);

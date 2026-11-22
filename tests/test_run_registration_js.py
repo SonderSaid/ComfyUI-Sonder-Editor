@@ -28,7 +28,7 @@ const out = [];
 {body}
 console.log("RESULT=" + JSON.stringify(out));
 """
-    result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, timeout=60)
+    result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, encoding="utf-8", timeout=60)
     assert result.returncode == 0, result.stderr
     line = next(line for line in result.stdout.splitlines() if line.startswith("RESULT="))
     return json.loads(line[len("RESULT="):])
@@ -260,9 +260,55 @@ out.push({ queued, notOutput, relay, missing, refused, posts: capPosts.map(p => 
     assert result["notOutput"] == {"state": "refused", "code": "branch_not_output"}
     assert result["relay"] == {"state": "refused", "code": "branch_not_output"}
     assert result["missing"] == {"state": "refused", "code": "branch_not_in_prompt"}
-    assert result["refused"] == {"state": "refused", "code": "prompt_outputs_failed_validation", "node_errors": {"4": {"errors": []}}}
+    assert result["refused"] == {"state": "refused", "code": "prompt_outputs_failed_validation"}
     # Only the accepted branch registered, as a branch.
     assert result["posts"] == [["branch", ["1"]]]
+
+
+def test_branch_refusal_describes_the_submitted_inputs_and_keeps_the_native_rejection():
+    (result,) = _branch(r"""
+const badChoice = input_name => ({
+    type: "value_not_in_list", message: "private server text", details: "private path",
+    extra_info: { input_name, received_value: "untrusted echo", input_config: [["private option"]] },
+});
+const rejection = Object.assign(new Error("native error"), { response: {
+    error: { type: "prompt_outputs_failed_validation" },
+    node_errors: {
+        "5:7": { errors: [badChoice("scheduler"), badChoice("scheduler"), null] },
+        "5:8": { errors: [badChoice("sampler_name")] },
+        "5:9": { errors: [badChoice("secret"), { type: "exception_in_validation", details: "private exception" }] },
+        "5:10": { errors: [{ type: "value_bigger_than_max", extra_info: { input_name: "width", input_config: ["INT", { max: 64 }] } }] },
+        "5:11": { errors: [{ type: "required_input_missing", extra_info: { input_name: "image" } }] },
+        "5:12": { errors: [{ type: "required_input_missing", extra_info: { input_name: "second" } }] },
+        "5:13": { errors: [{ type: "required_input_missing", extra_info: { input_name: "third" } }] },
+    },
+} });
+let seen;
+app.queuePrompt = async (n, b, ids) => {
+    const submitted = { ...output,
+        "5:7": { class_type: "BasicScheduler", _meta: { title: "Schedule\n\u202e" }, inputs: { scheduler: "bong_tangent" } },
+        "5:8": { class_type: "KSamplerSelect", inputs: { sampler_name: "res_2s" } },
+        "5:9": { class_type: "CustomCombo", inputs: { secret: "credential-like-value" } },
+        "5:10": { class_type: "Latent", inputs: { width: 96 } },
+    };
+    try { await api.queuePrompt(n, { output: submitted }, { partialExecutionTargets: ids }); }
+    catch (error) { seen = error; }
+};
+reply = () => Promise.reject(rejection);
+const outcome = await mod.runBranch("4");
+out.push({ outcome, sameRejection: seen === rejection, posts: capPosts.length });
+""")
+    assert result["sameRejection"] and result["posts"] == 0
+    assert set(result["outcome"]) == {"state", "code", "problems"}
+    lines = result["outcome"]["problems"]
+    assert lines[:2] == [
+        "“Schedule · scheduler”: “bong_tangent” isn't one of its choices on this ComfyUI.",
+        "“KSamplerSelect · sampler_name”: “res_2s” isn't one of its choices on this ComfyUI.",
+    ]
+    assert "CustomCombo · secret" in lines[2] and "credential" not in " ".join(lines)
+    assert "private" not in " ".join(lines) and "untrusted echo" not in " ".join(lines)
+    assert "96 is above its maximum, 64" in lines[4]
+    assert len(lines) == 7 and lines[-1].startswith("+2 more.")
 
 
 def test_run_branch_waits_behind_another_queue_then_gives_up_unconfirmed():
@@ -333,7 +379,11 @@ const queued = await make(async () => {{ order.push("flush"); return true; }}).r
 const ids = new Set(bodies.map(b => b.request_id));
 answers = [{{ ok: false, code: "not_owner" }}];
 const refused = await make(async () => true).runBranch("4");
-console.log("RESULT=" + JSON.stringify({{ unsaved, queued, ids: [...ids], order, refused, first: bodies[0] }}));
+answers = [{{ ok: true, state: "pending" }}, {{ ok: true, state: "refused", code: "prompt_outputs_failed_validation",
+    problems: ["Check Scheduler", "Check Sampler"] }}];
+const detailed = await make(async () => true).runBranch("4");
+console.log("RESULT=" + JSON.stringify({{ unsaved, queued, ids: [...ids], order, refused, detailed,
+    detailIds: bodies.slice(-2).map(b => b.request_id), first: bodies[0] }}));
 """
     result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
@@ -344,3 +394,6 @@ console.log("RESULT=" + JSON.stringify({{ unsaved, queued, ids: [...ids], order,
     assert out["ids"] == ["id-0"]  # the queued request posted three times under one id
     assert out["first"] == {"host_id": "h", "session_id": "tab", "request_id": "id-0", "target": "4"}
     assert out["refused"] == {"state": "refused", "code": "not_owner"}
+    assert out["detailed"] == {"state": "refused", "code": "prompt_outputs_failed_validation",
+                               "problems": ["Check Scheduler", "Check Sampler"]}
+    assert out["detailIds"] == ["id-4", "id-4"]

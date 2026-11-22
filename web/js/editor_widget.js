@@ -651,6 +651,8 @@ import { mountViewPanes } from "./view_panes.js";
 import { normalizeSource as normalizeViewSource } from "./view_timing.js";
 import { viewUrl } from "./comfy_view_url.js";
 
+const NATIVE_ERROR_DIALOG = '[data-dialog-key="global-error"][data-state="open"]';
+
 function describeKeyboardDebugElement(element) {
     if (!element) return "null";
     const tag = String(element.tagName || element.nodeName || "").toLowerCase();
@@ -24313,7 +24315,7 @@ export class EditorWidget {
 
         const overlay = document.createElement("div");
         overlay.style.cssText = `
-            position: fixed; inset: 0; z-index: 9999;
+            position: fixed; inset: 0; z-index: var(--sonder-fullscreen-layer, 9999);
             background: ${COLORS.bg}; display: none;
             flex-direction: column;
         `;
@@ -24322,6 +24324,16 @@ export class EditorWidget {
         // accepts drops by default) reached the graph interceptor and created
         // a loader on the hidden graph (extension.js; Phase 4, 2026-11).
         overlay.dataset.sonderEditor = "1";
+        overlay.dataset.sonderFullscreen = "1";
+        // ComfyUI's modal blocks outside interaction while open. Give its
+        // backdrop and close control room above this fullscreen layer.
+        const nativeDialogStyle = document.createElement("style");
+        nativeDialogStyle.textContent = `
+            body:has(${NATIVE_ERROR_DIALOG}) [data-sonder-fullscreen="1"] {
+                --sonder-fullscreen-layer: 1600;
+            }
+        `;
+        overlay.appendChild(nativeDialogStyle);
         applyNativeControlTheme(overlay);
 
         // Toolbar
@@ -24826,6 +24838,7 @@ export class EditorWidget {
         // Every non-consume branch must `return false` — silent fall-through
         // would starve LiteGraph by accident.
         this._editorKeyConsumer = (e) => {
+            if (this.isFullscreen && document.querySelector(NATIVE_ERROR_DIALOG)) return false;
             const key = e.key;
             const normalizedKey = String(key || "").toLowerCase();
             const ctrl = e.ctrlKey || e.metaKey;

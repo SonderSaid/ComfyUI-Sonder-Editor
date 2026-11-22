@@ -7,6 +7,7 @@
 // are inspection only; nothing here reaches a prompt or the project.
 
 import { KJ_PREVIEW_CLASS, VIEW_FEED_SAMPLING, viewFeed } from "./control_targets.js";
+import { readBranchProblems } from "./branch_refusal.js";
 
 export const MAX_PANES = 4;
 export const MAX_LAYOUT_RECORDS = 64;
@@ -227,7 +228,7 @@ export function inactiveText(reason) {
 // ── Run outcomes ─────────────────────────────────────────────────────────────
 
 // One shape for every host's branch-run answer:
-// {state: "queued", promptId?, runId?} | {state: "refused"|"unsupported", code}
+// {state: "queued", promptId?, runId?} | {state: "refused", code, problems?} | {state: "unsupported", code}
 // | {state: "unconfirmed"|"busy"|"pending"}.
 export function normalizeOutcome(raw, mode) {
     if (!raw || typeof raw !== "object") return { state: "refused", code: "no_answer" };
@@ -243,7 +244,11 @@ export function normalizeOutcome(raw, mode) {
     }
     const state = raw.state;
     if (state === "queued") return raw.prompt_id ? { state, promptId: String(raw.prompt_id) } : { state: "unconfirmed" };
-    if (state === "refused" || state === "unsupported") return { state, code: String(raw.code || state) };
+    if (state === "refused") {
+        const problems = readBranchProblems(raw.problems);
+        return { state, code: String(raw.code || state), ...(problems.length ? { problems } : {}) };
+    }
+    if (state === "unsupported") return { state, code: String(raw.code || state) };
     if (state === "busy") return { state: "busy" };
     // Mounted: the canvas has not answered yet, or went away with the request.
     if (state === "pending" || state === "claimed") return { state: "pending" };
@@ -255,10 +260,12 @@ const REFUSALS = {
     branch_not_output: "This output is switched off or not an output node.",
     branch_not_in_prompt: "This output is switched off, so it can't run.",
     prompt_no_outputs: "ComfyUI found no output to run.",
+    prompt_outputs_failed_validation: "ComfyUI rejected this output's inputs. Check the canvas for details.",
     controls_unsaved: "A Controls edit was not saved, so the output did not run.",
     controls_not_saved: "A Controls edit was not saved, so the output did not run.",
     generate_refused: "This output can't run yet.",
     missing_nodes: "Some nodes of this workflow are not installed.",
+    missing_node_type: "Some nodes of this workflow are not installed.",
     workflow_switching: "Wait for the workflow switch to finish.",
     workflow_changed: "The workflow changed. Try again.",
     too_many_runs: "Too many runs are already waiting.",

@@ -387,14 +387,18 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         const adapter = current();
         if (!view?.path || !adapter) return;
         const at = now();
-        panes[index].outcome = { state: "starting", settled: false, at };
+        const runToken = Symbol();
+        panes[index].outcome = { state: "starting", settled: false, at, runToken };
         changed();
         const outcome = await adapter.runBranch(view.path);
-        if (destroyed || panes[index].outcome?.at !== at) return;
+        const starting = panes[index].outcome;
+        if (destroyed || starting?.runToken !== runToken) return;
         if (outcome.state === "queued" || outcome.state === "unconfirmed" || outcome.state === "pending") {
-            panes[index].outcome = { ...outcome, settled: false, at };
+            panes[index].outcome = { ...outcome, settled: false, at, runToken };
+        } else if (starting.suppressRefusal) {
+            panes[index].outcome = null;
         } else {
-            panes[index].outcome = { ...outcome, settled: true, at,
+            panes[index].outcome = { ...outcome, settled: true, at, runToken,
                 message: outcome.state === "busy" ? "Another output is waiting for ComfyUI" : refusalText(outcome),
                 detail: outcome.state === "busy" ? "" : refusalDetail(outcome) };
         }
@@ -411,7 +415,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         const resolved = adapter.resolve?.(outcome) || outcome;
         const result = await adapter.cancel(resolved);
         if (destroyed) return;
-        if (!result.ok && panes[index].outcome?.at === outcome.at) {
+        if (!result.ok && panes[index].outcome?.runToken === outcome.runToken) {
             panes[index].outcome = { ...panes[index].outcome, canceling: false };
             notify("The run could not be canceled.");
         }
@@ -491,10 +495,11 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         const itemIndex = Math.min(pane.item, Math.max(0, entries.length - 1));
         const entry = entries[status.result?.fixedIndex ? 0 : itemIndex] || null;
         const media = state.condition ? mediaStatus(state.condition, { takeSaved: !!status.result?.run?.saved_to_project }) : null;
+        const runMessage = state.outcome?.settled ? state.outcome.message : null;
         let chip = media?.chip || status.chip, chipTitle = "";
         if (state.outcome?.canceling && !state.outcome.settled) chip = "Canceling…";
-        else if (state.outcome?.settled && state.outcome.message) {
-            chip = `Didn't run: ${state.outcome.message}`;
+        else if (runMessage) {
+            chip = `Didn't run: ${runMessage}`;
             chipTitle = state.outcome.detail || "";  // the worded problems after the first, on hover
         }
         else if (state.outcome && !state.outcome.settled && !chip) chip = "Running";
@@ -508,12 +513,12 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         let linkChip = null;
         if (linked && link.previous === "changed") linkChip = "Previous context";
         else if (link && !linked && link.reason !== "off" && link.text) linkChip = `Unlinked: ${link.text}`;
-        if (!media?.chip) {
+        if (!media?.chip && !runMessage) {
             if (catching) chip = "Catching up";
             else if (linkChip) chip = chip ? `${linkChip} · ${chip}` : linkChip;
         }
         return {
-            ...model, view, read: item, status, entries, itemIndex, entry, chip, chipTitle,
+            ...model, view, read: item, status, entries, itemIndex, entry, chip, chipTitle, runMessage,
             linkable: !!entry && isLinkable(entry), link, linked, outside,
             message: media?.message || status.message || (outside ? "Outside generated range" : linked && link.pending ? "Linking…" : null),
             unavailable: !!status.unavailable,
@@ -623,6 +628,9 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
             if (panes[i].held) releasePane(i, { quiet: true });
             audio?.release(paneId(i));
             resetLive(i);
+            const outcome = panes[i].outcome;
+            if (outcome?.settled && outcome.message) panes[i].outcome = null;
+            else if (outcome?.state === "starting") outcome.suppressRefusal = true;
             panes[i].condition = null;
             panes[i].followerState = null;
         }

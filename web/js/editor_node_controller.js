@@ -3034,7 +3034,8 @@ export class EditorNodeController {
                 }
                 const outcome = result.state === "queued" ? { state: "queued", prompt_id: result.prompt_id }
                     : result.state === "unconfirmed" ? { state: "unconfirmed" }
-                        : { state: "refused", code: result.code || result.state };
+                        : { state: "refused", code: result.code || result.state,
+                            ...(result.problems?.length ? { problems: result.problems } : {}) };
                 await post(`/${encodeURIComponent(request.request_id)}/report`, { outcome });
             }
         } finally {

@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from aiohttp import web
 
-from . import control_descriptors, control_rows, control_views
+from . import control_descriptors, control_rows, control_views, validation_refusal
 
 logger = logging.getLogger("sonder_editor")
 
@@ -1209,10 +1209,17 @@ def _prune_run_requests_locked(key: HostKey, now: float) -> dict[str, dict[str, 
     return requests
 
 
-def _run_request_answer(request: dict[str, Any], now: float) -> dict[str, Any]:
+def _run_request_answer(request: dict[str, Any], now: float, session_id: str) -> dict[str, Any]:
     from . import sdk_runs
     if request["outcome"] is not None:
-        return {"ok": True, "request_id": request["request_id"], **request["outcome"]}
+        answer = {"ok": True, "request_id": request["request_id"], **request["outcome"]}
+        if request["session_id"] != session_id:
+            # The new owner can read the run state, while the old tab's input
+            # feedback belongs to the session that requested this branch.
+            answer.pop("problems", None)
+        elif "problems" in answer:
+            answer["problems"] = list(answer["problems"])
+        return answer
     if request["state"] == "pending":
         return {"ok": True, "request_id": request["request_id"], "state": "pending"}
     receipt = sdk_runs.receipt_state(request["request_id"]) or {}
@@ -1241,7 +1248,7 @@ async def post_run_request(project_id: str, host_id: str, session_id: str, reque
             requests = _prune_run_requests_locked(key, now)
             existing = requests.get(request_id)
             if existing is not None:
-                result = (_run_request_answer(existing, now) if existing["target"] == target
+                result = (_run_request_answer(existing, now, session_id) if existing["target"] == target
                           else {"ok": False, "code": "request_conflict"})
             elif sum(1 for r in requests.values() if r["state"] == "pending") >= RUN_REQUESTS_MAX_PENDING:
                 result = {"ok": False, "code": "queue_full"}
@@ -1294,6 +1301,10 @@ async def report_run_request(project_id: str, host_id: str, session_id: str, req
     for name in ("prompt_id", "code"):
         if isinstance(outcome.get(name), str):
             clean[name] = outcome[name][:200]
+    if clean["state"] == "refused":
+        problems = validation_refusal.clean_canvas_problems(outcome.get("problems"))
+        if problems:
+            clean["problems"] = problems
     async with _lock:
         code = _controls_gate_locked(key, session_id, "canvas", events)
         request = _run_requests.get(key, {}).get(str(request_id or ""))

@@ -82,9 +82,16 @@ out.outcomes = [
     M.normalizeOutcome({state:'claimed'}, 'mounted'), M.normalizeOutcome({state:'unknown'}, 'mounted'),
     M.normalizeOutcome({ok:true, payload:{run_ids:['run-1']}}, 'sdk'), M.normalizeOutcome({ok:false, payload:{run_ids:['run-2'], code:'x'}}, 'sdk'),
     M.normalizeOutcome({ok:false, payload:{code:'branch_not_output', error:'Only an output…'}}, 'sdk'), M.normalizeOutcome(null, 'canvas')];
-out.refusal = [M.refusalText({code:'controls_unsaved'}), M.refusalText({code:'zzz'}), M.refusalText({message:'Server said'})];
+out.refusal = [M.refusalText({code:'controls_unsaved'}), M.refusalText({code:'zzz'}), M.refusalText({message:'Server said'}),
+    M.refusalText({code:'missing_node_type'})];
 // ComfyUI's refusal worded per setting by the server: the first line leads, all of them on hover.
 const worded = M.normalizeOutcome({ok:false, payload:{code:'branch_refused', error:'Prompt outputs failed validation', problems:['“A”: one.', '“B”: two.', 7]}}, 'sdk');
+out.canvas = ['canvas', 'mounted'].map(mode => {
+    const raw = {state:'refused', code:'prompt_outputs_failed_validation', problems:['“A”: one.', '“B”: two.', 7]};
+    const outcome = M.normalizeOutcome(raw, mode);
+    return [M.refusalText(outcome), M.refusalDetail(outcome),
+        M.refusalText(M.normalizeOutcome({...raw, problems: Array(8).fill('x')}, mode))];
+});
 out.worded = {outcome: worded, text: M.refusalText(worded), detail: M.refusalDetail(worded),
     one: M.refusalText({problems:['“A”: one.'], message:'x'}), oneDetail: M.refusalDetail({problems:['“A”: one.']}),
     capped: M.refusalText({problems:['“A”: one.', '“B”: two.', '+4 more. The ComfyUI console lists every one.']}),
@@ -100,10 +107,13 @@ out.worded = {outcome: worded, text: M.refusalText(worded), detail: M.refusalDet
         {"state": "unconfirmed", "runId": "run-2"}, {"state": "refused", "code": "branch_not_output", "message": "Only an output…"},
         {"state": "refused", "code": "no_answer"}]
     assert out["refusal"][0].startswith("A Controls edit") and out["refusal"][1] == "The output did not run." and out["refusal"][2] == "Server said"
+    assert out["refusal"][3] == "Some nodes of this workflow are not installed."
     worded = out["worded"]
     assert worded["outcome"]["problems"] == ["“A”: one.", "“B”: two."]
     # The chip's hover joins the chip and the rest (view_panes), so the rest starts at the second line.
     assert worded["text"] == "“A”: one. (+1 more)" and worded["detail"] == "“B”: two."
+    assert out["canvas"] == [["“A”: one. (+1 more)", "“B”: two.",
+                              "ComfyUI rejected this output's inputs. Check the canvas for details."]] * 2
     assert worded["one"] == "“A”: one." and worded["oneDetail"] == ""
     # The server's own "+N more" line counts what it left out, not itself.
     assert worded["capped"] == "“A”: one. (+5 more)" and worded["cappedDetail"].endswith("+4 more. The ComfyUI console lists every one.")

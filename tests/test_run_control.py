@@ -163,6 +163,43 @@ def test_the_tab_posts_the_canvas_claims_once_and_retries_answer_the_outcome():
     assert r["reported"]["ok"] and r["final"]["state"] == "queued"
 
 
+def test_mounted_refusal_details_are_bounded_and_stay_with_the_requesting_tab():
+    async def scenario():
+        await setup_hosts()
+        other = "aaaaaaaa-1111-4111-8111-000000000002"
+        queued = "aaaaaaaa-1111-4111-8111-000000000003"
+        for rid in (REQUEST, other, queued):
+            assert (await sr.post_run_request(PID, HID, TAB, rid, "4"))["state"] == "pending"
+            assert (await sr.claim_run_requests(PID, HID, CANVAS))["requests"] == [
+                {"request_id": rid, "target": "4"}
+            ]
+        payload = {"state": "refused", "code": "prompt_outputs_failed_validation",
+                   "problems": ["Schedule\u202e\n option", {"secret": 1}, "x" * 301, "Sampler"]}
+        wrong_role = await sr.report_run_request(PID, HID, TAB, REQUEST, payload)
+        assert (await sr.report_run_request(PID, HID, CANVAS, REQUEST, payload))["ok"]
+        assert (await sr.report_run_request(PID, HID, CANVAS, other, {**payload, "problems": ["x"] * 8}))["ok"]
+        assert (await sr.report_run_request(PID, HID, CANVAS, queued, {**payload, "state": "queued"}))["ok"]
+        original = await sr.post_run_request(PID, HID, TAB, REQUEST, "4")
+        retry = await sr.post_run_request(PID, HID, TAB, REQUEST, "4")
+        invalid = await sr.post_run_request(PID, HID, TAB, other, "4")
+        accepted = await sr.post_run_request(PID, HID, TAB, queued, "4")
+        assert (await sr.release_session(PID, TAB, host_id=HID))["ok"]
+        info = {"host_id": HID, "source_node_id": "editor-1"}
+        assert (await sr.claim_session(PID, "other-fs", "fullscreen", info))["ok"]
+        handoff = await sr.create_handoff(PID, "other-fs", host_id=HID)
+        assert (await sr.claim_session(PID, "other-tab", "tab", info, handoff_token=handoff["token"]))["ok"]
+        replacement = await sr.post_run_request(PID, HID, "other-tab", REQUEST, "4")
+        assert (await sr.claim_run_requests(PID, HID, CANVAS))["requests"] == []
+        return wrong_role, original, retry, invalid, accepted, replacement
+
+    wrong_role, original, retry, invalid, accepted, replacement = run(scenario())
+    assert wrong_role["code"] == "not_canvas_host"
+    assert original == retry and original["problems"] == ["Schedule option", "Sampler"]
+    assert invalid["state"] == "refused" and "problems" not in invalid
+    assert accepted["state"] == "queued" and "problems" not in accepted
+    assert replacement == {key: value for key, value in original.items() if key != "problems"}
+
+
 def test_a_claim_lost_with_its_canvas_reads_unknown_and_is_never_handed_out_again():
     async def scenario():
         await setup_hosts()

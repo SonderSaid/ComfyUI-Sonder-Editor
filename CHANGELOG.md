@@ -19,6 +19,7 @@ a fresh `[Unreleased]` block.
 - The Launcher lists Controls that are off because their node isn't installed in one line, "Controls off until their nodes are installed", instead of one note each.
 
 ### Fixed
+- Failed Output View runs in fullscreen and Mount in Tab name the inputs ComfyUI rejected. When ComfyUI uses a validation dialog, it can be dismissed without leaving fullscreen.
 - Launcher workflows you haven't selected yet read **Select to check** instead of a count of notes.
 - A Launcher line naming missing node packs says which node each "is needed by" choice belongs to, instead of appearing to apply to every pack.
 - The Launcher no longer says "No seed exposed" for a workflow whose seed Control is off only because its node pack isn't installed.

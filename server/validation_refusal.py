@@ -22,6 +22,7 @@ from typing import Any
 from . import control_descriptors
 
 import re
+import unicodedata
 
 MAX_LINES = 6
 MAX_LINE_CHARS = 300
@@ -29,6 +30,21 @@ MAX_VALUE_CHARS = 120
 # Invisible format characters the tooltip cleaner keeps: bidi marks, the
 # Arabic letter mark, zero-width characters and the word joiner / BOM.
 _INVISIBLE = re.compile("[​-‏؜⁠﻿]")
+
+
+def clean_canvas_problems(raw: Any) -> list[str]:
+    """Accept only bounded, plain-text lines from a canvas branch report."""
+    if not isinstance(raw, list) or len(raw) > MAX_LINES + 1:
+        return []
+    lines = []
+    for value in raw:
+        if not isinstance(value, str) or len(value) > MAX_LINE_CHARS:
+            continue
+        line = "".join(char for char in " ".join(value.split())
+                       if unicodedata.category(char) not in {"Cc", "Cf", "Cs"}).strip()
+        if line:
+            lines.append(line)
+    return lines
 
 
 def _clean(value: Any) -> str:

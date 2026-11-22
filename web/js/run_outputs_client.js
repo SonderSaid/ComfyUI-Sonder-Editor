@@ -198,7 +198,7 @@ export function createRunRequestClient({
         }
     };
     return {
-        // Resolves to {state: "queued", prompt_id} | {state: "refused", code} |
+        // Resolves to {state: "queued", prompt_id} | {state: "refused", code, problems?} |
         // {state: "unconfirmed" | "unknown" | "pending" | "claimed"} (the last two: still waiting at the deadline).
         async runBranch(target) {
             if ((await flush()) === false) return { state: "refused", code: "controls_unsaved" };

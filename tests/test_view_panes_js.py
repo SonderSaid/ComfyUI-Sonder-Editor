@@ -296,8 +296,9 @@ const stored = new Map();
 const layoutStore = { read: k => stored.get(k) || null, write: (k, r) => (r ? stored.set(k, JSON.parse(JSON.stringify(r))) : stored.delete(k)) };
 const notes = [];
 const audio = createAudioOwnership();
+const scene = { projectId: () => 'P', sceneId: () => 's1', fps: () => 24 };
 let clock = 1000;
-const c = createViewsCoordinator({ host: () => host, controls, layoutStore, audio, notify: m => notes.push(m),
+const c = createViewsCoordinator({ host: () => host, controls, layoutStore, audio, scene, notify: m => notes.push(m),
     onChange: () => globalThis.onCoordinatorChange?.(),
     now: () => clock, setTimer: (fn, ms) => (timers.push([ms, fn]), timers.length), clearTimer: () => {}, raf: fn => (fn(), 1),
     documentRef: document });
@@ -354,6 +355,55 @@ out.defaultDeleted = stored.has('c:wf') ? stored.get('c:wf').count : null;
     assert out["released"] == [False, "Released"]
     assert out["pagehide"] == [["h2"], True]
     assert out["shrunk"] == "h3"
+
+
+def test_refusal_belongs_to_the_current_pane_run_even_when_the_clock_does_not_advance():
+    out = run_coordinator("""
+c.setVisible(true); c.setLayout({count: 2}); c.assign(1, {kind: 'view', viewId: 'a'}); await settle();
+answer.sources = {'9': {state:'ok', result:{prompt_id:'old', fresh:true, run:{},
+    editor_context:{'5':{project_folder:'P', scene_id:'s1', fps:24}},
+    entries:[{index:0,kind:'video',file:{filename:'previous.mp4'},
+        scene_map:{scene_id:'s1',scene_start:0,scene_end:24,fps:24}}]}}};
+client.hint(); await settle();
+const finish = [];
+host.runBranch = () => new Promise(resolve => finish.push(resolve));
+const refuse = name => ({state:'refused', code:'prompt_outputs_failed_validation', problems:[name, 'Second problem']});
+const old = c.run(1);
+c.assign(1, {kind:'composite'});
+c.assign(1, {kind:'view', viewId:'a'});
+c.setPaneOption(1, {link:true});
+c.setFollowerState(1, 'catching_up');
+const current = c.run(1);
+const [finishOld, finishCurrent] = finish.splice(0, 2);
+finishCurrent(refuse('New problem')); await current;
+finishOld(refuse('Old problem')); await old;
+const model = c.paneModel(1);
+out.current = [model.chip, model.chipTitle, model.entry?.file?.filename, model.linked];
+const retry = c.run(1);
+out.retryCleared = !c.paneModel(1).runMessage && c.paneModel(1).chipTitle === '';
+finish.shift()({state:'queued',promptId:'retry'}); await retry;
+out.retryQueued = c.paneModel(1).cancellable.enabled;
+answer.runs = [{prompt_id:'retry', finished:true}];
+client.hint(); await settle();
+const nextFailure = c.run(1);
+finish.shift()(refuse('Next problem')); await nextFailure;
+c.setLayout({count: 1}); c.setLayout({count: 2});
+out.reopened = c.paneModel(1).outcome;
+const pending = c.run(1);
+c.setLayout({count:1});
+c.setLayout({count:2});
+finish.shift()(refuse('Hidden problem')); await pending;
+out.hidden = c.paneModel(1).outcome;
+const running = c.run(1);
+c.setLayout({count:1});
+finish.shift()({state:'queued',promptId:'p9'}); await running;
+c.setLayout({count:2});
+out.queued = c.paneModel(1).cancellable.enabled;
+""")
+    assert out["current"] == ["Didn't run: New problem (+1 more)", "Second problem", "previous.mp4", True]
+    assert out["retryCleared"] and out["retryQueued"]
+    assert out["reopened"] is None and out["hidden"] is None
+    assert out["queued"] is True
 
 
 def test_coordinator_runs_settle_cancel_session_loss_workflow_switch_and_create():
