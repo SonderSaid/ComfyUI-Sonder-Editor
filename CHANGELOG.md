@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-22
+
 ### Added
 - Copy, cut and paste keep Context chips when you paste into another prompt field of the same scene: in Prompt Management, Writing or the timeline prompt bar. A chip that can't go where you paste it is left out with a notice, and the text still pastes; anywhere else the paste is plain text.
 
