@@ -96,6 +96,76 @@ async function run(driver) {
         samples.push({ kind: "stale", name: "older selection, Tab to a chip, then typing", op: "x",
             pass: !failures.length, failures, after: after.doc, attachments: after.data[1], focus: after.selection.active });
     }
+    // The 2026-11 user report ("more text than I highlighted was deleted ...
+    // Ctrl+Z didn't save me"): the older-selection class, widened. An older
+    // selection made several ways, then a click or drag starting on a chip,
+    // then a destructive key. Nothing outside the new highlight may go, focus
+    // stays in the editor, one Ctrl+Z restores. 0.9.0 failed 48 of these 60.
+    const olds = {
+        "drag across both chips": async () => drag(["L", 10], ["R", 6]),
+        "drag L to M": async () => drag(["L", 4], ["M", 8]),
+        "shift+arrows across C": async () => { const p = await go(`point(["L", 6])`); await driver.drag(p, p);
+            for (let i = 0; i < 18; i++) await driver.key("ArrowRight", { shift: true }); },
+        "cut then undo": async () => { await drag(["L", 10], ["R", 6]); await press("Cut"); await delay(60); await undo(); },
+    };
+    // Each press names what it may remove: prose outside its span (the
+    // prefix and suffix) and the other chip must survive, whatever is live.
+    const L = "KEEP-LEFT alpha ", M = " beta ONE\nline TWO ", R = " omega KEEP-RIGHT";
+    const click = (id) => async () => { const p = await go(`point(["${id}", 3])`); await driver.drag(p, p); };
+    const presses = {
+        "drag C to M": { run: async () => drag(["C", 3], ["M", 5]), prefix: L, suffix: M.slice(5) + R, stays: "D" },
+        "drag D to R": { run: async () => drag(["D", 3], ["R", 8]), prefix: L + M, suffix: R.slice(8), stays: "C" },
+        "drag C back to L": { run: async () => drag(["C", 3], ["L", 3]), prefix: L.slice(0, 3), suffix: M + R, stays: "D" },
+        "click C": { run: click("C"), prefix: L, suffix: M + R, stays: "D" },
+        "click D": { run: click("D"), prefix: L + M, suffix: R, stays: "C" },
+    };
+    for (const [oldName, makeOld] of Object.entries(olds)) for (const [pressName, press1] of Object.entries(presses))
+        for (const op of ["Delete", "Backspace", "Cut"]) {
+            const before = await go(`setup({ variant: "pills" })`);
+            await makeOld(); await press1.run(); await delay(60);
+            const hl = await go("highlighted()");
+            await press(op); await delay(80);
+            const after = await go("state()");
+            const undone = await undo();
+            const failures = [];
+            if (!after.doc.startsWith(press1.prefix) || !after.doc.endsWith(press1.suffix)
+                    || after.doc.length < press1.prefix.length + press1.suffix.length)
+                failures.push(`removed prose outside the press: ${JSON.stringify(after.doc)}`);
+            if (!after.data[1].includes(press1.stays)) failures.push(`chip ${press1.stays} removed (outside the press)`);
+            if (after.selection.active === "BODY") failures.push("focus fell to the page");
+            if (JSON.stringify(undone.data) !== JSON.stringify(before.data)) failures.push("one Ctrl+Z did not restore");
+            samples.push({ kind: "report", name: `${oldName}, then ${pressName}`, op, pass: !failures.length, failures,
+                highlight: hl, after: after.doc, attachments: after.data[1], focus: after.selection.active });
+        }
+    // A partial highlight across chips removes exactly what is highlighted, and
+    // the field shows what the model (and so the save) holds.
+    const spots = [["L", 3], ["M", 0], ["M", 13], ["R", 0], ["R", 12]];
+    for (let i = 0; i < spots.length; i++) for (let j = i + 1; j < spots.length; j++) {
+        if (spots[i][0] === spots[j][0]) continue;
+        for (const [from, to, op] of [[spots[i], spots[j], "Delete"], [spots[j], spots[i], "Cut"]]) {
+            const before = await go(`setup({ variant: "pills" })`);
+            await drag(from, to);
+            const hl = await go("highlighted()");
+            await press(op); await delay(80);
+            const after = await go("state()");
+            const screen = await go("screenProse()");
+            const undone = await undo();
+            const failures = [];
+            const at = before.doc.indexOf(hl);
+            const exact = hl && [...before.doc.matchAll(new RegExp(hl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"))]
+                .some((m) => before.doc.slice(0, m.index) + before.doc.slice(m.index + hl.length) === after.doc);
+            if (at < 0 || !exact) failures.push(`removed other than ${JSON.stringify(hl)}: ${JSON.stringify(after.doc)}`);
+            if (screen !== after.doc) failures.push(`screen ${JSON.stringify(screen)} differs from the model`);
+            const order = { L: 0, C: 1, M: 2, D: 3, R: 4 };
+            const [lo, hi] = [order[from[0]], order[to[0]]].sort((x, y) => x - y);
+            const expectChips = ["C", "D"].filter((id) => !(lo < order[id] && order[id] < hi));
+            if (JSON.stringify(after.data[1]) !== JSON.stringify(expectChips))
+                failures.push(`chips ${JSON.stringify(after.data[1])}, expected ${JSON.stringify(expectChips)}`);
+            if (JSON.stringify(undone.data) !== JSON.stringify(before.data)) failures.push("Ctrl+Z did not restore");
+            samples.push({ kind: "report", name: `partial ${from} to ${to}`, op, pass: !failures.length, failures,
+                highlight: hl, after: after.doc });
+        }
+    }
     return samples;
 }
 

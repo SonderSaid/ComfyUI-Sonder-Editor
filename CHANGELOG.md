@@ -12,7 +12,7 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
-- Copy, cut and paste carry Context chips between prompt boxes of the same project and scene: the Prompt panel, Writing and the timeline bar. A pasted chip is an independent copy. A cut chip pasted once in the same tab stays linked to its group. A chip the target box can't take (for example a Shot outside the shot-marker channel, or a Prompt link to a later section) is left out with a notice, and the text still pastes. Anywhere else, the paste is plain text.
+- Copy, cut and paste carry Context chips between prompt boxes of the same project and scene: the Prompt panel, Writing and the timeline bar. A pasted chip is an independent copy. A cut chip pasted once in the same tab, while the box you cut it from is still open, stays linked to its group. A chip the target box can't take is left out with a notice, and the text still pastes: for example a Shot outside the shot-marker channel, a Prompt link pasted into a section (or Writing block) that doesn't start after its source, or a chip whose new identity is still being saved. Anywhere else, the paste is plain text.
 
 ### Changed
 - When ComfyUI refuses a Sonder App run, **Generate** (and an Output View's **Didn't run:**) names what it refused, for example a sampler this ComfyUI doesn't have, instead of only "ComfyUI didn't accept the run". An Output View that Sonder itself can't run yet also names the first reason.
@@ -37,6 +37,8 @@ a fresh `[Unreleased]` block.
 - **Customize** on a Reference chip's Summary task types now unlocks the checkboxes even when no task type is chosen automatically.
 - Typing in the Prompt panel while saves are slow rarely shows `Error project_version_conflict` in its diagnostics any more. The preview keeps its last result, marked out of date, and refreshes once; the error appears only if that refresh conflicts too.
 - **Discard** on a failed Prompt draft now asks in the panel itself, so it works where browser dialogs are suppressed. Escape keeps the draft, and the draft is kept if the server's text can't be reloaded.
+- **Ctrl+Z** in a Prompt panel box still undoes after the panel refreshes (for example when a save lands or References reload right after your edit). It used to do nothing.
+- Splitting a block in Writing no longer copies its Prompt links and Vocal events into the new block, where they had no place in the text.
 - An edit to a prompt section that would leave a Prompt link or Vocal event with no place in its text is refused and kept as a draft, instead of saving a chip that blocks the section.
 
 ## [0.9.0] - 2026-11-19

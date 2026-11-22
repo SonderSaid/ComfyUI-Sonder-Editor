@@ -6748,11 +6748,48 @@ export class EditorWidget {
         const intents = [];
         for (const [unitId, pending] of
                 (this._pendingPromptIdentityCreateIntents?.entries?.() || [])) {
+            if (pending?.sending) continue;
             if (!committedAttachmentIds.has(String(pending?.attachmentId || ""))) continue;
             intents.push(structuredClone(pending.intent));
-            this._pendingPromptIdentityCreateIntents.delete(unitId);
         }
         return intents;
+    }
+
+    /** The save holding these creates is being sent: they stay in the map,
+     * still pending (a paste reads it to refuse a chip bound to an identity
+     * that may yet be refused), and `sending` keeps a second save from
+     * sending them twice. Called first inside the save's `try`, so a throw
+     * before it leaves nothing marked that no settle would clear. */
+    _markPromptIdentityCreatesSending(intents = []) {
+        for (const intent of intents || []) {
+            const pending = this._pendingPromptIdentityCreateIntents
+                ?.get(String(intent?.unit?.semantic_unit_id || ""));
+            if (pending) pending.sending = true;
+        }
+    }
+
+    /** Ends the pending state `_takePromptIdentityCreateIntents` began.
+     * Acknowledged or `drop`: the entry goes, and so does the draft's copy, which would
+     * otherwise re-pend an identity that now exists. Refused: it stays
+     * pending, unsent, so the retry sends the create again -- unless the
+     * server says the id already exists with another definition, when the
+     * identity is there and re-sending would only be refused again. */
+    _settlePromptIdentityCreateIntents(intents = [], { acknowledged = false, drop = false, error = null, draft = null } = {}) {
+        const code = String(error?.code || error?.payload?.code || "");
+        drop = drop || acknowledged || code === "prompt_semantic_unit_collision";
+        const store = this._pendingPromptIdentityCreateIntents;
+        const ids = new Set((intents || []).map((intent) =>
+            String(intent?.unit?.semantic_unit_id || "")).filter(Boolean));
+        for (const id of ids) {
+            const pending = store?.get(id);
+            if (!pending?.sending) continue;
+            if (drop) store.delete(id);
+            else delete pending.sending;
+        }
+        // Even when a project switch already cleared the map mid-flight: the
+        // draft's copy would otherwise put the create back (follow-up audit F6).
+        if (drop && draft?.identityCreates)
+            draft.identityCreates = draft.identityCreates.filter(([id]) => !ids.has(id));
     }
 
     _adoptPromptIdentitiesFromMutation(result) {
@@ -17472,6 +17509,7 @@ export class EditorWidget {
         this._renderSceneAfterLocalMutation({ viewport: false });
 
         try {
+            this._markPromptIdentityCreatesSending(identityCreateIntents);
             const result = await this._runSceneMutation(
                 [...identityCreateIntents,
                     { type: "create_prompt_section", fields }],
@@ -17481,9 +17519,13 @@ export class EditorWidget {
                     coalesce: false,
                 }
             );
+            this._settlePromptIdentityCreateIntents(identityCreateIntents, { acknowledged: true });
             this._adoptPromptIdentitiesFromMutation(result);
             this._finalizePromptIdentityCreationHistory(undoEntry, result);
         } catch (e) {
+            // The refetch removes the chip that named it, so nothing is left
+            // to retry the create for.
+            this._settlePromptIdentityCreateIntents(identityCreateIntents, { drop: true });
             notifyWarning(e?.message || "Prompt section was refused.", { source: "prompt-create-refused" });
             await this._fetchScenes({ ignoreMutationGate: true, reason: "add_prompt_error" });
             if (identityCreateIntents.length) {
@@ -17748,11 +17790,12 @@ export class EditorWidget {
         for (const [id, pending] of draft?.identityCreates || []) {
             if (!pendingStore.has(id)) pendingStore.set(id, structuredClone(pending));
         }
-        const pendingCreates = new Map(pendingStore);
         const identityCreateIntents = this._takePromptIdentityCreateIntents(attachments);
         if (draft) draft.identityCreates = identityCreateIntents.map((intent) => {
             const id = String(intent?.unit?.semantic_unit_id || "");
-            return [id, pendingCreates.get(id)];
+            const pending = pendingStore.get(id);
+            return [id, pending && { attachmentId: pending.attachmentId,
+                intent: structuredClone(pending.intent) }];
         }).filter(([, pending]) => pending);
         const undoEntry = this._pushUndo(undoLabel,
             { promptIdentityCreateIntents: identityCreateIntents });
@@ -17763,6 +17806,7 @@ export class EditorWidget {
         sceneRef.prompt = composeSectionText(next.global_channels, false);
         this._renderSceneAfterLocalMutation({ viewport: false });
         try {
+            this._markPromptIdentityCreatesSending(identityCreateIntents);
             const result = await this._runSceneMutation(
                 [...identityCreateIntents, { type: "update_scene_fields", fields,
                     expected_prompt_template: template }],
@@ -17786,6 +17830,7 @@ export class EditorWidget {
                 for (const field of Object.keys(next)) sceneRef[field] = structuredClone(result.payload.scene[field]);
                 sceneRef.prompt = result.payload.scene.prompt;
             }
+            this._settlePromptIdentityCreateIntents(identityCreateIntents, { acknowledged: true, draft });
             if (this._projectDirName() === projectId && this.activeSceneId === sceneId) {
                 this._adoptPromptIdentitiesFromMutation(result);
                 this._finalizePromptIdentityCreationHistory(undoEntry, result);
@@ -17799,12 +17844,7 @@ export class EditorWidget {
                 ...(acknowledged ? { value: acknowledged } : {}) };
         } catch (error) {
             this._discardUndoEntry(undoEntry);
-            for (const intent of identityCreateIntents) {
-                const id = String(intent?.unit?.semantic_unit_id || "");
-                const pending = pendingCreates.get(id);
-                if (pending && !pendingStore.has(id))
-                    pendingStore.set(id, pending);
-            }
+            this._settlePromptIdentityCreateIntents(identityCreateIntents, { error, draft });
             if (this._promptEditRevisions.get(key) === revision) {
                 Object.assign(sceneRef, previous);
                 sceneRef.prompt = composeSectionText(previous.global_channels, false);
@@ -20042,11 +20082,12 @@ export class EditorWidget {
         for (const [id, pending] of draft?.identityCreates || []) {
             if (!pendingStore.has(id)) pendingStore.set(id, structuredClone(pending));
         }
-        const pendingCreates = new Map(pendingStore);
         const identityCreateIntents = this._takePromptIdentityCreateIntents(updates.attachments || []);
         if (draft) draft.identityCreates = identityCreateIntents.map((intent) => {
             const id = String(intent?.unit?.semantic_unit_id || "");
-            return [id, pendingCreates.get(id)];
+            const pending = pendingStore.get(id);
+            return [id, pending && { attachmentId: pending.attachmentId,
+                intent: structuredClone(pending.intent) }];
         }).filter(([, pending]) => pending);
         const undoEntry = this._pushUndo(undoLabel,
             { promptIdentityCreateIntents: identityCreateIntents });
@@ -20057,6 +20098,7 @@ export class EditorWidget {
         this._selectedPromptIdx = null;
         this._renderSceneAfterLocalMutation({ viewport: false });
         try {
+            this._markPromptIdentityCreatesSending(identityCreateIntents);
             const result = await this._runSceneMutation(
                 [...identityCreateIntents, { type: "update_prompt_section", index: idx,
                     expected, fields, expected_prompt_template: template }],
@@ -20065,6 +20107,7 @@ export class EditorWidget {
                     failureMessage: "Prompt save failed. The Prompt tool keeps your draft." });
             const saved = result?.payload?.scene?.prompt_sections?.find((row) => row.prompt_id === before.prompt_id);
             if (saved && this._promptEditRevisions.get(key) === revision) Object.assign(section, structuredClone(saved));
+            this._settlePromptIdentityCreateIntents(identityCreateIntents, { acknowledged: true, draft });
             if (this._projectDirName() === projectId && this.activeSceneId === sceneId) {
                 this._adoptPromptIdentitiesFromMutation(result);
                 this._finalizePromptIdentityCreationHistory(undoEntry, result);
@@ -20074,12 +20117,7 @@ export class EditorWidget {
             } : {}) };
         } catch (error) {
             this._discardUndoEntry(undoEntry);
-            for (const intent of identityCreateIntents) {
-                const id = String(intent?.unit?.semantic_unit_id || "");
-                const pending = pendingCreates.get(id);
-                if (pending && !pendingStore.has(id))
-                    pendingStore.set(id, pending);
-            }
+            this._settlePromptIdentityCreateIntents(identityCreateIntents, { error, draft });
             if (this._promptEditRevisions.get(key) === revision) Object.assign(section, previous);
             this._refreshPromptContextDependencyConsumers();
             if (identityCreateIntents.length && this._projectDirName() === projectId) await this._fetchReferences({ ignoreMutationGate: true,
@@ -20142,6 +20180,7 @@ export class EditorWidget {
         }
         this._renderSceneAfterLocalMutation({ viewport: false });
         try {
+            this._markPromptIdentityCreatesSending(identityCreateIntents);
             const result = await this._runSceneMutation(
                 [...identityCreateIntents, ...operations], {
                 key: `prompt:${this.activeSceneId}:linked:${groupId}`,
@@ -20162,10 +20201,13 @@ export class EditorWidget {
                 // seeing the refusal and re-authoring against what is there.
                 retryOnConflict: false,
             });
+            this._settlePromptIdentityCreateIntents(identityCreateIntents, { acknowledged: true });
             this._adoptPromptIdentitiesFromMutation(result);
             this._finalizePromptIdentityCreationHistory(undoEntry, result);
             return true;
         } catch (error) {
+            // As for a new section: the refetch removes the chip.
+            this._settlePromptIdentityCreateIntents(identityCreateIntents, { drop: true });
             notifyWarning(error?.message || "Linked Context edit conflicted with newer state.", {
                 source: "prompt-linked-edit-refused",
             });
@@ -28920,6 +28962,7 @@ export class EditorWidget {
         this._customReferenceRecipes = [];
         this._promptContextProfiles = [];
         this._promptSemanticUnits = [];
+        this._pendingPromptIdentityCreateIntents?.clear?.();
         this._referenceRecipeFieldSchema = [];
         this._promptContextCatalog = {};
         this._referencesLoaded = false;

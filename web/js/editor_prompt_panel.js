@@ -81,6 +81,7 @@ import {
     splitWritingPromptDocument,
     setPromptAttachmentCapabilityEnabled,
     openAttachmentChipOnField,
+    INLINE_ONLY_KINDS,
 } from "./prompt_context_chips.js";
 import { getProjectVersion } from "./api_client.js";
 import { notifyInfo, notifySuccess, notifyWarning } from "./editor_notifications.js";
@@ -887,32 +888,93 @@ const WRITING_SHOT_PROBE = "__sonder_shot_probe__";
  *  stood in for by a probe anchor placed at `bookmark` (null appends, as
  *  `restorePromptInsertion` does). Pure, so it is tested directly.
  */
+/**
+ * The draft's nodes with a probe chip at a model position (`{node_id,
+ * offset}`). `splitWritingPromptDocument` gives text after a separator new
+ * ids, so a caret's node id says nothing about its block; a chip keeps its
+ * id through the split, so the probe does. An unknown position puts the probe
+ * at the end.
+ */
+function writingNodesWithProbe(draft, start) {
+    let nodes = normalizePromptDocument(draft).nodes;
+    const probe = { type: "attachment", node_id: WRITING_SHOT_PROBE,
+        attachment_id: WRITING_SHOT_PROBE };
+    const index = start?.node_id ? nodes.findIndex((node) => node.node_id === start.node_id) : -1;
+    if (index < 0) return [...nodes, probe];
+    if (nodes[index].type === "text") {
+        const offset = Math.max(0, start.offset | 0);
+        const head = nodes[index].text.slice(0, offset);
+        const tail = nodes[index].text.slice(offset);
+        return [...nodes.slice(0, index),
+            ...(head ? [{ ...nodes[index], text: head }] : []), probe,
+            ...(tail ? [{ ...nodes[index], node_id: `${WRITING_SHOT_PROBE}:tail`,
+                text: tail }] : []),
+            ...nodes.slice(index + 1)];
+    }
+    const at = Number(start.offset) > 0 ? index + 1 : index;
+    return [...nodes.slice(0, at), probe, ...nodes.slice(at)];
+}
+
+/**
+ * The Writing block a model position lies in, counted the way
+ * `splitWritingPromptDocument(draft, { keepEmpty })` lists blocks; -1 when the
+ * position is unknown. By position, not node id: the split re-identifies text
+ * after a separator, which made a later block's caret read as block 1 (manual
+ * check 509).
+ */
+/** The identities a chip pasted into Writing must wait for: those a channel
+ * box is still creating (the host's pending map), minus the draft's own
+ * staged creates, which Apply creates whatever the chip id. */
+export function writingPastePendingIds(hostPending, ownCreates = []) {
+    const own = new Set((ownCreates || []).map((intent) => String(intent?.unit?.semantic_unit_id || "")));
+    return [...(hostPending?.keys?.() || [])].map(String).filter((id) => id && !own.has(id));
+}
+
+/** What Escape returns a focused box to after an acknowledgement. A repainted
+ * document is the server's now. A box the acknowledgement did not repaint
+ * keeps the text it had at focus (Escape still drops what was typed since) and
+ * takes the stored chip list, the one registry its boxes share, kept
+ * consistent with that text: an anchor whose record is gone is dropped, and a
+ * chip this box placed after focus goes with the typing Escape drops, so
+ * neither an anchor without a record nor an orphan record is left
+ * (follow-up audit F4). Records other boxes hold are untouched. */
+export function focusedRevertAfterAck(revert, now, repainted) {
+    if (repainted) return now;
+    const id = (value) => String(value?.attachment_id || "");
+    const anchors = (doc) => new Set((doc?.nodes || []).filter((node) => node?.type === "attachment").map(id));
+    const records = Array.isArray(now?.attachments) ? now.attachments : [];
+    const stored = new Set(records.map(id));
+    const document = revert?.document && Array.isArray(revert.document.nodes)
+        ? { ...revert.document, nodes: revert.document.nodes.filter((node) =>
+            node?.type !== "attachment" || stored.has(id(node))) }
+        : revert?.document;
+    const atFocus = new Set((revert?.attachments || []).map(id));
+    const anchoredThen = anchors(document), anchoredNow = anchors(now?.document);
+    const attachments = records.filter((record) => atFocus.has(id(record))
+        || anchoredThen.has(id(record)) || !anchoredNow.has(id(record)));
+    return { ...(revert || {}), document, attachments };
+}
+
+export function writingBlockIndexAt(draft, start, { keepEmpty = true } = {}) {
+    if (!start?.node_id || !normalizePromptDocument(draft).nodes
+        .some((node) => node.node_id === start.node_id)) return -1;
+    const blocks = splitWritingPromptDocument({ nodes: writingNodesWithProbe(draft, start) },
+        { keepEmpty: true });
+    const at = blocks.findIndex((block) => block.nodes
+        .some((node) => node.attachment_id === WRITING_SHOT_PROBE));
+    if (at < 0 || keepEmpty) return at;
+    // Without empty blocks: count the non-empty ones before it (the probe's
+    // own block would otherwise be empty only if the caret sits alone in it).
+    return blocks.slice(0, at).filter((block) => promptDocumentText(block).trim()
+        || block.nodes.some((node) => node.type === "attachment")).length;
+}
+
 export function writingShotPlacement({ document: draft, attachments = [],
     bookmark = null, attachmentId = "", channelKeys = [], defaultKey = "",
     shotChannel = "" } = {}) {
     const targetId = attachmentId || WRITING_SHOT_PROBE;
-    let nodes = normalizePromptDocument(draft).nodes;
-    if (!attachmentId) {
-        const probe = { type: "attachment", node_id: WRITING_SHOT_PROBE,
-            attachment_id: WRITING_SHOT_PROBE };
-        const start = bookmark?.start || null;
-        const index = start ? nodes.findIndex((node) => node.node_id === start.node_id) : -1;
-        if (index < 0) {
-            nodes = [...nodes, probe];
-        } else if (nodes[index].type === "text") {
-            const offset = Math.max(0, start.offset | 0);
-            const head = nodes[index].text.slice(0, offset);
-            const tail = nodes[index].text.slice(offset);
-            nodes = [...nodes.slice(0, index),
-                ...(head ? [{ ...nodes[index], text: head }] : []), probe,
-                ...(tail ? [{ ...nodes[index], node_id: `${WRITING_SHOT_PROBE}:tail`,
-                    text: tail }] : []),
-                ...nodes.slice(index + 1)];
-        } else {
-            const at = Number(start.offset) > 0 ? index + 1 : index;
-            nodes = [...nodes.slice(0, at), probe, ...nodes.slice(at)];
-        }
-    }
+    const nodes = attachmentId ? normalizePromptDocument(draft).nodes
+        : writingNodesWithProbe(draft, bookmark?.start || null);
     const block = splitWritingPromptDocument({ nodes }, { keepEmpty: true })
         .find((value) => value.nodes.some((node) => node.attachment_id === targetId));
     if (!block) return { offered: false, opensSection: true };
@@ -951,6 +1013,19 @@ export function writingShotPlacement({ document: draft, attachments = [],
  * gap, or not starting at frame 0, does NOT survive a round trip, and that is
  * by construction rather than by defect.
  */
+/** The scope chips a block split off in Writing starts with: copies of its
+ * source block's, under new ids. Shots and timestamps belong to one place in
+ * time, and an inline-only record (a Prompt link, a vocal event) lives where
+ * its anchor is: the anchor stays in one block, so a copy elsewhere would be
+ * an orphan the server refuses (`_newly_unanchored_inline`). */
+export function cloneSplitScopedAttachments(values, newId = () =>
+        globalThis.crypto?.randomUUID?.().replaceAll("-", "")
+            || `${Date.now()}${Math.random()}`.replaceAll(".", "")) {
+    return normalizePromptAttachments(values)
+        .filter((value) => !["shot", "timestamp", ...INLINE_ONLY_KINDS].includes(value.kind))
+        .map((value) => ({ ...structuredClone(value), attachment_id: newId() }));
+}
+
 export function writingSectionsFromDraft({
     blocks = [], attachments = [], blockMeta = [], allocations = [],
     channelKeys = [], defaultKey = "", minLen = 1, newId = () => "",
@@ -1185,6 +1260,11 @@ export function mountPromptManagementPanel(host) {
         references: host._referencesView?.() ?? (host._references || []),
         semanticUnits: host._promptSemanticUnits || [],
     });
+    const reviseFocusedRevert = (box, repainted) => {
+        const focused = guard.focusedBox;
+        if (focused?.el !== box || !focused.structured) return;
+        focused.revert = focusedRevertAfterAck(focused.revert, box.promptState, repainted);
+    };
     const registerPromptBoxGuard = (area, revertValue) => {
         area.addEventListener("focus", () => {
             const structuredState = area.promptState;
@@ -1334,17 +1414,18 @@ export function mountPromptManagementPanel(host) {
     }));
     const documentNodeIds = (documentValue) => normalizePromptDocument(documentValue).nodes
         .map((node) => String(node.node_id || "")).filter(Boolean);
-    const cloneSplitScopedAttachments = (values) => normalizePromptAttachments(values)
-        .filter((value) => !["shot", "timestamp"].includes(value.kind))
-        .map((value) => ({ ...structuredClone(value),
-            attachment_id: globalThis.crypto?.randomUUID?.().replaceAll("-", "")
-                || `${Date.now()}${Math.random()}`.replaceAll(".", "") }));
     const writingDraftKey = () => `${host._projectDirName?.() || ""}::${host.activeSceneId || ""}`;
     // Writing mode is one flat text, and `key:` headers are what let it carry
     // every channel rather than just one. `---` still splits sections; headers
     // split channels within a section. A whole MiniMax-format model output
     // therefore pastes in and arranges itself.
+    // Which draft the Writing box's undo history belongs to. A rebuild of the
+    // panel carries a box's history only within one draft: Apply, Reset and
+    // Restore start another, whose text can read the same while its block
+    // metadata and section ids do not (follow-up audit F1).
+    let writingGeneration = 0;
     const reconstructDraftFromSections = () => {
+        writingGeneration += 1;
         const sections = host.activeScene?.prompt_sections || [];
         const template = host._channelTemplate();
         const keys = templateChannelKeys(template);
@@ -1705,6 +1786,10 @@ Server value: ${serverValue}` : ""}`;
             const revision = row.revision;
             const projectId = host._projectDirName(), sceneId = host.activeSceneId;
             const returnFocus = document.activeElement;
+            // The box's Escape target as it was: refocusing it on the way back
+            // would otherwise record what it holds now, and Escape would stop
+            // dropping what was typed before the confirm opened.
+            const guardAtOpen = guard.focusedBox?.el === returnFocus ? guard.focusedBox : null;
             const question = document.createElement("span");
             question.textContent = "Discard this draft and reload the server's text?";
             question.style.cssText = `font-weight:600;color:${COLORS.text};`;
@@ -1725,6 +1810,7 @@ Server value: ${serverValue}` : ""}`;
                 question.remove(); confirmButton.remove(); keep.remove();
                 for (const button of buttons) button.style.display = "";
                 if (hadFocus && returnFocus?.isConnected) returnFocus.focus?.({ preventScroll: true });
+                if (hadFocus && guardAtOpen && document.activeElement === guardAtOpen.el) guard.focusedBox = guardAtOpen;
             };
             const state = { teardown };
             discardConfirm = state;
@@ -2151,15 +2237,18 @@ Server value: ${serverValue}` : ""}`;
         let draftTimer = null;
         let draftArea = null;
         refreshWritingDecorations = null;
-        const draftAttachmentContext = (nodeId = "") => {
+        // `position` is a model position (`{node_id, offset}`), else the live
+        // caret. The block is found by position (`writingBlockIndexAt`): the
+        // split gives text after a separator new ids, so looking the caret's
+        // node id up in the blocks fell back to block 1 (manual check 509).
+        const draftAttachmentContext = (position = null) => {
+            const keepEmpty = writingState.blockMeta.length > 0;
             const blockDocuments = reconcileWritingBlockMeta(
-                splitWritingPromptDocument(writingState.document, {
-                    keepEmpty: writingState.blockMeta.length > 0,
-                }));
-            const selectedNodeId = nodeId || draftArea?.promptSelection?.node_id || "";
-            let selectedIndex = blockDocuments.findIndex((documentValue) =>
-                documentNodeIds(documentValue).includes(selectedNodeId));
-            if (selectedIndex < 0) selectedIndex = 0;
+                splitWritingPromptDocument(writingState.document, { keepEmpty }));
+            const at = position?.node_id ? position : (draftArea?.promptSelection || null);
+            let selectedIndex = at ? writingBlockIndexAt(
+                draftArea?.promptDocument || writingState.document, at, { keepEmpty }) : -1;
+            if (selectedIndex < 0 || selectedIndex >= blockDocuments.length) selectedIndex = 0;
             let cursor = 0;
             const promptSections = blockDocuments.map((documentValue, index) => {
                 const length = Math.max(
@@ -2194,8 +2283,8 @@ Server value: ${serverValue}` : ""}`;
             shotChannel: host._channelTemplate().shot_marker_channel || "",
             ...options,
         });
-        const configureDraftAttachment = (attachment, nodeId = "") => {
-            const context = draftAttachmentContext(nodeId);
+        const configureDraftAttachment = (attachment, position = null) => {
+            const context = draftAttachmentContext(position);
             const anchored = attachment?.kind === "shot" && normalizePromptDocument(
                 draftArea?.promptDocument || writingState.document).nodes.some((node) =>
                 node.attachment_id === attachment.attachment_id);
@@ -2703,7 +2792,7 @@ Server value: ${serverValue}` : ""}`;
             onActivateAttachment: async (attachment, node) => {
                 const configured = acceptDraftConfiguration(
                     await configureDraftAttachment(
-                        attachment, String(node?.node_id || "")));
+                        attachment, { node_id: String(node?.node_id || ""), offset: 0 }));
                 if (configured) draftArea.replaceAttachment(configured);
             },
             getHostSnapshot: () => writingState.blockMeta,
@@ -2749,6 +2838,7 @@ Server value: ${serverValue}` : ""}`;
         draftArea.style.minHeight = "120px";
         applyBoxHeight(host, draftArea, "panelDraftBoxHeight", 160);
         registerPromptBoxGuard(draftArea, () => writingState.draft);
+        draftArea.dataset.sonderHistoryKey = JSON.stringify([writingDraftKey(), "writing", writingGeneration]);
         draftArea.addEventListener("blur", (event) => {
             if (guard.suppressBlurCommit) return;
             if (event.relatedTarget?.closest?.("[data-sonder-prompt-context-modal='1'],[data-sonder-prompt-context-menu='1']")) return;
@@ -2803,16 +2893,23 @@ Server value: ${serverValue}` : ""}`;
             // A pasted chip is judged where it lands, as Writing's chip dialog
             // judges it (`draftAttachmentContext`): that block's start and
             // window, section scope, the draft's pending identities included
-            // (they are created at Apply, whatever the chip id).
-            pasteContext: (bookmark) => ({
-                scene: draftAttachmentContext(bookmark?.start?.node_id || "").scene,
-                references: offerableReferences(),
-                semanticUnits: writingSemanticUnits(),
-                profileId: scene?.prompt_context_profile_id
-                    || host._channelTemplate().default_context_profile || "generic@1",
-                scope: "section",
-                resolvedProfile: host._resolvedPromptContextProfile?.(),
-            }),
+            // (they are created at Apply, whatever the chip id). A create a
+            // channel box is still sending is not the draft's: it rides with
+            // that box's chip id, so a chip bound to it waits, as it does in
+            // the boxes (`_pendingPromptIdentityCreateIntents`).
+            pasteContext: (bookmark) => {
+                return {
+                    scene: draftAttachmentContext(bookmark?.start || null).scene,
+                    references: offerableReferences(),
+                    semanticUnits: writingSemanticUnits(),
+                    profileId: scene?.prompt_context_profile_id
+                        || host._channelTemplate().default_context_profile || "generic@1",
+                    scope: "section",
+                    resolvedProfile: host._resolvedPromptContextProfile?.(),
+                    pendingSemanticUnitIds: writingPastePendingIds(
+                        host._pendingPromptIdentityCreateIntents, writingState.pendingSemanticUnitCreates),
+                };
+            },
             writingAids: host._promptContextWritingAids?.(
                 scene?.prompt_context_profile_id
                     || host._channelTemplate().default_context_profile || "generic@1") || [],
@@ -2894,6 +2991,7 @@ Server value: ${serverValue}` : ""}`;
         restoreBtn?.addEventListener("click", () => {
             const stash = writingState.stash;
             if (!stash) return;
+            writingGeneration += 1;
             writingState.document = normalizePromptDocument(
                 stash.document, String(stash.draft || ""));
             writingState.draft = promptDocumentText(writingState.document);
@@ -4053,6 +4151,36 @@ Server value: ${serverValue}` : ""}`;
         bodyEl.appendChild(card);
     };
 
+    // A rebuild replaces every prompt box, and a box's undo history lived only
+    // in it: a refresh landing between an edit and Ctrl+Z (a references
+    // reload, a dependency refresh after a save) left Undo with nothing, and
+    // the orphan notice of manual check 498 never came. Each box's history is
+    // taken before the rebuild, keyed by draft key and channel, and offered
+    // to the box mounted under that key once the rebuild is done; the box
+    // adopts it only while it shows the same document (`adoptHistory`).
+    // Nothing is kept past that: ownership stays with the mounted box.
+    let carriedHistories = null;
+    const carryBoxHistories = (root) => {
+        const stash = carriedHistories || new Map();
+        for (const box of root.querySelectorAll("[data-sonder-prompt-box='1']")) {
+            const key = box.dataset?.sonderHistoryKey;
+            const taken = key ? box.takeHistory?.() : null;
+            if (taken && (taken.history.length || taken.future.length)) stash.set(key, taken);
+        }
+        if (!stash.size || carriedHistories) return;
+        carriedHistories = stash;
+        // After the synchronous rebuild, before any input reaches a new box.
+        queueMicrotask(() => {
+            const pending = carriedHistories;
+            carriedHistories = null;
+            if (!mounted) return;
+            for (const box of root.querySelectorAll("[data-sonder-prompt-box='1']")) {
+                const state = pending.get(box.dataset?.sonderHistoryKey);
+                if (state) box.adoptHistory?.(state);
+            }
+        });
+    };
+
     renderNow = () => {
         dormancyRefreshers = [];
         if (!mounted) return;
@@ -4073,6 +4201,7 @@ Server value: ${serverValue}` : ""}`;
         }
         deferredDraftRender = false;
         renderedDraftScene = draftSceneIdentity();
+        carryBoxHistories(body);
         liveMounts.clear();
         textStaleChecks = [];
         host._stampManagementPanel?.("prompt");
@@ -4242,6 +4371,7 @@ Server value: ${serverValue}` : ""}`;
             input.dataset.sonderPromptDraftKey = globalDraftKey;
             applyBoxHeight(host, input, "panelGlobalBoxHeight", 72);
             registerPromptBoxGuard(input, () => globalChannels[key] || "");
+            input.dataset.sonderHistoryKey = JSON.stringify([globalDraftKey, key]);
             const commitGlobal = async () => {
                 if (globalLocked || guard.suppressBlurCommit) return;
                 globalChannels[key] = input.value;
@@ -4424,7 +4554,7 @@ Server value: ${serverValue}` : ""}`;
                         } else {
                             box.syncPromptAttachments?.(globalAttachments);
                         }
-                        if (guard.focusedBox?.el === box) guard.focusedBox.revert = box.promptState;
+                        reviseFocusedRevert(box, Object.hasOwn(repaint.documents, channelKey));
                     }
                     renderGlobalScope();
                 }
@@ -4651,6 +4781,7 @@ Server value: ${serverValue}` : ""}`;
                 });
                 applyBoxHeight(host, input, "panelChannelBoxHeight", 72);
                 registerPromptBoxGuard(input, () => channels[key] || "");
+                input.dataset.sonderHistoryKey = JSON.stringify([sectionDraftKey, key]);
                 channelInputs[key] = input;
                 input._sonderSyncDraft = () => {
                     channelDocuments[key] = input.promptDocument;
@@ -4946,7 +5077,7 @@ Server value: ${serverValue}` : ""}`;
                             } else {
                                 box.syncPromptAttachments?.(sectionAttachments);
                             }
-                            if (guard.focusedBox?.el === box) guard.focusedBox.revert = box.promptState;
+                            reviseFocusedRevert(box, Object.hasOwn(repaint.documents, channelKey));
                         }
                         renderScope();
                     }

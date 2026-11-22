@@ -8,7 +8,8 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = fileURLToPath(new URL(".", import.meta.url));
-const JS = resolve(HERE, "..", "..", "..", "web", "js");
+// SONDER_JS_DIR points the page at another copy of web/js (a release, say).
+const JS = process.env.SONDER_JS_DIR || resolve(HERE, "..", "..", "..", "web", "js");
 
 const MARKUP = `<!doctype html><meta charset="utf-8"><title>Sonder prompt chip selection</title>
 <style>body{margin:24px;font:16px sans-serif}#host{width:540px}#other{margin-top:40px}</style>
@@ -38,8 +39,8 @@ const selection = () => {
 const record = () => [e.promptDocument.nodes.map((n) => [n.node_id, n.type === 'text' ? n.text : n.attachment_id]),
   e.promptAttachments.map((a) => a.attachment_id)];
 window.state = () => ({ doc: e.value, data: record(), changes: [...changes], selection: selection() });
-window.setup = ({ variant = 'pills' } = {}) => {
-  const nodes = variant === 'plain' ? [text('L', 'KEEP-LEFT alpha ONE\nline TWO beta KEEP-RIGHT')]
+window.setup = ({ variant = 'pills', nodes: custom = null } = {}) => {
+  const nodes = custom ? custom : variant === 'plain' ? [text('L', 'KEEP-LEFT alpha ONE\nline TWO beta KEEP-RIGHT')]
     : variant === 'one' ? [text('L', 'KEEP-LEFT alpha '), chip('C'), text('M', ' beta KEEP-RIGHT')]
     : [text('L', 'KEEP-LEFT alpha '), chip('C'), text('M', ' beta ONE\nline TWO '), chip('D'), text('R', ' omega KEEP-RIGHT')];
   changes = [];
@@ -68,6 +69,13 @@ window.point = (where) => {
   return { x: Math.round(b.x), y: Math.round(b.y + b.height / 2) };
 };
 window.focusEditor = () => { e.focus(); return document.activeElement === e; };
+// What the author sees: the highlighted prose and the field's prose, with chip
+// labels and zero-width padding left out (what the model's text holds).
+const prose = (root) => { root.querySelectorAll?.('[data-node-type="attachment"]').forEach((n) => n.remove());
+  root.querySelectorAll?.('br').forEach((b) => b.replaceWith('\n'));
+  return root.textContent.split('\u200b').join('').split('\ufeff').join(''); };
+window.highlighted = () => { const s = getSelection(); return s.rangeCount ? prose(s.getRangeAt(0).cloneContents()) : ''; };
+window.screenProse = () => prose(e.cloneNode(true));
 `;
 
 // Clipboard qualification page (clipboard.mjs): `copy`/`cut` write text/plain

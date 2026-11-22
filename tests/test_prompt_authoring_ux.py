@@ -9667,8 +9667,9 @@ def test_prompt_panel_uses_zero_height_recovery_chrome_and_commits_user_close():
     assert "cleanup: () => close({ commitFocused: false })" in panel
     assert "focused.el.promptState = focused.revert" in panel
     assert "guard.suppressBlurCommit = true;\n                focused.el.blur();" in panel
-    # Acknowledgement repaints refresh the Esc baseline of a focused box.
-    assert panel.count("guard.focusedBox.revert = box.promptState") == 2
+    # Acknowledgement repaints refresh the Esc baseline of a focused box: the
+    # document only where it was repainted (follow-up audit M1).
+    assert panel.count("reviseFocusedRevert(box, Object.hasOwn(repaint.documents, channelKey));") == 2
 
 
 def test_prompt_recovery_actions_preserve_focus_and_discard_one_key():

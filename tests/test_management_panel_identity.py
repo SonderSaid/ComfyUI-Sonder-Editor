@@ -27,6 +27,8 @@ _PROMPT_HOST = """
         w._promptPanelHandle = { refresh: () => { refreshes += 1; } };
         w._channelTemplate = () => ({ channels: [] });
         w._takePromptIdentityCreateIntents = () => [];
+        w._settlePromptIdentityCreateIntents = () => {};
+        w._markPromptIdentityCreatesSending = () => {};
         w._adoptPromptIdentitiesFromMutation = () => {};
         w._finalizePromptIdentityCreationHistory = () => {};
         w._refreshPromptContextDependencyConsumers = () => {};

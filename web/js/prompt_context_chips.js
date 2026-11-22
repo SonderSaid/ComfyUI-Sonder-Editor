@@ -10,6 +10,7 @@ import {
     resolveReferenceVerdicts,
 } from "./reference_resolution.js";
 import { lanePopulation } from "./reference_lane_identity.js";
+import { promptRecordsEquivalent } from "./prompt_edit_intent.js";
 import { EDITOR_COLORS as COLORS, chromeInputCss, setButtonDisabled,
     setButtonVariant } from "./editor_theme.js";
 import { PRESERVE_DEFAULT, PRIORITY as KEY_PRIORITY,
@@ -280,8 +281,24 @@ export const PROMPT_FRAGMENT_FORMAT = "sonder-prompt-fragment@1";
 const FRAGMENT_LIMITS = Object.freeze({ bytes: 262144, nodes: 2000, attachments: 64,
     text: 100000, id: 128, depth: 12 });
 // A cut moves its chips (same link group) only when pasted in the tab that cut
-// them, once; without this token a pasted fragment is a copy.
+// them, once; without this token a pasted fragment is a copy. It also needs
+// the cut chips still gone from the box they were cut from. A panel rebuild
+// replaces that box, and the replacement's Undo (its history carried over)
+// can bring them back without clearing the token, so a replaced source is
+// judged by the box now mounted under its history key. A source with no
+// replacement (a closed timeline bar) committed the cut as it closed.
 let livePromptCut = null;
+function promptCutStillMoves(cut, token) {
+    if (!cut || !token || cut.token !== token) return false;
+    const source = cut.source?.deref?.();
+    const box = source?.isConnected ? source : cut.key
+        ? [...(globalThis.document?.querySelectorAll?.("[data-sonder-prompt-box='1']") || [])]
+            .find((value) => value !== source && value.dataset?.sonderHistoryKey === cut.key) || null
+        : null;
+    if (!box) return true;
+    const present = new Set((box.promptAttachments || []).map((value) => value?.attachment_id));
+    return !(cut.ids || []).some((id) => present.has(id));
+}
 
 function jsonDepth(value, depth = 0) {
     if (depth > FRAGMENT_LIMITS.depth) return depth;
@@ -394,6 +411,13 @@ export function promptPasteVerdict(attachment, { allowedKinds = AUTHORING_KINDS,
     }
     if (kind === "reference" && listed(attachment?.source?.semantic_unit_ids).some((id) => pending.has(id)))
         return "its identity is still being created";
+    // Every identity a Reference names must exist here, not only the one its
+    // option is keyed by: a chip with physical sources is otherwise never
+    // checked against the identities, and the pending map is empty after a
+    // reload or a project switch while the clipboard still holds the chip
+    // (follow-up audit F8).
+    if (kind === "reference" && listed(attachment?.source?.semantic_unit_ids).some((id) => !unitIds.has(id)))
+        return "its identity is not saved yet";
     if (kind === "reference") {
         const source = attachment?.source || {};
         const physical = ["picture", "video", "audio"].find((name) =>
@@ -2968,7 +2992,8 @@ export function createPromptDocumentEditor({
             nodes, attachments: structuredClone(records) };
         if (op === "cut") {
             fragment.cut_token = uid();
-            livePromptCut = { token: fragment.cut_token, source: new WeakRef(editor) };
+            livePromptCut = { token: fragment.cut_token, source: new WeakRef(editor), ids: [...ids],
+                key: String(editor.dataset?.sonderHistoryKey || "") };
         }
         try { event.clipboardData.setData(PROMPT_FRAGMENT_TYPE, JSON.stringify(fragment)); }
         catch (_error) { /* a browser refusing the custom type leaves plain text */ }
@@ -3527,8 +3552,7 @@ export function createPromptDocumentEditor({
         const from = modelPositionFor(bookmark?.start);
         const to = modelPositionFor(bookmark?.end);
         if (!from) return false;
-        const moving = fragment.op === "cut" && Boolean(fragment.cutToken)
-            && livePromptCut?.token === fragment.cutToken;
+        const moving = fragment.op === "cut" && promptCutStillMoves(livePromptCut, fragment.cutToken);
         const refused = [];
         const fresh = new Map();
         for (const record of fragment.attachments) {
@@ -3595,6 +3619,30 @@ export function createPromptDocumentEditor({
         }
         if (moving && added.length) livePromptCut = null;
         emit(added.length || removedAttachment ? "attachment" : "document");
+        return true;
+    };
+    // Undo across a host rebuild (manual check 498). History lives in this
+    // editor, and a panel refresh replaces every box: the host takes it from
+    // the old box and offers it to the new one. The new box adopts it only
+    // while showing the same document, since its entries are relative to
+    // that text, and only with no history of its own. Registry changes are
+    // inverted against the registry as it is then, so a record changed in
+    // between is still left alone.
+    // The arrays are handed over, not cloned: the box they come from is being
+    // replaced, and its entries are never written again. An open entry is
+    // closed by `pushHistory`'s rule: its action reported no registry change.
+    editor.takeHistory = () => {
+        const open = history[history.length - 1];
+        if (open && open.after === null) open.after = open.attachments;
+        return { history: [...history], future: [...future], document: structuredClone(model) };
+    };
+    editor.adoptHistory = (state) => {
+        if (!Array.isArray(state?.history) || !Array.isArray(state?.future)) return false;
+        if (!state.history.length && !state.future.length) return false;
+        if (history.length || future.length) return false;
+        if (!promptRecordsEquivalent("documents", state.document, model)) return false;
+        history = [...state.history];
+        future = [...state.future];
         return true;
     };
     // Lets a host that mutates the document through `promptState` still
