@@ -1,5 +1,6 @@
 """Fullscreen history ownership against ComfyUI's earlier deferred listener."""
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,6 +17,7 @@ def run_node(body):
     guard = extension[extension.index('function shouldSuppressComfyGraphUndo()'):extension.index('function getNodeById(')]
     widget = (ROOT / 'web/js/editor_widget.js').read_text(encoding='utf-8')
     keyboard = widget[widget.index('    _setupKeyboardEvents() {'):widget.index('    _keyboardConsumerId(suffix) {')]
+    dialog_selector = re.search(r"^const NATIVE_ERROR_DIALOG = .*;$", widget, re.M).group(0)
     # Execute the actual setup prefix, so omitting installation from setup fails.
     setup = extension.split('    setup() {', 1)[1].split('// Page-level notification', 1)[0]
     script = '''
@@ -31,7 +33,7 @@ globalThis.Element=class {
  closest(selector){return (this.kind==='prompt'&&selector.includes('prompt-box')) ||
   (this.kind==='inspect'&&selector.includes('inspect-overlay')) ? this : null;}
 };
-globalThis.document={activeElement:new Element('BODY'),addEventListener(){}};
+globalThis.document={activeElement:new Element('BODY'),addEventListener(){},querySelector(){return null;}};
 const root={_nodes:[],subgraphs:new Map()};
 const loads=[];
 const app={graph:root,rootGraph:root,loadGraphData:async value=>{loads.push(value);return value;}};
@@ -50,7 +52,7 @@ class Tracker {
 }
 const preexisting=new Tracker();
 window.comfyAPI={changeTracker:{ChangeTracker:Tracker}};
-''' + guard + '\nfunction setupGuard(){' + setup + '\n}\n' + '''
+''' + dialog_selector + '\n' + guard + '\nfunction setupGuard(){' + setup + '\n}\n' + '''
 const {register:registerKeyboardConsumer,PRIORITY:KEY_PRIORITY,PRESERVE_DEFAULT} = await import(MODULE_URL);
 class Editor {
 ''' + keyboard + '''
@@ -164,4 +166,21 @@ const textOff=registerKeyboardConsumer({id:'text',priority:KEY_PRIORITY.TEXT_EDI
 const text=event('DIV','z',{},'prompt');dispatch(text);assert.equal(text.stopped,true);assert.equal(text.defaultPrevented,undefined);textOff();
 editor.isFullscreen=false;const unfocused=event('BUTTON');dispatch(unfocused);assert.equal(unfocused.defaultPrevented,undefined);
 editor._editorFocused=true;dispatch(event('BUTTON'));assert.equal(editor.undos,before+1);
+''')
+
+
+def test_an_open_comfy_validation_dialog_keeps_the_keys_in_fullscreen():
+    """e05a63d: while ComfyUI's validation dialog is open over fullscreen, the
+    editor takes no key, so the dialog's Escape and close work and no undo
+    lands on the timeline behind it."""
+    run_node('''
+const editor=new Editor();
+let open=true;
+document.querySelector=(selector)=>open&&selector===NATIVE_ERROR_DIALOG?{}:null;
+for(const [key,extra] of [['z',{}],['y',{}],['Escape',{ctrlKey:false}],['Delete',{ctrlKey:false}]]){
+ const e=event('BUTTON',key,extra);dispatch(e);assert.equal(e.defaultPrevented,undefined,key);
+}
+assert.equal(editor.undos,0);assert.equal(editor.redos,0);
+open=false;const after=event('BUTTON');dispatch(after);
+assert.equal(editor.undos,1);assert.equal(after.defaultPrevented,true);
 ''')

@@ -248,7 +248,7 @@ def test_only_undo_and_redo_reach_the_timeline_under_a_management_modal():
     _run_gesture_node("""
         window.addEventListener = () => {}; window.removeEventListener = () => {};
         globalThis.Element = class {};
-        globalThis.document = { activeElement: null,
+        globalThis.document = { activeElement: null, querySelector() { return null; },
             addEventListener() {}, removeEventListener() {} };
         const w = makeWidget();
         w.isFullscreen = true; w.selectedItems = [{ type: 'clip', id: 'c' }];
@@ -737,7 +737,7 @@ def test_a_ctrl_chord_under_a_modal_is_consumed_but_clipboard_keys_are_not():
     _run_gesture_node("""
         window.addEventListener = () => {}; window.removeEventListener = () => {};
         globalThis.Element = class {};
-        globalThis.document = { activeElement: null,
+        globalThis.document = { activeElement: null, querySelector() { return null; },
             addEventListener() {}, removeEventListener() {} };
         const w = makeWidget();
         w.isFullscreen = true;
