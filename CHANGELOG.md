@@ -12,36 +12,37 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
-- Copy, cut and paste carry Context chips between prompt boxes of the same project and scene: the Prompt panel, Writing and the timeline bar. A pasted chip is an independent copy. A cut chip pasted once in the same tab, while the box you cut it from is still open, stays linked to its group. A chip the target box can't take is left out with a notice, and the text still pastes: for example a Shot outside the shot-marker channel, a Prompt link pasted into a section (or Writing block) that doesn't start after its source, or a chip whose new identity is still being saved. Anywhere else, the paste is plain text.
+- Copy, cut and paste keep Context chips when you paste into another prompt field of the same scene: in Prompt Management, Writing or the timeline prompt bar. A chip that can't go where you paste it is left out with a notice, and the text still pastes; anywhere else the paste is plain text.
 
 ### Changed
-- When ComfyUI refuses a Sonder App run, **Generate** (and an Output View's **Didn't run:**) names what it refused, for example a sampler this ComfyUI doesn't have, instead of only "ComfyUI didn't accept the run". An Output View that Sonder itself can't run yet also names the first reason.
-- The Launcher lists Controls that are off because their node isn't installed in one line, "Controls off until their nodes are installed", instead of one note each.
+- When ComfyUI refuses a run, **Generate** in the Sonder App and an Output View's **Didn't run:** (in the Sonder App, fullscreen and Mount in Tab) name what it refused, such as a sampler this ComfyUI doesn't have, instead of only "ComfyUI didn't accept the run". Further problems show on hover.
+- The Launcher lists Controls that are off until their nodes are installed in one line, instead of one note each.
+- Chips a text selection covers are outlined, so you can see they are part of it.
 
 ### Fixed
-- Failed Output View runs in fullscreen and Mount in Tab name the inputs ComfyUI rejected. When ComfyUI uses a validation dialog, it can be dismissed without leaving fullscreen.
-- Launcher workflows you haven't selected yet read **Select to check** instead of a count of notes.
-- A Launcher line naming missing node packs says which node each "is needed by" choice belongs to, instead of appearing to apply to every pack.
-- The Launcher no longer says "No seed exposed" for a workflow whose seed Control is off only because its node pack isn't installed.
-- Launcher badges read "1 note" and "1 model missing".
-- **Settings ▸ Sonder App** no longer says a package "stays loaded until ComfyUI restarts" once that package is installed again.
-- A Prompt section no longer gets stuck refusing every save ("This prompt field changed elsewhere") after a **Retry** or **Use server's version**, and a save no longer drags along fields you didn't touch.
-- Text typed into a Prompt box is no longer lost when its save is refused while the Prompt panel redraws. **Retry** after a refused save no longer overwrites what someone else saved; choose **Use server's version** or **Discard** instead.
-- Saving from the timeline prompt bar no longer undoes a field you just saved in the Prompt panel for the same section. If you edited that same field in both, the later save is refused and kept as a draft, with **Use server's version** and **Discard**, instead of silently replacing the other.
-- A Context chip added through **+ Attach** shows in the open Prompt panel right away, instead of only after reopening it. If the section was deleted or the scene changed while the dialog was open, nothing is attached and a notice says why.
-- **Convert to copy** on a section Prompt link now works (it used to fail without changing anything), and it changes only the fields it fills in.
-- The Prompt panel's save-failed bar says when a draft also changed other fields that **Use server's version** keeps.
-- **Ctrl+Z** in one prompt box no longer brings back a Context chip you deleted in another box of the same section, or removes one you added there. A Prompt link deleted that way used to come back with no place in the text and block the section from running.
-- A Context chip placed in two channel boxes of a section stays when you delete it from just one of them.
-- Pressing on a Context chip no longer leaves an older text selection active, so Delete, Backspace or Cut no longer removes text and chips you had selected earlier. In Firefox the editor also keeps focus, and **Ctrl+Z** brings the text back.
-- Chips a selection covers are outlined, so you can see they are part of it.
-- **Customize** on a Reference chip's Summary task types now unlocks the checkboxes even when no task type is chosen automatically.
-- Typing in the Prompt panel while saves are slow rarely shows `Error project_version_conflict` in its diagnostics any more. The preview keeps its last result, marked out of date, and refreshes once; the error appears only if that refresh conflicts too.
-- **Discard** on a failed Prompt draft now asks in the panel itself, so it works where browser dialogs are suppressed. Escape keeps the draft, and the draft is kept if the server's text can't be reloaded.
-- **Use server's version** on a Prompt field now also takes the server's version of the chips in that text. A chip you had just added there no longer makes the next save fail ("…would leave a Prompt link or Vocal event chip with no place in the text"), and a chip you had deleted there is no longer saved as gone while the text still shows it.
-- **Ctrl+Z** in a Prompt panel box still undoes after the panel refreshes (for example when a save lands or References reload right after your edit). It used to do nothing.
-- Splitting a block in Writing no longer copies its Prompt links and Vocal events into the new block, where they had no place in the text.
-- An edit to a prompt section that would leave a Prompt link or Vocal event with no place in its text is refused and kept as a draft, instead of saving a chip that blocks the section.
+- Selecting text that contains Context chips, then pressing on a chip, could delete more than you selected with **Delete**, **Backspace** or **Cut**, and in Firefox **Ctrl+Z** didn't bring it back. Only what you select is removed now, and **Ctrl+Z** restores it.
+- Prompt saves no longer revert or block each other:
+  - A field saved in Prompt Management is no longer undone by a save from the timeline prompt bar for the same section. If both changed the same field, the later save is refused and kept as a draft.
+  - Text typed into a prompt field is no longer lost when its save is refused while Prompt Management redraws.
+  - A section no longer gets stuck refusing every save ("This prompt field changed elsewhere") after **Retry** or **Use server's version**, and a save sends only the fields you changed.
+  - **Retry** after a refused save no longer overwrites what someone else saved; choose **Use server's version** or **Discard**.
+- **Use server's version** also takes the server's version of the chips in that field's text, so the next save no longer fails on a chip you had just added there, and a chip you had deleted there comes back with the text. The save-failed bar says which of your other changes it keeps.
+- **Discard** on a failed prompt draft asks in Prompt Management itself, so it works where browser dialogs are suppressed.
+- **Ctrl+Z** in a prompt field undoes only that field's chip changes: it no longer brings back a chip you deleted in another field, or removes one you added there. It also keeps working after Prompt Management refreshes.
+- A chip placed in two fields of a section stays when you delete it from one of them.
+- A prompt edit that would leave a Prompt link or Vocal event with no place in the text is refused and kept as a draft, instead of saving a chip that stops the section from running.
+- A chip added through **+ Attach** shows in the open Prompt Management right away.
+- **Convert to copy** on a section Prompt link works again, and changes only the fields it fills in.
+- **Customize** on a Reference chip's Summary task types unlocks the checkboxes even when no task type is chosen automatically.
+- Typing while saves are slow no longer shows `Error project_version_conflict` in the diagnostics; the preview dims until it refreshes.
+- Splitting a block in Writing no longer copies its Prompt links and Vocal events into the new block.
+- ComfyUI's own validation dialog can be dismissed without leaving fullscreen.
+- Launcher:
+  - Workflows you haven't selected yet read **Select to check** instead of a count of notes.
+  - A line naming missing node packs says which node each "is needed by" choice belongs to.
+  - It no longer says "No seed exposed" when the seed's node pack is only missing.
+  - Badges read "1 note" and "1 model missing".
+- **Settings ▸ Sonder App** no longer says a package "stays loaded until ComfyUI restarts" once it is installed again.
 
 ## [0.9.0] - 2026-11-19
 

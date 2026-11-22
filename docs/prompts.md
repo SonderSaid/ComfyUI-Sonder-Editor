@@ -110,6 +110,8 @@ open the chip and untick that part.
 **+ Attach** adds one. Chips sit either inline in a field or in the section's own context row, depending on
 where the format places them. To change a chip later, click an inline chip
 (marked `✎`), or click a context-row chip and choose **Configure…**.
+Copy, cut and paste keep chips when you paste into another prompt field of the
+same scene; anywhere else they paste as plain text.
 
 | Chip | What it contributes |
 |---|---|
