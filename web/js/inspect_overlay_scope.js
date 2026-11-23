@@ -71,16 +71,88 @@ export function planCompareRemoval({ sideLists = {}, sameTypeIds = [], leftId = 
     return { compare: true, leftId: left, rightId: right };
 }
 
+/**
+ * An external item (a View pane's output or sampling preview,
+ * `view_inspect_items.js`) in the shape the overlay reads. It names no file
+ * and no project record, so nothing asset-keyed can resolve it.
+ */
+export function externalOverlayAsset(item) {
+    return {
+        asset_id: item.id,
+        asset_type: item.kind,
+        name: item.title,
+        external: true,
+        path: "",
+        fps: item.fps,
+        duration_sec: null,
+        has_thumbnail: false,
+        has_audio: false,
+        place: item.place || "",
+        note: item.note || "",
+        status: item.status || "",
+        details: item.details || [],
+    };
+}
+
+/**
+ * What the overlay offers for its source. Project assets get everything; an
+ * external item gets nothing that reads or writes the project: no favorite or
+ * Trash, no search, sort or metadata filtering, no provenance demand, proxies
+ * or server media.
+ */
+export function inspectOverlayPolicy(external = false) {
+    const project = !external;
+    return {
+        favorites: project,
+        trash: project,
+        metadataFilters: project,
+        detailDemand: project,
+        projectMedia: project,
+        chooserSearch: project,
+        // External candidates keep pane order.
+        chooserSort: project,
+        chooserTitle: (side) => (project ? `Gallery ${side}` : `Pane ${side}`),
+        chooserHint: (side) => (project
+            ? `Left click assigns A. Right click assigns B. Search filters Gallery ${side}.`
+            : "Left click assigns A. Right click assigns B."),
+        compareTitle: (possible) => {
+            if (project) return possible ? "Compare (C)" : "Compare needs ≥ 2 same-type visible assets";
+            return possible ? "Compare with another pane showing the same kind of media (C)"
+                : "Compare needs another pane showing the same kind of media";
+        },
+        cycleTitle: `Up/Down arrows cycle this side's ${project ? "asset" : "pane"} in compare mode (click to switch side)`,
+        metadataTitle: project ? "Show or hide asset metadata in this inspector" : "Show or hide what this View is",
+    };
+}
+
+// Shortcuts that act on a project asset, so an external overlay has neither.
+export const INSPECT_ASSET_ONLY_KEYS = Object.freeze(new Set(["S", "Delete"]));
+const EXTERNAL_SHORTCUT_TEXT = {
+    "ArrowLeft / ArrowRight": "Video: step 1 frame back / forward · Image/Audio: previous / next pane",
+    "ArrowUp / ArrowDown": "Previous / next pane (compare: cycle the active A/B side)",
+};
+
+// The overlay's own help rows: `[key, description]` pairs.
+export function inspectHelpRows(rows, external = false) {
+    if (!external) return rows;
+    return rows.filter(([key]) => !INSPECT_ASSET_ONLY_KEYS.has(key))
+        .map(([key, text]) => [key, EXTERNAL_SHORTCUT_TEXT[key] || text]);
+}
+
 export function resolveInspectOverlayScope({
     origin = "gallery",
     requestedAssetId = "",
     visibleAssets = [],
     sortedProjectAssets = [],
+    externalItems = [],
 } = {}) {
     const direct = origin === "direct";
-    const source = direct
-        ? sortedProjectAssets.filter(isDirectInspectAssetUsable)
-        : visibleAssets;
+    const external = origin === "external";
+    const source = external
+        ? externalItems.map(externalOverlayAsset)
+        : direct
+            ? sortedProjectAssets.filter(isDirectInspectAssetUsable)
+            : visibleAssets;
     const seen = new Set();
     const assets = [];
     for (const asset of source) {
@@ -91,7 +163,7 @@ export function resolveInspectOverlayScope({
     }
     const asset = assets.find((entry) => entry.asset_id === requestedAssetId) || null;
     return {
-        origin: direct ? "direct" : "gallery",
+        origin: external ? "external" : direct ? "direct" : "gallery",
         assets,
         asset,
     };

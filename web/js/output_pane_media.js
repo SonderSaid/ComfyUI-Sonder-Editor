@@ -13,6 +13,7 @@ import { createClockFollower } from "./clock_follower.js";
 import { mountMediaScrubBar } from "./media_scrub_bar.js";
 import { mediaFailedToDecode } from "./media_preview_support.js";
 import { entryPlayer } from "./views_model.js";
+import { decodeChannel, minMaxPeaks } from "./waveform_peaks.js";
 import { EDITOR_COLORS as COLORS, FONT, SPACE, TYPE, chromeButtonCss } from "./editor_theme.js";
 
 const make = (tag, css = "") => {
@@ -31,36 +32,29 @@ function smallButton(text, title) {
 
 // A waveform of an audio blob, drawn once (decoded offline, never played).
 async function drawWaveform(canvas, url, signal) {
-    try {
-        const buffer = await (await fetch(url, { signal })).arrayBuffer();
-        const Offline = globalThis.OfflineAudioContext || globalThis.webkitOfflineAudioContext;
-        if (!Offline || signal.aborted) return;
-        const audio = await new Offline(1, 1, 44100).decodeAudioData(buffer);
-        if (signal.aborted) return;
-        const data = audio.getChannelData(0);
-        const ctx = canvas.getContext("2d");
-        const { width, height } = canvas;
-        ctx.clearRect(0, 0, width, height);
-        ctx.fillStyle = COLORS.textDim;
-        const step = Math.max(1, Math.floor(data.length / width));
-        for (let x = 0; x < width; x++) {
-            let peak = 0;
-            for (let i = x * step; i < Math.min(data.length, (x + 1) * step); i++) peak = Math.max(peak, Math.abs(data[i]));
-            const bar = Math.max(1, peak * height);
-            ctx.fillRect(x, (height - bar) / 2, 1, bar);
-        }
-    } catch (_error) {
-        // A waveform is decoration; the transport still plays.
-    }
+    const data = await decodeChannel(url, { signal });
+    if (!data) return;
+    const ctx = canvas.getContext("2d");
+    const { width, height } = canvas;
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = COLORS.textDim;
+    // Whole-sample steps, as the bars always were: a tail shorter than a bar is not drawn.
+    const peaks = minMaxPeaks(data, width, Math.max(1, Math.floor(data.length / width)));
+    peaks.forEach(([min, max], x) => {
+        const bar = Math.max(1, Math.max(Math.abs(min), Math.abs(max)) * height);
+        ctx.fillRect(x, (height - bar) / 2, 1, bar);
+    });
 }
 
 // `entry` is a normalized output entry (server output_media). `zoom` is the
-// pane's persisted {scale, x, y}|null; `onZoom` stores a change.
+// pane's persisted {scale, x, y}|null; `onZoom` stores a change. `onLoaded`
+// says when the media starts or stops being showable.
 // Catching up shows only once it lasts: a quick recovery is not news.
 export const CATCHING_UP_DELAY_MS = 250;
 
 export function mountOutputMedia({ container, entry, cache, paneId, audio, fit = "contain", zoom = null, onZoom = () => {},
-    onCondition = () => {}, takeSaved = false, clock = null, link = null, onDuration = () => {}, onFollowerState = () => {} }) {
+    onCondition = () => {}, takeSaved = false, clock = null, link = null, onDuration = () => {}, onFollowerState = () => {},
+    onLoaded = () => {} }) {
     const player = entryPlayer(entry);
     const controller = new AbortController();
     let destroyed = false;
@@ -80,13 +74,18 @@ export function mountOutputMedia({ container, entry, cache, paneId, audio, fit =
     // A file that failed to decode stops its follower's seeks (it would hold a
     // page seek slot to the timeout and make healthy panes wait).
     let failed = false;
+    let loaded = false; // the media can be shown now (Inspect is offered for it)
     const condition = value => {
         if (destroyed) return;
         failed = value === "decode";
         follower?.setUnavailable(failed);
+        const was = loaded;
+        loaded = value === null;
         onCondition(value);
+        if (loaded !== was) onLoaded(loaded);
     };
-    const inert = { destroy() { stage.remove(); transport.remove(); }, setFit() {}, setLink() {}, pause() {} };
+    const inert = { destroy() { stage.remove(); transport.remove(); }, setFit() {}, setLink() {}, pause() {},
+        loaded: () => false, currentTime: () => 0 };
     if (player === "unsupported") { condition("unsupported"); return inert; }
     if (entry.available === false) { condition("missing_file"); return inert; }
 
@@ -226,6 +225,8 @@ export function mountOutputMedia({ container, entry, cache, paneId, audio, fit =
             if (changed && follower) follower.sync({ discontinuity: true });
         },
         pause() { try { media?.pause?.(); } catch (_error) { /* detached */ } },
+        loaded: () => loaded && !destroyed,
+        currentTime: () => Math.max(0, Number(media?.currentTime) || 0),
         destroy() {
             if (destroyed) return;
             follower?.destroy();

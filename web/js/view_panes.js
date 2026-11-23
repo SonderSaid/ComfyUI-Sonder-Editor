@@ -2,15 +2,17 @@
 // Guides, a Driver lane or an output View. Owns the grid, the pane count
 // (1–4) and arrangement (Grid / Row / Column) segments in the viewport header,
 // and each pane's chrome: its source
-// button and picker, status chip, Hold/Release, Run/Cancel, item picker, fit
-// and sound, and for a video or audio output its Link to the editor clock. A
-// sampling-preview View (Phase 4) shows its node's newest preview with its
-// step, and offers only Fit and zoom/pan. The coordinator (views_coordinator.js)
+// button and picker, status chip, Hold/Release, Run/Cancel, item picker, fit,
+// Inspect (the gallery's overlay, through the host) and sound, and for a video
+// or audio output its Link to the editor clock. A sampling-preview View
+// (Phase 4) shows its node's newest preview with its step, and offers only Fit,
+// Inspect and zoom/pan. The coordinator (views_coordinator.js)
 // owns state; the widget owns the Composite canvas and is told where it goes
 // (`placeComposite`).
 import {
-    ARRANGEMENTS, ARRANGEMENT_TITLES, PANE_COUNT_TITLES, effectiveArrangement, entryPlayer, paneCount, paneGrid, pickerSections,
+    ARRANGEMENTS, ARRANGEMENT_TITLES, PANE_COUNT_TITLES, effectiveArrangement, entryPlayer, paneCount, paneGrid, pickerSections, viewLabel,
 } from "./views_model.js";
+import { inspectableKind, inspectKind } from "./view_inspect_items.js";
 import { openPanePicker } from "./view_pane_picker.js";
 import { mountOutputMedia, messageEl } from "./output_pane_media.js";
 import { mountSamplingMedia } from "./sampling_pane_media.js";
@@ -19,6 +21,7 @@ import { fileKey } from "./output_media_cache.js";
 import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, THEME, TYPE, segmentCss, setButtonDisabled, setButtonVariant } from "./editor_theme.js";
 
 const ZOOM_SAVE_MS = 300;
+const INSPECT_TITLE = "Open in the inspect overlay. Compare it there with another pane of the same kind";
 const make = (tag, text, css = "") => {
     const el = document.createElement(tag);
     if (text !== undefined) el.textContent = text;
@@ -54,7 +57,7 @@ export function sourceLabel(model, { driverLabel = index => `Driver ${index + 1}
     if (source.kind === "composite") return "Composite";
     if (source.kind === "guides") return "Guides";
     if (source.kind === "driver") return driverLabel(source.index);
-    return model.view?.label || model.view?.default_label || "Output";
+    return viewLabel(model.view);
 }
 
 // What a pane's content is: rebuilt only when this changes (chips and buttons
@@ -68,8 +71,13 @@ function contentKey(model) {
     return `view:${source.viewId}:${model.entry ? fileKey(model.entry) : ""}`;
 }
 
-export function mountViewPanes({ root, header, coordinator, cache, audio, sourceHost, placeComposite }) {
+// `onInspect(index, {startTime, models})` opens a pane's media in the inspect
+// overlay (its promise settles once it opened or failed); without it there is no
+// button. `onModels(models)` hears the visible panes' models after each render.
+export function mountViewPanes({ root, header, coordinator, cache, audio, sourceHost, placeComposite, onInspect = null, onModels = () => {} }) {
     let destroyed = false;
+    let models = []; // the visible panes' models, from the last render
+    let inspecting = null; // {index}: an Inspect still opening
     let frame = null;
     let picker = null; // {index, close}
     let lastShape = null; // "count:arrangement" at the last render
@@ -79,7 +87,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
     root.style.cssText = "flex:1;display:grid;gap:2px;min-height:0;position:relative;overflow:hidden;";
 
     // Header: the pane count and arrangement, and with one pane its own bar.
-    const headerSlot = make("div", undefined, `display:flex;align-items:center;gap:${SPACE.s2}px;min-width:0;flex:1 1 auto;justify-content:flex-end;`);
+    const headerSlot = make("div", undefined, `display:flex;align-items:center;gap:${SPACE.s2}px;min-width:0;flex:1 1 auto;justify-content:flex-end;margin-right:${SPACE.s2}px;`);
     const layoutControl = make("div", undefined, `display:flex;align-items:stretch;gap:${SPACE.s2}px;flex:0 0 auto;`);
     const group = label => {
         const el = make("div", undefined, "display:flex;gap:0;");
@@ -189,7 +197,8 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         const actions = make("span", undefined, `display:flex;gap:${SPACE.s1}px;flex:0 0 auto;min-width:0;margin-left:auto;`);
         bar.append(sourceButton, chip, actions);
         el.append(bar, body);
-        cells[index] = { index, el, bar, body, sourceButton, chip, actions, key: null, content: null, message: null, painterStatus: null };
+        cells[index] = { index, el, bar, body, sourceButton, chip, actions, key: null, content: null, message: null, painterStatus: null,
+            inspect: null, model: null };
         return cells[index];
     }
 
@@ -227,6 +236,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
                 container: entry.body, entry: model.entry, cache, paneId: coordinator.paneId(index), audio,
                 fit: model.pane.fit, zoom: model.pane.zoom, takeSaved: !!model.result?.run?.saved_to_project,
                 clock: sourceHost.clock, link: model.linked ? model.link : null,
+                onLoaded: () => schedule(), // Inspect opens once the media has loaded
                 onDuration: sec => coordinator.setMediaDuration(index, fileKey(model.entry), sec),
                 onFollowerState: state => coordinator.setFollowerState(index, state),
                 onZoom: zoom => {
@@ -250,6 +260,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         if (model.source.kind !== "view") return out;
         if (model.sampling) {
             if (model.frame) out.push(fitButton(index, model));
+            if (model.inspectOffered) out.push(inspectButton(index));
             return out;
         }
         const entries = model.entries || [];
@@ -265,6 +276,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         }
         const player = model.entry ? entryPlayer(model.entry) : null;
         if (player && player !== "audio" && player !== "unsupported") out.push(fitButton(index, model));
+        if (model.inspectOffered) out.push(inspectButton(index));
         // A video or audio output follows the editor clock while linked.
         if (model.linkable) {
             const on = !!model.pane.link;
@@ -324,11 +336,51 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         return fit;
     }
 
+    function inspectButton(index) {
+        const inspect = button("Inspect", INSPECT_TITLE);
+        inspect.dataset.sonderPaneInspect = String(index);
+        cells[index].inspect = inspect;
+        inspect.addEventListener("click", () => {
+            if (!cells[index]?.model?.inspectable || inspecting?.index === index) return;
+            const opening = inspecting = { index };
+            schedule();
+            let opened;
+            try { opened = onInspect(index, { startTime: cells[index]?.content?.currentTime?.() || 0, models }); } catch (error) {
+                console.warn("[Sonder] pane Inspect failed:", error);
+            }
+            const done = () => {
+                if (inspecting !== opening) return;
+                inspecting = null;
+                schedule();
+            };
+            Promise.resolve(opened).then(done, done);
+        });
+        return inspect;
+    }
+
+    // Written on the button there is, so a result loading or an Inspect opening never
+    // rebuilds the row under a press, or takes a button's focus: aria-disabled, not disabled.
+    function syncInspect(entry, model) {
+        const inspect = entry.inspect;
+        if (!inspect || !model.inspectOffered) { entry.inspect = null; return; }
+        const busy = inspecting?.index === entry.index;
+        const off = busy || !model.inspectable;
+        const title = model.inspectable ? INSPECT_TITLE
+            : model.condition ? "This media can't be shown, so it can't be inspected" : "Inspect opens once this has loaded";
+        if (inspect.title !== title) inspect.title = title;
+        for (const [name, on] of [["aria-disabled", off], ["aria-busy", busy]]) {
+            if (on) inspect.setAttribute(name, "true");
+            else inspect.removeAttribute(name);
+        }
+        inspect.style.opacity = off ? "0.55" : "";
+        inspect.style.cursor = off ? "not-allowed" : "";
+    }
+
     function actionSignature(model) {
         return JSON.stringify([model.entries?.length || 0, model.itemIndex, model.pane.fit, model.audible, model.held, model.holdPending,
             model.unavailable, model.canHold, model.cancellable, model.runnable,
             model.entry ? entryPlayer(model.entry) : null, !!model.linkable, !!model.pane.link, !!model.linked,
-            !!model.sampling, !!model.frame]);
+            !!model.sampling, !!model.frame, !!model.inspectOffered]);
     }
 
     function renderPane(index, single) {
@@ -350,6 +402,11 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
             // clip, a new layout): the painter reads it again.
             entry.content?.update?.();
         }
+        // Whether the pane's media has loaded is the content's own to say.
+        model.loaded = !!entry.content?.loaded?.();
+        model.inspectOffered = !!onInspect && !!inspectableKind(model);
+        model.inspectable = model.inspectOffered && !!inspectKind(model);
+        entry.model = model;
         entry.sourceButton.textContent = `${sourceLabel(model, { driverLabel: sourceHost.driverLabel })} ▾`;
         entry.sourceButton.setAttribute("aria-expanded", String(picker?.index === index));
         entry.chip.textContent = model.chip || "";
@@ -361,6 +418,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
             entry.actionSignature = signature;
             entry.actions.replaceChildren(...actionsFor(index, model));
         }
+        syncInspect(entry, model);
         entry.bar.title = model.runnable && !model.runnable.show ? model.runnable.reason : "";
         if (model.source.kind === "view") showMessage(entry, model.message || null);
         else if (model.source.kind === "composite") showMessage(entry, null);
@@ -372,11 +430,17 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         }
         entry.bar.style.padding = single ? "0" : `2px ${SPACE.s1}px`;
         // In the header the bar takes the free width; in a cell it keeps its
-        // height, and its buttons wrap to a second line when the pane is narrow.
+        // height. Either way its buttons wrap to a second line when the pane is
+        // narrow; in the header they wrap among themselves, so the source keeps
+        // enough width to be read.
         entry.bar.style.flex = single ? "1 1 auto" : "0 0 auto";
         entry.bar.style.flexWrap = single ? "nowrap" : "wrap";
-        entry.actions.style.flex = single ? "0 0 auto" : "0 1 auto";
-        entry.actions.style.flexWrap = single ? "nowrap" : "wrap";
+        entry.sourceButton.style.minWidth = single ? "72px" : "0";
+        // A long name gives way before the buttons wrap.
+        entry.sourceButton.style.flexShrink = single ? "1000" : "1";
+        entry.actions.style.flex = "0 1 auto";
+        entry.actions.style.flexWrap = "wrap";
+        entry.actions.style.justifyContent = "flex-end";
         return { entry, model };
     }
 
@@ -403,8 +467,10 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         cells.length = Math.min(cells.length, count);
         if (picker && picker.index >= count) closePicker();
         let compositeBody = null;
+        models = [];
         for (let i = 0; i < count; i++) {
             const { entry, model } = renderPane(i, count === 1);
+            models.push(model);
             entry.el.style.gridRow = grid.spans[i];
             if (entry.el.parentElement !== root || root.children[i] !== entry.el) root.insertBefore(entry.el, root.children[i] || null);
             if (model.source.kind === "composite") compositeBody = entry.body;
@@ -412,6 +478,7 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
         if (count !== 1 && headerSlot.childElementCount) headerSlot.replaceChildren();
         placeComposite(compositeBody);
         refreshPicker();
+        try { onModels(models); } catch (error) { console.warn("[Sonder] pane models listener failed:", error); }
     }
 
     function schedule() {
@@ -468,6 +535,10 @@ export function mountViewPanes({ root, header, coordinator, cache, audio, source
     schedule();
     return {
         update: schedule,
+        // The overlay closed: focus goes back to the button that opened it, if it is still there.
+        focusInspect(index) {
+            cells[index]?.actions.querySelector?.("[data-sonder-pane-inspect]")?.focus?.({ preventScroll: true });
+        },
         destroy() {
             if (destroyed) return;
             destroyed = true;

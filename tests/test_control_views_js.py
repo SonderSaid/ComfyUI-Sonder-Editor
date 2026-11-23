@@ -307,8 +307,9 @@ out.output = B.resolveViews(root, manifest({s:{}, h:{}})).views.s.status;
 sampler.mode = 2;
 r = B.resolveViews(root, m).views;
 out.muted = [r.s.status, r.s.participation, r.s.inactiveReason.mode];
-// A muted core sampler is a candidate that is off; a muted unknown node is not.
+// A muted known sampler is a candidate that is off; a muted unknown node is not.
 const other = add(root, 'CustomSampler', 33); other.mode = 2;
+const shark = add(root, 'ClownsharKSampler_Beta', 34); shark.mode = 2;
 out.inactive = B.inactiveOutputs(root).map(v => v.path);
 // The export keeps the feed and adds the facts.
 const exported = JSON.parse(B.exportManifest(JSON.stringify(m), root)).views.items;
@@ -317,7 +318,7 @@ out.exported = [exported.s.feed, exported.s.status, exported.s.class_type];
     assert out["ok"] == ["ok", "active", "KSampler"]
     assert out["host"] == "kind" and out["output"] == "kind"
     assert out["muted"] == ["ok", "inactive", "muted"]
-    assert "6" in out["inactive"] and "33" not in out["inactive"]
+    assert {"6", "34"} <= set(out["inactive"]) and "33" not in out["inactive"]
     assert out["exported"] == ["sampling", "ok", "KSampler"]
 
 

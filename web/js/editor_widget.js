@@ -365,6 +365,7 @@ function sessionDiagEndLoad(kind, markerId, payload) {
     sessionDiagRecord(`${kind}_end`, { marker_id: markerId, ...(payload || {}) });
 }
 
+import { openInspectSession } from "./view_inspect_items.js";
 import { INSPECT_OVERLAY_SHORTCUTS, mountSharedAssetGallery, getActiveDragAsset } from "./shared_asset_gallery.js";
 import { getActiveReferenceDrag, mountReferenceLibrary, referenceMemberMediaKind, SONDER_REFERENCE_MIME } from "./editor_reference_library.js";
 import { mountControlsPanel } from "./editor_controls_panel.js";
@@ -4772,6 +4773,7 @@ export class EditorWidget {
         this._controlsHost = controlsHost || null;
         if (mounted) this._showFullscreenSidebarContent(this._settings?.layout?.fullscreenSidebarContent, { persist: false });
         // Views belong to the workflow too: the panes follow the new one.
+        this._closeViewInspect();
         this._bindViewsControls();
         this._viewsCoordinator?.hostChanged();
     }
@@ -4810,6 +4812,7 @@ export class EditorWidget {
     // clients exist.
 
     setViewsHost(host) {
+        this._closeViewInspect();
         this._viewsHostAdapter = host || null;
         this._viewsCoordinator?.hostChanged();
     }
@@ -4979,11 +4982,51 @@ export class EditorWidget {
             root: this._fsViewportContent, header: this._vpHeaderEl, coordinator, cache: this._outputMediaCache,
             audio: this._audioOwnership, sourceHost: this._viewsSourceHost(),
             placeComposite: (body, options) => this._placeComposite(body, options),
+            onInspect: (index, request) => this._inspectViewPane(index, request),
+            onModels: (models) => this._viewInspect?.session.refresh(models),
         });
         coordinator.setVisible(true);
     }
 
+    // A View pane's Inspect: its media in the gallery's overlay (view_inspect_items.js),
+    // never project data. The overlay owns the session once it opens. The latest press
+    // wins, and a scope change (`_closeViewInspect`) ends it whatever state it is in.
+    async _inspectViewPane(index, { startTime = 0, models = [] } = {}) {
+        this._closeViewInspect();
+        const controller = new AbortController();
+        const session = openInspectSession({
+            models, cache: this._outputMediaCache, anchorIndex: index, fps: this._effectiveFps, startTime,
+            subgraphNames: this._viewsCoordinator?.controlsView()?.subgraph_names || null, signal: controller.signal,
+        });
+        const current = this._viewInspect = { controller, session };
+        const result = await session.ready;
+        if (this._viewInspect !== current || controller.signal.aborted) return;
+        const opened = !result.error && this._assetGallery?.inspectExternal?.(session, {
+            onClosed: () => {
+                if (this._viewInspect === current) this._viewInspect = null;
+                this._viewPanes?.focusInspect?.(index);
+            },
+        });
+        if (opened) {
+            this._viewPanes?.update();
+            return;
+        }
+        this._viewInspect = null;
+        session.release();
+        notifyWarning("This pane's media could not be opened.", { source: "output-views" });
+    }
+
+    // Closes a pane's Inspect, or gives up one still opening.
+    _closeViewInspect() {
+        const inspect = this._viewInspect;
+        if (!inspect) return;
+        this._viewInspect = null;
+        this._assetGallery?.closeExternalInspect?.();
+        inspect.controller.abort();
+    }
+
     _unmountViewPanes() {
+        this._closeViewInspect();
         this._viewsCoordinator?.setVisible(false);
         this._viewPanes?.destroy();
         this._viewPanes = null;
@@ -23525,7 +23568,10 @@ export class EditorWidget {
                 ["Delete", "Trash or permanently delete selection (when gallery focused)"],
                 ["Esc", "Clear or reduce gallery selection"],
             ]) +
-            this._shortcutSection("Inspect Overlay", INSPECT_OVERLAY_SHORTCUTS) +
+            this._shortcutSection("Inspect Overlay", [
+                ...INSPECT_OVERLAY_SHORTCUTS,
+                ["From a View pane", "S and Delete don’t apply; ↑ / ↓ moves between panes"],
+            ]) +
             this._shortcutSection("Reference Media Editor", REFERENCE_MEDIA_EDITOR_SHORTCUTS) +
             this._shortcutSection("View", [
                 ["Wheel", "Vertical lane scroll"],
@@ -29020,6 +29066,7 @@ export class EditorWidget {
     updateProject(projectDir) {
         if (projectDir === this.projectDir) return;
         this._controlsPickerSources?.contextChanged();
+        this._closeViewInspect();
         // Holds and results belong to the project's runs: they end before its sync goes.
         this._viewsAssetsLoaded = false;
         this._viewsAssetIndex = null;

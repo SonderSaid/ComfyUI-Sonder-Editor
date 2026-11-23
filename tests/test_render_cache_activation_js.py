@@ -190,6 +190,7 @@ class Host {{
   _clearStaleReplayState() {{}}
   _updateSceneIdentity() {{}}
   _updateProjectIdentity() {{}}
+  _closeViewInspect() {{}}
   _stopPlayback() {{}}
   _clearVideoCache() {{}}
   _fetchProjectSettings() {{}}

@@ -2,7 +2,12 @@
 
 import asyncio
 import base64
+import importlib.util
 import io
+import json
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -702,3 +707,75 @@ def test_kj_degrades_only_while_an_observed_run_executes_and_heals(_clean):
     assert kj_preview_adapter.status()["state"] == "degraded"
     kj(_clean, "p1", "s", "kj", image=WEBP, mime="image/webp")  # attributed: the stray one was not the adapter
     assert kj_preview_adapter.status() == {"state": "ok"}
+
+
+# --- RES4LYF samplers (UX pass Phase 6): attribution never branches on the class ------
+
+# Run apart: the repo's `nodes` and `server` packages must not meet ComfyUI's.
+_V3_INPUT_TYPES = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from comfy_api.latest import io
+class SonderTestSharkSampler(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(node_id="SonderTestSharkSampler", category="test",
+                         inputs=[io.Model.Input("model", optional=True), io.Latent.Input("latent_image", optional=True),
+                                 io.Int.Input("steps", default=4)],
+                         outputs=[io.Latent.Output()])
+    @classmethod
+    def execute(cls, **_kwargs):
+        return io.NodeOutput(None)
+print("SPEC=" + json.dumps(SonderTestSharkSampler.INPUT_TYPES(), default=str))
+"""
+
+
+def test_a_v3_samplers_optional_model_input_is_read_as_the_installed_api_gives_it(_clean, monkeypatch):
+    """RES4LYF's samplers are V3 nodes with an optional MODEL input."""
+    found = importlib.util.find_spec("comfy_api")
+    if found is None:
+        pytest.skip("real ComfyUI required; add its root to PYTHONPATH")
+    comfy = Path(next(iter(found.submodule_search_locations))).parent
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", _V3_INPUT_TYPES, str(comfy)],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    line = next((l for l in result.stdout.splitlines() if l.startswith("SPEC=")), None)
+    assert line, result.stdout[-2000:] + result.stderr[-4000:]
+    spec = json.loads(line[5:])
+    assert "model" in spec["optional"]
+    classes = dict(CLASSES, ClownsharKSampler_Beta=SimpleNamespace(INPUT_TYPES=lambda: spec))
+    monkeypatch.setattr(sp, "_class_lookup", lambda name: classes.get(name))
+    types = sp._input_types("ClownsharKSampler_Beta")
+    assert types["model"] == "MODEL" and types["latent_image"] == "LATENT"
+    # An Override ahead of it; another feeds only its latent, so it is not on the chain.
+    prompt = graph()
+    prompt["kj2"] = {"class_type": "ModelPreviewOverrideKJ", "inputs": {"model": ["load", 0]}}
+    prompt["s0"] = {"class_type": "KSampler", "inputs": {"model": ["kj2", 0]}}
+    prompt["s"] = {"class_type": "ClownsharKSampler_Beta", "inputs": {"model": ["kj", 0], "latent_image": ["s0", 0]}}
+    queue("p1", prompt)
+    kj(_clean, "p1", "s", "kj2", image=WEBP, mime="image/webp")
+    answer = live("kj", "kj2")["sources"]
+    assert answer["kj"]["live"]["reattributed"] is True and answer["kj"]["live"]["via"] == "s"
+    assert answer["kj2"]["live"] is None
+
+
+@pytest.mark.parametrize("overrides", [1, 2])
+def test_a_chainsampler_takes_its_model_from_the_latent_so_only_a_lone_override_attributes(_clean, monkeypatch, overrides):
+    classes = dict(CLASSES, ClownsharKSampler_Beta=_node_class(model="MODEL", latent_image="LATENT"),
+                   SharkChainsampler_Beta=_node_class(model="MODEL", latent_image="LATENT"))
+    monkeypatch.setattr(sp, "_class_lookup", lambda name: classes.get(name))
+    prompt = graph()
+    prompt["s"]["class_type"] = "ClownsharKSampler_Beta"
+    # No model connected: the chain walk follows MODEL links, so it finds no Override.
+    prompt["s2"] = {"class_type": "SharkChainsampler_Beta", "inputs": {"latent_image": ["s", 0]}}
+    prompt["out"]["inputs"]["v"] = ["s2", 0]
+    if overrides == 2:
+        prompt["kj2"] = {"class_type": "ModelPreviewOverrideKJ", "inputs": {"model": ["load", 0]}}
+        prompt["s3"] = {"class_type": "KSampler", "inputs": {"model": ["kj2", 0]}}
+        prompt["out"]["inputs"]["w"] = ["s3", 0]
+    queue("p1", prompt)
+    kj(_clean, "p1", "s2", "kj", image=WEBP, mime="image/webp")
+    record = live("kj")["sources"]["kj"]["live"]
+    if overrides == 1:
+        assert record["via"] == "s2"
+    else:
+        assert record is None and sp.COUNTERS["kj_ambiguous"] == 1

@@ -11,6 +11,10 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- **Inspect** on a View pane opens its output or sampling preview fullscreen in the gallery's inspect overlay, where **Compare** puts it beside another View pane showing the same kind of media. A sampling preview keeps following its sampler; an output stays the one you opened. Nothing is added to the project.
+- **Sampling previews** in a pane's source menu lists RES4LYF's ClownsharKSampler, SharkSampler, Chainsamplers and BongSampler before their first run.
+
 ## [0.9.1] - 2026-11-22
 
 ### Added

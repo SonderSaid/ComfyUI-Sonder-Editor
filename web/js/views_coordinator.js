@@ -480,7 +480,7 @@ export function createViewsCoordinator({ host, controls, layoutStore, audio, cac
         const pane = layout.panes[index];
         const state = panes[index];
         const model = { index, pane, source: pane.source, held: !!state.held, holdPending: !!state.held?.pending,
-            outcome: state.outcome, released: state.released };
+            outcome: state.outcome, released: state.released, condition: state.condition };
         if (pane.source.kind !== "view") return model;
         const view = viewFor(pane.source.viewId);
         if (!view && state.creating) return { ...model, view: null, entries: [], entry: null, chip: null,

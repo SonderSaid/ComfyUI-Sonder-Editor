@@ -1,7 +1,7 @@
 // The pane picker: a toggled menu under a pane's source button. Sections:
 // Editor (Composite, Guides, each Driver lane), Views (with their status), Add
 // output… (output nodes without a View; muted ones say why) and Sampling
-// previews (core samplers and nodes that sent previews in a recent run; one the
+// previews (known samplers and nodes that sent previews in a recent run; one the
 // page knows is off or gone is greyed out with why). It closes
 // from its trigger, on an outside pointer and on Escape (keyboard ownership,
 // OVERLAY). Owns its DOM and listeners; returns close().

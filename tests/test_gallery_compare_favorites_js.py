@@ -15,6 +15,7 @@ from test_project_mutation_queue import _run_gesture_node
 SCOPE_URL = (GALLERY.parent / "inspect_overlay_scope.js").as_uri()
 
 _OVERLAY_FUNCTIONS = (
+    "isExternalOverlay", "overlayPolicy", "overlayItem", "overlayScope",
     "compareModeActive", "compareStageShown", "compareStageDrawn", "compareStageSignature",
     "resolvedCompareSlots", "compareSideAsset", "overlayFavoriteTarget", "handleOverlayFavoriteKey",
     "refreshCompareInPlace", "compareListSignature", "syncOverlayWithAssets",
@@ -42,7 +43,7 @@ def _overlay_source() -> str:
 # can reach. A side's search matches names containing it; `tracked:` stays
 # "not ready" until `metadataReady` is set.
 _OVERLAY_HARNESS = """
-        const { planCompareRemoval, resolveCompareSlots, resolveInspectOverlayScope } = await import('__SCOPE_URL__');
+        const { inspectOverlayPolicy, planCompareRemoval, resolveCompareSlots, resolveInspectOverlayScope } = await import('__SCOPE_URL__');
         Object.assign(state, { scopeMode: 'all', overlaySession: 1 });
         state.overlayState.replacedAt = { A: 0, B: 0, single: 0 };
         let favoritesView = false;
@@ -578,7 +579,7 @@ def test_the_compare_star_goes_through_the_guarded_handler():
 
 def test_each_inspect_opening_is_a_new_session_with_no_guard_carried_over():
     source = GALLERY.read_text(encoding="utf-8")
-    body = _gallery_function(source, "openInspectOverlay")
+    body = _gallery_function(source, "startInspectOverlay")
     opened = body.index("state.overlayState.open = true;")
     assert opened < body.index("state.overlaySession += 1;")
     assert opened < body.index("state.overlayState.replacedAt = { A: 0, B: 0, single: 0 };")

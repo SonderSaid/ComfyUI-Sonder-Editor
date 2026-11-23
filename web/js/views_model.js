@@ -169,7 +169,7 @@ export function subgraphChain(path, names) {
 }
 
 // The pane picker's sections. `views`, `candidates` and `samplingCandidates`
-// come from the Controls view (the server's lists of eligible outputs and core
+// come from the Controls view (the server's lists of eligible outputs and known
 // samplers); `seen` from a runs/live read (nodes that sent previews in a recent
 // run); `drivers` from the scene. `nodeState(path)` says, where the page can
 // tell (the canvas), that a seen node is switched off or gone: {inactive} |
@@ -188,7 +188,7 @@ export function pickerSections({ views = [], candidates = [], samplingCandidates
     const viewItems = views.map(view => {
         const chain = chainOf(view.path);
         return {
-            kind: "view", label: view.label || view.default_label || "Output", source: { kind: "view", viewId: view.view_id },
+            kind: "view", label: viewLabel(view), source: { kind: "view", viewId: view.view_id },
             status: view.status, detail: view.status !== "ok" ? "Unavailable" : view.participation === "inactive" ? "Switched off"
                 : chain ? `In ${chain}` : "",
             reason: view.reason || "",
@@ -218,6 +218,9 @@ export function pickerSections({ views = [], candidates = [], samplingCandidates
     }
     return { editor, views: viewItems, add, sampling, viewsError, viewsReady };
 }
+
+// What a View is called: its own name, else its node's title.
+export const viewLabel = view => view?.label || view?.default_label || "Output";
 
 export function inactiveText(reason) {
     if (!reason) return "";

@@ -402,7 +402,7 @@ def test_sampling_candidates_inventory_and_one_view_per_node():
     authoring = {"40": {"class_type": "SamplerCustom", "inputs": {}, "_meta": {}, "mode": "muted", "by": "self", "label": "Off"}}
     view = describe(prompt, authoring=authoring)
     offered = {c["path"]: c for c in view["view_sampling_candidates"]}
-    # The core classes only; a custom sampler is offered once a run saw it publish (the pane picker).
+    # The known samplers only; a custom sampler is offered once a run saw it publish (the pane picker).
     assert set(offered) == {"6", "30", "32", "40"}
     assert offered["30"]["title"] == "Pass 2" and offered["40"]["inactive"]["mode"] == "muted"
     index = view["_view_sampling_index"]
@@ -415,6 +415,20 @@ def test_sampling_candidates_inventory_and_one_view_per_node():
     view = describe(prompt)
     assert "6" not in {c["path"] for c in view["view_sampling_candidates"]}
     assert "9" not in {c["path"] for c in view["view_candidates"]}
+
+
+def test_every_known_sampler_is_offered_before_a_run_and_an_output_node_never_is():
+    res4lyf = {"ClownsharKSampler_Beta", "SharkSampler_Beta", "ClownsharkChainsampler_Beta", "SharkChainsampler_Beta", "BongSampler"}
+    assert res4lyf <= cv.SAMPLING_CLASSES
+    prompt = {str(i): node(name) for i, name in enumerate(sorted(cv.SAMPLING_CLASSES), 1)}
+    offered, truncated = cv.sampling_candidates(prompt, class_lookup=CLASSES.get)
+    assert {c["class_type"] for c in offered} == set(cv.SAMPLING_CLASSES) and not truncated
+
+    class OutputSampler:
+        OUTPUT_NODE = True
+    lookup = {**CLASSES, "BongSampler": OutputSampler}.get
+    offered, _truncated = cv.sampling_candidates(prompt, class_lookup=lookup)
+    assert {c["class_type"] for c in offered} == set(cv.SAMPLING_CLASSES) - {"BongSampler"}
 
 
 def test_describe_sampling_views_never_run_and_need_no_output_node():

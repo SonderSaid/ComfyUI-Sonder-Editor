@@ -168,7 +168,7 @@ def test_asset_gallery_qol_regression_contracts_are_wired():
     viewport_source = (root / "web" / "js" / "viewport_surface.js").read_text(encoding="utf-8")
     panel_source = (root / "web" / "js" / "editor_settings_panel.js").read_text(encoding="utf-8")
 
-    overlay_start = gallery_source.index("function overlayAssets()")
+    overlay_start = gallery_source.index("function overlayScope(")
     overlay_end = gallery_source.index("function currentOverlayAsset()", overlay_start)
     assert "activeNavigableAssets()" in gallery_source[overlay_start:overlay_end]
     assert "selectionAnchorAssetId" in gallery_source

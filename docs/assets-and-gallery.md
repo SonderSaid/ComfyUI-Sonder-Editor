@@ -158,7 +158,8 @@ trashed ones.
 
 ## The inspect overlay
 
-Double-click (or Space) a gallery asset for fullscreen inspection.
+Double-click (or Space) a gallery asset for fullscreen inspection. **Inspect**
+on a [View pane](generating.md#the-view-pane) opens its result here too.
 
 - **Images** — wheel zoom pivots toward the cursor, up to **16×**; left-drag
   pans.
@@ -327,3 +328,6 @@ export in its target player or editor.
 | + / − | Zoom |
 | Wheel | Zoom (image/video) / waveform zoom (audio) |
 | Esc | Close |
+
+Opened from a View pane, ↑ / ↓ move between panes, as ← / → do for images and
+audio. S and Delete do nothing.

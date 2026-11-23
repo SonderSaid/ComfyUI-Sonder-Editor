@@ -465,6 +465,10 @@ A View pane shows the newest result of its output node. Its bar has:
 - **Fit** / **Fill**: shows the whole output, or fills the pane. The mouse
   wheel zooms toward the cursor and dragging pans, as in
   [the inspect overlay](assets-and-gallery.md#the-inspect-overlay).
+- **Inspect**: opens this result fullscreen in the inspect overlay. There,
+  click **Compare** to put it beside another View pane showing the same kind of
+  media, such as the same View held in a second pane. If the output runs again,
+  the overlay keeps the result you opened.
 - **Unmute** (**Listen** while the pane is linked): hear this pane instead of
   the timeline. Only one source plays sound at a time; **Mute** gives the
   sound back to the timeline.
@@ -528,13 +532,17 @@ ComfyUI shows on the sampler node. To set one up, see
 
 A pane's source button lists, under **Sampling previews**, the workflow's
 **KSampler**, **KSampler (Advanced)**, **SamplerCustom**,
-**SamplerCustomAdvanced** and KJNodes **Model Preview Override** nodes, plus
-any other node that sent previews in a recent run (marked **Sent previews in a
-recent run**).
+**SamplerCustomAdvanced** and KJNodes **Model Preview Override** nodes, and
+RES4LYF's **ClownsharKSampler**, **SharkSampler**, **ClownsharkChainsampler**,
+**SharkChainsampler** and **BongSampler**, plus any other node that sent
+previews in a recent run (marked **Sent previews in a recent run**).
 
 A sampling View has no **Run**: run the workflow as usual. The pane shows the
-newest preview, with **Fit** / **Fill**, wheel zoom and drag to pan. For a
-moving preview of a video model, see
+newest preview, with **Fit** / **Fill**, wheel zoom and drag to pan.
+**Inspect** opens it in
+[the inspect overlay](assets-and-gallery.md#the-inspect-overlay), where it keeps
+following the sampler; **Compare** there can put it beside an image output. For
+a moving preview of a video model, see
 [Watch a sampler while it runs](getting-started.md#watch-a-sampler-while-it-runs).
 
 The text beside the source button says:

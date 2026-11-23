@@ -40,7 +40,9 @@ import {
     setButtonDisabled,
     statusPillCss,
 } from "./editor_theme.js";
-import { planCompareRemoval, resolveCompareSlots, resolveInspectOverlayScope } from "./inspect_overlay_scope.js";
+import {
+    inspectHelpRows, inspectOverlayPolicy, planCompareRemoval, resolveCompareSlots, resolveInspectOverlayScope,
+} from "./inspect_overlay_scope.js";
 import { mountMediaScrubBar } from "./media_scrub_bar.js";
 import { attachZoomPan as attachZoomPanCore } from "./media_zoom_pan.js";
 import { openContextMenu } from "./editor_context_menu.js";
@@ -78,6 +80,8 @@ const FAVORITE_STAR_COLOR = THEME.favoriteStar;
 // under it (a compare side, or the single view moving on): the second click of
 // a double-click would land on the newcomer. Windows' default double-click time.
 const OVERLAY_REPLACED_CLICK_GUARD_MS = 500;
+// A View pane's video the browser can't play: no still, proxy or asset to point at.
+const EXTERNAL_UNPLAYABLE = "Can't play this video here.";
 const THUMBNAIL_SIZE_CONFIG = {
     small: { thumbWidth: 60, thumbHeight: 44, gap: 6, padding: 5, nameFont: 10, metaFont: 9 },
     medium: { thumbWidth: 72, thumbHeight: 54, gap: 8, padding: 6, nameFont: 11, metaFont: 10 },
@@ -965,6 +969,19 @@ export function mountSharedAssetGallery(container, options = {}) {
             open: false,
             assetId: "",
             origin: "gallery",
+            // What a View pane opened (`view_inspect_items.js`), or null for project
+            // assets. Let go by clearExternalSession() only.
+            external: null,
+            externalOff: null,
+            onExternalClosed: null,
+            // The media elements on the stage showing an external item ({ id, el }),
+            // and the hook that repaints its name, note and counter in place.
+            externalMedia: [],
+            externalRefresh: null,
+            // { el, write }: writes its own words in place; false when it needs a rebuild.
+            externalTextRefreshers: [],
+            // Where the first render of an opened item starts ({ time, playing }).
+            initialMediaState: null,
             zoomLevel: 1,
             panX: 0,
             panY: 0,
@@ -1161,7 +1178,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     function videoBlocked(asset) {
-        return asset?.asset_type === "video" && galleryVideoSource(asset).variant === "blocked";
+        return asset?.asset_type === "video" && !asset.external && galleryVideoSource(asset).variant === "blocked";
     }
 
     function galleryBlockedState(asset) {
@@ -1230,6 +1247,8 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     function overlayWatchedAssets() {
         const overlay = state.overlayState;
+        // An external item has no proxy to watch.
+        if (isExternalOverlay()) return [];
         return [
             currentOverlayAsset(),
             data.assets.find((entry) => entry.asset_id === overlay.compareLeftAssetId),
@@ -1361,7 +1380,145 @@ export function mountSharedAssetGallery(container, options = {}) {
         }
     }
 
+    // External items (View panes) load from the session's own URLs, never a project
+    // route, the gallery's blob LRU or a proxy. `_sonderGalleryAsset` stays unset, so
+    // a decode failure is not reported against an asset.
+    function loadExternalMedia(asset, mediaEl) {
+        const session = state.overlayState.external;
+        const url = session?.urlOf(asset.asset_id) || "";
+        if (!url || !mediaEl) return { cleanup: () => {} };
+        setExternalMediaUrl(mediaEl, url);
+        const onShown = () => session.markShown(asset.asset_id, mediaEl._sonderExternalUrl);
+        const onError = () => session.markFailed(asset.asset_id, mediaEl._sonderExternalUrl);
+        const event = mediaEl.tagName === "IMG" ? "load" : "loadeddata";
+        mediaEl.addEventListener(event, onShown);
+        mediaEl.addEventListener("error", onError);
+        // `dropProbe` abandons a newer preview still loading beside it. `resume` is where
+        // a video was when a swap began, until the new file is there; `endHold` ends what
+        // stands in for it meanwhile.
+        const entry = { id: asset.asset_id, el: mediaEl, dropProbe: null, resume: null, endHold: null };
+        state.overlayState.externalMedia.push(entry);
+        return {
+            cleanup() {
+                mediaEl.removeEventListener(event, onShown);
+                mediaEl.removeEventListener("error", onError);
+                entry.dropProbe?.();
+                entry.endHold?.();
+                const media = state.overlayState.externalMedia;
+                const at = media.indexOf(entry);
+                if (at >= 0) media.splice(at, 1);
+            },
+        };
+    }
+
+    function setExternalMediaUrl(mediaEl, url) {
+        mediaEl._sonderExternalUrl = url;
+        mediaEl.src = url;
+    }
+
+    // Where the stage's media is: a swapped video still loading is where it was.
+    function overlayMediaState() {
+        const overlay = state.overlayState;
+        return overlay.externalMedia.find((entry) => entry.resume)?.resume
+            || (typeof overlay.captureMediaState === "function" ? overlay.captureMediaState() : null);
+    }
+
+    /**
+     * A followed preview changed: swap each element on the stage that shows it,
+     * without a rebuild, so zoom, the divider and a pending drag stay. The new file
+     * loads beside the shown one first, so one that can't decode leaves the last
+     * picture (and the session goes back to it). A video keeps its place, plays on if
+     * it was playing, and holds its frame meanwhile. An element a failure took off the
+     * stage needs the rebuild.
+     */
+    function swapExternalMedia(id) {
+        const overlay = state.overlayState;
+        const session = overlay.external;
+        for (const entry of overlay.externalMedia.filter((media) => media.id === id)) {
+            const { el } = entry;
+            const url = session.urlOf(id);
+            entry.dropProbe?.();
+            if (!url || el._sonderExternalUrl === url) continue;
+            if (el._sonderExternalFailed) { renderInspectOverlay(); return; }
+            const isImage = el.tagName === "IMG";
+            const probe = document.createElement(isImage ? "img" : "video");
+            let live = true;
+            const dropProbe = () => {
+                live = false;
+                if (entry.dropProbe === dropProbe) entry.dropProbe = null;
+                probe.removeAttribute("src");
+                probe.load?.();
+            };
+            const settle = (ok) => {
+                // Overtaken by a newer one, off the stage, or closed.
+                const wanted = live && overlay.externalMedia.includes(entry) && !session.released && session.urlOf(id) === url;
+                dropProbe();
+                if (!wanted) return;
+                if (!ok) { session.markFailed(id, url); return; }
+                if (isImage) {
+                    el.decoding = "sync";
+                    setExternalMediaUrl(el, url);
+                } else swapExternalVideo(entry, url);
+            };
+            entry.dropProbe = dropProbe;
+            if (!isImage) {
+                probe.muted = true;
+                probe.preload = "auto";
+                probe.addEventListener("loadeddata", () => settle(!mediaFailedToDecode(probe)), { once: true });
+                probe.addEventListener("error", () => settle(false), { once: true });
+            }
+            probe.src = url;
+            if (isImage) probe.decode().then(() => settle(true), () => settle(false));
+        }
+    }
+
+    function swapExternalVideo(entry, url) {
+        const overlay = state.overlayState;
+        const { el } = entry;
+        // A second swap before the first has loaded keeps the first one's place and hold.
+        if (!entry.resume) {
+            entry.resume = overlay.captureMediaState?.() || { time: 0, playing: false };
+            overlay.pausePlayback?.();
+            entry.endHold?.();
+            const still = stillFrameOf(el);
+            if (still) el.parentElement?.insertBefore(still, el);
+            const onReady = () => {
+                const was = entry.resume;
+                entry.resume = null;
+                overlay.seekPlayback?.(was.time);
+                if (was.playing && !overlay.captureMediaState?.()?.playing) overlay.togglePlayback?.();
+            };
+            // Before the hold's own listener: it waits for this seek to land.
+            el.addEventListener("loadeddata", onReady, { once: true });
+            const offHold = holdVideoOverUnderlay(el, still);
+            entry.endHold = () => {
+                offHold();
+                el.removeEventListener("loadeddata", onReady);
+                el.style.opacity = "";
+                still?.remove();
+            };
+        }
+        setExternalMediaUrl(el, url);
+    }
+
+    // A canvas with the frame a video shows, laid out as the video is; null with none.
+    function stillFrameOf(video) {
+        if (!(video.readyState >= 2 && video.videoWidth > 0)) return null;
+        try {
+            const canvas = document.createElement("canvas");
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext("2d").drawImage(video, 0, 0);
+            canvas.style.cssText = video.style.cssText;
+            Object.assign(canvas.style, { position: "absolute", inset: "0", pointerEvents: "none" });
+            return canvas;
+        } catch (_error) {
+            return null;
+        }
+    }
+
     function loadGalleryMediaAsBlob(asset, mediaEl) {
+        if (asset?.external) return loadExternalMedia(asset, mediaEl);
         // A video plays its ready proxy, else its original; an original that cannot
         // play here is never loaded (opening a 500 MB FFV1 asset used to download the
         // whole file to display black). An original nothing has judged yet still
@@ -1610,11 +1767,17 @@ export function mountSharedAssetGallery(container, options = {}) {
         if (highPriority) img.fetchPriority = "high";
         img.style.opacity = "0";
         img.style.transition = `opacity ${IMAGE_REVEAL_FADE_MS}ms ease`;
-        img.src = buildAssetViewUrl(currentProjectDir(), asset.path);
-        return revealImageAfterDecode(img, () => {
+        let externalHandle = null;
+        if (asset.external) externalHandle = loadExternalMedia(asset, img);
+        else img.src = buildAssetViewUrl(currentProjectDir(), asset.path);
+        const revealCleanup = revealImageAfterDecode(img, () => {
             clearThumbnailPlaceholder(placeholderSurface);
             onShown?.();
         }, onFailed);
+        return () => {
+            revealCleanup();
+            externalHandle?.cleanup();
+        };
     }
 
     function storageKey(suffix) {
@@ -1994,6 +2157,22 @@ export function mountSharedAssetGallery(container, options = {}) {
 
     // ---------- Compare-mode B-side query (mirrors A-side state.query semantics) ----------
 
+    // The overlay shows View panes' media (`inspectExternal`), not project assets.
+    function isExternalOverlay() {
+        return !!state.overlayState.external;
+    }
+
+    function overlayPolicy() {
+        return inspectOverlayPolicy(isExternalOverlay());
+    }
+
+    // The item the overlay knows by this id: a pane's, or the asset the gallery shows.
+    function overlayItem(assetId) {
+        return isExternalOverlay()
+            ? overlayAssets().find((entry) => entry.asset_id === assetId) || null
+            : shownAsset(assetId);
+    }
+
     function compareModeActive() {
         return !!(state.overlayState && state.overlayState.open && state.overlayState.compareMode);
     }
@@ -2048,7 +2227,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     // back, so a slot id always names what is on screen.
     function compareSideAsset(side) {
         const overlay = state.overlayState;
-        return shownAsset(side === "B" ? overlay.compareRightAssetId : overlay.compareLeftAssetId);
+        return overlayItem(side === "B" ? overlay.compareRightAssetId : overlay.compareLeftAssetId);
     }
 
     // What the overlay's S favorites: the ↑/↓ side on a drawn compare stage,
@@ -2063,7 +2242,8 @@ export function mountSharedAssetGallery(container, options = {}) {
     // The overlay's S. A held key toggles once: auto-repeat would flip the
     // star back and forth.
     function handleOverlayFavoriteKey(event) {
-        if (!event.repeat) {
+        // Claimed but inert for a View pane's media: there is nothing to favorite.
+        if (!event.repeat && overlayPolicy().favorites) {
             const target = overlayFavoriteTarget();
             if (target) void handleToggleFavorite(target);
         }
@@ -2102,7 +2282,8 @@ export function mountSharedAssetGallery(container, options = {}) {
      */
     function syncOverlayWithAssets(assetIds = [], { listArrival = false } = {}) {
         const overlay = state.overlayState;
-        if (!overlay.open) return;
+        // No project list touches a View pane's media.
+        if (!overlay.open || isExternalOverlay()) return;
         if (listArrival && !currentOverlayAsset()) return;
         if (compareStageDrawn()) {
             const resolved = resolvedCompareSlots();
@@ -2214,7 +2395,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         let currentId = "";
         let wrap = false;
         const overlay = state.overlayState;
-        const current = overlay.open ? currentOverlayAsset() : null;
+        // An external overlay shows no asset: the list behind it keeps its window.
+        const current = overlay.open && overlayPolicy().detailDemand ? currentOverlayAsset() : null;
         if (current) {
             if (compareStageShown()) {
                 const side = overlay.compareCycleSide === "A" ? "A" : "B";
@@ -3327,7 +3509,7 @@ export function mountSharedAssetGallery(container, options = {}) {
      */
     function planFavoriteRemovalInOverlay(removedId) {
         const overlay = state.overlayState;
-        if (!overlay.open) return null;
+        if (!overlay.open || isExternalOverlay()) return null;
         const viewBefore = overlayAssets();
         const inView = (assetId) => overlayAssets().some((entry) => entry.asset_id === assetId);
         if (!viewBefore.some((entry) => entry.asset_id === removedId)) return null;
@@ -3442,7 +3624,7 @@ export function mountSharedAssetGallery(container, options = {}) {
      */
     function planFavoriteRemoval(asset) {
         const removedId = asset.asset_id;
-        const inspecting = !!state.overlayState.open;
+        const inspecting = !!state.overlayState.open && !isExternalOverlay();
         const inView = () => (inspecting ? overlayAssets() : activeNavigableAssets())
             .some((entry) => entry.asset_id === removedId);
         if (!inView()) return null;
@@ -3519,7 +3701,8 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     async function handleToggleFavorite(asset, nextFavorite = null) {
-        if (!asset?.asset_id || !options.onUpdateAsset) return false;
+        // A View pane's media is no asset, whatever asked.
+        if (!asset?.asset_id || asset.external || !options.onUpdateAsset) return false;
         // What the gallery shows, not the caller's copy: a second S before the
         // first save returns toggles back.
         const shown = shownAsset(asset.asset_id) || asset;
@@ -4400,6 +4583,31 @@ export function mountSharedAssetGallery(container, options = {}) {
         return wrap;
     }
 
+    // A View pane's own rows: which View and node, its kind, its status. Display only.
+    function externalDetailsSection(item) {
+        const section = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;min-width:0;`);
+        const rowsOf = (entry) => [...entry.details, ...(entry.note ? [["Note", entry.note]] : [])];
+        const cells = rowsOf(item).map(([label, value]) => {
+            const copy = { kind: "value", label: "Copy value", text: value };
+            const cell = makeMetaCell(label, value, { copy });
+            section.appendChild(cell);
+            return { label, copy, content: cell.children[1] };
+        });
+        // Its pane says something else now (a step): the words are written in place,
+        // since a rebuild would drop a press. False asks for the rebuild (other rows).
+        state.overlayState.externalTextRefreshers.push({ el: section, write: () => {
+            const rows = rowsOf(overlayItem(item.asset_id) || item);
+            if (rows.length !== cells.length || rows.some(([label], i) => label !== cells[i].label)) return false;
+            rows.forEach(([, value], i) => {
+                if (cells[i].copy.text === value) return;
+                cells[i].copy.text = value;
+                cells[i].content.textContent = value;
+            });
+            return true;
+        } });
+        return section;
+    }
+
     function renderOverlayMetadataPanel(assetOrAssets, options = {}) {
         const assetList = (Array.isArray(assetOrAssets) ? assetOrAssets : [assetOrAssets]).filter(Boolean);
         if (!assetList.length) return document.createElement("div");
@@ -4414,13 +4622,13 @@ export function mountSharedAssetGallery(container, options = {}) {
         const header = style(document.createElement("div"), `display:flex;align-items:center;gap:6px;color:#f1f5f8;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;`);
         if (isCompareSide) {
             const sideBadge = style(document.createElement("span"), `padding:2px 6px;border-radius:999px;font-size:9px;font-weight:800;letter-spacing:0.06em;background:${role === "A" ? "rgba(143,192,240,0.18)" : "rgba(232,184,109,0.18)"};color:${role === "A" ? "#c5dff7" : "#f0d8a8"};border:1px solid ${role === "A" ? "rgba(143,192,240,0.4)" : "rgba(232,184,109,0.4)"};`);
-            sideBadge.textContent = `Gallery ${role}`;
+            sideBadge.textContent = overlayPolicy().chooserTitle(role);
             header.append(sideBadge);
         } else {
             header.textContent = "Metadata";
         }
         panel.appendChild(header);
-        if (isCompareSide) {
+        if (isCompareSide && overlayPolicy().metadataFilters) {
             const hint = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;`);
             hint.textContent = "Left click = filter A | Right click = filter B";
             panel.appendChild(hint);
@@ -4444,6 +4652,11 @@ export function mountSharedAssetGallery(container, options = {}) {
                 title.title = assetDisplayName(item);
                 attachCopyToElement(title, { kind: "value", label: "Copy asset name", text: assetDisplayName(item) }, "asset name");
                 section.appendChild(title);
+            }
+            if (item.external) {
+                section.appendChild(externalDetailsSection(item));
+                panel.appendChild(section);
+                continue;
             }
             const quick = style(document.createElement("div"), `display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;`);
             quick.append(
@@ -4911,7 +5124,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         closeBtn.textContent = "Close";
         header.append(title, closeBtn);
         const list = style(document.createElement("div"), `display:flex;flex-direction:column;gap:4px;`);
-        for (const [key, desc] of INSPECT_OVERLAY_SHORTCUTS) {
+        for (const [key, desc] of inspectHelpRows(INSPECT_OVERLAY_SHORTCUTS, isExternalOverlay())) {
             const row = style(document.createElement("div"), `display:grid;grid-template-columns:minmax(116px,auto) minmax(0,1fr);gap:12px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.05);`);
             const keyEl = style(document.createElement("div"), `color:#9fc9ec;font-size:11px;font-family:${FONT.mono};white-space:nowrap;`);
             keyEl.textContent = key;
@@ -4941,31 +5154,52 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
         }
         overlay.togglePlayback = null;
+        overlay.pausePlayback = null;
+        overlay.seekPlayback = null;
         overlay.stepVideoCompare = null;
         overlay.stepVideoSingle = null;
         overlay.videoCompareFps = 30;
         overlay.applyAudioMonitor = null;
         overlay.captureMediaState = null;
+        overlay.externalMedia.length = 0;
+        overlay.externalRefresh = null;
+        overlay.externalTextRefreshers.length = 0;
+    }
+
+    function overlayScope(requestedAssetId) {
+        const external = state.overlayState.external;
+        if (external) return resolveInspectOverlayScope({ origin: "external", requestedAssetId, externalItems: external.items });
+        return resolveInspectOverlayScope({
+            origin: state.overlayState.origin,
+            requestedAssetId,
+            visibleAssets: activeNavigableAssets(),
+            sortedProjectAssets: sortAssets(data.assets),
+        });
     }
 
     function overlayAssets() {
-        return resolveInspectOverlayScope({
-            origin: state.overlayState.origin,
-            requestedAssetId: state.overlayState.assetId,
-            visibleAssets: activeNavigableAssets(),
-            sortedProjectAssets: sortAssets(data.assets),
-        }).assets;
+        return overlayScope(state.overlayState.assetId).assets;
     }
 
     function currentOverlayAsset() {
         const assetId = state.overlayState.assetId;
-        if (!assetId) return null;
-        return resolveInspectOverlayScope({
-            origin: state.overlayState.origin,
-            requestedAssetId: assetId,
-            visibleAssets: activeNavigableAssets(),
-            sortedProjectAssets: sortAssets(data.assets),
-        }).asset;
+        return assetId ? overlayScope(assetId).asset : null;
+    }
+
+    // Lets an external session go, exactly once, whatever closes or replaces it.
+    // `notifyClosed` is false when another Inspect takes its place.
+    function clearExternalSession({ notifyClosed = true } = {}) {
+        const overlay = state.overlayState;
+        const { external, externalOff, onExternalClosed } = overlay;
+        if (!external) return;
+        overlay.external = null;
+        overlay.externalOff = null;
+        overlay.onExternalClosed = null;
+        overlay.initialMediaState = null;
+        externalOff?.();
+        external.release();
+        if (!notifyClosed) return;
+        try { onExternalClosed?.(); } catch (error) { console.warn("[Sonder] Inspect closed hook failed:", error); }
     }
 
     function sameTypeOverlayAssets(asset) {
@@ -5019,6 +5253,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.overlayEl?.remove();
         state.overlayState.overlayEl = null;
         clearOverlayMediaCache();
+        // After the overlay is gone: the host may move focus back to a pane.
+        clearExternalSession();
         if (!state.destroyed && !state.inspectorCollapsed) {
             renderDetail(selectedAsset());
         }
@@ -5033,6 +5269,18 @@ export function mountSharedAssetGallery(container, options = {}) {
             : (options && typeof options === "object" ? options : {});
         const { onTransform = null, onClick = null, transformState = state.overlayState } = normalizedOptions;
         return attachZoomPanCore(surface, targets, { transformState, onTransform, onClick });
+    }
+
+    // An asset's waveform ({ peaks } or null): the server's, or for a View pane's
+    // audio the session's own decode.
+    async function overlayWaveform(asset) {
+        try {
+            if (asset.external) return await (state.overlayState.external?.peaksOf(asset.asset_id) ?? null);
+            const resp = await fetch(buildWaveformUrl(currentProjectDir(), asset.asset_id));
+            return resp.ok ? await resp.json() : null;
+        } catch {
+            return null;
+        }
     }
 
     function renderWaveformPanel(assets, colors) {
@@ -5084,14 +5332,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             ctx.globalAlpha = 1;
         };
 
-        Promise.all(assetList.map(async (asset) => {
-            try {
-                const resp = await fetch(buildWaveformUrl(currentProjectDir(), asset.asset_id));
-                return resp.ok ? await resp.json() : null;
-            } catch {
-                return null;
-            }
-        })).then((datasets) => {
+        Promise.all(assetList.map(overlayWaveform)).then((datasets) => {
             if (!active) return;
             if (!datasets.some((dataset) => dataset?.peaks?.length)) {
                 status.textContent = "Waveform unavailable.";
@@ -5376,14 +5617,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             }
         }) || null;
 
-        Promise.all(assetList.map(async (asset) => {
-            try {
-                const resp = await fetch(buildWaveformUrl(currentProjectDir(), asset.asset_id));
-                return resp.ok ? await resp.json() : null;
-            } catch {
-                return null;
-            }
-        })).then((results) => {
+        Promise.all(assetList.map(overlayWaveform)).then((results) => {
             if (!active) return;
             datasets = results;
             if (!results.some((d) => d?.peaks?.length)) {
@@ -5437,6 +5671,8 @@ export function mountSharedAssetGallery(container, options = {}) {
     // Single source of truth so up/down cycling walks the same list the user sees (and composes with
     // each side's own search query, including the strength/toggle-aware power_loras filter).
     function compareFilteredCandidates(side) {
+        // Panes keep their own order and have nothing to search.
+        if (!overlayPolicy().chooserSort) return sameTypeOverlayAssets(currentOverlayAsset());
         const parsed = parseAssetSearchQuery(state.overlayState[compareQueryRef(side)] || "");
         return sortAssetsByMode(
             sameTypeOverlayAssets(currentOverlayAsset()).filter((entry) => assetMatchesParsedQuery(entry, parsed)),
@@ -5451,12 +5687,16 @@ export function mountSharedAssetGallery(container, options = {}) {
         const side = state.overlayState.compareCycleSide === "A" ? "A" : "B";
         const slotKey = side === "B" ? "compareRightAssetId" : "compareLeftAssetId";
         prepareMetadataSearch(parseAssetSearchQuery(state.overlayState[compareQueryRef(side)] || ""));
-        const list = compareFilteredCandidates(side);
+        // Few panes: stepping onto the other side's would only be turned back.
+        const otherId = side === "B" ? state.overlayState.compareLeftAssetId : state.overlayState.compareRightAssetId;
+        const list = compareFilteredCandidates(side).filter((entry) => !entry.external || entry.asset_id !== otherId);
         if (!list.length) return;
         const currentIndex = list.findIndex((entry) => entry.asset_id === state.overlayState[slotKey]);
         const nextIndex = currentIndex < 0
             ? (direction > 0 ? 0 : list.length - 1)
             : (currentIndex + direction + list.length) % list.length;
+        // Nothing else to step to: the stage stays as it is.
+        if (list[nextIndex].external && nextIndex === currentIndex) return;
         state.overlayState[slotKey] = list[nextIndex].asset_id;
         renderInspectOverlay();
     }
@@ -5477,17 +5717,23 @@ export function mountSharedAssetGallery(container, options = {}) {
             state.overlayState.carriedMediaState = null;
             state.overlayState.mediaSignature = "";
         }
+        // A gallery or Reference Inspect takes a View pane's place.
+        clearExternalSession({ notifyClosed: false });
+        startInspectOverlay(asset.asset_id, origin === "direct" ? "direct" : "gallery");
+    }
+
+    function startInspectOverlay(assetId, origin) {
         if (!state.overlayState.open) {
             try { options.onInspectOpenChange?.(true); } catch (error) { console.warn("[Sonder] Inspect open hook failed:", error); }
         }
         state.overlayState.open = true;
         state.overlaySession += 1;
         state.overlayState.replacedAt = { A: 0, B: 0, single: 0 };
-        state.overlayState.assetId = asset.asset_id;
-        state.overlayState.origin = origin === "direct" ? "direct" : "gallery";
+        state.overlayState.assetId = assetId;
+        state.overlayState.origin = origin;
         state.overlayState.compareMode = false;
         state.overlayState.showMetadata = false;
-        state.overlayState.compareLeftAssetId = asset.asset_id;
+        state.overlayState.compareLeftAssetId = assetId;
         state.overlayState.compareRightAssetId = "";
         state.overlayState.comparePickerQuery = "";
         state.overlayState.comparePickerQueryB = "";
@@ -5498,6 +5744,53 @@ export function mountSharedAssetGallery(container, options = {}) {
         state.overlayState.showWaveform = false;
         resetOverlayTransform();
         renderInspectOverlay();
+    }
+
+    /**
+     * Open a View pane's media (`view_inspect_items.openInspectSession`, its anchor
+     * ready). The overlay owns the session from here: it lets it go when it closes
+     * or another Inspect replaces it, and then calls `onClosed` (close only).
+     * Inspection only: nothing here reads or writes the project.
+     */
+    function inspectExternal(session, { onClosed = null } = {}) {
+        const anchor = session?.items.find((item) => item.id === session.anchorId);
+        if (state.destroyed || !anchor || session.released) return false;
+        closeInspectOverlay();
+        const overlay = state.overlayState;
+        overlay.external = session;
+        overlay.onExternalClosed = onClosed;
+        overlay.externalOff = session.subscribe(handleExternalEvent);
+        // Opened paused, at the pane's own moment.
+        overlay.initialMediaState = { time: anchor.startTime, playing: false };
+        startInspectOverlay(anchor.id, "external");
+        const overlayEl = overlay.overlayEl;
+        if (overlayEl) {
+            // Focus leaves the pane's button, or Enter would press it again from behind.
+            overlayEl.tabIndex = -1;
+            overlayEl.setAttribute("role", "dialog");
+            overlayEl.setAttribute("aria-label", `Inspect ${anchor.title}`);
+            overlayEl.style.outline = "none";
+            overlayEl.focus?.({ preventScroll: true });
+        }
+        return true;
+    }
+
+    function closeExternalInspect() {
+        if (isExternalOverlay()) closeInspectOverlay();
+    }
+
+    // A followed preview changed, an item joined, or a name or note did.
+    function handleExternalEvent({ type, id }) {
+        const overlay = state.overlayState;
+        if (!overlay.open || !isExternalOverlay()) return;
+        // A preview that is now another kind of media needs another stage, if it is on it.
+        const drawn = [overlay.assetId, ...(compareStageDrawn() ? [overlay.compareLeftAssetId, overlay.compareRightAssetId] : [])];
+        if (type === "kind" && drawn.includes(id)) {
+            renderInspectOverlay();
+            return;
+        }
+        if (type === "media") swapExternalMedia(id);
+        try { overlay.externalRefresh?.(type === "joined" || type === "kind"); } catch (error) { console.warn("[Sonder] Inspect refresh failed:", error); }
     }
 
     function inspectAsset(assetId) {
@@ -5533,7 +5826,9 @@ export function mountSharedAssetGallery(container, options = {}) {
                 applyThumbnailPlaceholder(stage, asset);
             }
             state.overlayState.stageImage = underlay;
-            const img = style(document.createElement("img"), `position:relative;max-width:100%;max-height:100%;display:block;user-select:none;pointer-events:none;`);
+            // A latent preview can be a few pixels wide: it fills the stage, as it fills its pane.
+            const imgSize = asset.external ? "width:100%;height:100%;object-fit:contain;" : "max-width:100%;max-height:100%;";
+            const img = style(document.createElement("img"), `position:relative;${imgSize}display:block;user-select:none;pointer-events:none;`);
             img.draggable = false;
             img.alt = assetDisplayName(asset);
             const imageRevealCleanup = configureDecodedImage(img, asset, {
@@ -5590,6 +5885,11 @@ export function mountSharedAssetGallery(container, options = {}) {
                 }
             };
             state.overlayState.togglePlayback = togglePlayback;
+            state.overlayState.pausePlayback = () => video.pause();
+            state.overlayState.seekPlayback = (time) => {
+                const dur = Number(video.duration) || 0;
+                video.currentTime = dur > 0 ? clamp(time, 0, dur - 0.001) : Math.max(0, time);
+            };
             const playbackRow = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;`);
             const playPauseBtn = makeActionButton("subtle");
             const playbackHint = style(document.createElement("div"), `color:${CHROME.textDim};font-size:10px;`);
@@ -5636,9 +5936,10 @@ export function mountSharedAssetGallery(container, options = {}) {
                 playbackRow.style.display = "none";
                 scrub.el.style.display = "none";
                 const note = style(document.createElement("div"), `margin:auto;padding:10px 14px;border-radius:8px;background:rgba(2,5,7,.78);color:${CHROME.textDim};font-size:12px;text-align:center;max-width:80%;`);
-                note.textContent = decode
-                    ? blockedNoticeText(asset)
-                    : "This video could not be loaded. Close and reopen it to try again.";
+                if (asset.external) video._sonderExternalFailed = true;
+                note.textContent = !decode
+                    ? "This video could not be loaded. Close and reopen it to try again."
+                    : asset.external ? EXTERNAL_UNPLAYABLE : blockedNoticeText(asset);
                 stage.appendChild(note);
             };
             state.overlayState.cleanupFns.push(
@@ -5711,7 +6012,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         const title = style(document.createElement("div"), `color:#d7e5f1;font-size:11px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;`);
         title.textContent = slotLabel;
         const hint = style(document.createElement("div"), `color:#8ea0af;font-size:10px;line-height:1.45;`);
-        hint.textContent = `Left click assigns A. Right click assigns B. Search filters Gallery ${side}.`;
+        const policy = overlayPolicy();
+        hint.textContent = policy.chooserHint(side);
         const controls = style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;`);
         const search = style(document.createElement("input"), `width:100%;box-sizing:border-box;${inputChromeCss()}`);
         search.type = "search";
@@ -5727,7 +6029,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         sort.value = COMPARE_SORT_OPTIONS.some((entry) => entry.value === state.overlayState.comparePickerSortMode)
             ? state.overlayState.comparePickerSortMode
             : DEFAULT_SORT_MODE;
-        controls.append(search, sort);
+        if (policy.chooserSearch) controls.append(search);
+        if (policy.chooserSort) controls.append(sort);
         const list = chromeScroller(style(document.createElement("div"), `display:flex;flex-direction:column;gap:6px;overflow:auto;min-height:0;padding-right:2px;${chromeScrollbarCss()}`));
         // Persist scroll across the full overlay rebuild that assignSlot triggers (each rebuild makes
         // a fresh list element). renderRows restores from here; this keeps it fresh as the user scrolls.
@@ -5755,7 +6058,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             for (const { id, side } of ids) {
                 // Live, not the candidates captured at mount: a refresh after a
                 // favorite change must show the new star.
-                const asset = shownAsset(id);
+                const asset = overlayItem(id);
                 if (asset) items.push({ asset, role: "top", forcedSide: side });
             }
             return items;
@@ -5809,7 +6112,21 @@ export function mountSharedAssetGallery(container, options = {}) {
                 name.appendChild(favoriteMark);
             }
             const meta = style(document.createElement("div"), `color:#8ea0af;font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
-            meta.textContent = `${assetKindLabel(asset.asset_type)} | ${formatDuration(asset)}`;
+            if (asset.external) {
+                const writeMeta = (entry) => {
+                    // The pane first: a long name cuts it off the line above.
+                    const text = [entry.place, entry.status, entry.note].filter(Boolean).join(" · ");
+                    if (meta.textContent !== text) meta.textContent = text;
+                    row.title = [assetDisplayName(entry), entry.status, entry.note].filter(Boolean).join(" · ");
+                };
+                writeMeta(asset);
+                state.overlayState.externalTextRefreshers.push({ el: row, write: () => {
+                    writeMeta(overlayItem(asset.asset_id) || asset);
+                    return true;
+                } });
+            } else {
+                meta.textContent = `${assetKindLabel(asset.asset_type)} | ${formatDuration(asset)}`;
+            }
             text.append(name, meta);
             row.append(thumb, text);
             row.addEventListener("click", () => onAssign("left", asset.asset_id));
@@ -5867,7 +6184,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             requestRefresh();
         });
         renderRows();
-        wrap.append(title, hint, controls, list);
+        wrap.append(title, hint, ...(controls.childElementCount ? [controls] : []), list);
         return { el: wrap, refresh: renderRows };
     }
 
@@ -5882,6 +6199,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         const chip = style(document.createElement("div"), `position:absolute;${placement}z-index:4;display:flex;align-items:center;gap:5px;padding:3px 6px;border-radius:5px;background:rgba(0,0,0,0.58);color:${CHROME.text};font-size:10px;pointer-events:none;`);
         const letter = document.createElement("span");
         letter.textContent = side;
+        if (!overlayPolicy().favorites) {
+            chip.append(letter);
+            return { el: chip, refresh() {} };
+        }
         const star = style(document.createElement("button"), `appearance:none;border:none;background:none;margin:0;padding:0 1px;font-size:12px;line-height:1;cursor:pointer;pointer-events:auto;transition:opacity 120ms;`);
         star.type = "button";
         star.tabIndex = -1;
@@ -5934,6 +6255,13 @@ export function mountSharedAssetGallery(container, options = {}) {
         return { el: chip, refresh };
     }
 
+    // Text standing in for a compare side whose video can't be shown.
+    function compareSideNote(text) {
+        const note = style(document.createElement("div"), `position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:8px 12px;border-radius:8px;background:rgba(2,5,7,.78);color:${CHROME.textDim};font-size:11px;text-align:center;max-width:70%;pointer-events:none;`);
+        note.textContent = text;
+        return note;
+    }
+
     function renderCompareOverlay(asset, host, carriedMedia = null) {
         const candidates = sameTypeOverlayAssets(asset);
         // renderInspectOverlay resolved both slots and wrote them back.
@@ -5957,8 +6285,8 @@ export function mountSharedAssetGallery(container, options = {}) {
             renderInspectOverlay();
         };
         let refreshCompareChoosers = () => {};
-        const chooserA = renderCompareChooser("Gallery A", compareA.asset_id, assignSlot, () => refreshCompareChoosers(), "A");
-        const chooserB = renderCompareChooser("Gallery B", compareB.asset_id, assignSlot, () => refreshCompareChoosers(), "B");
+        const chooserA = renderCompareChooser(overlayPolicy().chooserTitle("A"), compareA.asset_id, assignSlot, () => refreshCompareChoosers(), "A");
+        const chooserB = renderCompareChooser(overlayPolicy().chooserTitle("B"), compareB.asset_id, assignSlot, () => refreshCompareChoosers(), "B");
         refreshCompareChoosers = () => {
             chooserA.refresh();
             chooserB.refresh();
@@ -5978,7 +6306,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         // The toggle doubles as the up/down legend: it shows which side ↑/↓ cycles and switches it on click.
         const cycleToggle = makeActionButton("subtle");
         cycleToggle.textContent = `↑ / ↓ cycle: ${state.overlayState.compareCycleSide === "A" ? "A" : "B"}`;
-        cycleToggle.title = "Up/Down arrows cycle this side's asset in compare mode (click to switch side)";
+        cycleToggle.title = overlayPolicy().cycleTitle;
         cycleToggle.addEventListener("click", () => {
             const next = state.overlayState.compareCycleSide === "A" ? "B" : "A";
             state.overlayState.compareCycleSide = next;
@@ -6180,9 +6508,7 @@ export function mountSharedAssetGallery(container, options = {}) {
                         applyThumbnailPlaceholder(group, sideAsset);
                         layer.style.display = "none";
                         layer._sonderCompareBlocked = true;
-                        const note = style(document.createElement("div"), `position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:8px 12px;border-radius:8px;background:rgba(2,5,7,.78);color:${CHROME.textDim};font-size:11px;text-align:center;max-width:70%;pointer-events:none;`);
-                        note.textContent = blockedNoticeText(sideAsset);
-                        group.appendChild(note);
+                        group.appendChild(compareSideNote(blockedNoticeText(sideAsset)));
                     } else {
                         // The side's previous video holds its box on its frame (paused
                         // and muted by the teardown) until the new one can show one.
@@ -6202,6 +6528,10 @@ export function mountSharedAssetGallery(container, options = {}) {
                                 layer.style.display = "none";
                                 underlay?.remove();
                                 applyThumbnailPlaceholder(group, sideAsset);
+                                if (!sideAsset.external) return;
+                                // No server still to stand in: say so.
+                                layer._sonderExternalFailed = true;
+                                group.appendChild(compareSideNote(EXTERNAL_UNPLAYABLE));
                             }),
                         );
                     }
@@ -6220,6 +6550,8 @@ export function mountSharedAssetGallery(container, options = {}) {
                     fallbackDurations: liveCompareSides.map(([, sideAsset]) => assetDurationSeconds(sideAsset)),
                 });
                 state.overlayState.togglePlayback = () => transport.toggle();
+                state.overlayState.pausePlayback = () => transport.pause();
+                state.overlayState.seekPlayback = (time) => transport.seek(time);
                 state.overlayState.stepVideoCompare = (deltaSeconds) => transport.step(deltaSeconds);
                 state.overlayState.captureMediaState = () => ({ time: transport.getPlayhead(), playing: transport.isPlaying() });
                 state.overlayState.cleanupFns.push(
@@ -6376,9 +6708,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         // so metadata toggles and the compare layout/monitor/cycle buttons resume where the user
         // was instead of snapping playback back to frame 0. Whether it is actually carried is
         // gated below by an asset signature (same media only — never across asset navigation).
-        const carriedMediaState = (typeof overlay.captureMediaState === "function")
-            ? overlay.captureMediaState()
-            : null;
+        const carriedMediaState = overlayMediaState();
+        // Where a just-opened item starts, read once: there is no earlier render to carry.
+        const initialMediaState = overlay.mediaSignature ? null : overlay.initialMediaState;
+        overlay.initialMediaState = null;
         // The image on screen before this rebuild; only a single-image render takes it,
         // and each compare side's, which only an image compare render takes.
         const carriedImage = overlay.stageImage;
@@ -6396,6 +6729,8 @@ export function mountSharedAssetGallery(container, options = {}) {
             overlayEl = style(document.createElement("div"), `position:fixed;inset:0;z-index:99999;background:rgba(7,10,14,0.86);display:flex;align-items:stretch;justify-content:center;padding:20px;box-sizing:border-box;`);
             overlayEl.addEventListener("mousedown", (event) => {
                 if (event.target === overlayEl) {
+                    // Or the press would take the focus the close gives back to a pane.
+                    if (isExternalOverlay()) event.preventDefault();
                     closeInspectOverlay();
                 }
             });
@@ -6476,7 +6811,7 @@ export function mountSharedAssetGallery(container, options = {}) {
             if (event.ctrlKey || event.metaKey || event.altKey) return shouldCaptureOverlayShortcut(event);
             if (event.key === "s" || event.key === "S") return handleOverlayFavoriteKey(event);
             if (!overlay.compareMode && event.key === "Delete") {
-                void handleOverlayAssetDelete(activeAsset);
+                if (overlayPolicy().trash) void handleOverlayAssetDelete(activeAsset);
                 return true;
             }
             if (event.key === "Escape") { closeInspectOverlay(); return true; }
@@ -6550,11 +6885,22 @@ export function mountSharedAssetGallery(container, options = {}) {
         const titleWrap = style(document.createElement("div"), `display:flex;flex-direction:column;gap:2px;min-width:0;`);
         const title = style(document.createElement("div"), `color:#f1f5f8;font-size:15px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
         title.textContent = assetDisplayName(asset);
-        const counter = style(document.createElement("div"), `color:${CHROME.textDim};font-size:11px;`);
-        attachCopyToElement(title, { kind: "value", label: "Copy asset name", text: assetDisplayName(asset) }, "asset name");
-        const assets = overlayAssets();
-        const assetIndex = Math.max(0, assets.findIndex((entry) => entry.asset_id === asset.asset_id));
-        counter.textContent = `${assetIndex + 1} / ${Math.max(assets.length, 1)}`;
+        const counter = style(document.createElement("div"), `color:${CHROME.textDim};font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`);
+        const policy = overlayPolicy();
+        const nameKind = asset.external ? "name" : "asset name";
+        attachCopyToElement(title, { kind: "value", label: `Copy ${nameKind}`, text: assetDisplayName(asset) }, nameKind);
+        // What the panes showing it say: a step, a note that a newer result landed.
+        const counterText = () => {
+            const entries = overlayAssets();
+            const position = `${Math.max(0, entries.findIndex((entry) => entry.asset_id === asset.asset_id)) + 1} / ${Math.max(entries.length, 1)}`;
+            if (!isExternalOverlay()) return position;
+            const says = (entry) => [entry?.status, entry?.note].filter(Boolean).join(" · ");
+            if (!compareStageShown()) return [position, says(overlayItem(asset.asset_id))].filter(Boolean).join(" · ");
+            return ["A", "B"].map((side) => {
+                const entry = compareSideAsset(side);
+                return [`${side}: ${assetDisplayName(entry)}`, says(entry)].filter(Boolean).join(" · ");
+            }).join("   |   ");
+        };
         titleWrap.append(title, counter);
 
         const toolbarActions = style(document.createElement("div"), `display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end;`);
@@ -6562,10 +6908,10 @@ export function mountSharedAssetGallery(container, options = {}) {
         const stageShown = compareStageShown();
         // The compare stage carries a star per side; any single view, including
         // compare left with one candidate, keeps the toolbar star.
-        if (!stageShown) {
+        if (!stageShown && policy.favorites) {
             toolbarActions.appendChild(makeFavoriteButton(asset, { overlay: true }));
         }
-        if (!overlay.compareMode) {
+        if (!overlay.compareMode && policy.trash) {
             const trashBtn = makeActionButton("danger");
             trashBtn.textContent = "Trash";
             trashBtn.title = "Move to Trash (Delete)";
@@ -6585,8 +6931,11 @@ export function mountSharedAssetGallery(container, options = {}) {
         toolbarActions.appendChild(fitBtn);
         const compareBtn = makeActionButton();
         compareBtn.textContent = overlay.compareMode ? "Compare Off" : "Compare";
-        compareBtn.title = compareCandidates.length < 2 ? "Compare needs ≥ 2 same-type visible assets" : "Compare (C)";
-        compareBtn.disabled = compareCandidates.length < 2;
+        const syncCompareButton = (count) => {
+            compareBtn.title = policy.compareTitle(count >= 2);
+            compareBtn.disabled = count < 2;
+        };
+        syncCompareButton(compareCandidates.length);
         compareBtn.addEventListener("click", () => {
             overlay.compareMode = !overlay.compareMode;
             ensureCompareDefaults(asset);
@@ -6597,7 +6946,7 @@ export function mountSharedAssetGallery(container, options = {}) {
 
         const metadataBtn = makeActionButton(overlay.showMetadata ? "active" : "subtle");
         metadataBtn.textContent = overlay.showMetadata ? "Metadata On" : "Metadata";
-        metadataBtn.title = "Show or hide asset metadata in this inspector";
+        metadataBtn.title = policy.metadataTitle;
         metadataBtn.addEventListener("click", () => {
             overlay.showMetadata = !overlay.showMetadata;
             renderInspectOverlay();
@@ -6636,15 +6985,19 @@ export function mountSharedAssetGallery(container, options = {}) {
             // toggle keeps both slots, so the captured scrub state carries — but cycling either
             // slot or switching mode changes the signature and starts the new media fresh.
             const signature = compareStageSignature(asset.asset_type, overlay.compareLeftAssetId, overlay.compareRightAssetId);
-            overlay.carriedMediaState = (carriedMediaState && overlay.mediaSignature === signature) ? carriedMediaState : null;
+            overlay.carriedMediaState = initialMediaState
+                || ((carriedMediaState && overlay.mediaSignature === signature) ? carriedMediaState : null);
             overlay.mediaSignature = signature;
             renderCompareOverlay(asset, mediaWrap, carriedCompareMedia);
         } else {
             const signature = `s:${asset.asset_id}`;
-            overlay.carriedMediaState = (carriedMediaState && overlay.mediaSignature === signature) ? carriedMediaState : null;
+            overlay.carriedMediaState = initialMediaState
+                || ((carriedMediaState && overlay.mediaSignature === signature) ? carriedMediaState : null);
             overlay.mediaSignature = signature;
             renderSingleOverlay(asset, mediaWrap, carriedImage);
         }
+        // Once a compare render has settled which item each side shows.
+        counter.textContent = counterText();
         // The active renderer has consumed the carried scrub state (or there was none).
         overlay.carriedMediaState = null;
         // Drop any prior metadata-refresh hook before deciding whether to mount a new one,
@@ -6666,7 +7019,8 @@ export function mountSharedAssetGallery(container, options = {}) {
                 mediaWrap.style.order = "1";
                 const buildSidePanel = (slotRole) => {
                     const targetId = slotRole === "A" ? overlay.compareLeftAssetId : overlay.compareRightAssetId;
-                    const item = data.assets.find((entry) => entry.asset_id === targetId) || asset;
+                    const item = (asset.external ? overlayItem(targetId)
+                        : data.assets.find((entry) => entry.asset_id === targetId)) || asset;
                     return renderOverlayMetadataPanel(item, { role: slotRole });
                 };
                 slotA.appendChild(buildSidePanel("A"));
@@ -6681,7 +7035,8 @@ export function mountSharedAssetGallery(container, options = {}) {
                 };
             } else {
                 const slot = style(document.createElement("div"), `display:flex;min-height:0;`);
-                const buildPanel = () => renderOverlayMetadataPanel(asset, { role: "single" });
+                const buildPanel = () => renderOverlayMetadataPanel(
+                    (asset.external && overlayItem(asset.asset_id)) || asset, { role: "single" });
                 slot.appendChild(buildPanel());
                 contentWrap.appendChild(slot);
                 state.overlayMetadataRefresh = () => {
@@ -6693,6 +7048,19 @@ export function mountSharedAssetGallery(container, options = {}) {
                 };
             }
         }
+        // A pane moved on, or an item joined: the words follow, the stage stays.
+        overlay.externalRefresh = isExternalOverlay() ? (joined) => {
+            const text = counterText();
+            if (counter.textContent !== text) counter.textContent = text;
+            if (joined) {
+                syncCompareButton(sameTypeOverlayAssets(overlayItem(asset.asset_id)).length);
+                refreshCompareInPlace();
+            }
+            // Rows and panels rebuilt since are gone from the page.
+            overlay.externalTextRefreshers = overlay.externalTextRefreshers.filter(({ el }) => el.isConnected);
+            const inPlace = overlay.externalTextRefreshers.map(({ write }) => write()).every(Boolean);
+            if (!inPlace) invalidateOverlayMetadata();
+        } : null;
         syncDetailDemand();
     }
 
@@ -7250,6 +7618,7 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     async function handleAssetDelete(asset, { onPainted = null, onUnpainted = null } = {}) {
+        if (!asset || asset.external) return false;
         // The fullscreen host owns diagnostics. Dormant hosts omit this hook.
         const run = (diagnostics) => handleAssetDeleteWithinGesture(asset, diagnostics,
             { onPainted, onUnpainted });
@@ -7270,19 +7639,22 @@ export function mountSharedAssetGallery(container, options = {}) {
     }
 
     async function handleOverlayAssetDelete(asset) {
-        if (state.overlayState.compareMode) return false;
+        if (!asset || asset.external || state.overlayState.compareMode) return false;
+        // Another Inspect may be open by the time the trash paints: not its to move.
+        const session = state.overlaySession;
         // The Inspect view moves on when the asset leaves the list, not when
         // the save returns -- and back, if the trash is undone while it still
         // shows where it moved to.
         let advancedTo = null;
         const comeBack = () => {
             const overlay = state.overlayState;
-            if (!advancedTo || !overlay.open || overlay.assetId !== advancedTo) return;
+            if (!advancedTo || !overlay.open || state.overlaySession !== session || overlay.assetId !== advancedTo) return;
             overlay.assetId = asset.asset_id;
             resetOverlayTransform();
             renderInspectOverlay();
         };
         const advance = () => {
+            if (state.overlaySession !== session) return;
             const nextAsset = selectedAsset();
             if (nextAsset && !isTrashed(nextAsset)) {
                 state.overlayState.assetId = nextAsset.asset_id;
@@ -8744,7 +9116,7 @@ export function mountSharedAssetGallery(container, options = {}) {
         const changed = changedAssetIds(changes, projectIdFromDir(currentProjectDir()));
         if (!changed.size) return;
         const overlay = state.overlayState;
-        if (overlay.open) {
+        if (overlay.open && !isExternalOverlay()) {
             const watched = overlayWatchedAssets();
             const playing = typeof overlay.captureMediaState === "function" && overlay.captureMediaState()?.playing;
             if (!playing && watched.some((entry) => changed.has(entry.asset_id))
@@ -8804,6 +9176,8 @@ export function mountSharedAssetGallery(container, options = {}) {
         hasSelectionOwnership,
         refreshCurrentScene,
         inspectAsset,
+        inspectExternal,
+        closeExternalInspect,
         revealAsset,
     };
 }

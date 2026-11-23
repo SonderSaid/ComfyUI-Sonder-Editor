@@ -10,6 +10,11 @@ import { attachZoomPan } from "./media_zoom_pan.js";
 
 const IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const VIDEO_MIMES = new Set(["video/mp4"]);
+// What a preview of this MIME type shows as: "image" | "video" | null (it can't).
+export function previewKind(mime) {
+    const value = String(mime || "").toLowerCase();
+    return VIDEO_MIMES.has(value) ? "video" : IMAGE_MIMES.has(value) ? "image" : null;
+}
 
 const make = (tag, css = "") => {
     const el = document.createElement(tag);
@@ -67,9 +72,9 @@ export function mountSamplingMedia({ container, fit = "contain", zoom = null, on
             return;
         }
         if (frame.key === (incoming || shown)?.key || frame.key === failedKey) return;
-        const mime = String(frame.mime || "").toLowerCase();
-        const video = VIDEO_MIMES.has(mime);
-        if (!video && !IMAGE_MIMES.has(mime)) { report("unsupported"); return; }
+        const kind = previewKind(frame.mime);
+        if (!kind) { report("unsupported"); return; }
+        const video = kind === "video";
         // A newer preview replaces one still loading: only the newest matters.
         drop(incoming);
         incoming = null;
@@ -102,6 +107,7 @@ export function mountSamplingMedia({ container, fit = "contain", zoom = null, on
     return {
         el: stage,
         show,
+        currentTime: () => Math.max(0, Number(shown?.el.currentTime) || 0),
         setFit(value) {
             fitValue = value === "cover" ? "cover" : "contain";
             for (const item of [shown, incoming]) if (item) item.el.style.objectFit = fitValue;

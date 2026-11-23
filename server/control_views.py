@@ -29,10 +29,14 @@ from . import view_timing
 SOURCE = "view"
 MAX_CANDIDATES = 128
 FEED_OUTPUT, FEED_SAMPLING = cm.VIEW_FEED_OUTPUT, cm.VIEW_FEED_SAMPLING
-# Always offered as sampling-preview sources (any other node is offered once a
-# recent run saw it publish). web/js/control_bindings.js mirrors it.
+# Known samplers, always offered as sampling-preview sources (any other node is
+# offered once a recent run saw it publish): the core ones, KJNodes' Model Preview
+# Override, and every RES4LYF node that runs its own sampling loop.
+# web/js/control_bindings.js mirrors it.
 SAMPLING_CLASSES = frozenset({"KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced",
-                              "ModelPreviewOverrideKJ"})
+                              "ModelPreviewOverrideKJ",
+                              "ClownsharKSampler_Beta", "SharkSampler_Beta", "ClownsharkChainsampler_Beta",
+                              "SharkChainsampler_Beta", "BongSampler"})
 
 # Never a View: they have no media of their own.
 EXCLUDED_CLASSES = frozenset({"SonderEditor", cm.RELAY_CLASS_TYPE})
@@ -148,15 +152,15 @@ def _node_rows(prompt: dict, authoring: dict | None, off: dict | None, keep: Cal
 
 def sampling_candidates(prompt: dict, authoring: dict | None = None, *, off: dict | None = None,
                         class_lookup: Callable[[str], Any] | None = None) -> tuple[list[dict], bool]:
-    """The core sampling-preview sources in the prompt (``SAMPLING_CLASSES``, never an output node)."""
+    """The known samplers in the prompt (``SAMPLING_CLASSES``, never an output node)."""
     return _node_rows(prompt, authoring, off, lambda class_type: class_type in SAMPLING_CLASSES
                       and not is_output_class(class_type, class_lookup), MAX_CANDIDATES)
 
 
 def sampling_index(prompt: dict, authoring: dict | None = None, *,
                    class_lookup: Callable[[str], Any] | None = None) -> dict[str, str]:
-    """``{path: class_type}`` of every node a sampling View could name: the core
-    classes, and any other node a recent run saw publish previews (the pane picker
+    """``{path: class_type}`` of every node a sampling View could name: the known
+    samplers, and any other node a recent run saw publish previews (the pane picker
     offers those). Never an output node, the Editor or the Relay. Uncapped, and
     only a path and a class per node: validation only, never published."""
     index: dict[str, str] = {}

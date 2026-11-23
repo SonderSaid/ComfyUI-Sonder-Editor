@@ -1092,7 +1092,7 @@ panes.destroy();
     # Before any preview: the message, and no Run, Hold, Link, Fit or sound.
     assert out["waiting"][1] is True
     assert [b for b in out["waiting"][0] if not b.endswith("▾")] == []
-    assert [b for b in out["live"][0] if not b.endswith("▾")] == ["Fit"]
+    assert [b for b in out["live"][0] if not b.endswith("▾")] == ["Fit"]  # no host to open the overlay, no Inspect
     assert out["live"][1:] == ["Sampling · step 2/6", "Sampling · step 2/6 · Matched through the model chain", 1]
     assert out["picker"] == [True, True, True, False]
     assert out["created"] == {"candidate": {"path": "31"}, "feed": "sampling"}
@@ -1365,7 +1365,7 @@ out.teardown = header.children.length;
     assert out["focus"] is True and out["blur"] is True and out["mouseFocus"] is True
     assert out["names"] == [None, "Two panes", "Grid: two by two, or one large pane and two stacked"]
     assert out["pickerOpen"] is True and out["pickerClosed"] is True
-    assert out["headerBar"] == ["nowrap", "nowrap"]
+    assert out["headerBar"] == ["nowrap", "wrap"]  # the source keeps its place, the buttons wrap among themselves
     assert out["teardown"] == 0
 
 

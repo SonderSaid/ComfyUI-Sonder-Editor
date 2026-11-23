@@ -347,9 +347,10 @@ export function readExecution(raw) {
     return {controls: result, error: null};
 }
 
-// Always offered as sampling-preview sources; mirrors control_views.SAMPLING_CLASSES.
+// Known samplers, always offered as sampling-preview sources; mirrors control_views.SAMPLING_CLASSES.
 export const SAMPLING_CLASSES = new Set(["KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced",
-    KJ_PREVIEW_CLASS]);
+    KJ_PREVIEW_CLASS, "ClownsharKSampler_Beta", "SharkSampler_Beta", "ClownsharkChainsampler_Beta",
+    "SharkChainsampler_Beta", "BongSampler"]);
 
 // The saved Views, tolerant like control_manifest.read_views (parity-tested).
 export const isOurViewsSection = raw => isPlainObject(raw) && (!Object.hasOwn(raw, "v") || raw.v === VIEWS_VERSION);
@@ -1381,7 +1382,7 @@ function exportViews(saved, root, manifest) {
     return out;
 }
 
-// Muted and bypassed output nodes and core sampling-preview sources
+// Muted and bypassed output nodes and known samplers
 // (`SAMPLING_CLASSES`), root and inside instances, with their path and reason:
 // the server lists them as View candidates that are off.
 export function inactiveOutputs(root, { isOutputNode = isOutputNodeOf, limit = MAX_INACTIVE_BODIES } = {}) {
