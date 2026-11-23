@@ -838,21 +838,171 @@ const promptIdentityIdsInAttachments = (attachments = []) => {
         normalizePromptAttachments(attachments)));
 };
 
-/** Pending identity creates still reachable from the browser-local draft. */
-export function reachableWritingSemanticUnitCreates(
-        creates = [], attachments = [], blockMeta = []) {
+/**
+ * Split a Writing draft's identity creates into those a chip still reaches
+ * (`pending`: preview and Apply send these) and those no chip reaches now
+ * (`parked`). A create is parked, not deleted, so the chip coming back — box
+ * Undo/Redo, or a cut chip pasted back — brings its create with it (G4-F02):
+ * deleting it left the restored chip naming an identity Apply never created.
+ *
+ * Pending wins over parked for one id. `parked` is oldest first, and the two
+ * together stay within `cap` by evicting the oldest parked, so revival can
+ * never push `pending` past the cap. Parked creates live in memory only: after
+ * a reload nothing can revive one.
+ */
+export function partitionWritingSemanticUnitCreates({
+    pending = [], parked = [], attachments = [], blockMeta = [],
+    cap = WRITING_PENDING_IDENTITY_CAP,
+} = {}) {
     const referenced = promptIdentityIdsInAttachments([
         ...normalizePromptAttachments(attachments),
         ...(Array.isArray(blockMeta) ? blockMeta : []).flatMap((value) =>
             normalizePromptAttachments(value?.attachments)),
     ]);
     const seen = new Set();
-    return (Array.isArray(creates) ? creates : []).filter((intent) => {
+    const nextPending = [];
+    const stillParked = [];
+    const newlyParked = [];
+    const visit = (intent, fromParked) => {
         const id = String(intent?.unit?.semantic_unit_id || "");
-        if (!id || seen.has(id) || !referenced.has(id)) return false;
+        if (!id || seen.has(id)) return;
         seen.add(id);
-        return true;
-    }).map((intent) => structuredClone(intent));
+        if (referenced.has(id)) nextPending.push(structuredClone(intent));
+        else (fromParked ? stillParked : newlyParked).push(structuredClone(intent));
+    };
+    for (const intent of Array.isArray(pending) ? pending : []) visit(intent, false);
+    for (const intent of Array.isArray(parked) ? parked : []) visit(intent, true);
+    const room = Math.max(0, cap - nextPending.length);
+    const nextParked = [...stillParked, ...newlyParked];
+    return {
+        pending: nextPending,
+        parked: room ? nextParked.slice(-room) : [],
+    };
+}
+
+/**
+ * The identities a Writing surface resolves against: the stored ones, plus
+ * each create intent projected as an identity. A projected identity carries
+ * its own sources, so eligibility and "cites this picture" are right before
+ * Apply, and its name labels its chip. Its handle stays empty: a suggestion
+ * is never a resolvable handle until the server stores it. A stored record of
+ * the same id wins.
+ */
+export function writingIdentityProjection(storedUnits = [], intents = []) {
+    const stored = Array.isArray(storedUnits) ? storedUnits : [];
+    const seen = new Set(stored.map((unit) => String(unit?.semantic_unit_id || "")));
+    const projected = [];
+    for (const intent of Array.isArray(intents) ? intents : []) {
+        const id = String(intent?.unit?.semantic_unit_id || "");
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        projected.push({
+            ...structuredClone(intent.unit || {}),
+            handle: "", sources: structuredClone(intent.unit?.sources || []),
+            _pending_create: true,
+        });
+    }
+    return [...stored, ...projected];
+}
+
+/** Parked creates trimmed so pending + parked stays within `cap`, oldest
+ * parked first, and never holding an id that is pending. Staging calls it so
+ * the cap invariant holds between partitions too. */
+export function trimWritingParkedCreates(pending = [], parked = [],
+        cap = WRITING_PENDING_IDENTITY_CAP) {
+    const pendingIds = new Set((pending || []).map((intent) =>
+        String(intent?.unit?.semantic_unit_id || "")));
+    const kept = (parked || []).filter((intent) =>
+        !pendingIds.has(String(intent?.unit?.semantic_unit_id || "")));
+    const room = Math.max(0, cap - (pending || []).length);
+    return room ? kept.slice(-room) : [];
+}
+
+/**
+ * Writing's caret-menu `onCreate` (Attach, and Insert at cursor). `configure`
+ * opens the chip dialog; `accept` stages any identity create the dialog
+ * returned on the draft and gives back the chip, or null when it refused
+ * (the 64-create cap). Staging happens BEFORE the menu inserts the chip, so a
+ * refusal inserts nothing, and the result carries no intent, so the menu's
+ * `onInserted` cannot stage it twice. G4-F02: this path used to hand the
+ * dialog's result straight back and the create was dropped.
+ */
+export function writingDraftMenuCreate(configure, accept, {
+    token = () => "", onStale = () => {},
+} = {}) {
+    return async (attachment) => {
+        // The dialog answered for the draft it was opened on, or not at all.
+        const opened = token();
+        const result = await configure(attachment);
+        if (token() !== opened) {
+            if (result) onStale();
+            return null;
+        }
+        const configured = accept(result);
+        return configured ? { attachment: configured } : null;
+    };
+}
+
+/** The block-meta entry with this `block_id`, as the draft holds it NOW.
+ * `reconcileWritingBlockMeta` replaces the array (and every entry) on each
+ * caret dialog, paste, Undo and strip refresh, so a row handler that writes to
+ * the entry it captured at render writes to a dead object (G4-F02). */
+export function liveWritingBlockMeta(blockMeta, blockId) {
+    const id = String(blockId || "");
+    if (!id) return null;
+    return (Array.isArray(blockMeta) ? blockMeta : []).find((value) =>
+        String(value?.block_id || "") === id) || null;
+}
+
+/** A block's scoped (non-anchored) chips, from its live entry. */
+export function writingBlockScopedAttachments(meta, anchorIds = new Set()) {
+    return normalizePromptAttachments(meta?.attachments)
+        .filter((value) => !anchorIds.has(value.attachment_id));
+}
+
+/**
+ * The identities a Writing Apply would store that do not exist and are not
+ * created by this Apply — the class of defect G4-F02 stored silently. One row
+ * per (section, chip, identity). An identity counts as known when it is
+ * stored (`knownUnitIds`), except one a channel box is still creating
+ * (`hostPendingIds`: its optimistic record sits in the stored list before the
+ * server has it), or when this Apply creates it (`pendingCreates`). One the
+ * lane already names is tolerated: a deleted identity compiles as Source
+ * removed, and an older lane may already hold such chips.
+ */
+export function writingApplyUnknownIdentityIds({
+    sections = [], pendingCreates = [], knownUnitIds = [], hostPendingIds = [],
+    laneSections = [], laneGlobalAttachments = [],
+} = {}) {
+    const hostPending = new Set((hostPendingIds || []).map(String));
+    const known = new Set((knownUnitIds || []).map(String)
+        .filter((id) => id && !hostPending.has(id)));
+    for (const intent of pendingCreates || []) {
+        const id = String(intent?.unit?.semantic_unit_id || "");
+        if (id) known.add(id);
+    }
+    const onLane = new Set(semanticIdentityDependencyIds([
+        ...normalizePromptAttachments(laneGlobalAttachments),
+        ...(Array.isArray(laneSections) ? laneSections : []).flatMap((value) =>
+            normalizePromptAttachments(value?.attachments)),
+    ]));
+    const unknown = [];
+    (Array.isArray(sections) ? sections : []).forEach((section, sectionIndex) => {
+        const docs = section?.channel_docs && typeof section.channel_docs === "object"
+            ? section.channel_docs : {};
+        for (const attachment of normalizePromptAttachments(section?.attachments)) {
+            for (const id of semanticIdentityDependencyIds([attachment])) {
+                if (known.has(id) || onLane.has(id)) continue;
+                const channelKey = Object.keys(docs).find((key) =>
+                    normalizePromptDocument(docs[key]).nodes.some((node) =>
+                        node.type === "attachment"
+                        && node.attachment_id === attachment.attachment_id)) || "";
+                unknown.push({ id, attachment, sectionIndex, channelKey,
+                    stillSaving: hostPending.has(id) });
+            }
+        }
+    });
+    return unknown;
 }
 
 function scopedAttachmentIdentity(attachment) {
@@ -1129,6 +1279,8 @@ export function mountPromptManagementPanel(host) {
                 return null;
             }
             writingState.pendingSemanticUnitCreates = staged.creates;
+            writingState.parkedSemanticUnitCreates = trimWritingParkedCreates(
+                staged.creates, writingState.parkedSemanticUnitCreates);
         }
         return configured.attachment;
     };
@@ -1260,6 +1412,18 @@ export function mountPromptManagementPanel(host) {
         references: host._referencesView?.() ?? (host._references || []),
         semanticUnits: host._promptSemanticUnits || [],
     });
+    // Writing's own surfaces (draft box, block rows, its Apply notice) also
+    // resolve the draft's pending and parked creates (`writingSemanticUnits`,
+    // declared below and read only at call time), so a chip bound to one
+    // shows the new identity's name instead of a bare "Reference" before
+    // Apply (G4-F02). Parked too: box Redo paints the chip before the save
+    // that revives its create. Other boxes keep the stored identities only:
+    // a draft's create is not theirs.
+    const writingAttachmentLabelFor = (attachment) => resolveReferenceAttachmentIdentity(attachment, {
+        scene: host.activeScene,
+        references: host._referencesView?.() ?? (host._references || []),
+        semanticUnits: writingSemanticUnits({ withParked: true }),
+    });
     const reviseFocusedRevert = (box, repainted) => {
         const focused = guard.focusedBox;
         if (focused?.el !== box || !focused.structured) return;
@@ -1339,6 +1503,11 @@ export function mountPromptManagementPanel(host) {
         key: "", draft: "", document: null, attachments: [],
         allocations: [], blockMeta: [], baseModifiedAt: "",
         pendingSemanticUnitCreates: [],
+        // Creates no chip reaches right now, kept so the chip's return (box
+        // Undo/Redo, a cut chip pasted back) brings its create back
+        // (`partitionWritingSemanticUnitCreates`). In memory only: it is not
+        // part of the saved draft or a stash, and every new draft clears it.
+        parkedSemanticUnitCreates: [],
         // Pre-Reset snapshot. Reset is the ONLY escape offered when Apply is
         // staleness-blocked, so without this the one control a stuck author can
         // reach is also the one that destroys their unapplied work.
@@ -1365,24 +1534,22 @@ export function mountPromptManagementPanel(host) {
             structuredClone(writingState.pendingSemanticUnitCreates),
     });
     const pruneWritingSemanticUnitCreates = () => {
-        writingState.pendingSemanticUnitCreates =
-            reachableWritingSemanticUnitCreates(
-                writingState.pendingSemanticUnitCreates,
-                writingState.attachments,
-                writingState.blockMeta);
-        return structuredClone(writingState.pendingSemanticUnitCreates);
+        const { pending, parked } = partitionWritingSemanticUnitCreates({
+            pending: writingState.pendingSemanticUnitCreates,
+            parked: writingState.parkedSemanticUnitCreates,
+            attachments: writingState.attachments,
+            blockMeta: writingState.blockMeta,
+        });
+        writingState.pendingSemanticUnitCreates = pending;
+        writingState.parkedSemanticUnitCreates = parked;
+        return structuredClone(pending);
     };
-    const writingSemanticUnits = () => [
-        ...(host._promptSemanticUnits || []),
-        // A pending identity carries its own sources, so eligibility and
-        // "cites this picture" are right before Apply. Its handle stays empty:
-        // a suggestion is never a resolvable handle until the server stores it.
-        ...writingState.pendingSemanticUnitCreates.map((intent) => ({
-            ...structuredClone(intent.unit || {}),
-            handle: "", sources: structuredClone(intent.unit?.sources || []),
-            _pending_create: true,
-        })),
-    ];
+    // `withParked`: a paste may name a parked create too (its chip coming
+    // back); pickers and dialogs offer only what Apply would create.
+    const writingSemanticUnits = ({ withParked = false } = {}) =>
+        writingIdentityProjection(host._promptSemanticUnits || [], [
+            ...writingState.pendingSemanticUnitCreates,
+            ...(withParked ? writingState.parkedSemanticUnitCreates : [])]);
     // Where this draft's unheadered text actually goes. One accessor for the
     // hint and both split call sites, so what the panel promises and what Apply
     // does cannot disagree. A stamp naming a channel the template no longer
@@ -1424,6 +1591,16 @@ export function mountPromptManagementPanel(host) {
     // Restore start another, whose text can read the same while its block
     // metadata and section ids do not (follow-up audit F1).
     let writingGeneration = 0;
+    // A Writing Apply is running (guard and write). Mount-level, not per
+    // render: the Apply button is rebuilt by every panel render.
+    let writingApplyInFlight = false;
+    // Which draft a Writing dialog was opened for. A dialog that answers after
+    // a scene switch, Apply, Reset or Restore must not stage or write into the
+    // draft now loaded (rule 479).
+    const writingDraftToken = () => `${writingDraftKey()}#${writingGeneration}`;
+    const notifyWritingDialogStale = () => notifyWarning(
+        "The draft changed while the dialog was open, so the change was not applied.",
+        { source: "prompt-writing-dialog-stale" });
     const reconstructDraftFromSections = () => {
         writingGeneration += 1;
         const sections = host.activeScene?.prompt_sections || [];
@@ -1445,6 +1622,7 @@ export function mountPromptManagementPanel(host) {
         writingState.attachments = normalizePromptAttachments(
             sections.flatMap((section) => section.attachments || []));
         writingState.pendingSemanticUnitCreates = [];
+        writingState.parkedSemanticUnitCreates = [];
         writingState.allocations = sections.map((s) => ({
             length: Math.max(1, (s.end_frame || 0) - (s.start_frame || 0)),
             dirty: false,
@@ -1475,6 +1653,9 @@ export function mountPromptManagementPanel(host) {
         const key = writingDraftKey();
         if (writingState.key === key) return;
         writingState.key = key;
+        // Another draft (key change, or the reload Apply forces): nothing
+        // parked for the previous one may come back here.
+        writingState.parkedSemanticUnitCreates = [];
         const saved = host._settings?.prompts?.writingDraftByProjectScene?.[key];
         const loadState = writingDraftLoadState(saved);
         // The one predicate, not a copy of it. This site had its own inlined
@@ -1560,6 +1741,8 @@ export function mountPromptManagementPanel(host) {
                 pendingSemanticUnitCreates: [] },
         } } });
         writingState.stash = applied;
+        writingState.pendingSemanticUnitCreates = [];
+        writingState.parkedSemanticUnitCreates = [];
         writingState.key = ""; // force reload (reconstruct) on next render
     };
     const reconcileWritingBlockMeta = (blockDocuments) => {
@@ -2537,7 +2720,7 @@ Server value: ${serverValue}` : ""}`;
             };
             const rowsFor = (channelKey, pool, payload, origin) => channelContributionRows({
                 channelKey, attachments: pool, candidate: payload,
-                attachmentLabelFor, origin,
+                attachmentLabelFor: writingAttachmentLabelFor, origin,
             })
                 // An inline capability compiles where its anchor sits, so it is
                 // already in the sentence the author wrote. Printing it again
@@ -2793,7 +2976,7 @@ Server value: ${serverValue}` : ""}`;
             text: writingState.draft,
             attachments: writingState.attachments,
             previews: currentCandidatePayload()?.attachment_previews || {},
-            attachmentLabelFor,
+            attachmentLabelFor: writingAttachmentLabelFor,
             attachmentContext: { scene, template: host._channelTemplate() },
             disabled: applyBlocked,
             ariaLabel: "Writing mode narrative draft",
@@ -2807,9 +2990,14 @@ Server value: ${serverValue}` : ""}`;
                 draftTimer = setTimeout(() => updateStrip(), 300);
             },
             onActivateAttachment: async (attachment, node) => {
-                const configured = acceptDraftConfiguration(
-                    await configureDraftAttachment(
-                        attachment, { node_id: String(node?.node_id || ""), offset: 0 }));
+                const opened = writingDraftToken();
+                const result = await configureDraftAttachment(
+                    attachment, { node_id: String(node?.node_id || ""), offset: 0 });
+                if (writingDraftToken() !== opened) {
+                    if (result) notifyWritingDialogStale();
+                    return;
+                }
+                const configured = acceptDraftConfiguration(result);
                 if (configured) draftArea.replaceAttachment(configured);
             },
             getHostSnapshot: () => writingState.blockMeta,
@@ -2887,7 +3075,10 @@ Server value: ${serverValue}` : ""}`;
                 writingState.attachments = draftArea.promptAttachments;
                 saveWritingState();
             },
-            onCreate: (attachment) => configureDraftAttachment(attachment),
+            // Stages the dialog's identity create on the draft before the chip
+            // is inserted (G4-F02: it used to be dropped here).
+            onCreate: writingDraftMenuCreate(configureDraftAttachment, acceptDraftConfiguration,
+                { token: writingDraftToken, onStale: notifyWritingDialogStale }),
             // One box over every block and channel: Shot is offered only when
             // the caret is in a block's shot-marker channel.
             shotPlacementAt: (bookmark) => draftShotPlacement({ bookmark }),
@@ -2913,18 +3104,22 @@ Server value: ${serverValue}` : ""}`;
             // (they are created at Apply, whatever the chip id). A create a
             // channel box is still sending is not the draft's: it rides with
             // that box's chip id, so a chip bound to it waits, as it does in
-            // the boxes (`_pendingPromptIdentityCreateIntents`).
+            // the boxes (`_pendingPromptIdentityCreateIntents`). A parked create
+            // is the draft's too: a cut chip pasted back is accepted and the
+            // next save revives its create (`partitionWritingSemanticUnitCreates`).
             pasteContext: (bookmark) => {
                 return {
                     scene: draftAttachmentContext(bookmark?.start || null).scene,
                     references: offerableReferences(),
-                    semanticUnits: writingSemanticUnits(),
+                    semanticUnits: writingSemanticUnits({ withParked: true }),
                     profileId: scene?.prompt_context_profile_id
                         || host._channelTemplate().default_context_profile || "generic@1",
                     scope: "section",
                     resolvedProfile: host._resolvedPromptContextProfile?.(),
                     pendingSemanticUnitIds: writingPastePendingIds(
-                        host._pendingPromptIdentityCreateIntents, writingState.pendingSemanticUnitCreates),
+                        host._pendingPromptIdentityCreateIntents, [
+                            ...writingState.pendingSemanticUnitCreates,
+                            ...writingState.parkedSemanticUnitCreates]),
                 };
             },
             writingAids: host._promptContextWritingAids?.(
@@ -3021,6 +3216,7 @@ Server value: ${serverValue}` : ""}`;
             writingState.pendingSemanticUnitCreates = Array.isArray(
                 stash.pendingSemanticUnitCreates)
                 ? structuredClone(stash.pendingSemanticUnitCreates) : [];
+            writingState.parkedSemanticUnitCreates = [];
             writingState.baseModifiedAt = String(stash.baseModifiedAt || "");
             // The stamp travels with the draft. Without it a restored
             // pre-declaration draft picks up the CURRENT default and its
@@ -3172,14 +3368,37 @@ Server value: ${serverValue}` : ""}`;
                     .map((node) => node.attachment_id));
                 const renderBlockScope = () => {
                     const meta = writingState.blockMeta[i];
-                    const scoped = normalizePromptAttachments(meta?.attachments)
-                        .filter((value) => !anchorIds.has(value.attachment_id));
+                    const scoped = writingBlockScopedAttachments(meta, anchorIds);
+                    // Every write below resolves this block by id at WRITE
+                    // time: a caret dialog, a paste, box Undo and the strip's
+                    // debounce all replace `writingState.blockMeta`, and a
+                    // write to the entry captured here landed in a dead object
+                    // (G4-F02: the chip's create was made, the section never
+                    // got the chip).
+                    const blockId = String(meta?.block_id || "");
+                    const liveBlock = (message = "That block changed. Try again.") => {
+                        const live = liveWritingBlockMeta(writingState.blockMeta, blockId);
+                        if (!live) {
+                            notifyWarning(message, { source: "prompt-writing-block-changed" });
+                            updateStrip();
+                        }
+                        return live;
+                    };
+                    const commitBlockScope = (live, nextRegistry, nextScoped) => {
+                        draftArea.transactPromptAttachments?.(nextRegistry, () => {
+                            live.attachments = nextScoped;
+                        });
+                        saveWritingState();
+                        // Not this render's row and documents: they may be
+                        // the ones the write just outlived.
+                        updateStrip();
+                    };
                     const row = createScopeChipRow({
                         label: `Block ${i + 1} context`,
                         attachments: scoped,
                         previews: candidateForSection(writingBlockPromptId(
                             i, writingState.allocations.length))?.attachment_previews || {},
-                        attachmentLabelFor,
+                        attachmentLabelFor: writingAttachmentLabelFor,
                         disabled: applyBlocked,
                         profile: host._resolvedPromptContextProfile?.(),
                         allowedKinds: host._channelTemplate().shot_marker_channel
@@ -3190,17 +3409,15 @@ Server value: ${serverValue}` : ""}`;
                         reuseContext: { scene: attachmentScene,
                             template: host._channelTemplate() },
                         onReuse: (configured) => {
-                            const nextRegistry = normalizePromptAttachments([
-                                ...writingState.attachments, configured]);
-                            draftArea.transactPromptAttachments?.(nextRegistry, () => {
-                                meta.attachments = [...scoped, configured];
-                            });
-                            saveWritingState(); renderBlockScope();
-                            previewWritingBlocks(blockDocuments);
+                            const live = liveBlock();
+                            if (!live) return;
+                            commitBlockScope(live, normalizePromptAttachments([
+                                ...writingState.attachments, configured]), [
+                                ...writingBlockScopedAttachments(live, anchorIds), configured]);
                         },
                         onAdd: async (kind) => {
-                            const configured = acceptDraftConfiguration(
-                                await configurePromptAttachment({ kind }, {
+                            const opened = writingDraftToken();
+                            const result = await configurePromptAttachment({ kind }, {
                                 assets: host._allProjectAssetsForGallery?.() || [],
                                 referenceProsePolicy: host._referenceProsePolicy,
                                 scene: attachmentScene,
@@ -3217,19 +3434,26 @@ Server value: ${serverValue}` : ""}`;
                                 managedSpeakerSubjectIds: currentManagedSpeakerSubjectIds(),
                                 ordinalManifest: currentCandidatePayload()?.ordinal_manifest || {},
                                 candidate: currentCandidatePayload(),
-                            }));
-                            if (!configured) return;
-                            const nextRegistry = normalizePromptAttachments([
-                                ...writingState.attachments, configured]);
-                            draftArea.transactPromptAttachments?.(nextRegistry, () => {
-                                meta.attachments = [...scoped, configured];
                             });
-                            saveWritingState(); renderBlockScope();
-                            previewWritingBlocks(blockDocuments);
+                            if (!promptAttachmentConfiguration(result).attachment) return;
+                            if (writingDraftToken() !== opened) {
+                                notifyWritingDialogStale();
+                                return;
+                            }
+                            // The target first: a create is staged only for a
+                            // chip that has a block to land in.
+                            const live = liveBlock(
+                                "That block changed while the dialog was open. Attach again.");
+                            if (!live) return;
+                            const configured = acceptDraftConfiguration(result);
+                            if (!configured) return;
+                            commitBlockScope(live, normalizePromptAttachments([
+                                ...writingState.attachments, configured]), [
+                                ...writingBlockScopedAttachments(live, anchorIds), configured]);
                         },
                         onActivate: async (attachment) => {
-                            const configured = acceptDraftConfiguration(
-                                await configurePromptAttachment(attachment, {
+                            const opened = writingDraftToken();
+                            const result = await configurePromptAttachment(attachment, {
                                 assets: host._allProjectAssetsForGallery?.() || [],
                                 referenceProsePolicy: host._referenceProsePolicy,
                                 scene: attachmentScene,
@@ -3246,7 +3470,12 @@ Server value: ${serverValue}` : ""}`;
                                 managedSpeakerSubjectIds: currentManagedSpeakerSubjectIds(),
                                 candidate: currentCandidatePayload(),
                                 ordinalManifest: currentCandidatePayload()?.ordinal_manifest || {},
-                            }));
+                            });
+                            if (writingDraftToken() !== opened) {
+                                if (result) notifyWritingDialogStale();
+                                return;
+                            }
+                            const configured = acceptDraftConfiguration(result);
                             if (!configured) return;
                             const groupId = attachment.emission_group_id;
                             const linked = writingState.attachments.filter((value) =>
@@ -3268,30 +3497,26 @@ Server value: ${serverValue}` : ""}`;
                                                 ? configured : value));
                                 }
                             });
-                            saveWritingState(); renderBlockScope();
-                            previewWritingBlocks(blockDocuments);
+                            saveWritingState();
+                            updateStrip();
                         },
                         onUnlink: (configured) => {
-                            const nextRegistry = writingState.attachments.map((value) =>
+                            const live = liveBlock();
+                            if (!live) return;
+                            commitBlockScope(live, writingState.attachments.map((value) =>
                                 value.attachment_id === configured.attachment_id
-                                    ? configured : value);
-                            draftArea.transactPromptAttachments?.(nextRegistry, () => {
-                                meta.attachments = scoped.map((value) =>
-                                    value.attachment_id === configured.attachment_id
-                                        ? configured : value);
-                            });
-                            saveWritingState(); renderBlockScope();
-                            previewWritingBlocks(blockDocuments);
+                                    ? configured : value),
+                            writingBlockScopedAttachments(live, anchorIds).map((value) =>
+                                value.attachment_id === configured.attachment_id
+                                    ? configured : value));
                         },
                         onRemove: (attachment) => {
-                            const nextRegistry = writingState.attachments.filter((value) =>
-                                value.attachment_id !== attachment.attachment_id);
-                            draftArea.transactPromptAttachments?.(nextRegistry, () => {
-                                meta.attachments = scoped.filter((value) =>
-                                    value.attachment_id !== attachment.attachment_id);
-                            });
-                            saveWritingState(); renderBlockScope();
-                            previewWritingBlocks(blockDocuments);
+                            const live = liveBlock();
+                            if (!live) return;
+                            commitBlockScope(live, writingState.attachments.filter((value) =>
+                                value.attachment_id !== attachment.attachment_id),
+                            writingBlockScopedAttachments(live, anchorIds).filter((value) =>
+                                value.attachment_id !== attachment.attachment_id));
                         },
                     });
                     const previous = blockCard.querySelector("[data-writing-scope]");
@@ -3316,8 +3541,8 @@ Server value: ${serverValue}` : ""}`;
             updateStrip();
         });
 
-        applyBtn.addEventListener("click", async () => {
-            if (applyBtn.disabled) return;
+        // What Apply would send, built from the draft as it is NOW.
+        const buildWritingApply = () => {
             const blocks = reconcileWritingBlockMeta(
                 splitWritingPromptDocument(writingState.document, {
                     keepEmpty: writingState.blockMeta.length > 0,
@@ -3329,13 +3554,91 @@ Server value: ${serverValue}` : ""}`;
                 allocations: writingState.allocations,
                 channelKeys: templateChannelKeys(host._channelTemplate()),
                 defaultKey: writingDefaultChannelKey(),
-                minLen,
+                // The template's frame step now, not the render's: Apply may
+                // run after an await this render did not see.
+                minLen: Math.max(1, parseInt(host._resolveFrameConstraintForTemplate?.(
+                    host._templateId)?.step, 10) || 1),
                 newId: (index) => globalThis.crypto?.randomUUID?.()
                     || `${Date.now()}-${index}`,
             });
+            return { sections, cursor,
+                promptSemanticUnitCreates: pruneWritingSemanticUnitCreates() };
+        };
+        // What the author saw when they pressed Apply: a guard that waits
+        // must not then send a draft edited during the wait.
+        const writingApplySignature = () => JSON.stringify({
+            document: writingState.document,
+            attachments: writingState.attachments,
+            blocks: writingState.blockMeta.map((value) => value?.attachments || []),
+            allocations: writingState.allocations.map((value) => value?.length || 0),
+        });
+        const unknownApplyIdentities = ({ sections, promptSemanticUnitCreates }) =>
+            writingApplyUnknownIdentityIds({
+                sections, pendingCreates: promptSemanticUnitCreates,
+                knownUnitIds: (host._promptSemanticUnits || []).map((unit) =>
+                    String(unit?.semantic_unit_id || "")),
+                hostPendingIds: writingPastePendingIds(
+                    host._pendingPromptIdentityCreateIntents, promptSemanticUnitCreates),
+                laneSections: host.activeScene?.prompt_sections || [],
+                laneGlobalAttachments: host.activeScene?.global_attachments || [],
+            });
+        const refuseUnknownIdentities = (unknown) => {
+            const rows = unknown.map(({ attachment, sectionIndex, channelKey, stillSaving }) => {
+                const label = writingAttachmentLabelFor(attachment)
+                    || (attachment?.kind === "vocal_event" ? "Vocal Event" : "Reference");
+                return `Block ${sectionIndex + 1} · ${channelKey || "block context"} · ${label}: `
+                    + (stillSaving ? "its identity is still being saved"
+                        : "its identity does not exist (deleted, or removed by Undo)");
+            });
+            notifyWarning(`Apply refused, nothing was changed. ${[...new Set(rows)].join("; ")}. `
+                + "Remove or re-attach the chip, or wait for the save to finish.",
+            { source: "prompt-writing-unknown-identity" });
+        };
+        const runWritingApply = async () => {
+            let built = buildWritingApply();
+            // G4-F02 stored chips naming identities nothing created, silently.
+            // A miss gets one identity refresh (another window may have made
+            // it) before Apply is refused; nothing is sent either way. The
+            // check is client-side and best effort: the server still accepts
+            // any id.
+            if (unknownApplyIdentities(built).length) {
+                const startKey = writingDraftKey();
+                const startGeneration = writingGeneration;
+                const startTemplate = JSON.stringify(projectTemplateValue(host._channelTemplate()));
+                const startSignature = writingApplySignature();
+                applyBtn.disabled = true;
+                try {
+                    // The refresh re-renders the panel, so this handler's
+                    // button may be gone by the time it answers; the mount's
+                    // in-flight flag is what keeps a second Apply out.
+                    await host._fetchReferences?.({ force: true, ignoreMutationGate: true,
+                        reason: "writing_apply_guard" });
+                } catch {
+                    // The recheck below decides on what is known.
+                } finally {
+                    applyBtn.disabled = applyBlocked;
+                }
+                // The await let anything happen: another draft, scene,
+                // project or template, a lock, or an edit (rule 479).
+                if (writingDraftKey() !== startKey || writingGeneration !== startGeneration
+                        || JSON.stringify(projectTemplateValue(host._channelTemplate())) !== startTemplate
+                        || writingApplySignature() !== startSignature
+                        || host._isPromptTrackLocked?.() || host._isGlobalPromptTrackLocked?.()) {
+                    notifyWarning("The draft or scene changed while Apply was checking it. Nothing was applied.",
+                        { source: "prompt-writing-apply-changed" });
+                    return;
+                }
+                built = buildWritingApply();
+                const unknown = unknownApplyIdentities(built);
+                if (unknown.length) {
+                    refuseUnknownIdentities(unknown);
+                    return;
+                }
+            }
+            const { sections, cursor, promptSemanticUnitCreates } = built;
+            if (!sections.length) return;
             const sceneDur = host.activeScene?.duration_frames || host.totalFrames || 0;
             const extendDurationTo = cursor > sceneDur ? cursor : 0;
-            const promptSemanticUnitCreates = pruneWritingSemanticUnitCreates();
             // The writing tool rewrites SECTIONS only, so the scene-global text
             // has to be handed back untouched. Passing just `global` is not that:
             // it is the label-free mirror over the LEGACY three channels, so it
@@ -3374,9 +3677,13 @@ Server value: ${serverValue}` : ""}`;
                 const adopted = new Set((applied?.adopted_prompt_semantic_unit_ids || [])
                     .map(String));
                 if (adopted.size) {
+                    const notAdopted = (intent) =>
+                        !adopted.has(String(intent?.unit?.semantic_unit_id || ""));
                     writingState.pendingSemanticUnitCreates =
-                        writingState.pendingSemanticUnitCreates.filter((intent) =>
-                            !adopted.has(String(intent?.unit?.semantic_unit_id || "")));
+                        writingState.pendingSemanticUnitCreates.filter(notAdopted);
+                    // Published now: a parked copy must never come back.
+                    writingState.parkedSemanticUnitCreates =
+                        writingState.parkedSemanticUnitCreates.filter(notAdopted);
                     saveWritingState();
                     notifyInfo(`${adopted.size === 1 ? "The pending identity was" : `${adopted.size} pending identities were`} created, but the lane changed before reconciliation. The draft remains retryable.`,
                         { source: "prompt-writing-partial-reconcile" });
@@ -3403,6 +3710,19 @@ Server value: ${serverValue}` : ""}`;
                     : reshaped,
                 { source: "prompt-writing-apply" });
             render();
+        };
+        applyBtn.addEventListener("click", async () => {
+            // One Apply at a time per mount. A render during Apply's awaits
+            // (the guard's refresh, a project echo, the strip's debounce)
+            // brings back an enabled button whose click would otherwise
+            // start a second Apply: new prompt ids and every create twice.
+            if (applyBtn.disabled || writingApplyInFlight) return;
+            writingApplyInFlight = true;
+            try {
+                await runWritingApply();
+            } finally {
+                writingApplyInFlight = false;
+            }
         });
 
         updateStrip();

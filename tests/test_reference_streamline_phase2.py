@@ -610,9 +610,11 @@ def test_writing_keeps_a_pending_subject_with_its_sources_through_reload():
         console.log(JSON.stringify({
             useSaved: load.useSavedDraft,
             reloaded: saved.pendingSemanticUnitCreates,
-            reachable: mod.reachableWritingSemanticUnitCreates(saved.pendingSemanticUnitCreates, [chip], [])
+            reachable: mod.partitionWritingSemanticUnitCreates({
+                pending: saved.pendingSemanticUnitCreates, attachments: [chip]}).pending
                 .map((value) => value.unit.semantic_unit_id),
-            orphaned: mod.reachableWritingSemanticUnitCreates(saved.pendingSemanticUnitCreates, [], []).length,
+            orphaned: mod.partitionWritingSemanticUnitCreates({
+                pending: saved.pendingSemanticUnitCreates}).pending.length,
             afterApply: mod.writingAppliedRestoreSnapshot(saved).pendingSemanticUnitCreates,
         }));
     """)

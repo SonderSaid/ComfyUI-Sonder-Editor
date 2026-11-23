@@ -2796,7 +2796,11 @@ def test_every_reference_chip_surface_uses_runtime_identity_and_authoring_contro
     # 9, not 10: the Writing decoration resolved its rows twice — once for
     # written channels and once for fed-but-unwritten ones — and now does
     # it through one `rowsFor` helper. A surface was merged, not lost.
-    assert panel.count("attachmentLabelFor,") == 11
+    # G4-F02: Writing's three surfaces (draft box, block rows, its compiled
+    # rows) resolve with `writingAttachmentLabelFor`, which also knows the
+    # draft's pending creates; the other eight keep the stored identities.
+    assert panel.count("attachmentLabelFor,") == 8
+    assert panel.count("attachmentLabelFor: writingAttachmentLabelFor") == 3
     assert "Shared identity default · ${unit.handle ? `@${unit.handle}`" in chips
     assert "Prompt Format default ·" in chips
     assert "Audio target speaker" not in chips
@@ -8782,11 +8786,11 @@ def test_writing_pending_identity_create_is_reachable_only_while_draft_reference
             emission_group_id:attachmentId,kind:"vocal_event",
             source:{subject_ids:ids},config:{},capabilities:[]});
         const creates = [create("one","One"),create("two","Two")];
-        const direct = mod.reachableWritingSemanticUnitCreates(creates,
-            [vocal("a",["one"])], []);
-        const scoped = mod.reachableWritingSemanticUnitCreates(creates, [],
-            [{attachments:[vocal("b",["two"])]}]);
-        const removed = mod.reachableWritingSemanticUnitCreates(creates, [], []);
+        const reachable = (attachments, blockMeta) => mod.partitionWritingSemanticUnitCreates(
+            {pending: creates, attachments, blockMeta}).pending;
+        const direct = reachable([vocal("a",["one"])], []);
+        const scoped = reachable([], [{attachments:[vocal("b",["two"])]}]);
+        const removed = reachable([], []);
         console.log(JSON.stringify({
             direct:direct.map((value)=>value.unit.semantic_unit_id),
             scoped:scoped.map((value)=>value.unit.semantic_unit_id),
@@ -8855,6 +8859,285 @@ def test_writing_pending_identity_overlay_uses_shared_preview_and_atomic_apply_p
     assert create_at < replace_at
     assert "pending: identityCreateIntents.length > 0" in apply
     assert "_refreshAndReconcilePromptSetupIdentityCreates" in apply
+
+
+# ── G4-F02: Writing New Subject keeps its create intent ──────────────────
+
+def _run_panel_and_chips(body):
+    panel_url = (ROOT / "web/js/editor_prompt_panel.js").as_uri()
+    chips_url = (ROOT / "web/js/prompt_context_chips.js").as_uri()
+    return _run_node(
+        f"const panel = await import({json.dumps(panel_url)});\n"
+        f"const chips = await import({json.dumps(chips_url)});\n"
+        "const create = (id, name, type = 'create_prompt_identity_with_sources') => ({type,\n"
+        "    handle_suggestion: name, unit: {semantic_unit_id: id, name, kind: 'subject'}});\n"
+        "const ref = (attachmentId, ids) => ({attachment_id: attachmentId,\n"
+        "    emission_group_id: attachmentId, kind: 'reference',\n"
+        "    source: {semantic_unit_ids: ids}, config: {}, capabilities: []});\n"
+        "const vocal = (attachmentId, ids) => ({attachment_id: attachmentId,\n"
+        "    emission_group_id: attachmentId, kind: 'vocal_event',\n"
+        "    source: {subject_ids: ids}, config: {}, capabilities: []});\n"
+        "const ids = (list) => list.map((value) => value.unit.semantic_unit_id);\n"
+        + body + "\n")
+
+
+def test_writing_caret_menu_stages_the_identity_create_before_inserting_the_chip():
+    """G4-F02: Attach and Insert at cursor in Writing used to drop the create."""
+    result = _run_panel_and_chips(r"""
+        const run = async ({path, refuse = false, cancel = false, stale = false}) => {
+            const log = [];
+            const intent = create("identity:new", "New");
+            let draft = "scene-a#1";
+            const configure = async (attachment) => {
+                if (stale) draft = "scene-b#1";
+                return cancel ? null : ({
+                attachment: {...(attachment.kind === "vocal_event"
+                    ? vocal("c1", ["identity:new"]) : ref("c1", ["identity:new"]))},
+                identityCreateIntent: intent});
+            };
+            // The panel's `acceptDraftConfiguration`, reduced to what it does:
+            // stage the create (or refuse at the cap) and give back the chip.
+            const accept = (result) => {
+                const configured = chips.promptAttachmentConfiguration(result);
+                if (configured.identityCreateIntent) {
+                    if (refuse) { log.push("refused"); return null; }
+                    log.push("staged:" + configured.identityCreateIntent.unit.semantic_unit_id);
+                }
+                return configured.attachment;
+            };
+            const editor = {restorePromptSelection: () => true, focusEnd() {},
+                insertAttachment: (value) => log.push("insert:" + value.attachment_id),
+                promptDocument: {nodes: []}, promptAttachments: []};
+            const items = chips.createPromptContextMenuItems({editor, bookmark: null,
+                onCreate: panel.writingDraftMenuCreate(configure, accept, {
+                    token: () => draft, onStale: () => log.push("stale")}),
+                onInserted: (value) => log.push("inserted-intent:"
+                    + String(value.identityCreateIntent ?? null))});
+            const item = path === "attach"
+                ? items.find((value) => value.label === "Attach")
+                : items.find((value) => value.label === "Insert at cursor")
+                    .submenu.find((value) => value.kind === "vocal_event");
+            await item.action();
+            return log;
+        };
+        console.log(JSON.stringify({
+            attach: await run({path: "attach"}),
+            vocal: await run({path: "vocal"}),
+            refused: await run({path: "attach", refuse: true}),
+            cancelled: await run({path: "attach", cancel: true}),
+            stale: await run({path: "attach", stale: true}),
+        }));
+    """)
+    # A dialog answering after the draft changed stages and inserts nothing.
+    assert result["stale"] == ["stale"]
+    # Staged first, then inserted; the menu never sees an intent to stage again.
+    assert result["attach"] == ["staged:identity:new", "insert:c1", "inserted-intent:null"]
+    assert result["vocal"] == ["staged:identity:new", "insert:c1", "inserted-intent:null"]
+    # The cap refusal inserts nothing, and a cancelled dialog stages nothing.
+    assert result["refused"] == ["refused"]
+    assert result["cancelled"] == []
+
+
+def test_writing_menu_create_wiring_and_apply_guard_order_are_pinned():
+    """The helper tests above prove nothing if the panel stops calling it."""
+    panel = _source("web/js/editor_prompt_panel.js")
+    assert ("onCreate: writingDraftMenuCreate(configureDraftAttachment, acceptDraftConfiguration,\n"
+            "                { token: writingDraftToken, onStale: notifyWritingDialogStale }),") in panel
+    assert "onCreate: (attachment) => configureDraftAttachment(attachment)" not in panel
+    handler = panel[panel.index("const runWritingApply = async () => {"):]
+    handler = handler[:handler.index("clearWritingState({")]
+    guard_at = handler.index("unknownApplyIdentities(built)")
+    signature_at = handler.index("const startSignature = writingApplySignature();")
+    fetch_at = handler.index("host._fetchReferences?.(")
+    recheck_at = handler.index("writingDraftKey() !== startKey")
+    rebuild_at = handler.index("built = buildWritingApply();", recheck_at)
+    apply_at = handler.index("host._applyPromptSetup(")
+    assert guard_at < signature_at < fetch_at < recheck_at < rebuild_at < apply_at
+    assert "ignoreMutationGate: true" in handler[fetch_at:recheck_at]
+    recheck = handler[recheck_at:rebuild_at]
+    assert "writingApplySignature() !== startSignature" in recheck
+    assert "projectTemplateValue(host._channelTemplate())" in recheck
+    # One Apply at a time per mount, held across the guard AND the write.
+    click = panel[panel.index('applyBtn.addEventListener("click", async () => {'):]
+    click = click[:click.index("});")]
+    assert "writingApplyInFlight) return;" in click
+    assert click.index("writingApplyInFlight = true;") < click.index(
+        "await runWritingApply();") < click.index("writingApplyInFlight = false;")
+    assert "let writingApplyInFlight = false;" in panel
+    # The draft's creates: the prune keeps parked creates, staging trims
+    # them, and every new draft (Reset, load, restore, Apply) clears them;
+    # an adopted id leaves both lists.
+    prune = panel[panel.index("const pruneWritingSemanticUnitCreates = () => {"):]
+    prune = prune[:prune.index("\n    };")]
+    assert "partitionWritingSemanticUnitCreates({" in prune
+    assert "writingState.parkedSemanticUnitCreates = parked;" in prune
+    accept = panel[panel.index("const acceptDraftConfiguration = (result) => {"):]
+    accept = accept[:accept.index("\n    };")]
+    assert "trimWritingParkedCreates(" in accept
+    for start, end in (("const reconstructDraftFromSections = () => {", "const loadWritingState"),
+                       ("const loadWritingState = () => {", "const saveWritingState"),
+                       ("const clearWritingState = (", "\n    };"),
+                       ('restoreBtn?.addEventListener("click", () => {', "saveWritingState();")):
+        body = panel[panel.index(start):]
+        body = body[:body.index(end, len(start))]
+        assert "writingState.parkedSemanticUnitCreates = [];" in body, start
+    assert "writingState.parkedSemanticUnitCreates.filter(notAdopted);" in panel
+    # A dialog that answers for another draft writes nothing.
+    for start in ("onActivateAttachment: async (attachment, node) => {",
+                  "onAdd: async (kind) => {", "onActivate: async (attachment) => {"):
+        body = panel[panel.index(start):]
+        body = body[:body.index("acceptDraftConfiguration(result)")]
+        assert "writingDraftToken() !== opened" in body, start
+    # Every block-row write resolves its block at write time.
+    row = panel[panel.index("const renderBlockScope = () => {"):]
+    row = row[:row.index("renderBlockScope();")]
+    for handler_name in ("onReuse:", "onAdd:", "onUnlink:", "onRemove:"):
+        body = row[row.index(handler_name):]
+        body = body[:body.index("\n                        },")]
+        assert "liveBlock(" in body, handler_name
+        assert "meta.attachments" not in body, handler_name
+    # onAdd confirms its block before staging the create.
+    add = row[row.index("onAdd:"):]
+    assert add.index("liveBlock(") < add.index("acceptDraftConfiguration(result)")
+
+
+def test_writing_unreachable_creates_are_parked_and_revived_by_their_chip():
+    result = _run_panel_and_chips(r"""
+        const a = create("a", "A"), b = create("b", "B"), c = create("c", "C");
+        // Undo removed the chip naming "a": it is parked, not deleted.
+        const undone = panel.partitionWritingSemanticUnitCreates({
+            pending: [a, b], parked: [], attachments: [ref("x", ["b"])], blockMeta: []});
+        // Redo brought the chip back: the create comes back with it.
+        const redone = panel.partitionWritingSemanticUnitCreates({
+            pending: undone.pending, parked: undone.parked,
+            attachments: [ref("x", ["b"]), ref("y", ["a"])], blockMeta: []});
+        // A block-scoped chip reaches its create too.
+        const scoped = panel.partitionWritingSemanticUnitCreates({
+            pending: [], parked: [c], attachments: [],
+            blockMeta: [{attachments: [vocal("v", ["c"])]}]});
+        // Pending wins over a parked copy of the same id.
+        const both = panel.partitionWritingSemanticUnitCreates({
+            pending: [create("a", "Renamed")], parked: [a],
+            attachments: [ref("y", ["a"])], blockMeta: []});
+        // The cap evicts the oldest parked and never a pending create.
+        const parkedMany = [create("p1", "P1"), create("p2", "P2"), create("p3", "P3")];
+        const capped = panel.partitionWritingSemanticUnitCreates({
+            pending: [a, b], parked: parkedMany, attachments: [ref("x", ["a", "b"])],
+            blockMeta: [], cap: 3});
+        const full = panel.partitionWritingSemanticUnitCreates({
+            pending: [a, b], parked: parkedMany, attachments: [ref("x", ["a", "b"])],
+            blockMeta: [], cap: 2});
+        const trimmed = panel.trimWritingParkedCreates([a, b], [a, ...parkedMany], 4);
+        console.log(JSON.stringify({
+            undone: {pending: ids(undone.pending), parked: ids(undone.parked)},
+            redone: {pending: ids(redone.pending), parked: ids(redone.parked)},
+            scoped: ids(scoped.pending),
+            both: both.pending.map((value) => value.unit.name).concat(ids(both.parked)),
+            capped: {pending: ids(capped.pending), parked: ids(capped.parked)},
+            full: {pending: ids(full.pending), parked: ids(full.parked)},
+            trimmed: ids(trimmed),
+        }));
+    """)
+    assert result["undone"] == {"pending": ["b"], "parked": ["a"]}
+    assert result["redone"] == {"pending": ["b", "a"], "parked": []}
+    assert result["scoped"] == ["c"]
+    assert result["both"] == ["Renamed"]
+    assert result["capped"] == {"pending": ["a", "b"], "parked": ["p3"]}
+    assert result["full"] == {"pending": ["a", "b"], "parked": []}
+    # Staging keeps pending + parked within the cap, drops a pending id from
+    # parked, and evicts the oldest parked first.
+    assert result["trimmed"] == ["p2", "p3"]
+
+
+def test_writing_parked_create_lets_a_cut_chip_paste_back_and_labels_pending_chips():
+    result = _run_panel_and_chips(r"""
+        const stored = [{semantic_unit_id: "stored", name: "Stored", handle: "Stored"}];
+        const parked = [create("identity:cut", "Cut Subject")];
+        const chip = vocal("p", ["identity:cut"]);
+        const verdict = (units, pendingIds = []) => chips.promptPasteVerdict(chip, {
+            referenceContext: {semanticUnits: units, pendingSemanticUnitIds: pendingIds}});
+        const withParked = panel.writingIdentityProjection(stored, parked);
+        const pendingOnly = panel.writingIdentityProjection(stored, []);
+        // The draft's own creates are subtracted from the host's pending map.
+        const hostPending = new Map([["identity:cut", {}], ["identity:box", {}]]);
+        const label = chips.resolveReferenceAttachmentIdentity(ref("r", ["identity:cut"]),
+            {semanticUnits: panel.writingIdentityProjection(stored, parked)});
+        const storedWins = panel.writingIdentityProjection(stored, [create("stored", "Shadow")]);
+        console.log(JSON.stringify({
+            accepted: verdict(withParked),
+            refused: verdict(pendingOnly),
+            pendingIds: panel.writingPastePendingIds(hostPending, parked),
+            label,
+            storedWins: storedWins.map((unit) => unit.name),
+        }));
+    """)
+    assert result["accepted"] is None
+    assert result["refused"] == "its speaker is not saved yet"
+    assert result["pendingIds"] == ["identity:box"]
+    # A pending chip shows its new identity's name, not a bare "Reference".
+    assert result["label"] == "Cut Subject"
+    assert result["storedWins"] == ["Stored"]
+
+
+def test_writing_apply_guard_refuses_identities_that_do_not_exist():
+    result = _run_panel_and_chips(r"""
+        const section = (attachments, docs = {}) => ({prompt_id: "s", start_frame: 0,
+            end_frame: 10, channels: {}, channel_docs: docs, attachments});
+        const anchored = {detailed_description: {schema: "prompt_document_v1",
+            nodes: [{type: "attachment", node_id: "n", attachment_id: "a1"}]}};
+        const guard = (sections, extra = {}) => panel.writingApplyUnknownIdentityIds({
+            sections, knownUnitIds: ["stored", "optimistic"], ...extra})
+            .map((row) => [row.id, row.sectionIndex, row.channelKey, row.stillSaving]);
+        console.log(JSON.stringify({
+            unknown: guard([section([ref("a1", ["ghost"])], anchored)]),
+            pending: guard([section([ref("a1", ["new"])])],
+                {pendingCreates: [create("new", "New")]}),
+            stored: guard([section([ref("a1", ["stored"])])]),
+            onLane: guard([section([ref("a1", ["deleted"])])],
+                {laneSections: [section([ref("old", ["deleted"])])]}),
+            onLaneGlobal: guard([section([ref("a1", ["deleted"])])],
+                {laneGlobalAttachments: [ref("g", ["deleted"])]}),
+            stillSaving: guard([section([ref("a1", ["optimistic"])])],
+                {hostPendingIds: ["optimistic"]}),
+            vocal: guard([section([vocal("v", ["ghost"])])]),
+            physical: guard([section([{attachment_id: "p", kind: "reference",
+                source: {picture_ids: ["m1"]}, config: {}, capabilities: []}])]),
+        }));
+    """)
+    # Not stored, not created by this Apply, not already on the lane: refused,
+    # with the block and the channel the chip sits in.
+    assert result["unknown"] == [["ghost", 0, "detailed_description", False]]
+    assert result["pending"] == []
+    assert result["stored"] == []
+    # A lane may already hold a deleted identity's chip: it compiles as
+    # Source removed and is tolerated.
+    assert result["onLane"] == []
+    assert result["onLaneGlobal"] == []
+    # A channel box's optimistic identity is not stored yet.
+    assert result["stillSaving"] == [["optimistic", 0, "", True]]
+    assert result["vocal"] == [["ghost", 0, "", False]]
+    # A physical-only Reference names no identity.
+    assert result["physical"] == []
+
+
+def test_writing_block_row_resolves_its_block_after_a_reconcile_replaced_it():
+    result = _run_panel_and_chips(r"""
+        const captured = {block_id: "b1", attachments: [ref("old", ["x"])]};
+        // A reconcile replaced the array and every entry; the id survives.
+        const live = [{block_id: "b0", attachments: []},
+            {block_id: "b1", attachments: [ref("old", ["x"]), ref("inline", ["y"])]}];
+        const found = panel.liveWritingBlockMeta(live, captured.block_id);
+        console.log(JSON.stringify({
+            sameObject: found === live[1],
+            notCaptured: found !== captured,
+            gone: panel.liveWritingBlockMeta([{block_id: "b9"}], "b1"),
+            noId: panel.liveWritingBlockMeta(live, ""),
+            scoped: panel.writingBlockScopedAttachments(found, new Set(["inline"]))
+                .map((value) => value.attachment_id),
+        }));
+    """)
+    assert result == {"sameObject": True, "notCaptured": True, "gone": None,
+                      "noId": None, "scoped": ["old"]}
 
 
 def test_cross_project_prompt_template_exports_vocal_identity_dependency_closure():

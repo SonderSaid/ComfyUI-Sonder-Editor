@@ -15,6 +15,12 @@ a fresh `[Unreleased]` block.
 - **Inspect** on a View pane opens its output or sampling preview fullscreen in the gallery's inspect overlay, where **Compare** puts it beside another View pane showing the same kind of media. A sampling preview keeps following its sampler; an output stays the one you opened. Nothing is added to the project.
 - **Sampling previews** in a pane's source menu lists RES4LYF's ClownsharKSampler, SharkSampler, Chainsamplers and BongSampler before their first run.
 
+### Fixed
+- In Prompt Management's **Writing** mode, **New Subject…** chosen from the right-click or Shift+F10 **Attach** now creates the Subject on **Apply**. Before, Apply stored the chip without its Subject. A new speaker for a Vocal event, chosen from **Insert at cursor**, is fixed too.
+- In Writing, a chip waiting for its new Subject shows the Subject's name before Apply. **Ctrl+Z** and **Ctrl+Y**, or cutting and pasting the chip, no longer lose the Subject it will create.
+- A chip added with a Writing block's **+ Attach** while the draft was still updating is no longer left out of its section.
+- Writing's **Apply** refuses a chip whose Subject doesn't exist, says which chip and why, and changes nothing.
+
 ## [0.9.1] - 2026-11-22
 
 ### Added
