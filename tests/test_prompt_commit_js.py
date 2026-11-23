@@ -53,13 +53,16 @@ def test_section_bar_commits_on_focus_loss_and_dedupes_unchanged_channels():
     # Moving focus inside the bar (Save/Delete) is not a commit trigger.
     assert "if (e.relatedTarget && editor.contains(e.relatedTarget)) return;" in editor
     assert "commit({ close: false })" in editor
-    assert "this._promptEditorCommit = () => commit({ close: false });" in editor
+    # A commit made on the way out of the scene keeps the bar open: the
+    # caller's options may not override `close`.
+    assert "this._promptEditorCommit = (options = {}) => commit({ ...options, close: false });" in editor
     # Only a real change reaches the mutation pipeline, so repeated focus
     # changes cannot stack no-op writes or undo entries. The bar records the
     # records it changed (any template's channels) and saves only when the
     # draft holds one; behavior is covered in test_prompt_tool_integrity_baseline.
     assert "const row = mount.record({ documents: channelInputs.readDocuments()," in editor
-    assert "if (row) {" in editor
+    # A refused draft is sent again only by an explicit Save or Retry.
+    assert "if (row && (retryRefused || promptDraftNeedsSend(row))) {" in editor
     # Esc discards; Delete arms before the blur it causes.
     assert "this._hidePromptEditor({ commit: false });" in editor
     assert 'deleteBtn.addEventListener("mousedown", () => { discard = true; });' in editor
@@ -101,11 +104,8 @@ def test_discarding_close_paths_do_not_write_stale_edits():
     delete_section = _method(widget, "_deletePromptSection", "_showItemEditor")
     assert "this._hidePromptEditor({ commit: false });" in delete_section
 
-    # Leaving fullscreen flushes before the mutation drain, not after.
-    exit_fullscreen = _method(widget, "_requestExitFullscreen", "_exitFullscreen")
-    flush_at = exit_fullscreen.index("this._hidePromptEditor();")
-    drain_at = exit_fullscreen.index("await this._drainProjectMutations(")
-    assert flush_at < drain_at
+    # Leaving fullscreen flushes before the mutation drain, and again when a bar
+    # opened while it waited: behaviour in `test_prompt_waiting_saves.py`.
 
 
 def test_timeline_bars_hear_every_acknowledgement_and_stop_when_hidden():

@@ -11,6 +11,14 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Fixed
+- Prompt text saved while an earlier save of the same field is still sending is no longer lost on slow saves:
+  - Switching scene waits until it has been sent ("Finish saving, Undo, or Redo before switching scenes"). Before, the switch dropped it with no message.
+  - **Exit** waits for it and shows *Saving prompt text before closing…*. Before, the editor closed first and showed the old text when reopened.
+  - **+ Queue**, **+ Batch** and **Queue Prompt Sections** send the job after it, so the job gets the new text, and each job keeps the range you clicked.
+- One **Save** in the prompt bar sends once, and text the server refused is not sent again until you change it or press **Save** or **Retry**.
+- A prompt save that can't be sent because its scene is no longer open or its lane is locked now says so, instead of doing nothing.
+
 ## [0.9.2] - 2026-11-23
 
 ### Added

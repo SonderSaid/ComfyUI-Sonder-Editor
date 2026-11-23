@@ -513,6 +513,59 @@ function acknowledgedRecords(row, submitted, acknowledged) {
     return records;
 }
 
+/**
+ * The saves in flight, one promise per row, each covering that row's whole
+ * drain: the running save and any save waiting behind it. A refused row has
+ * none. For callers that must not leave while prompt text is unsent.
+ */
+export function pendingPromptDraftSaves(drafts) {
+    return [...(drafts?.values?.() || [])].map((row) => row?.pending).filter(Boolean);
+}
+
+/**
+ * Whether a save is WAITING behind a running one. It is in no mutation queue
+ * yet, and it is sent against the host's scene at that time, so the scene may
+ * not change first (`EditorWidget._historyIsBusy`). A save already sent carries
+ * its own scene and holds nothing.
+ */
+export function hasWaitingPromptSave(drafts) {
+    return [...(drafts?.values?.() || [])].some((row) => Boolean(row?.pending && row.saveAgain));
+}
+
+/** Whether a commit that is not an explicit Save or Retry should send this row:
+ * not when the server refused exactly this text and it has not changed since. */
+export function promptDraftNeedsSend(row) {
+    return Boolean(row) && !(row.error && !row.pending && row.revision === row.submittedRevision);
+}
+
+const progressListeners = new WeakMap();
+
+/** Hear when a save has been sent or a row's drain has ended; returns cleanup. */
+export function addPromptSaveProgressListener(drafts, listener) {
+    let set = progressListeners.get(drafts);
+    if (!set) progressListeners.set(drafts, set = new Set());
+    set.add(listener);
+    return () => set.delete(listener);
+}
+
+function announceSaveProgress(drafts) {
+    for (const listener of [...(progressListeners.get(drafts) || [])]) {
+        try { listener(); } catch (error) { console.warn("[Sonder] Prompt save listener failed:", error); }
+    }
+}
+
+/** Resolves once no save is waiting behind a running one (at once when none is). */
+export function promptSavesSent(drafts) {
+    if (!hasWaitingPromptSave(drafts)) return Promise.resolve();
+    return new Promise((resolve) => {
+        const stop = addPromptSaveProgressListener(drafts, () => {
+            if (hasWaitingPromptSave(drafts)) return;
+            stop();
+            resolve();
+        });
+    });
+}
+
 function normalizedSaveResult(result) {
     if (result === true) return { status: "acknowledged" };
     if (result === false || result == null) return { status: "refused" };
@@ -536,7 +589,13 @@ export async function savePromptDraft(drafts, key, save) {
     // The save path is host-level, not render-level: a Retry from any surface
     // goes through the same host gesture and the same publication.
     row.retry = () => savePromptDraft(drafts, key, save);
-    if (row.pending) { row.saveAgain = true; return row.pending; }
+    if (row.pending) {
+        // Another send only for a value the running one does not carry. One Save
+        // asks twice (its commit, then the bar's close), and a blur then a Save
+        // ask with the same text: neither may hold the scene or repeat a refusal.
+        if (row.revision !== row.submittedRevision) row.saveAgain = true;
+        return row.pending;
+    }
     row.pending = (async () => {
         let ok = true;
         do {
@@ -551,9 +610,12 @@ export async function savePromptDraft(drafts, key, save) {
             }
             const edit = promptDraftEdit(row);
             row.submitted = clone(row.value);
+            row.submittedRevision = row.revision;
             const submitted = row.submitted;
             try {
-                const outcome = normalizedSaveResult(await save(edit, row));
+                const sending = save(edit, row);
+                announceSaveProgress(drafts);
+                const outcome = normalizedSaveResult(await sending);
                 if (outcome.status === "refused") {
                     row.error = outcome.message
                         || "Save refused. Your draft is kept; copy or discard it before replacing server text.";
@@ -608,6 +670,7 @@ export async function savePromptDraft(drafts, key, save) {
         return await row.pending;
     } finally {
         row.pending = null;
+        announceSaveProgress(drafts);
         // A refusal published during the drain was drawn while the save was
         // still pending (Discard disabled); say it again now that it is not.
         if (row.error && drafts.get(key) === row) publish(drafts, { key, global: row.global, refused: true });

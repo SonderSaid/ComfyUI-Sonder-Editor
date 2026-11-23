@@ -1299,7 +1299,7 @@ export function mountPromptManagementPanel(host) {
         if (host._promptTemplateChanging) event.preventDefault();
     }, true);
 
-    const drafts = host._promptToolDrafts ||= new Map();
+    const drafts = host._promptDrafts?.() || (host._promptToolDrafts ||= new Map());
     // The surfaces drawn by the CURRENT render, by draft key. Acknowledgements
     // and dialog results go here, never to the render that issued a save or
     // opened a dialog (bug tracker L4, L6).
@@ -5751,6 +5751,15 @@ Server value: ${serverValue}` : ""}`;
         },
         cleanup: () => close({ commitFocused: false }),
         isMounted: () => mounted,
+        /** A box the author is typing in, which only its blur would commit. */
+        hasFocusedBox: () => mounted && !!guard.focusedBox
+            && guard.focusedBox.el === document.activeElement,
+        /** Commit that box through its normal blur path, panel still open. */
+        flushFocused: () => {
+            if (!handle.hasFocusedBox()) return false;
+            guard.focusedBox.el.blur();
+            return true;
+        },
     };
     return handle;
 }

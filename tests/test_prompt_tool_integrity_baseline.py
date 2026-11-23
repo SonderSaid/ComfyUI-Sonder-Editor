@@ -1439,6 +1439,7 @@ def _identity_save_host(global_scope=False):
               else _method(widget, "_updatePromptSection", "_updateLinkedPromptAttachment"))
     take = _method(widget, "_takePromptIdentityCreateIntents", "_adoptPromptIdentitiesFromMutation")
     resolve = _method(widget, "_resolvePanelPromptSection", "_deletePromptSectionWithinGesture")
+    blocked = _method(widget, "_promptSaveBlocked", "_updateLinkedPromptAttachment")
     urls = {name: json.dumps((ROOT / f"web/js/{name}.js").as_uri()) for name in
             ("prompt_edit_intent", "prompt_composition", "prompt_channel_templates", "prompt_context_chips")}
     return f"""
@@ -1453,6 +1454,7 @@ class Host {{
  {method}
  {take}
  {resolve}
+ {blocked}
  constructor() {{this.projectDir="p";this.activeSceneId="s";this.row=structuredClone(baseline);this.activeScene=globalScope?this.row:{{prompt_sections:[this.row]}};this.calls=[];this._promptToolDrafts=new Map();}}
  _projectDirName(){{return "p";}} _channelTemplate(){{return getChannelTemplate("sonder");}}
  _isGlobalPromptTrackLocked(){{return false;}} _isPromptTrackLocked(){{return false;}}

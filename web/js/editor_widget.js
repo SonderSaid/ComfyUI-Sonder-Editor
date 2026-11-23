@@ -75,8 +75,9 @@
  * @mutation-obligation field.history-write-set -- MERGED_WRITE_FIELDS and Scene field classification
  */
 import { shouldJoinSweep } from "./render_cache_activation.js";
-import { addPromptDraftListener, createPromptDraftMount, promptEditBody, promptEditFields,
-    promptEditPaint, promptDraftKey, savePromptDraft, rebasePromptDraft } from "./prompt_edit_intent.js";
+import { addPromptDraftListener, addPromptSaveProgressListener, createPromptDraftMount, hasWaitingPromptSave,
+    pendingPromptDraftSaves, promptDraftNeedsSend, promptEditBody, promptEditFields, promptEditPaint, promptDraftKey,
+    promptSavesSent, savePromptDraft, rebasePromptDraft } from "./prompt_edit_intent.js";
 
 const { api } = window.comfyAPI.api;
 
@@ -1429,17 +1430,70 @@ export class EditorWidget {
         return !!(this._pendingHistoryWidgetState || this._pendingApplyWidgetState);
     }
 
+    /** The prompt draft registry, with the one listener that releases a scene
+     *  change deferred behind a waiting save. Every surface takes it from here. */
+    _promptDrafts() {
+        if (!this._promptToolDrafts) {
+            this._promptToolDrafts = new Map();
+            addPromptSaveProgressListener(this._promptToolDrafts, () => {
+                if (!this._destroyed && this._pendingHistoryWidgetState) {
+                    this._replayDeferredHistoryWidgetStateIfIdle?.();
+                }
+            });
+        }
+        return this._promptToolDrafts;
+    }
+
+    /** A prompt save waiting behind a running one is sent against the scene
+     *  that is active then, so a scene change must not overtake it. */
+    _hasWaitingPromptSave() {
+        return hasWaitingPromptSave(this._promptToolDrafts);
+    }
+
+    /** Commit an open timeline prompt bar before a scene-change guard is read:
+     *  the commit the bar makes on the way out could itself have to wait. Not a
+     *  retry: a refused draft the author has not changed is left alone. */
+    _commitOpenPromptBar() {
+        this._promptEditorCommit?.({ retryRefused: false });
+    }
+
+    /** Before a scene change that has already begun (create, duplicate) takes
+     *  the author away: send what waits, and whatever the bar still holds. */
+    async _promptSavesSentBeforeLeaving() {
+        for (;;) {
+            this._commitOpenPromptBar();
+            if (!this._hasWaitingPromptSave()) return;
+            await promptSavesSent(this._promptToolDrafts);
+        }
+    }
+
+    /** For a render job authored while a prompt save waits. The server composes
+     *  a job from the stored scene in queue order, so only the enqueue waits:
+     *  the caller has already read its range and painted its job. Resolves with
+     *  the click's diagnostics, which the wait would otherwise lose. */
+    async _jobBehindPromptSaves() {
+        const diagnostics = this._snapshotMutationDiagnostics?.() ?? null;
+        await promptSavesSent(this._promptToolDrafts);
+        return diagnostics;
+    }
+
     _hasPendingHistoryCommit() {
         return !!this._undoStack?.some((entry) => entry?.pending);
     }
 
-    _historyIsBusy() {
+    /** The one answer to "may the scene change now": Undo/Redo, a scene
+     *  lifecycle, a pending history commit, or a waiting prompt save.
+     *  `leavesScene: false` is for work that stays on the scene (the Prompt
+     *  panel's Format and Attach), which a waiting save does not touch. */
+    _historyIsBusy({ leavesScene = true } = {}) {
         return !!(this._sceneHistoryLifecycleOwner
-            || this._historyOperationInFlight || this._hasPendingHistoryCommit());
+            || this._historyOperationInFlight || this._hasPendingHistoryCommit()
+            || (leavesScene && this._hasWaitingPromptSave?.()));
     }
 
     _beginSceneHistoryLifecycle(label = "scene change", { allowSceneSwitch = false } = {}) {
-        if (this._historyIsBusy()) {
+        if (allowSceneSwitch) this._commitOpenPromptBar?.();
+        if (this._historyIsBusy({ leavesScene: allowSceneSwitch })) {
             notifyInfo("Another scene change is still finishing. Try again in a moment.",
                 { source: "scene-history-lifecycle-pending" });
             return null;
@@ -1464,6 +1518,9 @@ export class EditorWidget {
         if (!values || typeof values !== "object") return;
         let nextValues = values;
         const carriesScene = Object.prototype.hasOwnProperty.call(nextValues, "scene_id");
+        if (carriesScene && String(nextValues.scene_id || "") !== String(this.activeSceneId || "")) {
+            this._commitOpenPromptBar?.();
+        }
         if (this._historyIsBusy() && Object.keys(nextValues).length > 0) {
             // Remote widget updates may carry scene-relative selection fields
             // beside scene_id. Defer the whole payload so none of B's state is
@@ -2090,7 +2147,11 @@ export class EditorWidget {
             if (resp.ok) {
                 const scene = await resp.json();
                 this.scenes.push(scene);
-                this._setActiveScene(scene, { lifecycleToken });
+                // The lifecycle owns this switch, so the guard lets it through.
+                await this._promptSavesSentBeforeLeaving?.();
+                if (!this._destroyed && this.projectDir?.split(/[/\\]/).pop() === dirName) {
+                    this._setActiveScene(scene, { lifecycleToken });
+                }
             }
         } catch (e) {
             console.warn("[Sonder] Failed to create scene:", e);
@@ -2104,8 +2165,10 @@ export class EditorWidget {
         const lifecycleOwnsSwitch = !!(lifecycleToken
             && this._sceneHistoryLifecycleOwner === lifecycleToken
             && lifecycleToken.allowSceneSwitch);
-        if (this._historyIsBusy() && !lifecycleOwnsSwitch && this.activeSceneId
-                && String(scene?.scene_id || "") !== String(this.activeSceneId)) {
+        const changesScene = this.activeSceneId
+            && String(scene?.scene_id || "") !== String(this.activeSceneId);
+        if (changesScene) this._commitOpenPromptBar?.();
+        if (this._historyIsBusy() && !lifecycleOwnsSwitch && changesScene) {
             notifyInfo("Finish saving, Undo, or Redo before switching scenes.",
                 { source: "scene-switch-history-pending" });
             return false;
@@ -2481,6 +2544,7 @@ export class EditorWidget {
     }
 
     _cycleScene(dir) {
+        this._commitOpenPromptBar?.();
         if (this._historyIsBusy()) {
             notifyInfo("Finish saving, Undo, or Redo before switching scenes.",
                 { source: "scene-switch-history-pending" });
@@ -2743,7 +2807,12 @@ export class EditorWidget {
             this.scenes.push(newScene);
             // Duplicating the active scene jumps to the copy (existing flow); duplicating a
             // non-active scene from the switcher leaves the user on their current scene.
-            if (isActive) this._setActiveScene(newScene, { lifecycleToken });
+            if (isActive) {
+                await this._promptSavesSentBeforeLeaving?.();
+                if (!this._destroyed && this.projectDir?.split(/[/\\]/).pop() === dirName) {
+                    this._setActiveScene(newScene, { lifecycleToken });
+                }
+            }
         } finally {
             this._endSceneHistoryLifecycle(lifecycleToken);
         }
@@ -5838,8 +5907,18 @@ export class EditorWidget {
         this._fetchScenes({ ignoreMutationGate: true, reason });
     }
 
+    /**
+     * Wait for every write this editor owes: the mutation queue, and prompt
+     * saves waiting behind a running one, which are in no queue until their
+     * turn. A drain of the queue alone closed the editor between the two.
+     */
     async _drainProjectMutations(reason = "drain") {
-        await this._projectMutationQueue?.drain?.(reason);
+        for (;;) {
+            await this._projectMutationQueue?.drain?.(reason);
+            const saves = pendingPromptDraftSaves(this._promptToolDrafts);
+            if (!saves.length && !this._projectMutationQueue?.isBusy?.()) break;
+            await Promise.allSettled(saves);
+        }
         this._replayDeferredProjectBackedRefresh();
     }
 
@@ -17661,7 +17740,7 @@ export class EditorWidget {
         this._hidePromptEditor();
         const draftProjectId = this._projectDirName(), draftSceneId = this.activeSceneId;
         const draftTemplate = projectTemplateValue(this._channelTemplate());
-        const drafts = this._promptToolDrafts ||= new Map();
+        const drafts = this._promptDrafts();
         const draftKey = promptDraftKey(draftProjectId, draftSceneId, section.prompt_id);
         // The bar records only what it changes: `shown` is the section as the
         // server-side view had it (a first touch's base), the draft view is what
@@ -17689,13 +17768,13 @@ export class EditorWidget {
         const save = (edit) => this._updatePromptSection(idx, {}, { edit,
             promptId: shownSection.prompt_id || "", projectId: draftProjectId,
             sceneId: draftSceneId, template: draftTemplate });
-        const commit = ({ close = true } = {}) => {
+        const commit = ({ close = true, retryRefused = true } = {}) => {
             // Teardown fires a final focusout; only the mounted bar may write,
             // so Esc and Delete cannot be reversed by their own removal.
             if (this._promptEditorEl !== editor) return;
             const row = mount.record({ documents: channelInputs.readDocuments(),
                 attachments: channelInputs.readAttachments() });
-            if (row) {
+            if (row && (retryRefused || promptDraftNeedsSend(row))) {
                 savePromptDraft(drafts, draftKey, save);
                 // The mutation clears the lane highlight; an open bar should
                 // keep pointing at the section its Save/Delete still target.
@@ -17769,7 +17848,7 @@ export class EditorWidget {
         // Insert after timeline canvas
         this.timelineCanvas.parentElement.insertBefore(editor, this.timelineCanvas.nextSibling);
         this._promptEditorEl = editor;
-        this._promptEditorCommit = () => commit({ close: false });
+        this._promptEditorCommit = (options = {}) => commit({ ...options, close: false });
         this._observeInlinePromptEditor(editor);
         this._refreshTimelineLayout();
 
@@ -17792,7 +17871,7 @@ export class EditorWidget {
         this._hidePromptEditor();
         const draftProjectId = this._projectDirName(), draftSceneId = this.activeSceneId;
         const draftTemplate = projectTemplateValue(this._channelTemplate());
-        const drafts = this._promptToolDrafts ||= new Map();
+        const drafts = this._promptDrafts();
         const draftKey = promptDraftKey(draftProjectId, draftSceneId);
         // Records only, as in the section bar: `shown` is the scene's global
         // records as drawn, the draft view is what the bar displays.
@@ -17819,12 +17898,12 @@ export class EditorWidget {
         let suppressBlurCommit = false;
         const save = (edit) => this._updateSceneGlobalContext(null, null, null, { edit,
             projectId: draftProjectId, sceneId: draftSceneId, template: draftTemplate });
-        const commit = () => {
+        const commit = ({ retryRefused = true } = {}) => {
             if (suppressBlurCommit) return;
             if (this._promptEditorEl !== editor) return;
             const row = mount.record({ documents: channelInputs.readDocuments(),
                 attachments: channelInputs.readAttachments() });
-            if (row) savePromptDraft(drafts, draftKey, save);
+            if (row && (retryRefused || promptDraftNeedsSend(row))) savePromptDraft(drafts, draftKey, save);
         };
         const stopListening = addPromptDraftListener(drafts, (event) => {
             if (this._promptEditorEl !== editor) return;
@@ -17880,8 +17959,8 @@ export class EditorWidget {
         baseline = null, projectId = this._projectDirName(), sceneId = this.activeSceneId,
         template = projectTemplateValue(this._channelTemplate()), edit = null,
     } = {}) {
-        if (!this.activeScene || !this.projectDir || this._isGlobalPromptTrackLocked()
-                || projectId !== this._projectDirName() || sceneId !== this.activeSceneId) return false;
+        const blocked = this._promptSaveBlocked(projectId, sceneId, this._isGlobalPromptTrackLocked());
+        if (blocked) return edit ? this._refusePromptSave(blocked) : false;
         const sceneRef = this.activeScene;
         const previous = {
             global_channels: structuredClone(sceneRef.global_channels || {}),
@@ -17946,6 +18025,7 @@ export class EditorWidget {
                     // oldest.
                     coalesce: false,
                     failureMessage: "Global prompt save failed. The Prompt tool keeps your draft." });
+            if (!result) throw this._promptSaveNotSent();
             if (this._promptEditRevisions.get(key) === revision && result?.payload?.scene) {
                 for (const field of Object.keys(next)) sceneRef[field] = structuredClone(result.payload.scene[field]);
                 sceneRef.prompt = result.payload.scene.prompt;
@@ -19521,6 +19601,7 @@ export class EditorWidget {
     }
 
     async _queueSelectedPromptSections(...args) {
+        this._commitOpenPromptBar?.();
         return this._withMutationGesture("queueSelectedPromptSections", () =>
             this._queueSelectedPromptSectionsWithinGesture(...args));
     }
@@ -19581,10 +19662,12 @@ export class EditorWidget {
             this._applyStoredQueueBatchCollapseState();
             this._renderQueuePanel();
 
+            const jobDiagnostics = this._hasWaitingPromptSave?.() ? await this._jobBehindPromptSaves() : null;
             const result = await this._queueProjectMutation({
                 key: `project:queue:prompt-sections:${batchId}`,
                 label: "add prompt section batch",
                 coalesce: false,
+                diagnostics: jobDiagnostics,
                 intent: {
                     projectId,
                     snapshots: JSON.parse(JSON.stringify(snapshots)),
@@ -20173,11 +20256,12 @@ export class EditorWidget {
         template = projectTemplateValue(this._channelTemplate()),
         edit = null,
     } = {}) {
-        if (!this.activeScene || !this.projectDir || this._isPromptTrackLocked()
-                || projectId !== this._projectDirName() || sceneId !== this.activeSceneId) return false;
+        const blocked = this._promptSaveBlocked(projectId, sceneId, this._isPromptTrackLocked());
+        if (blocked) return edit ? this._refusePromptSave(blocked) : false;
         idx = this._resolvePanelPromptSection(idx, baseline?.prompt_id || promptId);
         const section = (this.activeScene.prompt_sections || [])[idx];
-        if (!section) return false;
+        // `_resolvePanelPromptSection` has told the author.
+        if (!section) return edit ? { status: "refused", message: "This prompt section changed or was removed since it was shown." } : false;
         const previous = structuredClone(section);
         const before = baseline || previous;
         // A draft's record edit (`edit`) names exactly the records an author
@@ -20225,6 +20309,7 @@ export class EditorWidget {
                 { key: `prompt:${sceneId}:${before.prompt_id}:fields`, sceneId,
                     label: "edit prompt", coalesce: false,
                     failureMessage: "Prompt save failed. The Prompt tool keeps your draft." });
+            if (!result) throw this._promptSaveNotSent();
             const saved = result?.payload?.scene?.prompt_sections?.find((row) => row.prompt_id === before.prompt_id);
             if (saved && this._promptEditRevisions.get(key) === revision) Object.assign(section, structuredClone(saved));
             this._settlePromptIdentityCreateIntents(identityCreateIntents, { acknowledged: true, draft });
@@ -20245,6 +20330,30 @@ export class EditorWidget {
             return { status: "refused", message: error?.message || "",
                 conflict: error?.payload?.conflict || null };
         }
+    }
+
+    /** Why a prompt save cannot be sent from here, or "" when it can. */
+    _promptSaveBlocked(projectId, sceneId, locked) {
+        if (!this.activeScene || !this.projectDir || projectId !== this._projectDirName()
+                || sceneId !== this.activeSceneId) {
+            return "Prompt text was not saved: its scene is no longer open. Open that scene again and save.";
+        }
+        return locked ? "Prompt text was not saved: its lane is locked. Unlock the lane and save again." : "";
+    }
+
+    /** A refusal before anything is sent. Every other refusal is told by the
+     *  mutation queue; these never reach it, and were silent. */
+    _refusePromptSave(message) {
+        notifyWarning(message, { source: "prompt-save-refused" });
+        return { status: "refused", message };
+    }
+
+    /** `_runSceneMutation` resolves null when there is no project or scene to
+     *  write to. Nothing was sent: read as a success it dropped the draft. */
+    _promptSaveNotSent() {
+        const message = "Prompt text was not saved: the project is not ready. Try again in a moment.";
+        notifyWarning(message, { source: "prompt-save-refused" });
+        return new Error(message);
     }
 
     async _updateLinkedPromptAttachment(...args) {
@@ -24783,10 +24892,38 @@ export class EditorWidget {
         }
         this._projectMutationCloseInProgress = (async () => {
             this._stopPlayback();
-            // Flush an open prompt bar before the drain so a pending edit is
-            // part of it rather than dying with the fullscreen DOM.
-            this._hidePromptEditor();
-            await this._drainProjectMutations(`fullscreen_exit:${reason}`);
+            // Said only when the wait is long enough to look like nothing
+            // happened, and only while prompt text is what it waits for.
+            let notice = null;
+            const noticeTimer = setInterval(() => {
+                const saving = !this._destroyed && pendingPromptDraftSaves(this._promptToolDrafts).length > 0;
+                if (saving) {
+                    notice ||= notifyProgress({ verb: "Waiting", message: "Saving prompt text before closing…",
+                        progress: null, source: "fullscreen-exit-prompt-saves" });
+                } else {
+                    notice?.dismiss?.();
+                    notice = null;
+                }
+            }, 600);
+            try {
+                for (;;) {
+                    // Flush an open prompt bar, and a box being typed in in the
+                    // Prompt panel, before the drain so a pending edit is part of
+                    // it rather than dying with the fullscreen DOM.
+                    this._hidePromptEditor();
+                    this._promptPanelHandle?.flushFocused?.();
+                    await this._drainProjectMutations(`fullscreen_exit:${reason}`);
+                    if (this._destroyed || !this.isFullscreen) break;
+                    // Editing stays possible while it waits: another pass for a
+                    // bar opened, or panel text typed, meanwhile.
+                    this._promptPanelHandle?.flushFocused?.();
+                    if (!this._promptEditorEl
+                            && !pendingPromptDraftSaves(this._promptToolDrafts).length) break;
+                }
+            } finally {
+                clearInterval(noticeTimer);
+                notice?.dismiss?.();
+            }
             if (!this._destroyed && this.isFullscreen) {
                 this._exitFullscreen();
             }
@@ -26225,6 +26362,7 @@ export class EditorWidget {
     }
 
     async _addToRenderQueue(...args) {
+        this._commitOpenPromptBar?.();
         return this._withMutationGesture("addToRenderQueue", () =>
             this._addToRenderQueueWithinGesture(...args));
     }
@@ -26260,10 +26398,12 @@ export class EditorWidget {
 
         try {
             const projectId = this._projectDirName();
+            const jobDiagnostics = this._hasWaitingPromptSave?.() ? await this._jobBehindPromptSaves() : null;
             const result = await this._queueProjectMutation({
                 key: `project:queue:add:${tempId}`,
                 label: "add render queue job",
                 coalesce: false,
+                diagnostics: jobDiagnostics,
                 intent: {
                     projectId,
                     snapshot: JSON.parse(JSON.stringify(snapshot)),
@@ -26308,6 +26448,7 @@ export class EditorWidget {
     }
 
     async _addBatchToRenderQueue(...args) {
+        this._commitOpenPromptBar?.();
         return this._withMutationGesture("addBatchToRenderQueue", () =>
             this._addBatchToRenderQueueWithinGesture(...args));
     }
@@ -26372,12 +26513,15 @@ export class EditorWidget {
             this._applyStoredQueueBatchCollapseState();
             this._renderQueuePanel();
 
+            const projectId = this._projectDirName();
+            const jobDiagnostics = this._hasWaitingPromptSave?.() ? await this._jobBehindPromptSaves() : null;
             const result = await this._queueProjectMutation({
                 key: `project:queue:batch:${batchId}`,
                 label: "add render queue batch",
                 coalesce: false,
+                diagnostics: jobDiagnostics,
                 intent: {
-                    projectId: this._projectDirName(),
+                    projectId,
                     snapshots: JSON.parse(JSON.stringify(snapshots)),
                 },
                 refreshScenes: false,
