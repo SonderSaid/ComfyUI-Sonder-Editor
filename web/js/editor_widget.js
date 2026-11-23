@@ -23552,6 +23552,10 @@ export class EditorWidget {
                 ["Shift+F10 / Menu", "Open the insert menu at the cursor"],
                 ["Arrow keys / Enter", "Move through the menu and choose"],
                 ["Shift+Enter", "Line break (Enter commits a single-field box; a line break in the Writing draft)"],
+                ["On a chip: Enter / Space", "Open its settings"],
+                ["On a chip: Delete / Backspace", "Remove it"],
+                ["On a chip: ← / →", "Back to the text, before or after it"],
+                ["On a chip: type or Ctrl+V", "Continue after it"],
             ]) +
             this._shortcutSection("Controls", [
                 ["Drag row handle", "Reorder or move into another section"],

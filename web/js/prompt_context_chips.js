@@ -1835,14 +1835,115 @@ function promptCaretRangeFromPoint(x, y) {
     return range;
 }
 
+const promptDecoration = (node) => node?.dataset?.sonderDecoration === "1";
+/**
+ * A chip or writing-aid dialog is open. It does not take focus when it opens,
+ * so the chip that opened it stays focused under the backdrop: nothing may
+ * move that focus into the editor behind the modal, where typed text and
+ * pastes would land unseen and the host's post-dialog commit would save them.
+ */
+const promptContextModalOpen = () =>
+    Boolean(document.querySelector?.("[data-sonder-prompt-context-modal='1']"));
+const PROMPT_MAC = /Mac|iPhone|iPad|iPod/.test(String(globalThis.navigator?.platform || ""));
+const promptAuthoredText = (node) => String(node?.nodeValue || "").replaceAll("\u200b", "");
+
+/** Authored characters inside `node` (decorations skipped), or "" for a chip. */
+function promptAuthoredTextWithin(node) {
+    if (!node) return "";
+    if (node.nodeType === Node.TEXT_NODE) return promptAuthoredText(node);
+    if (promptDecoration(node)) return "";
+    if (node.dataset?.nodeType === "attachment") return "";
+    return [...(node.childNodes || [])].map(promptAuthoredTextWithin).join("");
+}
+
+/** Authored characters after DOM position (`container`, `offset`) inside `host`. */
+function promptAuthoredTextAfter(host, container, offset) {
+    // A text node first: a bare text node the browser left beside a chip is
+    // its own `host`, and has no child list to slice.
+    if (container === host && container?.nodeType !== Node.TEXT_NODE) {
+        return [...(host.childNodes || [])].slice(Math.max(0, Number(offset) || 0))
+            .map(promptAuthoredTextWithin).join("");
+    }
+    const at = Math.max(0, Number(offset) || 0);
+    // What follows the position in its own node: the rest of a text node, or
+    // the children after an element boundary's index.
+    let tail = container?.nodeType === Node.TEXT_NODE
+        ? String(container.nodeValue || "").slice(at).replaceAll("\u200b", "")
+        : [...(container?.childNodes || [])].slice(at).map(promptAuthoredTextWithin).join("");
+    // Then every later text in the span: a live `@handle` splits one span
+    // into several runs, and the caret may sit in any of them.
+    let node = container;
+    while (node && node !== host) {
+        const parent = node.parentElement;
+        const siblings = [...(parent?.childNodes || [])];
+        for (const sibling of siblings.slice(siblings.indexOf(node) + 1)) {
+            tail += promptAuthoredTextWithin(sibling);
+        }
+        node = parent;
+    }
+    return tail;
+}
+
+/**
+ * True when DOM position (`container`, `offset`) lies immediately before the
+ * direct child `chip`, or before a run of chips that ends with it: nothing
+ * authored in between. Decorations, zero-width placeholders and the
+ * trailing-break sentinel are not authored. Plain DOM walks, so bare text
+ * nodes the browser leaves beside a chip count as the authored text they are;
+ * the model resolvers cannot see them until the next read.
+ */
+function promptBoundaryImmediatelyBefore(editor, container, offset, chip) {
+    if (!container || !chip || chip.parentElement !== editor) return false;
+    const children = [...(editor.childNodes || [])];
+    const chipIndex = children.indexOf(chip);
+    if (chipIndex < 0) return false;
+    let from;
+    if (container === editor) {
+        from = Math.max(0, Math.min(children.length, Number(offset) || 0));
+    } else {
+        const host = children.find((child) => child === container
+            || (child.contains && child.contains(container)));
+        if (!host || host === chip || host.dataset?.nodeType === "attachment") return false;
+        const hostIndex = children.indexOf(host);
+        if (hostIndex >= chipIndex) return false;
+        if (promptAuthoredTextAfter(host, container, offset)) return false;
+        from = hostIndex + 1;
+    }
+    if (from > chipIndex) return false;
+    // Other chips may sit in between: Gecko reports the start of a run of
+    // chips for a click right of the run's last one.
+    return children.slice(from, chipIndex).every((between) => !promptAuthoredTextWithin(between));
+}
+
+/** The rect of a chip's LAST line box: an inline handle chip can wrap. */
+function promptChipLastRect(chip) {
+    const rects = [...(chip.getClientRects?.() || [])]
+        .filter((rect) => rect && (rect.width > 0 || rect.height > 0));
+    return rects.length ? rects[rects.length - 1] : chip.getBoundingClientRect();
+}
+
+/** True when a collapsed boundary is drawn on the row `rect` occupies. */
+function promptBoundaryOnRow(boundary, rect) {
+    const caret = boundary.getClientRects?.()[0];
+    if (!caret || !(caret.height > 0)) return false;
+    const middle = (caret.top + caret.bottom) / 2;
+    return middle >= rect.top && middle <= rect.bottom;
+}
+
 /**
  * Correct native point placement only at contenteditable's atomic boundaries.
  * Chromium can report a caret inside a `contenteditable=false` attachment when
  * the editor background beside or below that chip is clicked. Text positions
  * remain entirely native; this helper only snaps an atomic hit before/after the
  * direct model chip, with the below-terminal case taking precedence.
+ *
+ * Gecko instead maps a click right of a chip that ends its line to the text
+ * BEFORE the chip, so typing there lands in front of it (bug tracker, Firefox
+ * trailing chip). `live` is the browser's own collapsed result for this click;
+ * it and the point range are both checked, because which one Gecko reports as
+ * "before the chip" is the browser's business.
  */
-function snapPromptCaretAtAtomicBoundary(editor, x, y, range = null) {
+function snapPromptCaretAtAtomicBoundary(editor, x, y, range = null, { live = null } = {}) {
     // Editing may leave a bare text node in the live DOM until the next render.
     // `children` would skip it and falsely call the preceding chip terminal.
     const lastContentChild = [...(editor?.childNodes || [])].reverse().find((child) => {
@@ -1857,11 +1958,38 @@ function snapPromptCaretAtAtomicBoundary(editor, x, y, range = null) {
         if (y > rect.bottom) return setCaretAfter(lastContentChild);
     }
 
+    // A click right of a chip on its last line, resolved to the position just
+    // before that chip: the author aimed after it. A boundary inside the text
+    // after the chip, or Chromium's own after-chip result, is not "before".
+    const boundaries = [live, range].filter((value) => value?.collapsed !== false
+        && value?.startContainer && editor.contains?.(value.startContainer));
+    if (boundaries.length) {
+        // Last chip first: right of a run of chips means after the run's last.
+        // A click above the chip (the field's top padding, a taller line) counts
+        // only when the browser put the caret on the chip's own row: one near
+        // the bottom of the line above a soft-wrapped chip belongs to that line.
+        for (const candidate of [...(editor?.childNodes || [])].reverse()) {
+            if (candidate?.dataset?.nodeType !== "attachment") continue;
+            const rect = promptChipLastRect(candidate);
+            if (!(x > rect.right && y <= rect.bottom)) continue;
+            if (boundaries.some((boundary) =>
+                (y >= rect.top || promptBoundaryOnRow(boundary, rect))
+                && promptBoundaryImmediatelyBefore(
+                    editor, boundary.startContainer, boundary.startOffset, candidate))) {
+                return setCaretAfter(candidate);
+            }
+        }
+    }
+
     let container = range?.startContainer || null;
     if (container?.nodeType === Node.TEXT_NODE) container = container.parentElement;
     if (!(container instanceof HTMLElement)) container = container?.parentElement || null;
     const chip = container?.closest?.('[data-node-type="attachment"]') || null;
     if (!chip || chip.parentElement !== editor) return false;
+    // Right of a wrapped handle's last line is after it, though the middle of
+    // its bounding box lies further right.
+    const last = promptChipLastRect(chip);
+    if (x > last.right && y >= last.top) return setCaretAfter(chip);
     const rect = chip.getBoundingClientRect();
     return x < (rect.left + rect.right) / 2
         ? setCaretBefore(chip) : setCaretAfter(chip);
@@ -2133,6 +2261,61 @@ export function createPromptDocumentEditor({
             // stale saved caret into an end-of-document insertion.
             return false;
         }
+    };
+    /**
+     * Give the editor focus with a collapsed caret beside one of its chips.
+     *
+     * The single way out of a chip into the text: a focused chip is not
+     * editable, so letters did nothing there, Enter opened its settings, and a
+     * paste landed wherever `focus()` put the caret (the start of the prompt in
+     * Chromium). False when the box is locked or composing, the editor is
+     * detached, or the chip is no longer in the model; callers then leave
+     * things as they are rather than guess a position.
+     */
+    const caretBesideChip = (chipOrNodeId, side = "after") => {
+        if (!isEditable() || composing || editor.isConnected === false) return false;
+        const nodeId = typeof chipOrNodeId === "string"
+            ? chipOrNodeId : chipOrNodeId?.dataset?.nodeId;
+        if (!nodeId || !model.nodes.some((node) =>
+            node.node_id === nodeId && node.type === "attachment")) return false;
+        const boundary = { node_id: nodeId, offset: side === "after" ? 1 : 0 };
+        return restoreSelection({ start: boundary, end: boundary });
+    };
+    /** This editor's own chip for an event target, or null. */
+    const ownChipFor = (target) => {
+        const chip = target?.closest?.('[data-node-type="attachment"]');
+        return chip && chip.parentElement === editor ? chip : null;
+    };
+    /**
+     * Open a chip's settings, then hand the caret back beside it once the
+     * host's dialog has settled. The dialog removes itself without returning
+     * focus, which left the page focused and the author with no caret. A host
+     * or dialog that placed focus somewhere itself (the editor, a control) is
+     * left alone, and so is a remounted or detached editor.
+     */
+    const activateChip = (attachment, node) => {
+        let result;
+        try {
+            result = onActivateAttachment?.(attachment, node);
+        } finally {
+            // `Promise.resolve` of a native promise is that promise, so this
+            // handler is the host's own: log its failure rather than hide it.
+            Promise.resolve(result).catch((error) => {
+                console.warn("[Sonder] Chip settings failed:", error);
+            }).then(() => {
+                const active = document.activeElement;
+                if (active && active !== document.body && active !== document.documentElement) return;
+                if (editor.isConnected === false || !isEditable()) return;
+                // A host that returned before its dialog closed: never put a
+                // caret behind an open modal, where typing would go unseen.
+                if (promptContextModalOpen()) return;
+                if (!caretBesideChip(node?.node_id, "after")) editor.focusEnd?.();
+            }).catch((error) => {
+                // Focus repair is best effort: the dialog's own result stands.
+                console.warn("[Sonder] Could not return the caret after a chip dialog:", error);
+            });
+        }
+        return result;
     };
 
     // A history entry restores this box's DOCUMENT whole, but the attachment
@@ -2495,13 +2678,13 @@ export function createPromptDocumentEditor({
             chip.addEventListener("click", (event) => {
                 event.preventDefault();
                 event.stopPropagation();
-                onActivateAttachment?.(attachment, node);
+                activateChip(attachment, node);
             });
             chip.addEventListener("keydown", (event) => {
                 if (!["Enter", " "].includes(event.key)) return;
                 event.preventDefault();
                 event.stopPropagation();
-                onActivateAttachment?.(attachment, node);
+                activateChip(attachment, node);
             });
             editor.appendChild(chip);
             paintDecorations(nodeIndex);
@@ -2681,11 +2864,80 @@ export function createPromptDocumentEditor({
     // on a chip breaks click-to-open and focus (durable rule, chip pointer
     // mapping). Primary button, no modifiers, mouse or pen; right-click, touch,
     // keyboard activation and the nested Remove button keep their own paths.
+    // A press that starts on a chip and is released off it: the chip took
+    // focus on the press (it is a tab stop), no click opens it, and the
+    // author was left with no text caret in every browser (bug tracker,
+    // trailing chip). The release is read on the document in the capture
+    // phase, because it may land anywhere and Gecko can retarget it, and
+    // "released on the chip" is decided by the chip's rects, not the target.
+    // Settled after the click and the browser's own mouseup selection pass,
+    // so neither overrides the caret. Always a COLLAPSED caret: a range that
+    // was live before the press is never handed to the editor, which would
+    // let the next key act on text the author did not select.
+    let pendingChipPress = null;
+    const pointIn = (rect, x, y) => rect && x >= rect.left && x <= rect.right
+        && y >= rect.top && y <= rect.bottom;
+    const settleChipPress = (press, x, y) => {
+        if (editor.isConnected === false || !isEditable() || composing) return;
+        if (promptContextModalOpen()) return;
+        const chip = [...editor.childNodes].find((child) =>
+            child?.dataset?.nodeId === press.nodeId && child.dataset.nodeType === "attachment");
+        if (chip && [...(chip.getClientRects?.() || [chip.getBoundingClientRect()])]
+            .some((rect) => pointIn(rect, x, y))) return;
+        const active = document.activeElement;
+        // Something else took focus meanwhile (a dialog, another control).
+        if (active && active !== editor && !editor.contains(active)
+                && active !== document.body) return;
+        if (pointIn(editor.getBoundingClientRect(), x, y)
+                && setPromptCaretFromPoint(editor, x, y)) {
+            const landed = selectionPoint(editor);
+            const host = landed && (landed.startContainer?.nodeType === Node.TEXT_NODE
+                ? landed.startContainer.parentElement : landed.startContainer);
+            const misplaced = !landed
+                || host?.closest?.("[data-sonder-decoration='1']")
+                || (host !== editor && ownChipFor(host));
+            if (!misplaced) return;
+        }
+        if (!caretBesideChip(press.nodeId, "after")) editor.focusEnd?.();
+    };
+    const armChipPress = (chip, pointerId) => {
+        pendingChipPress?.disarm();
+        const press = { nodeId: chip.dataset.nodeId };
+        // Only this pointer's release settles the press. A release lost to an
+        // iframe or a window switch must not let the next unrelated click
+        // anywhere pull focus into the prompt: any new press, or the window
+        // losing focus, disarms it instead.
+        const ours = (event) => pointerId === undefined || event.pointerId === undefined
+            || event.pointerId === pointerId;
+        const onRelease = (event) => {
+            if (!ours(event)) return;
+            press.disarm();
+            if (event.type !== "pointerup") return;
+            const { clientX: x, clientY: y } = event;
+            setTimeout(() => settleChipPress(press, x, y), 0);
+        };
+        const onAbandon = () => press.disarm();
+        press.disarm = () => {
+            document.removeEventListener?.("pointerup", onRelease, true);
+            document.removeEventListener?.("pointercancel", onRelease, true);
+            document.removeEventListener?.("pointerdown", onAbandon, true);
+            globalThis.removeEventListener?.("blur", onAbandon);
+            if (pendingChipPress === press) pendingChipPress = null;
+        };
+        document.addEventListener?.("pointerup", onRelease, true);
+        document.addEventListener?.("pointercancel", onRelease, true);
+        // Registered while the arming press is already past the document's
+        // capture phase, so only a LATER press reaches it.
+        document.addEventListener?.("pointerdown", onAbandon, true);
+        globalThis.addEventListener?.("blur", onAbandon);
+        pendingChipPress = press;
+    };
     editor.addEventListener("pointerdown", (event) => {
         if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
         if (event.pointerType && !["mouse", "pen"].includes(event.pointerType)) return;
         const chip = event.target?.closest?.('[data-node-type="attachment"]');
         if (!chip || !editor.contains(chip) || event.target.closest?.("button")) return;
+        if (chip.parentElement === editor && isEditable() && !composing) armChipPress(chip, event.pointerId);
         const selection = globalThis.getSelection?.();
         if (!selection?.rangeCount || selection.isCollapsed) return;
         const rect = chip.getBoundingClientRect?.();
@@ -2750,8 +3002,9 @@ export function createPromptDocumentEditor({
         // `click` runs after the browser has made its native selection. Preserve
         // every ordinary text hit and repair only a native atomic-chip result.
         const range = promptCaretRangeFromPoint(event.clientX, event.clientY);
+        const live = selection.rangeCount ? selection.getRangeAt(0) : null;
         snapPromptCaretAtAtomicBoundary(
-            editor, event.clientX, event.clientY, range);
+            editor, event.clientX, event.clientY, range, { live });
     });
     /**
      * Rebuild the DOM from the model when a selection end sits in a bare
@@ -3061,6 +3314,13 @@ export function createPromptDocumentEditor({
         const chipTarget = event.target?.closest?.('[data-node-type="attachment"]');
         if (range && !range.collapsed && (chipTarget || !inEditor(range.startContainer)
                 || !inEditor(range.endContainer))) return;
+        // A paste a chip received lands after that chip. Inserting from there
+        // ran `editor.focus()` with no caret in the text, which Chromium puts
+        // at offset 0, so the paste saved at the start of the prompt. A chip
+        // the caret cannot be moved beside (a locked box, a stale chip) pastes
+        // nothing rather than anywhere else.
+        const ownChip = ownChipFor(event.target);
+        if (ownChip && (promptContextModalOpen() || !caretBesideChip(ownChip, "after"))) return;
         const scope = clipboardScope?.();
         if (fragment && scope && fragment.project === String(scope.project || "")
                 && fragment.scene === String(scope.scene || "")
@@ -3088,14 +3348,60 @@ export function createPromptDocumentEditor({
         if (composing || event.isComposing === true || event.keyCode === 229) {
             return false;
         }
+        // Behind an open chip dialog, keys aimed at the chip that opened it do
+        // nothing: no second dialog, no deletion, and no focus moved into the
+        // editor under the modal. Tab, Escape and the browser's own shortcuts
+        // (reload, copy, zoom) keep their handling; a key that could type or
+        // edit is swallowed, because Chrome types over a range left live here.
+        if (event.target?.dataset?.nodeType === "attachment" && ownChipFor(event.target)
+                && promptContextModalOpen()) {
+            const key = String(event.key || "");
+            const command = (event.ctrlKey || event.metaKey)
+                && event.getModifierState?.("AltGraph") !== true;
+            const edits = command
+                ? ["z", "y", "x", "v", "Delete", "Backspace", "Enter", " "].some((value) =>
+                    value.toLowerCase() === key.toLowerCase())
+                : !["Tab", "Escape"].includes(key)
+                    && (!/^F\d+$/.test(key) || (key === "F10" && event.shiftKey));
+            if (!edits) return false;
+            event.preventDefault();
+            return true;
+        }
         if (["Enter", " "].includes(event.key)
                 && event.target?.dataset?.nodeType === "attachment") {
             event.preventDefault();
             const attachment = attachments.find((value) =>
                 value.attachment_id === event.target.dataset.attachmentId);
             const node = model.nodes.find((value) => value.node_id === event.target.dataset.nodeId);
-            if (attachment && node) onActivateAttachment?.(attachment, node);
+            if (attachment && node) activateChip(attachment, node);
             return true;
+        }
+        // A chip holding focus is not editable: a paste, a printable key or the
+        // insert menu acts from the caret after it instead. The caret moves in
+        // keydown and the key is NOT consumed, so the browser delivers the
+        // paste or the character natively to the now-focused editor: one
+        // `beforeinput` and history entry, the `@` menu, dead keys and IME all
+        // as for ordinary typing. Moving first also collapses any older range,
+        // so the key never replaces text the author can no longer see.
+        const focusedChipTarget = event.target?.dataset?.nodeType === "attachment"
+            ? ownChipFor(event.target) : null;
+        if (focusedChipTarget) {
+            const key = String(event.key || "");
+            const command = event.ctrlKey || event.metaKey;
+            const altGraph = event.getModifierState?.("AltGraph") === true;
+            const paste = (command && key.toLowerCase() === "v")
+                || (event.shiftKey && key === "Insert");
+            const insertMenu = key === "ContextMenu" || (key === "F10" && event.shiftKey);
+            // Alt+letter is a menu accelerator on Windows and Linux and types
+            // nothing; on macOS, Option composes characters.
+            const printable = (!command || altGraph) && (!event.altKey || altGraph || PROMPT_MAC)
+                && (key === "Dead" || [...key].length === 1);
+            if (paste || printable) {
+                if (caretBesideChip(focusedChipTarget, "after")) return false;
+            } else if (insertMenu) {
+                // The menu opens and inserts at the caret: put it at the chip.
+                caretBesideChip(focusedChipTarget, "after");
+            }
         }
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
             event.preventDefault();
@@ -3219,8 +3525,14 @@ export function createPromptDocumentEditor({
         } else if (["ArrowLeft", "ArrowRight"].includes(event.key)
             && event.target?.dataset?.nodeType === "attachment") {
             event.preventDefault();
-            if (event.key === "ArrowLeft") setCaretBefore(event.target);
-            else setCaretAfter(event.target);
+            // Focus goes back to the text with the caret on that side; setting
+            // the selection alone left the chip focused, so the next letter
+            // still went nowhere. A locked box keeps the old caret-only move.
+            const side = event.key === "ArrowLeft" ? "before" : "after";
+            if (!caretBesideChip(event.target, side)) {
+                if (side === "before") setCaretBefore(event.target);
+                else setCaretAfter(event.target);
+            }
             return true;
         }
         for (const handler of ownedKeyHandlers) {

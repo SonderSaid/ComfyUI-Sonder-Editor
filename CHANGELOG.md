@@ -14,12 +14,18 @@ a fresh `[Unreleased]` block.
 ### Added
 - **Inspect** on a View pane opens its output or sampling preview fullscreen in the gallery's inspect overlay, where **Compare** puts it beside another View pane showing the same kind of media. A sampling preview keeps following its sampler; an output stays the one you opened. Nothing is added to the project.
 - **Sampling previews** in a pane's source menu lists RES4LYF's ClownsharKSampler, SharkSampler, Chainsamplers and BongSampler before their first run.
+- Typing or pasting while an inline chip in a prompt field is selected continues right after the chip; **Enter** and **Space** still open it. The editor's shortcut list (**?**) shows the keys a selected chip answers to.
 
 ### Fixed
 - In Prompt Management's **Writing** mode, **New Subject…** chosen from the right-click or Shift+F10 **Attach** now creates the Subject on **Apply**. Before, Apply stored the chip without its Subject. A new speaker for a Vocal event, chosen from **Insert at cursor**, is fixed too.
 - In Writing, a chip waiting for its new Subject shows the Subject's name before Apply. **Ctrl+Z** and **Ctrl+Y**, or cutting and pasting the chip, no longer lose the Subject it will create.
 - A chip added with a Writing block's **+ Attach** while the draft was still updating is no longer left out of its section.
 - Writing's **Apply** refuses a chip whose Subject doesn't exist, says which chip and why, and changes nothing.
+- In Firefox, clicking just after a chip that ends a line in a prompt field puts the cursor after the chip. What you typed used to land in front of it. The same is fixed in every browser for a chip whose name wraps onto a second line.
+- A drag that starts on a chip in a prompt field leaves a text cursor where you let go. Before, the chip stayed selected, so typing did nothing and **Save** had nothing to save.
+- Pasting while a chip is selected no longer puts the text at the start of the prompt.
+- While a chip's settings are open, **Delete** and other keys no longer change the prompt behind them.
+- Closing a chip's settings, or pressing **←** or **→** on a selected chip, puts the cursor back in the text beside it.
 
 ## [0.9.1] - 2026-11-22
 

@@ -85,6 +85,10 @@ def test_all_channels_is_the_new_browser_local_default_and_keeps_every_editor_mo
     assert "contextMenuHintDismissed: raw.contextMenuHintDismissed" in settings
     assert 'this._shortcutSection("Prompt"' in widget
     assert '"Shift+F10 / Menu"' in widget
+    # Chip Focus plan: the keys a focused chip answers to are listed.
+    for row in ('"On a chip: Enter / Space"', '"On a chip: Delete / Backspace"',
+                '"On a chip: ← / →"', '"On a chip: type or Ctrl+V"'):
+        assert row in widget, row
 
 
 def test_menu_rows_bound_declared_hint_text_and_keep_the_arrow_rightmost():

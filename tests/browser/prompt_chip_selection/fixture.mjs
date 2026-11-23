@@ -20,6 +20,7 @@ const MARKUP = `<!doctype html><meta charset="utf-8"><title>Sonder prompt chip s
 // `state` reports text, model, attachments, focus and the live selection.
 const FIXTURE = String.raw`
 import { createPromptDocumentEditor } from '/js/prompt_context_chips.js';
+import { register, PRIORITY } from '/js/keyboard_ownership.js';
 const text = (node_id, text) => ({ node_id, type: 'text', text });
 const chip = (node_id) => ({ node_id, type: 'attachment', attachment_id: node_id });
 let e, changes;
@@ -39,15 +40,44 @@ const selection = () => {
 const record = () => [e.promptDocument.nodes.map((n) => [n.node_id, n.type === 'text' ? n.text : n.attachment_id]),
   e.promptAttachments.map((a) => a.attachment_id)];
 window.state = () => ({ doc: e.value, data: record(), changes: [...changes], selection: selection() });
-window.setup = ({ variant = 'pills', nodes: custom = null } = {}) => {
+// A stand-in for a chip's settings dialog. Like the real one it covers the page,
+// takes no focus when it opens (the chip under it keeps it), closes on Cancel or
+// Escape, and removes itself without returning focus.
+window.dialogs = 0;
+const fakeDialog = () => new Promise((resolve) => {
+  window.dialogs += 1;
+  const backdrop = document.createElement('div');
+  backdrop.dataset.sonderPromptContextModal = '1';
+  backdrop.style.cssText = 'position:fixed;inset:0;background:rgba(5,8,12,.5)';
+  const cancel = document.createElement('button');
+  cancel.id = 'dialog-cancel'; cancel.textContent = 'Cancel';
+  let release = () => {};
+  const finish = () => { release(); backdrop.remove(); resolve(null); };
+  release = register({ id: 'fixture-dialog', priority: PRIORITY.OVERLAY,
+    keydown: (event) => { if (event.key !== 'Escape') return false; finish(); return true; } });
+  cancel.addEventListener('click', finish);
+  backdrop.append(cancel); document.body.append(backdrop);
+});
+window.setup = ({ variant = 'pills', nodes: custom = null, handle = false, dialog = false } = {}) => {
   const nodes = custom ? custom : variant === 'plain' ? [text('L', 'KEEP-LEFT alpha ONE\nline TWO beta KEEP-RIGHT')]
     : variant === 'one' ? [text('L', 'KEEP-LEFT alpha '), chip('C'), text('M', ' beta KEEP-RIGHT')]
+    : variant === 'trailing' ? [text('L', 'KEEP-LEFT alpha '), chip('C')]
+    : variant === 'run' ? [text('L', 'KEEP-LEFT alpha '), chip('C'), chip('D')]
+    : variant === 'alone' ? [text('L', 'first line\n'), chip('C'), text('M', '\nthird line')]
+    : variant === 'softwrap' ? [text('L', 'word '.repeat(16) + 'last '), chip('C')]
+    // A handle label long enough to wrap: its last line is short.
+    : variant === 'wrapped' ? [text('L', 'word '.repeat(14)),
+      { node_id: 'C', type: 'attachment', attachment_id: ' the quick brown fox jumps over it' }]
+    : variant === 'lineEnd' ? [text('L', 'KEEP-LEFT alpha '), chip('C'), text('M', '\nsecond line KEEP-RIGHT')]
     : [text('L', 'KEEP-LEFT alpha '), chip('C'), text('M', ' beta ONE\nline TWO '), chip('D'), text('R', ' omega KEEP-RIGHT')];
   changes = [];
+  window.dialogs = 0;
   e = createPromptDocumentEditor({ document: { nodes },
     attachments: nodes.filter((n) => n.type === 'attachment').map((n) =>
       ({ attachment_id: n.attachment_id, kind: 'reference', source: {}, config: {} })),
-    attachmentLabelFor: (a) => 'CHIP ' + a.attachment_id,
+    // '@Name' renders as a handle chip: inline, wrapping, affordances on focus.
+    attachmentLabelFor: (a) => (handle ? '@Hero' : 'CHIP ') + a.attachment_id,
+    ...(dialog ? { onActivateAttachment: fakeDialog } : {}),
     onChange: (d) => changes.push(d.reason) });
   window.e = e;
   document.getElementById('host').replaceChildren(e.promptField || e);
@@ -69,6 +99,20 @@ window.point = (where) => {
   return { x: Math.round(b.x), y: Math.round(b.y + b.height / 2) };
 };
 window.focusEditor = () => { e.focus(); return document.activeElement === e; };
+// A point beside a chip's LAST line box (a handle can wrap): dx right of its
+// right edge, dy below its middle.
+window.beside = (id, dx = 8, dy = 0) => {
+  const el = e.querySelector('[data-node-id="' + id + '"]');
+  const rects = [...el.getClientRects()].filter((r) => r.width || r.height);
+  const r = rects[rects.length - 1];
+  return { x: Math.round(r.right + dx), y: Math.round((r.top + r.bottom) / 2 + dy) };
+};
+window.outside = () => { const r = document.querySelector('#other').getBoundingClientRect();
+  return { x: Math.round(r.left + 40), y: Math.round(r.top + r.height / 2) }; };
+window.cancelPoint = () => { const r = document.getElementById('dialog-cancel').getBoundingClientRect();
+  return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; };
+// The model in reading order, chips as [id]: where a typed letter landed.
+window.order = () => e.promptDocument.nodes.map((n) => n.type === 'text' ? n.text : '[' + n.attachment_id + ']').join('');
 // What the author sees: the highlighted prose and the field's prose, with chip
 // labels and zero-width padding left out (what the model's text holds).
 const prose = (root) => { root.querySelectorAll?.('[data-node-type="attachment"]').forEach((n) => n.remove());
