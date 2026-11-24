@@ -20,6 +20,11 @@ a fresh `[Unreleased]` block.
   - A take that finishes while the other server is saving waits for it.
   - If the other server doesn't let go, the save says *Another ComfyUI process is saving this project. Try again in a moment.*
   - Favorites, names and folders still save without that check: one set at the moment a take lands can drop it from the project, on one server too.
+- Undo and Redo reverse only your own edit:
+  - A take that landed around the edit, or another server's change, is no longer removed along with it. Redo no longer hides such a take until it finishes.
+  - Undo of the first text in a prompt channel removes the text, and Redo brings it back. Before, the text stayed and Redo was refused. The same goes for a Writing **Apply** that creates Subjects.
+  - A Reference item or member you deleted from the Library is not brought back by an older step; a notice says what was left out.
+  - Undo of a lane removal is refused when a take has landed on that lane since, instead of putting your clip on the take's lane.
 - A queue run that fails keeps its own error when the job could not be marked failed.
 
 ### Changed

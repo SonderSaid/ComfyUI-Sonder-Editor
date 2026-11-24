@@ -98,6 +98,7 @@ from .scene_history_merge import (
     scene_history_write_fields,
     SceneMergeConflict,
     SceneRestoreReceiptStore,
+    drop_missing_reference_members,
     has_durable_scene_restore_receipt,
     merge_scene_history,
     remember_durable_scene_restore_receipt,
@@ -169,6 +170,7 @@ from . import prompt_context
 from . import frozen_prompt
 from . import minimax_h3
 from . import prompt_payload
+from . import scene_history_delta
 from . import scene_mutation_addressing
 from . import change_certificates
 from . import project_repair
@@ -6520,6 +6522,8 @@ def _apply_scene_mutation_batch(project: TimelineProject, scene_id: str,
                and change_certificates.batch_is_certifiable(operations)
                and not change_certificates.scene_ids_minted_at_load(scene) else None)
 
+    captured = scene_history_delta.capture(scene)
+
     if _media_io_operation_count(project, operations) > 1:
         _mutation_error(
             "A scene mutation batch may contain at most one media-I/O create operation",
@@ -6585,6 +6589,14 @@ def _apply_scene_mutation_batch(project: TimelineProject, scene_id: str,
         "results": results,
         "scene": scene.to_dict(),
     }
+    # The before side of this write's Undo step, from the same commit attempt as the
+    # `scene` beside it. Absent when it could not be built: the client then keeps the
+    # copy it took itself.
+    history_before = (
+        scene_history_delta.delta_from_capture(captured, scene, payload["scene"])
+        if committed else scene_history_delta.empty_delta())
+    if history_before is not None:
+        payload["history_before"] = history_before
     if any(str(operation.get("type") or "") in {
                "import_prompt_context_dependencies",
                "create_prompt_semantic_unit",
@@ -15027,6 +15039,13 @@ if routes is not None:
     # Scene restore (undo/redo support)
     # -----------------------------------------------------------------------
 
+    def _restore_receipt_notice(receipt) -> dict:
+        """What a receipt answer repeats of the committed answer besides the scene: the
+        notice, never `history_before`, which belongs to that commit's own scene."""
+        payload = receipt.payload if receipt is not None else None
+        count = (payload or {}).get("dropped_reference_members")
+        return {"dropped_reference_members": count} if count else {}
+
     @routes.post("/sonder-editor/project/{project_id}/scenes/{scene_id}/restore-token")
     async def api_issue_scene_restore_token(request: web.Request) -> web.Response:
         try:
@@ -15061,6 +15080,7 @@ if routes is not None:
                 "status": "committed",
                 "restore_token": token,
                 "scene": current_scene.to_dict() if current_scene is not None else None,
+                **_restore_receipt_notice(receipt),
             })
         if receipt is None:
             return _json_error("Scene restore receipt not found", 404)
@@ -15110,7 +15130,8 @@ if routes is not None:
             if current_scene is None:
                 return _json_error(f"Scene not found: {scene_id}", 404)
             return web.json_response({
-                "scene": current_scene.to_dict(), "restore_token": token})
+                "scene": current_scene.to_dict(), "restore_token": token,
+                **_restore_receipt_notice(receipt)})
         if receipt is None:
             return web.json_response({
                 "error": "Scene restore token is missing or expired; try Undo again.",
@@ -15121,7 +15142,8 @@ if routes is not None:
             if current_scene is None:
                 return _json_error(f"Scene not found: {scene_id}", 404)
             return web.json_response({
-                "scene": current_scene.to_dict(), "restore_token": token})
+                "scene": current_scene.to_dict(), "restore_token": token,
+                **_restore_receipt_notice(receipt)})
         if receipt.status == "refused" and receipt.payload is not None:
             return web.json_response(copy.deepcopy(receipt.payload), status=409)
 
@@ -15132,14 +15154,21 @@ if routes is not None:
                 if current_scene is None:
                     return _json_error(f"Scene not found: {scene_id}", 404)
                 return web.json_response({
-                    "scene": current_scene.to_dict(), "restore_token": token})
+                    "scene": current_scene.to_dict(), "restore_token": token,
+                    **_restore_receipt_notice(receipt)})
             scene = project.get_scene(scene_id)
             if scene is None:
                 return _json_error(f"Scene not found: {scene_id}", 404)
             stored_scene = scene.to_dict()
+            # A step never restores a Reference member the Library no longer has. Once
+            # per attempt: a CAS retry judges the document it reloaded.
+            step_base, step_target, dropped_members = drop_missing_reference_members(
+                base_scene, target_scene, stored_scene,
+                (member.member_id for entity in project.references or []
+                 for member in entity.members))
             try:
                 merged_dict = merge_scene_history(
-                    base_scene, target_scene, stored_scene)
+                    step_base, step_target, stored_scene)
             except SceneMergeConflict as exc:
                 payload = {
                     "error": str(exc),
@@ -15166,7 +15195,7 @@ if routes is not None:
                 # repairing stable member ids and pruning invalid linked groups.
                 _validate_scene_history_link_groups(merged_dict)
                 merged_scene = Scene.from_dict(merged_dict)
-                _validate_scene_history_merge(merged_scene, target_scene, stored_scene)
+                _validate_scene_history_merge(merged_scene, step_target, stored_scene)
             except (TypeError, ValueError) as exc:
                 exc = ProjectMutationRequestError(
                     f"Merged scene data is invalid: {exc}", 409,
@@ -15230,8 +15259,16 @@ if routes is not None:
                 continue
 
             payload = {"scene": merged_scene.to_dict(), "restore_token": token}
+            if dropped_members:
+                payload["dropped_reference_members"] = dropped_members
             _SCENE_RESTORE_RECEIPTS.finish(
                 token, project_id, scene_id, status="committed", payload=payload)
+            # Only this answer carries the pair: a receipt answers with the current
+            # scene, which this commit's before-state does not belong to.
+            history_before = scene_history_delta.delta_between_or_none(
+                stored_scene, payload["scene"])
+            if history_before is not None:
+                payload["history_before"] = history_before
             # A CAS retry may replace the request's initially remembered project.
             # The version-header middleware must stamp the object that actually
             # committed, or the client immediately regresses to a stale version.

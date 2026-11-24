@@ -1727,7 +1727,10 @@ def test_scene_restore_token_is_idempotent_and_queryable(tmp_path, monkeypatch):
         "project_id": "project", "scene_id": "scene-1", "token": restart_token})))
 
     assert first.status == second.status == after_restart.status == receipt.status == 200
-    assert _response_json(first) == _response_json(second)
+    # Only the answer of the request that committed carries its before-state.
+    committed = _response_json(first)
+    assert committed.pop("history_before")
+    assert committed == _response_json(second)
     assert _response_json(after_restart)["scene"]["name"] == "Before"
     assert _response_json(receipt)["status"] == "committed"
     assert _response_json(receipt)["scene"]["name"] == "Concurrent after restore"

@@ -78,6 +78,7 @@ import { shouldJoinSweep } from "./render_cache_activation.js";
 import { addPromptDraftListener, addPromptSaveProgressListener, createPromptDraftMount, hasWaitingPromptSave,
     pendingPromptDraftSaves, promptDraftNeedsSend, promptEditBody, promptEditFields, promptEditPaint, promptDraftKey,
     promptSavesSent, savePromptDraft, rebasePromptDraft } from "./prompt_edit_intent.js";
+import { isEmptySceneDelta, sceneBeforeFromDelta } from "./scene_history_delta.js";
 
 const { api } = window.comfyAPI.api;
 
@@ -6642,7 +6643,8 @@ export class EditorWidget {
                         this._recordHistoryOrderedScene?.(
                             queuedValue?.historyOrderContext, result?.payload?.scene);
                         this._stampHistoryPostSnapshot(
-                            queuedHistoryEntry, result?.payload?.scene, result?.response);
+                            queuedHistoryEntry, result?.payload?.scene, result?.response,
+                            result?.payload?.history_before);
                     }
                     return result;
                 } catch (mutationError) {
@@ -26884,7 +26886,7 @@ export class EditorWidget {
         return entry;
     }
 
-    _stampHistoryPostSnapshot(entry, scene, response = null) {
+    _stampHistoryPostSnapshot(entry, scene, response = null, historyBefore = null) {
         if (!entry || entry.kind || entry.postSnapshot || !scene?.scene_id
                 || !this._undoStack.includes(entry)
                 || String(entry.sceneId || "") !== String(scene.scene_id)) {
@@ -26895,6 +26897,14 @@ export class EditorWidget {
         // GET payloads are intentionally never fallbacks: both may include
         // concurrent work that this operation merely observed.
         entry.postSnapshot = structuredClone(scene);
+        // The before side comes from the same commit. The copy taken at the gesture
+        // lacks anything the server saved that this editor had not read, such as a
+        // take, and holds paint a later refusal may take back; Undo would reverse
+        // both. Without the delta (it could not be built, or the running server is
+        // older than this page) that copy stays. Shares values with postSnapshot:
+        // an entry's scenes are read-only.
+        entry.snapshot = sceneBeforeFromDelta(entry.postSnapshot, historyBefore)
+            || entry.snapshot;
         // Bind the version to this exact response. A newer GET can advance the
         // shared version map while response.json() is still being awaited.
         entry.postSnapshotProjectVersion = response?.headers?.get("X-Sonder-Project-Modified-At") || null;
@@ -27289,6 +27299,43 @@ export class EditorWidget {
         return scene;
     }
 
+    /** What an acknowledged restore changed: the scene it was applied to and the one
+     *  it produced. Absent where the answer may not be that commit's own (a receipt)
+     *  or the restore changed nothing: the reverse action then uses the pinned
+     *  restore target, so a Redo after an Undo that found nothing to reverse still
+     *  applies its step. */
+    _rememberRestoredHistoryPair(scene, post, delta) {
+        if (!scene || typeof scene !== "object" || isEmptySceneDelta(delta)) return;
+        const before = sceneBeforeFromDelta(post, delta);
+        if (!before) return;
+        this._restoredHistoryPairByScene ||= new WeakMap();
+        this._restoredHistoryPairByScene.set(scene, { before, post });
+    }
+
+    /** Give the reverse action its base and target after a restore. */
+    _stampHistoryOpposite(opposite, restoredScene, responseVersion) {
+        const pair = this._restoredHistoryPairByScene?.get?.(restoredScene);
+        if (pair) opposite.snapshot = pair.before;
+        // The base comes from the pair or the memo, never from the scene a receipt
+        // answered with, which is current state at query time.
+        opposite.postSnapshot = pair?.post || structuredClone(
+            this._historyBaseForRestoredScene?.(restoredScene) || restoredScene);
+        opposite.postSnapshotProjectVersion = responseVersion;
+        // For a pinned base this version describes the response, not the snapshot,
+        // which is then no proof of the exact committed bytes.
+        opposite.postSnapshotVersionSource = pair ? "acknowledged_restore" : "restore_target";
+    }
+
+    _notifyDroppedReferenceMembers(payload) {
+        const count = Number(payload?.dropped_reference_members) || 0;
+        if (count > 0) {
+            notifyInfo(`${count} Reference member${count === 1 ? " was" : "s were"} not restored.`, {
+                detail: "No longer in the Library.",
+                source: "history-reference-members-missing",
+            });
+        }
+    }
+
     _historyBaseForRestoredScene(scene) {
         return this._reconciledHistoryBaseByScene?.get?.(scene) || scene;
     }
@@ -27383,6 +27430,7 @@ export class EditorWidget {
             receiptEverKnown = true;
             const receipt = await response.json().catch(() => null);
             if (receipt?.status === "committed" && receipt.scene) {
+                this._notifyDroppedReferenceMembers?.(receipt);
                 return await acceptResolvedScene(receipt.scene, { committed: true });
             }
             if (receipt?.status === "refused") {
@@ -27930,12 +27978,7 @@ export class EditorWidget {
             this._recordHistoryOrderedScene?.(historyOrderContext, restoredScene);
             delete entry.restoreToken;
             delete entry._ambiguousAuxiliaryState;
-            opposite.postSnapshot = structuredClone(
-                this._historyBaseForRestoredScene?.(restoredScene) || restoredScene);
-            opposite.postSnapshotProjectVersion = historyPaint.responseVersion;
-            // This version describes the response; the snapshot is the pinned
-            // restore target, not proof of exact committed bytes.
-            opposite.postSnapshotVersionSource = "restore_target";
+            this._stampHistoryOpposite(opposite, restoredScene, historyPaint.responseVersion);
             if (entry.promptIdentityCreateIntents?.length) {
                 const cleanupPlan = promptIdentityCleanupPlan(
                     entry.promptIdentityCreateIntents);
@@ -28503,12 +28546,7 @@ export class EditorWidget {
             this._recordHistoryOrderedScene?.(historyOrderContext, restoredScene);
             delete entry.restoreToken;
             delete entry._ambiguousAuxiliaryState;
-            opposite.postSnapshot = structuredClone(
-                this._historyBaseForRestoredScene?.(restoredScene) || restoredScene);
-            opposite.postSnapshotProjectVersion = historyPaint.responseVersion;
-            // This version describes the response; the snapshot is the pinned
-            // restore target, not proof of exact committed bytes.
-            opposite.postSnapshotVersionSource = "restore_target";
+            this._stampHistoryOpposite(opposite, restoredScene, historyPaint.responseVersion);
             if (consumeEntry()) {
                 materializeOpposite(opposite);
             }
@@ -28966,6 +29004,7 @@ export class EditorWidget {
                     if (!receiptResponse.ok) continue;
                     const receipt = await receiptResponse.json();
                     if (receipt?.status === "committed" && receipt?.scene) {
+                        this._notifyDroppedReferenceMembers(receipt);
                         return receipt.scene;
                     }
                     if (receipt?.status === "refused") {
@@ -29106,10 +29145,15 @@ export class EditorWidget {
             // answers an already-receipted token with the *current* scene, and a
             // transparent transport retry reaches that branch with no
             // client-visible token. The restore target is never a worse merge
-            // base than the true committed scene and is strictly better for
-            // fields this operation did not touch, so pin it on every path.
+            // base than that current scene and is strictly better for fields this
+            // operation did not touch, so pin it on every path. The server sends
+            // `history_before` only with the answer of the request that committed,
+            // and that answer is exact: its pair then takes precedence.
+            const post = payload?.history_before ? structuredClone(payload.scene) : null;
             const scene = adopt(payload?.scene);
             this._rememberReconciledHistoryBase?.(scene, targetSnapshot);
+            this._rememberRestoredHistoryPair(scene, post, payload?.history_before);
+            this._notifyDroppedReferenceMembers(payload);
             return scene;
         } catch (responseBodyOrAdoptError) {
             this._keyboardDebug("restore success body/adoption lost", {

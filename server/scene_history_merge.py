@@ -177,6 +177,37 @@ def _append_tolerant_bundle(keys: tuple[str, ...], base_value: dict,
     return None
 
 
+# Each lane family's members: (count field, collection, id, lane index, clip role).
+_LANE_MEMBERS = (
+    ("video_lane_count", "clips", "clip_id", "track_index", "render"),
+    ("motion_driver_lane_count", "clips", "clip_id", "track_index", "motion_driver"),
+    ("audio_lane_count", "audio_tracks", "track_id", "lane_index", None),
+    ("reference_lane_count", "reference_items", "reference_item_id", "lane_index", None),
+)
+
+
+def _family_member_lanes(scene: dict, count_key: str) -> dict:
+    for count_field, collection, id_field, index_field, role in _LANE_MEMBERS:
+        if count_field == count_key:
+            members = scene.get(collection)
+            return {
+                str(member.get(id_field) or ""): member.get(index_field, 0)
+                for member in (members if isinstance(members, list) else [])
+                if isinstance(member, dict)
+                and (role is None or str(member.get("role") or "render") == role)}
+    return {}
+
+
+def _lanes_are_identified(keys: tuple[str, ...], family: dict) -> bool:
+    """Whether the family's lanes carry durable ids (Reference recipes do)."""
+    recipes = family.get("reference_lane_recipes", _MISSING)
+    if not isinstance(recipes, list) or len(recipes) != family[keys[0]]:
+        return False
+    ids = [str(recipe.get("lane_id") or "") if isinstance(recipe, dict) else ""
+           for recipe in recipes]
+    return all(ids) and len(set(ids)) == len(ids)
+
+
 def _merge_bundle(result: dict, keys: tuple[str, ...], base: dict, target: dict,
                   stored: dict, conflicts: list[dict], path: str) -> None:
     base_value = _bundle(base, keys)
@@ -187,7 +218,15 @@ def _merge_bundle(result: dict, keys: tuple[str, ...], base: dict, target: dict,
     stored_value = _bundle(stored, keys)
     if _same_bundle(target_value, base_value):
         return
-    if _same_bundle(stored_value, target_value):
+    # A step that changes the lane count and what stands on its lanes cannot trust a
+    # match by value: with default configs, a lane it removed and a take's lane appended
+    # since look the same, and the step's clip would land on the take's lane. A retry
+    # of a restore that committed is refused too, where its receipt is no longer known.
+    # Retire with the per-lane history merge the roadmap owns.
+    if _same_bundle(stored_value, target_value) and (
+            _same(base_value[keys[0]], target_value[keys[0]])
+            or _lanes_are_identified(keys, stored_value)
+            or _family_member_lanes(base, keys[0]) == _family_member_lanes(target, keys[0])):
         return
     if _same_bundle(stored_value, base_value):
         for key in keys:
@@ -377,15 +416,7 @@ def _validate_duration_sentinels(base: dict, target: dict, stored: dict,
 def _validate_lane_shrink_members(result: dict, base: dict, target: dict,
                                   stored: dict, conflicts: list[dict]) -> None:
     """Refuse a history-owned shrink that would strand concurrent members."""
-    specs = (
-        ("video_lane_count", "clips", "clip_id", "track_index", "render"),
-        ("motion_driver_lane_count", "clips", "clip_id", "track_index",
-         "motion_driver"),
-        ("audio_lane_count", "audio_tracks", "track_id", "lane_index", None),
-        ("reference_lane_count", "reference_items", "reference_item_id",
-         "lane_index", None),
-    )
-    for count_field, collection, id_field, index_field, role in specs:
+    for count_field, collection, id_field, index_field, role in _LANE_MEMBERS:
         try:
             base_count = int(base.get(count_field))
             target_count = int(target.get(count_field))
@@ -444,6 +475,120 @@ def _validate_lane_shrink_members(result: dict, base: dict, target: dict,
             )
 
 
+def _restore_removed_document_mirrors(result: dict, target: dict, stored: dict) -> None:
+    """The text mirror of a prompt document the merge removed becomes the target's.
+
+    ``channels`` and ``global_channels`` are derived, so the merge leaves them as stored.
+    The constructors rebuild a missing document from its mirror, so stored's mirror would
+    bring the undone text back under a new node id. A target that holds the text without
+    a document (older than documents) gets that text; usually it holds neither.
+    """
+    def restore(owner, wanted, before, docs_field, mirror_field):
+        before_docs, docs = before.get(docs_field), owner.get(docs_field)
+        mirror, wanted_mirror = owner.get(mirror_field), wanted.get(mirror_field)
+        if not isinstance(before_docs, dict) or not isinstance(mirror, dict):
+            return False
+        kept = docs if isinstance(docs, dict) else {}
+        removed = [key for key in before_docs if key not in kept]
+        if not removed:
+            return False
+        mirror = {key: value for key, value in mirror.items() if key not in removed}
+        if isinstance(wanted_mirror, dict):
+            mirror.update({key: copy.deepcopy(wanted_mirror[key])
+                           for key in removed if key in wanted_mirror})
+        owner[mirror_field] = mirror
+        return not mirror
+
+    def sections(scene):
+        rows = scene.get("prompt_sections")
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    if restore(result, target, stored, "global_channel_docs", "global_channels"):
+        # An empty mirror is reseeded from the flat prompt.
+        result["prompt"] = copy.deepcopy(target.get("prompt", ""))
+    stored_rows = {str(row.get("prompt_id") or ""): row for row in sections(stored)}
+    target_rows = {str(row.get("prompt_id") or ""): row for row in sections(target)}
+    for row in sections(result):
+        row_id = str(row.get("prompt_id") or "")
+        if row_id in stored_rows and row_id in target_rows:
+            restore(row, target_rows[row_id], stored_rows[row_id], "channel_docs", "channels")
+
+
+def drop_missing_reference_members(base: dict, target: dict, stored: dict,
+                                   library_member_ids) -> tuple[dict, dict, int]:
+    """``base`` and ``target`` without Reference members the Library no longer has.
+
+    Returns thinned copies (or the inputs, where nothing changes) and how many members
+    the step would have restored but cannot. A member the stored item still holds stays:
+    ``stored`` is never edited. See the plan's table (Undo Across Takes, Phase 1).
+    """
+    library = {str(value) for value in library_member_ids}
+
+    def rows(scene):
+        members = scene.get("reference_items")
+        if not isinstance(members, list):
+            return None
+        indexed = {}
+        for row in members:
+            row_id = str(row.get("reference_item_id") or "") if isinstance(row, dict) else ""
+            if not row_id or row_id in indexed or not isinstance(row.get("members"), list):
+                return None
+            indexed[row_id] = row
+        return indexed
+
+    base_rows, target_rows, stored_rows = rows(base), rows(target), rows(stored)
+    if base_rows is None or target_rows is None or stored_rows is None:
+        return base, target, 0
+
+    def ids(row):
+        return [str(member.get("member_id") or "") if isinstance(member, dict) else ""
+                for member in row["members"]]
+
+    new_base, new_target, dropped = dict(base_rows), dict(target_rows), 0
+    for row_id, target_row in target_rows.items():
+        base_row, stored_row = base_rows.get(row_id), stored_rows.get(row_id)
+        held = library | set(ids(stored_row) if stored_row is not None else ())
+
+        def thinned(row):
+            return {**row, "members": [
+                member for member, member_id in zip(row["members"], ids(row))
+                if member_id in held]}
+
+        gone = [member_id for member_id in ids(target_row) if member_id not in held]
+        target_thin = thinned(target_row)
+        emptied = bool(target_row["members"]) and not target_thin["members"]
+        if base_row is None:
+            if stored_row is None and gone:
+                dropped += len(gone)
+                if emptied:
+                    del new_target[row_id]
+                else:
+                    new_target[row_id] = target_thin
+            continue
+        if target_row["members"] == base_row["members"] and stored_row is not None:
+            continue
+        base_thin = thinned(base_row)
+        base_emptied = bool(base_row["members"]) and not base_thin["members"]
+        if stored_row is not None:
+            if emptied:
+                target_thin["members"] = list(base_thin["members"])
+                dropped += len(gone)
+            else:
+                dropped += len(set(gone) - set(ids(base_row)))
+            new_base[row_id], new_target[row_id] = base_thin, target_thin
+        elif emptied and base_emptied:
+            dropped += len(gone)
+            del new_base[row_id], new_target[row_id]
+        elif base_emptied:
+            dropped += len(gone)
+            del new_base[row_id]
+            new_target[row_id] = target_thin
+    if new_base == base_rows and new_target == target_rows:
+        return base, target, dropped
+    return ({**base, "reference_items": list(new_base.values())},
+            {**target, "reference_items": list(new_target.values())}, dropped)
+
+
 def merge_scene_history(base: dict, target: dict, stored: dict) -> dict:
     """Apply the base→target reversal onto stored without touching unrelated work.
 
@@ -480,6 +625,7 @@ def merge_scene_history(base: dict, target: dict, stored: dict) -> dict:
         _merge_collection(result, field, key, base, target, stored, conflicts,
                           per_field=per_field, excluded=excluded,
                           mapping_fields=mapping_fields)
+    _restore_removed_document_mirrors(result, target, stored)
 
     for path, keys in MERGED_WRITE_FIELDS["bundle"]:
         _merge_bundle(result, keys, base, target, stored, conflicts, path)

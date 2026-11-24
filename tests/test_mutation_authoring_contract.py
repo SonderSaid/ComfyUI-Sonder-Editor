@@ -75,6 +75,7 @@ OBLIGATIONS = {
 # Direct scanner consumers that support a listed obligation rather than asserting
 # their own coverage. Every reason states when the exception ceases to apply.
 DISCOVERY_SUPPORT = {
+    "test_scene_history_delta.py::test_the_corpus_runs_every_operation_the_dispatcher_accepts": ("field.history-write-set", "Completeness of the before-state corpus; remove when that corpus no longer runs the dispatcher."),
     "test_mutation_authoring_contract.py::test_contract_tripwires_reject_injected_drift": ("operation.media-budget", "Injection proof; remove when it no longer reads the dispatcher for its fixture."),
     REG + "_scan": ("gesture.guard-emission", "Literal inventory helper; remove when it stops serving the guard scan."),
     REG + "test_the_emitting_module_set_is_closed": ("gesture.guard-emission", "Emitter discovery; remove when the literal scan no longer depends on it."),
@@ -1303,6 +1304,13 @@ def test_severing_any_single_claim_link_fails_the_contract(old, new, count, mess
 # Header form: // @server-mirror relative/python_file.py::symbol
 # Authority citations and test references prove existence, never semantic coverage.
 MIRRORED_MODULES = {
+    "scene_history_delta.js": {
+        "scope": ("Reading the before-scene delta back; what changed is decided by the "
+                  "server alone."),
+        "authorities": ("server/scene_history_delta.py::delta_between",),
+        "tests": ("test_scene_history_delta.py::test_every_operation_describes_the_scene_it_was_applied_to",
+                  "test_scene_history_delta.py::test_every_merged_field_is_described"),
+    },
     "prompt_preview_freshness.js": {
         "scope": ("The candidate fields a preview compile takes from its request, "
                   "not the freshness decision built on them."),
@@ -1609,7 +1617,8 @@ def test_every_declared_mirror_has_a_live_parity_disposition():
     _assert_mirror_obligations(MIRRORED_MODULES, ROOT)
     # 72: `timeline_gesture_geometry.js` joined with one authority (UX pass phase 1).
     # 73: `reference_resolution.js` gained the member display label (UX pass phase 3a).
-    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 73
+    # 74: `scene_history_delta.js` (Undo across takes, phase 1).
+    assert sum(len(row["authorities"]) for row in MIRRORED_MODULES.values()) == 74
 
 @pytest.mark.parametrize("name, valid", [("TABLE", True), ("row", False), ("transform", True)])
 def test_mirror_authorities_are_module_declarations(tmp_path, name, valid):

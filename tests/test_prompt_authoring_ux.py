@@ -51,6 +51,17 @@ def _run_node(script: str):
         script = ("import { deriveRetryOnConflict, REPLAY_DECLINED_HEADER, "
                   "REPLAY_DECLINED_VALUE } from "
                   + json.dumps(addressing) + ";" + chr(10)) + script
+    if "this._stampHistoryOpposite(" in script or "this._rememberRestoredHistoryPair(" in script:
+        # A harness that lifts an Undo, a Redo or the restore lifts what they give the
+        # reverse action. First in the class, so a harness's own stub still wins.
+        widget = _source("web/js/editor_widget.js")
+        pairs = _method(widget, "_rememberRestoredHistoryPair", "_historyBaseForRestoredScene")
+        for host in ("Harness", "Host"):
+            script = script.replace("class " + host + " {", "class " + host + " {\n" + pairs)
+    if "sceneBeforeFromDelta(" in script:
+        script = ("import { isEmptySceneDelta, sceneBeforeFromDelta } from "
+                  + json.dumps((ROOT / "web/js/scene_history_delta.js").as_uri())
+                  + ";" + chr(10)) + script
     if "projectErrorMessage(" in script:
         widget = _source("web/js/editor_widget.js")
         errors = widget[widget.index("const PROJECT_ERROR_MESSAGES"):

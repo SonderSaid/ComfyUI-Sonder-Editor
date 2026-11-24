@@ -860,3 +860,210 @@ def test_the_warning_emits_one_line_per_field_not_per_combination():
         assert.equal(named(warnings[2]),'height',
             'already-reported fields repeated: '+named(warnings[2]));
     ''')
+
+
+# --------------------------------------------------------------------------
+# Both sides of a step come from its own commit (Undo Across Takes, Phase 1)
+# --------------------------------------------------------------------------
+
+_TAKES = """
+        const take={clip_id:'take'};
+        const delta=(fields,members={})=>({v:1,fields,absent:[],members});
+        const response=(payload,version='v2')=>({ok:true,status:200,
+            headers:new Headers({'X-Sonder-Project-Modified-At':version}),json:async()=>payload});
+        const sent=[];
+        const serve=(...restores)=>{globalThis.fetch=async(url,init)=>url.endsWith('/restore-token')
+            ? new Response(JSON.stringify({restore_token:'token',...capabilities}))
+            : init?.method==='PUT' ? (sent.push(JSON.parse(init.body)),restores.shift()())
+            : new Response(JSON.stringify({status:'pending'}));};
+"""
+
+
+def test_a_write_stamps_the_servers_before_state_not_the_editors():
+    _run_history_node(_TAKES + """
+        const w=makeHistoryWidget();
+        let rebasedAgainst=null;
+        Object.assign(w,{_maxUndoSteps:50,_clearRedoForNewEdit:()=>{},
+            _stampHistoryPostSnapshot:EditorWidget.prototype._stampHistoryPostSnapshot,
+            _rebaseSceneMutationIntentForHistory:(intent,ordered,authored)=>{rebasedAgainst=authored;return intent;}});
+        w.activeScene={scene_id:'scene',name:'before',clips:[],paint:'of a write refused later'};
+        EditorWidget.prototype._pushUndo.call(w,'edit');
+        const pushed=w._undoStack.at(-1);
+        w.activeScene.name='painted';
+        const after={scene_id:'scene',name:'after',clips:[take]};
+        const context=w._beginHistoryOrderContext('undo',1);
+        context.scenes.set('scene',{scene_id:'scene',name:'ordered',clips:[]});
+        await w._queueProjectMutation({key:'edit',coalesce:false,historyEntry:pushed,refreshScenes:false,
+            historyOrderContext:context,intent:{projectId:'project',sceneId:'scene',operations:[]},
+            run:async()=>({payload:{scene:after,history_before:delta({name:'stored'})},
+                response:response({})})});
+        assert.deepEqual(pushed.snapshot,{scene_id:'scene',name:'stored',clips:[take]});
+        assert.deepEqual(pushed.postSnapshot,after);
+        assert.equal(rebasedAgainst.name,'before','the rebase still reads what the author saw');
+        // A later adoption of the response object must not reach the entry.
+        after.clips.push({clip_id:'later'});
+        assert.equal(pushed.postSnapshot.clips.length,1);
+        assert.equal(pushed.snapshot.clips.length,1);
+    """)
+
+
+@pytest.mark.parametrize('history_before', [
+    'undefined', 'null', '{v:2}', "{v:1,fields:{},absent:[],members:{other:{}}}"])
+def test_without_a_readable_before_state_the_authored_copy_stays(history_before):
+    _run_history_node("""
+        const w=makeHistoryWidget(), e=entry(); delete e.postSnapshot; w._undoStack.push(e);
+        EditorWidget.prototype._stampHistoryPostSnapshot.call(w,e,{scene_id:'scene',name:'after',clips:[]},
+            new Response('{}'),""" + history_before + """);
+        assert.equal(e.snapshot.name,'before');
+        assert.equal(e.postSnapshot.name,'after');
+    """)
+
+
+@pytest.mark.parametrize('operation', ['Undo', 'Redo'])
+def test_the_reverse_action_is_what_the_restore_changed(operation):
+    _run_history_node(_TAKES + """
+        const w=makeHistoryWidget(), e=entry(), operation='""" + operation + """';
+        const [stack,opposite]=operation==='Undo'?['_undoStack','_redoStack']:['_redoStack','_undoStack'];
+        w[stack].push(e);
+        // The take landed after the step: the restore kept it.
+        serve(()=>response({scene:{scene_id:'scene',name:'before',clips:[take]},
+            history_before:delta({name:'after'})}));
+        await w['_run'+operation+'WithinGesture']();
+        const reverse=w[opposite].at(-1);
+        assert.deepEqual(reverse.snapshot,{scene_id:'scene',name:'after',clips:[take]});
+        assert.deepEqual(reverse.postSnapshot,{scene_id:'scene',name:'before',clips:[take]});
+        assert.equal(reverse.postSnapshotVersionSource,'acknowledged_restore');
+        assert.equal(reverse.postSnapshotProjectVersion,'v2');
+        // The editor shows its own copy.
+        w.activeScene.clips.length=0;
+        assert.equal(reverse.postSnapshot.clips.length,1);
+        // And that is what its paint shows.
+        w._historyObservedProjectVersion=()=>'v2';
+        const shown=[];const set=w._setActiveScene.bind(w);
+        w._setActiveScene=(scene,options={})=>{shown.push([!!options.optimisticHistory,scene.name,scene.clips.length]);set(scene,options);};
+        serve(()=>response({scene:{scene_id:'scene',name:'after',clips:[take]},
+            history_before:delta({name:'before'})}));
+        await w['_run'+(operation==='Undo'?'Redo':'Undo')+'WithinGesture']();
+        assert.deepEqual(shown,[[true,'after',1],[false,'after',1]]);
+        assert.deepEqual([sent.at(-1).base_scene.clips,sent.at(-1).target_scene.clips],[[take],[take]]);
+    """)
+
+
+@pytest.mark.parametrize('answer', [
+    "response({scene:e.snapshot})",
+    "response({scene:{...e.snapshot,clips:[take]},history_before:delta({})})",
+    "response({scene:e.snapshot,history_before:{v:2}})",
+])
+def test_a_restore_without_a_pair_keeps_the_pinned_base(answer):
+    """No pair, a restore that changed nothing, a delta this page cannot read: Redo
+    still applies the step it names."""
+    _run_history_node(_TAKES + """
+        const w=makeHistoryWidget(), e=entry(); w._undoStack.push(e);
+        serve(()=>""" + answer + """);
+        await w._runUndoWithinGesture();
+        const reverse=w._redoStack.at(-1);
+        assert.equal(reverse.snapshot.name,'after');
+        assert.equal(reverse.postSnapshot.name,'before');
+        assert.deepEqual(reverse.postSnapshot.clips,[]);
+        assert.equal(reverse.postSnapshotVersionSource,'restore_target');
+    """)
+
+
+def test_a_lost_response_keeps_the_pinned_base():
+    _run_history_node(_TAKES + """
+        const w=makeHistoryWidget(), e=entry(); w._undoStack.push(e);
+        globalThis.fetch=async(url,init)=>{
+            if(url.endsWith('/restore-token')) return new Response(JSON.stringify({restore_token:'token',...capabilities}));
+            if(init?.method==='PUT') throw new TypeError('lost');
+            return new Response(JSON.stringify({status:'committed',dropped_reference_members:2,
+                scene:{scene_id:'scene',name:'current',clips:[take]}}));
+        };
+        const notices=[];w._notifyDroppedReferenceMembers=(payload)=>notices.push(payload.dropped_reference_members);
+        await w._runUndoWithinGesture();
+        const reverse=w._redoStack.at(-1);
+        assert.equal(reverse.postSnapshot.name,'before');
+        assert.equal(reverse.postSnapshotVersionSource,'restore_target');
+        assert.deepEqual(notices,[2]);
+    """)
+
+
+def test_a_merged_slot_keeps_the_state_before_the_whole_merged_write():
+    """Two members of one slot: the oldest entry survives, with the before-state of the
+    write that carried both, not of the paint between them."""
+    _run_history_node(_TAKES + """
+        const w=makeHistoryWidget();
+        Object.assign(w,{_maxUndoSteps:50,_clearRedoForNewEdit:()=>{},
+            _claimHistoryPostSnapshotCapture:EditorWidget.prototype._claimHistoryPostSnapshotCapture,
+            _stampHistoryPostSnapshot:EditorWidget.prototype._stampHistoryPostSnapshot});
+        let release;const gate=new Promise(r=>{release=r;});
+        const first=w._queueProjectMutation({key:'other',coalesce:false,refreshScenes:false,
+            intent:{sceneId:'scene'},run:async()=>{await gate;return {payload:{}};}});
+        const edit=(name)=>{
+            EditorWidget.prototype._pushUndo.call(w,'edit');
+            w.activeScene.name=name;
+            return w._queueProjectMutation({key:'name',coalesce:true,refreshScenes:false,
+                intent:{projectId:'project',sceneId:'scene',operations:[name]},
+                run:async(intent)=>({payload:{scene:{scene_id:'scene',name:intent.operations[0],clips:[take]},
+                    history_before:delta({name:'stored'})},response:response({})})});
+        };
+        const a=edit('one'), b=edit('two');
+        release();await Promise.all([first,a,b]);
+        assert.equal(w._undoStack.length,1);
+        assert.deepEqual(w._undoStack[0].snapshot,{scene_id:'scene',name:'stored',clips:[take]});
+        assert.equal(w._undoStack[0].postSnapshot.name,'two');
+    """)
+
+
+def test_a_lost_response_resolved_by_the_next_write_still_says_it_was_partial():
+    _run_history_node(_TAKES + """
+        const w=makeHistoryWidget(), e=entry();
+        const notices=[];w._notifyDroppedReferenceMembers=(payload)=>notices.push(payload.dropped_reference_members);
+        const context=w._beginHistoryOrderContext('undo',1);
+        e.restoreToken='token';w._undoStack.push(e);
+        w._projectDirName=()=>'project';
+        w._markHistoryOrderContextAmbiguous(context,'scene','token',{operation:'undo',entry:e,
+            sourceStack:w._undoStack,opposite:{sceneId:'scene'},oppositeStack:w._redoStack});
+        globalThis.fetch=async()=>new Response(JSON.stringify({status:'committed',
+            dropped_reference_members:3,scene:{scene_id:'scene',name:'before',clips:[]}}));
+        await w._resolveHistoryOrderContextScene(context,'scene');
+        assert.deepEqual(notices,[3]);
+    """)
+
+
+def test_a_drop_that_posts_its_own_request_hands_on_the_before_state():
+    """The asset drop answers the queue with `{ok, payload}`: the stamp reads the payload."""
+    _run_history_node(_TAKES + """
+        const w=makeHistoryWidget(), e=entry(); delete e.postSnapshot; w._undoStack.push(e);
+        w._stampHistoryPostSnapshot=EditorWidget.prototype._stampHistoryPostSnapshot;
+        await w._queueProjectMutation({key:'drop',coalesce:false,historyEntry:e,refreshScenes:false,
+            intent:{projectId:'project',sceneId:'scene',operations:[]},
+            run:async()=>({ok:true,payload:{scene:{scene_id:'scene',name:'dropped',clips:[take]},
+                history_before:delta({name:'stored'})}})});
+        assert.equal(e.snapshot.name,'stored');
+        assert.deepEqual(e.snapshot.clips,[take]);
+    """)
+
+
+def test_a_partial_restore_says_so_once():
+    _run_history_node(_TAKES + """
+        const w=makeHistoryWidget(), e=entry(); w._undoStack.push(e);
+        const notices=[];w._notifyDroppedReferenceMembers=(payload)=>notices.push(payload.dropped_reference_members);
+        serve(()=>response({scene:e.snapshot,history_before:delta({name:'after'}),dropped_reference_members:1}));
+        await w._runUndoWithinGesture();
+        assert.deepEqual(notices,[1]);
+    """)
+
+
+def test_the_opposite_claimed_ahead_keeps_its_claim_and_gets_the_pair():
+    _run_history_node(_TAKES + """
+        const w=makeHistoryWidget(), e=entry(), claim={id:1}, later={id:2};
+        e.claimedBy=claim;w._undoStack.push(e);
+        const reservation=w._reserveHistoryOpposite('undo',e,claim);
+        reservation.claimedBy=later;
+        serve(()=>response({scene:{scene_id:'scene',name:'before',clips:[take]},
+            history_before:delta({name:'after'})}));
+        await w._runUndoWithinGesture(null,e,claim,null,reservation,null);
+        assert.equal(w._redoStack.at(-1),reservation);
+        assert.equal(reservation.claimedBy,later);
+        assert.deepEqual(reservation.snapshot.clips,[take]);
+    """)

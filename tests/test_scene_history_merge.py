@@ -438,7 +438,7 @@ def test_a_retry_after_an_append_finds_the_step_already_applied():
 def test_an_append_does_not_excuse_any_other_lane_change(change):
     """Everything but a pure tail append still refuses as one unit -- for lanes
     whose configs tell them apart. `_lock_step` names every lane; with default
-    configs the older by-value shortcut can alias instead (see the xfail below).
+    configs a step that keeps the count can still match by value.
     """
     target, base = _lock_step("video_lane_count", "video_lane_configs", count=3)
     stored = _append_lane(base, "video_lane_count", "video_lane_configs")
@@ -462,11 +462,6 @@ def test_an_append_does_not_excuse_any_other_lane_change(change):
     assert exc.value.conflicts[0]["path"] == "video_lane_family"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "pre-existing, bug tracker: with default lane configs, undoing a step that "
-    "removed a lane after a take was appended at the same index finds the "
-    "family equal to target BY VALUE, takes the no-op shortcut, and restores "
-    "the clip onto the take's lane. Flips to a failure when that is fixed."))
 def test_undo_of_a_lane_removal_after_a_take_refuses_instead_of_aliasing():
     default = {}
     # The step: deleting the lone clip on lane 1 compacted that lane away.
@@ -477,8 +472,112 @@ def test_undo_of_a_lane_removal_after_a_take_refuses_instead_of_aliasing():
     stored = _scene(video_lane_count=2, video_lane_configs=[default, default],
                     clips=[{"clip_id": "take", "track_index": 1}])
 
-    with pytest.raises(SceneMergeConflict):
+    with pytest.raises(SceneMergeConflict) as exc:
         merge_scene_history(base, target, stored)
+    assert exc.value.conflicts[0]["path"] == "video_lane_family"
+
+
+DOC = {"nodes": [{"type": "text", "node_id": "n", "text": "T"}]}
+
+
+@pytest.mark.parametrize(("target", "expected"), [
+    ({"channels": {"old": "KEPT"}, "channel_docs": {}}, {"old": "KEPT"}),
+    ({"channels": {"old": "KEPT"}}, {"old": "KEPT"}),
+    # A target older than documents: its text is what the step restores.
+    ({"channels": {"old": "KEPT", "new": "WAS"}, "channel_docs": {}},
+     {"old": "KEPT", "new": "WAS"}),
+    ({"channels": {"old": "KEPT", "new": "WAS"}}, {"old": "KEPT", "new": "WAS"}),
+    ({"channels": {"old": "KEPT", "new": "WAS"}, "channel_docs": None},
+     {"old": "KEPT", "new": "WAS"}),
+])
+def test_a_removed_document_leaves_the_text_the_target_holds(target, expected):
+    """`old` is text no document holds (written before documents): not a removal."""
+    base_row = {"prompt_id": "p", "channels": {"old": "KEPT", "new": "NOW"},
+                "channel_docs": {"new": DOC}}
+    base = _scene(prompt_sections=[base_row])
+    merged = merge_scene_history(
+        base, _scene(prompt_sections=[{"prompt_id": "p", **target}]), copy.deepcopy(base))
+    assert merged["prompt_sections"][0]["channels"] == expected
+    assert base["prompt_sections"][0] == base_row
+
+
+@pytest.mark.parametrize(("target", "channels", "prompt"), [
+    ({"global_channel_docs": {}}, {}, ""),
+    ({"global_channel_docs": {}, "prompt": "WAS"}, {}, "WAS"),
+    ({"global_channels": {"a": "WAS"}, "prompt": "WAS"}, {"a": "WAS"}, "NOW"),
+    ({"global_channels": {"a": "WAS"}, "global_channel_docs": None, "prompt": "WAS"},
+     {"a": "WAS"}, "NOW"),
+])
+def test_a_removed_global_document_leaves_the_text_the_target_holds(target, channels, prompt):
+    base = _scene(global_channel_docs={"a": DOC}, global_channels={"a": "NOW"}, prompt="NOW")
+    merged = merge_scene_history(base, _scene(**target), copy.deepcopy(base))
+    assert merged["global_channels"] == channels and merged["prompt"] == prompt
+
+
+@pytest.mark.parametrize("sections", ["text", [1], None, 5, True, 2.5, {"a": 1}])
+def test_a_malformed_target_is_refused_not_a_crash(sections):
+    base = _scene(prompt_sections=[])
+    try:
+        merge_scene_history(base, _scene(prompt_sections=sections), copy.deepcopy(base))
+    except SceneMergeConflict:
+        pass
+
+
+def _reference_lanes(*ids):
+    return dict(reference_lane_count=len(ids), reference_lane_configs=[{}] * len(ids),
+                reference_lane_recipes=[{"lane_id": value} for value in ids])
+
+
+@pytest.mark.parametrize(("stored_ids", "refused"), [
+    (("a", "b"), False), (("", ""), True), (("a", ""), True), (("a", "a"), True)])
+def test_lanes_with_ids_of_their_own_still_match_by_value(stored_ids, refused):
+    """A lane-count step whose target is already there is a no-op only where the lanes
+    can be told apart: equal ids are the same lanes, equal default configs are not."""
+    target = _scene(**_reference_lanes(*stored_ids), reference_items=[
+        {"reference_item_id": "i", "lane_index": 1}])
+    base = _scene(**_reference_lanes("a"))
+    stored = copy.deepcopy(target)
+    if refused:
+        with pytest.raises(SceneMergeConflict):
+            merge_scene_history(base, target, stored)
+    else:
+        assert merge_scene_history(base, target, stored)["reference_lane_count"] == 2
+
+
+LANES = {
+    "video": ("video_lane_count", "video_lane_configs", "clips",
+              {"clip_id": "m", "track_index": 1}),
+    "driver": ("motion_driver_lane_count", "motion_driver_lane_configs", "clips",
+               {"clip_id": "m", "track_index": 1, "role": "motion_driver"}),
+    "audio": ("audio_lane_count", "audio_lane_configs", "audio_tracks",
+              {"track_id": "m", "lane_index": 1}),
+}
+
+
+@pytest.mark.parametrize("family", sorted(LANES))
+@pytest.mark.parametrize("member", ["none", "this family", "re-laned", "another family"])
+def test_only_a_lane_step_that_moves_members_refuses_a_match_by_value(family, member):
+    """Adding or removing an EMPTY lane cannot put anything on another lane: where the
+    count is already what the step wants, it stays a no-op instead of sticking."""
+    count, configs, collection, row = LANES[family]
+    two = {count: 2, configs: [{}, {}]}
+    target, base = _scene(**two), _scene(**{count: 1, configs: [{}]})
+    if member == "this family":
+        target[collection] = [row]
+    elif member == "re-laned":
+        target[collection] = [row]
+        base[collection] = [{**row, next(k for k in row if k.endswith("_index")): 0}]
+    elif member == "another family":
+        target["clips"] = [{"clip_id": "other", "track_index": 0,
+                            "role": "render" if family == "driver" else "motion_driver"}]
+    stored = _scene(**two, **({collection: copy.deepcopy(base[collection])}
+                              if member == "re-laned" else {}))
+    if member in ("this family", "re-laned"):
+        with pytest.raises(SceneMergeConflict) as exc:
+            merge_scene_history(base, target, stored)
+        assert [item["path"] for item in exc.value.conflicts][-1].endswith("_lane_family")
+    else:
+        assert merge_scene_history(base, target, stored)[count] == 2
 
 
 def test_restore_receipts_are_count_bounded_and_ttl_prunes_every_entry(monkeypatch):
