@@ -11,15 +11,19 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-11-23
+
 ### Fixed
-- Prompt text saved while an earlier save of the same field is still sending is no longer lost on slow saves:
-  - Switching scene waits until it has been sent ("Finish saving, Undo, or Redo before switching scenes"). Before, the switch dropped it with no message.
-  - **Exit** waits for it and shows *Saving prompt text before closing…*. Before, the editor closed first and showed the old text when reopened.
-  - **+ Queue**, **+ Batch** and **Queue Prompt Sections** send the job after it, so the job gets the new text, and each job keeps the range you clicked.
-- One **Save** in the prompt bar sends once, and text the server refused is not sent again until you change it or press **Save** or **Retry**.
-- A prompt save that can't be sent because its scene is no longer open or its lane is locked now says so, instead of doing nothing.
-- Typing in a long, wrapped prompt on Firefox 159 no longer saves it shorter or drops a final `@mention`.
-- Some selections and caret positions on an `@mention` could make Delete, Backspace, Enter or paste act on more than the mention, or on a chip beside it; they now act exactly where the selection or caret is. A writing aid also wraps a selection that ends on a mention instead of inserting in front of it.
+- On Firefox 159, typing in a long, wrapped prompt no longer saves it shorter or drops a final `@mention`.
+- When prompt saves are slow, text saved while an earlier save of the same field is still sending is no longer lost:
+  - Switching, adding, duplicating or deleting a scene asks you to finish saving first. Before, switching dropped the text with no message.
+  - **Exit** waits for the save and shows *Saving prompt text before closing…*. Before, reopening the editor showed the old text.
+  - **+ Queue**, **+ Batch** and **Queue Prompt Sections** wait for the save, so the job gets the new text. It keeps the range from when you clicked.
+- One **Save** in the prompt bar sends once. Text the server refused is sent again only after you change it, or press **Save** or **Retry**.
+- A prompt save that can't be sent, because its scene is no longer open or its lane is locked, now says so instead of doing nothing.
+- Edits with the selection or text cursor on an `@mention`:
+  - **Delete**, **Backspace**, **Enter** and paste change only what is selected or beside the cursor. In some positions they could also remove text or a chip beyond the mention.
+  - A Writing aid wraps a selection that ends on a mention, instead of inserting in front of it.
 
 ## [0.9.2] - 2026-11-23
 
