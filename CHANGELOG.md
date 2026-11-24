@@ -11,6 +11,9 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Added
+- **Check and repair…** in the Launcher's project menu finds missing or damaged stored parts of a project that won't open, says what a repair would lose, and repairs it after saving a copy of `project.json`.
+
 ### Fixed
 - Two ComfyUI servers can have the same project open, for example one for editing and one for generating:
   - Their saves no longer break the project, and an edit made from an older version is refused instead of overwriting the other server's save. Before, the project could stop opening, with the message that its stored data could not be read. Both servers need this version; 0.9.3 and older don't take part.

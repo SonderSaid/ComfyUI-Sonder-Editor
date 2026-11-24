@@ -273,6 +273,15 @@ def register_project_saved_hook(hook: Callable[[TimelineProject], None]) -> None
         _PROJECT_SAVED_HOOKS.append(hook)
 
 
+def notify_project_saved(project: TimelineProject) -> None:
+    """Outside the project lock: hooks broadcast and schedule cross-thread work."""
+    for hook in list(_PROJECT_SAVED_HOOKS):
+        try:
+            hook(project)
+        except Exception:
+            logger.exception("Project save hook failed")
+
+
 def create_project(
     name: str,
     fps: float = 24.0,
@@ -373,6 +382,52 @@ def verify_project_version(project: TimelineProject,
         _require_stored_version(project, project_file, expected_modified_at)
 
 
+def write_project_root(project_dir: str, data: dict) -> str:
+    """Encode and atomically publish ``project.json``; returns the text written. The caller
+    holds `_project_commit_lock` and has published every component ``data`` names."""
+    project_file = os.path.join(project_dir, "project.json")
+    # The Sonder version that wrote these bytes (every save, repair saves
+    # included). Older versions keep the key as an unknown field, so after an
+    # older save it can name a newer version; only a too-new-format message
+    # reads it, and an older version cannot write a format it cannot read.
+    written_with = pack_version()
+    if written_with:
+        data["written_with"] = written_with
+    # One authoritative encode owns both persistence and compatibility
+    # shadow normalization. Pretty printing is deliberately retained; the
+    # incidents this path protects were diagnosed from readable files.
+    # Strict on purpose: a lone surrogate must fail here rather than reach
+    # disk, where the project's text routes could no longer encode it.
+    # Save nodes scrub what they record (Hardening Phase 10).
+    serialized = json.dumps(data, indent=2, ensure_ascii=False)
+    tmp_file = f"{project_file}.{uuid.uuid4().hex}.tmp"
+    try:
+        # `newline=""` is load-bearing on Windows: default text-mode
+        # translation would persist CRLF bytes that are not the serialized
+        # string subsequently parsed into the compatibility shadow.
+        with open(tmp_file, "w", encoding="utf-8", newline="") as f:
+            f.write(serialized)
+            if "storage" in data:
+                f.flush()
+                os.fsync(f.fileno())
+        atomic_replace(tmp_file, project_file)
+        if "storage" in data:
+            project_storage.sync_directory(project_dir)
+    finally:
+        # atomic_replace removes its temp after exhausted PermissionError,
+        # but a partial write or unrelated OSError used to leak a full-size
+        # UUID file. Cleanup is best effort and never hides the first error.
+        if os.path.exists(tmp_file):
+            try:
+                os.remove(tmp_file)
+            except OSError:
+                logger.warning(
+                    "Could not clean failed project temp file: %s", tmp_file,
+                    exc_info=True,
+                )
+    return serialized
+
+
 def save_project(
     project: TimelineProject,
     *,
@@ -426,45 +481,7 @@ def save_project(
             data = project_storage.assemble_for_save(
                 project, data, current_data, bump_modified_at=bump_modified_at,
                 new_project=expected_absent)
-        # The Sonder version that wrote these bytes (every save, repair saves
-        # included). Older versions keep the key as an unknown field, so after an
-        # older save it can name a newer version; only a too-new-format message
-        # reads it, and an older version cannot write a format it cannot read.
-        written_with = pack_version()
-        if written_with:
-            data["written_with"] = written_with
-        # One authoritative encode owns both persistence and compatibility
-        # shadow normalization. Pretty printing is deliberately retained; the
-        # incidents this path protects were diagnosed from readable files.
-        # Strict on purpose: a lone surrogate must fail here rather than reach
-        # disk, where the project's text routes could no longer encode it.
-        # Save nodes scrub what they record (Hardening Phase 10).
-        serialized = json.dumps(data, indent=2, ensure_ascii=False)
-        tmp_file = f"{project_file}.{uuid.uuid4().hex}.tmp"
-        try:
-            # `newline=""` is load-bearing on Windows: default text-mode
-            # translation would persist CRLF bytes that are not the serialized
-            # string subsequently parsed into the compatibility shadow.
-            with open(tmp_file, "w", encoding="utf-8", newline="") as f:
-                f.write(serialized)
-                if "storage" in data:
-                    f.flush()
-                    os.fsync(f.fileno())
-            atomic_replace(tmp_file, project_file)
-            if "storage" in data:
-                project_storage.sync_directory(project.project_dir)
-        finally:
-            # atomic_replace removes its temp after exhausted PermissionError,
-            # but a partial write or unrelated OSError used to leak a full-size
-            # UUID file. Cleanup is best effort and never hides the first error.
-            if os.path.exists(tmp_file):
-                try:
-                    os.remove(tmp_file)
-                except OSError:
-                    logger.warning(
-                        "Could not clean failed project temp file: %s", tmp_file,
-                        exc_info=True,
-                    )
+        serialized = write_project_root(project.project_dir, data)
         # Advance the compatibility shadow only after the atomic replace. A
         # failed CAS/write must not make unsaved state look durable in memory.
         if hasattr(project, "_raw_data"):
@@ -577,11 +594,7 @@ def save_project(
     except Exception:
         logger.debug("save_project failed to emit diag event", exc_info=True)
     if notify:
-        for hook in list(_PROJECT_SAVED_HOOKS):
-            try:
-                hook(project)
-            except Exception:
-                logger.exception("Project save hook failed")
+        notify_project_saved(project)
 
 
 def load_project(project_dir: str, *, ensure_subdirs: bool = True) -> TimelineProject:

@@ -193,13 +193,22 @@ def hydrate_asset(asset):
         if not getattr(asset, "_generation_unhydrated", False):
             return asset
         cold = read_component(project_dir, asset_component_name(asset.asset_id), asset._generation_descriptor)
-        if not isinstance(cold, dict) or any(key in INLINE_GENERATION_PARAM_KEYS for key in cold):
-            raise ProjectStorageError(f"Asset {asset.asset_id}: invalid provenance partition")
+        check_provenance_payload(asset.asset_id, cold)
         full = {**cold, **asset.generation_params_for_storage}
         object.__setattr__(asset, "generation_params", full)
         asset._generation_original = copy.deepcopy(full)
         asset._generation_unhydrated = False
     return asset
+
+
+def check_provenance_payload(asset_id, cold):
+    if not isinstance(cold, dict) or any(key in INLINE_GENERATION_PARAM_KEYS for key in cold):
+        raise ProjectStorageError(f"Asset {asset_id}: invalid provenance partition")
+
+
+def check_queue_payload(job_id, payload):
+    if not isinstance(payload, dict) or any(field not in payload for field in FROZEN_JOB_FIELDS):
+        raise ProjectStorageError(f"Queue {job_id}: incomplete frozen snapshot")
 
 
 def job_component_name(job_id):
@@ -231,8 +240,7 @@ def hydrate_job(project, job):
     from .project_manager import _project_write_lock
     with _project_write_lock(project.project_dir):
         payload = read_component(project.project_dir, job_component_name(job.job_id), job._frozen_descriptor)
-    if not isinstance(payload, dict) or any(field not in payload for field in FROZEN_JOB_FIELDS):
-        raise ProjectStorageError(f"Queue {job.job_id}: incomplete frozen snapshot")
+    check_queue_payload(job.job_id, payload)
     for field in FROZEN_JOB_FIELDS:
         setattr(job, field, copy.deepcopy(payload[field]))
     job._frozen_original = payload
@@ -273,7 +281,8 @@ class ProjectStorageError(Exception):
 # format", "Project state directory is missing or invalid", and a dozen more.
 PROJECT_STORAGE_UNREADABLE_MESSAGE = (
     "This project's stored data could not be read. Details are in the ComfyUI "
-    "server log."
+    "server log. If a stored part is missing or damaged, Check and repair in the "
+    "Launcher may help."
 )
 
 
@@ -609,6 +618,23 @@ def stage_prompt_history(project, history):
     staged["prompt_history"] = (copy.deepcopy(base), copy.deepcopy(history))
 
 
+def backup_root(project_dir, payload):
+    """Keep the exact bytes of a ``project.json`` for good. Returns the file name in ``state``."""
+    # Keep the permanent root backup within the same path budget as a
+    # component. The former legacy/project-<hash>.json costs 15 extra chars.
+    # GC only sweeps component .json names; .bak and old legacy/ stay intact.
+    name = f"{hashlib.sha256(payload).hexdigest()}.bak"
+    backup = project_state_path(project_dir, name)
+    if not backup:
+        raise ProjectStorageError("Legacy backup path is not contained")
+    if not os.path.exists(backup):
+        publish_bytes(backup, payload)
+    with open(backup, "rb") as handle:
+        if handle.read() != payload:
+            raise ProjectStorageError("Legacy backup byte verification failed")
+    return name
+
+
 def assemble_for_save(project, data, current, *, bump_modified_at, new_project=False):
     """Called only inside the manager's commit lock; never commits the root."""
     from .project_manager import ProjectVersionConflict, project_conflict_projection
@@ -644,19 +670,7 @@ def assemble_for_save(project, data, current, *, bump_modified_at, new_project=F
         # Backup original bytes, not a reconstruction. It is permanent and is
         # verified before the first split document can become authoritative.
         with open(os.path.join(project.project_dir, "project.json"), "rb") as handle:
-            legacy = handle.read()
-        digest = hashlib.sha256(legacy).hexdigest()
-        # Keep the permanent root backup within the same path budget as a
-        # component. The former legacy/project-<hash>.json costs 15 extra chars.
-        # GC only sweeps component .json names; .bak and old legacy/ stay intact.
-        backup = project_state_path(project.project_dir, f"{digest}.bak")
-        if not backup:
-            raise ProjectStorageError("Legacy backup path is not contained")
-        if not os.path.exists(backup):
-            publish_bytes(backup, legacy)
-        with open(backup, "rb") as handle:
-            if handle.read() != legacy:
-                raise ProjectStorageError("Legacy backup byte verification failed")
+            backup_root(project.project_dir, handle.read())
     previous = copy.deepcopy(components)
     if migrate:
         components["prompt_history"] = publish_history(project.project_dir,
@@ -778,15 +792,32 @@ def _descriptor_name(project_dir, name, descriptor):
 
 
 def _referenced_names(project_dir, storage):
-    """The file names the stored document and this process's loaded models still need,
-    or None when an index that names more of them cannot be read.
-
-    Children come from the index alone: reading every child would let one unreadable
-    child unprotect its siblings.
+    """The file names the stored document, this process's loaded models and a repair still
+    need, or None when an index or the held list that names more of them cannot be read.
     """
     from .project_storage_lifecycle import live_descriptors
     leases = live_descriptors(project_dir)
-    needed = [(lease.name, lease.descriptor) for lease in leases]
+    try:
+        return set(read_held(project_dir)) | document_names(
+            project_dir, storage, [(lease.name, lease.descriptor) for lease in leases])
+    except ProjectStorageError:
+        if project_dir not in _KEPT_ALL_WARNED:
+            _KEPT_ALL_WARNED.add(project_dir)
+            logger.warning("Unused stored parts of %s are kept: what is in use cannot be read",
+                           project_dir, exc_info=True)
+        return None
+
+
+_KEPT_ALL_WARNED = set()
+
+
+def document_names(project_dir, storage, also=()):
+    """The file names a document's current and retained components need, plus ``also``.
+
+    Children come from each index alone: reading every child would let one unreadable
+    child unprotect its siblings.
+    """
+    needed = list(also)
     for group in ("components", "recovery_previous", "authoring_previous"):
         descriptors = storage.get(group, {})
         if not isinstance(descriptors, dict):
@@ -799,18 +830,43 @@ def _referenced_names(project_dir, storage):
         if name == "prompt_history":
             indexes[file_name] = descriptor
     for descriptor in indexes.values():
-        try:
-            names.update(_history_entry_names(project_dir, descriptor))
-        except ProjectStorageError:
-            logger.debug("Keeping every unused component of %s: a history index in use is unreadable",
-                         project_dir, exc_info=True)
-            return None
+        names.update(_history_entry_names(project_dir, descriptor))
     return names
 
 
 def _history_entry_names(project_dir, descriptor):
     entries = _history_entry_descriptors(read_component(project_dir, "prompt_history", descriptor))
     return {_descriptor_name(project_dir, "history_entry", entry) for entry in entries or []}
+
+
+HELD_FILENAME = "held.json"
+
+
+def _held_path(project_dir):
+    path = project_state_path(project_dir, HELD_FILENAME)
+    if not path:
+        raise ProjectStorageError("Held component list path is not contained")
+    return path
+
+
+def read_held(project_dir):
+    """``{file name: backup}`` a repair keeps from collection. Unlike retention this is an
+    authority: one that cannot be read raises, and then nothing is collected."""
+    try:
+        value = json.loads(_read_bytes(_held_path(project_dir)))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise ProjectStorageError("Held component list cannot be read") from exc
+    held = value.get("held") if isinstance(value, dict) and value.get("v") == 1 else None
+    if not isinstance(held, dict) or not all(_COMPONENT_FILE.fullmatch(name) for name in held):
+        raise ProjectStorageError("Held component list is malformed")
+    return held
+
+
+def write_held(project_dir, held):
+    publish_bytes(_held_path(project_dir), json.dumps(
+        {"v": 1, "held": dict(sorted(held.items()))}, separators=(",", ":")).encode("utf-8"))
 
 
 def _retention_path(project_dir):
@@ -837,6 +893,11 @@ def _read_retention(project_dir):
 def _write_retention(project_dir, since):
     publish_bytes(_retention_path(project_dir), json.dumps(
         {"v": 1, "unreferenced_since": dict(sorted(since.items()))}, separators=(",", ":")).encode("utf-8"))
+
+
+def restart_retention(project_dir, storage):
+    """Restart it for everything a document names (a repair's, before its root is written)."""
+    _keep_newly_referenced(project_dir, None, storage)
 
 
 def _keep_newly_referenced(project_dir, old, storage):

@@ -148,10 +148,17 @@ locks. Move the project to a local drive.
 
 ### A project stopped opening after two ComfyUI servers used it
 
-Restore the project folder from a backup. To keep it from happening again,
-update Sonder Editor on **every** server that opens the project to a version
-newer than **0.9.3**, then restart them. If the console says a project's
-filesystem has no file locks, open that project in one server at a time.
+1. Close the project on every server.
+2. Open the Launcher, right-click the project and choose
+   **Check and repair…**.
+3. Read what would be lost, then press **Repair**. A copy of `project.json` is
+   saved first. If there is no **Repair** button, the dialog says what to do
+   instead.
+
+To keep it from happening again, update Sonder Editor on **every** server that
+opens the project to a version newer than **0.9.3**, then restart them. If the
+console says a project's filesystem has no file locks, open that project in
+one server at a time.
 
 ### A project won't open, save or extract on Windows
 

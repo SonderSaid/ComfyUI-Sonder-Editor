@@ -171,6 +171,7 @@ from . import minimax_h3
 from . import prompt_payload
 from . import scene_mutation_addressing
 from . import change_certificates
+from . import project_repair
 from . import proxy_media
 from . import control_descriptors
 from .guide_collision import driver_window_span, resolve_execution_window, resolve_guide_collisions
@@ -12919,6 +12920,60 @@ if routes is not None:
         if isinstance(incoming_metadata, dict) and proxy_media.METADATA_TIMING_KEY in incoming_metadata:
             await asyncio.to_thread(proxy_media.worker().settings_changed, project.project_dir)
         return web.json_response(project.to_dict())
+
+    def _storage_project_dir(request: web.Request) -> str:
+        """By folder: these projects may not load, and a malformed document has no id."""
+        if "path" in request.query:
+            raise _bad_project_request("?path is no longer supported for project routes")
+        project_dir = _project_dir_for_folder(request.match_info.get("project_id", ""))
+        if not project_dir:
+            raise FileNotFoundError("Project not found")
+        return project_dir
+
+    @routes.get("/sonder-editor/project/{project_id}/storage/check")
+    async def api_check_storage(request: web.Request) -> web.Response:
+        """What is missing or damaged in this project's stored components. Read only, by a
+        user's request only: outside the change-certificate contract."""
+        try:
+            project_dir = await run_project_io(_storage_project_dir, request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        return web.json_response({
+            "ok": True, **await run_project_io(project_repair.inspect_storage, project_dir)})
+
+    @routes.post("/sonder-editor/project/{project_id}/storage/repair")
+    async def api_repair_storage(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _json_error("Invalid JSON body", 400)
+        digest = body.get("digest") if isinstance(body, dict) else None
+        if not isinstance(digest, str) or not digest:
+            return _json_error("digest is required", 400)
+        try:
+            project_dir = await run_project_io(_storage_project_dir, request)
+        except FileNotFoundError as e:
+            return _json_error(str(e), 404)
+        try:
+            result = await run_project_io(project_repair.repair_storage, project_dir, digest)
+        except project_repair.RepairPlanStale:
+            return web.json_response({
+                "ok": False, "code": "repair_plan_stale",
+                "error": "The project changed since it was checked. Check it again."}, status=409)
+        except project_repair.RepairRefused as exc:
+            return web.json_response({
+                "ok": False, "code": "repair_refused", "reason": exc.reason,
+                "error": "This project can't be repaired. Check it again for the reason."}, status=409)
+        except ProjectBusyError:
+            raise  # the middleware's answer
+        except OSError:
+            # A repair raises only before project.json is written.
+            logger.exception("Repairing a project's storage failed")
+            return web.json_response({
+                "ok": False, "code": "repair_failed",
+                "error": "The project folder could not be written, so nothing was repaired. Check the project again."},
+                status=500)
+        return web.json_response({"ok": True, **result})
 
     @routes.post("/sonder-editor/project/{project_id}/reveal")
     async def api_reveal_project(request: web.Request) -> web.Response:

@@ -385,3 +385,161 @@ console.log(JSON.stringify({badges, lines, bar, parity, plural: [m.launcher_view
     server_text = SdkRunner._missing_nodes_text(readiness)
     assert server_text.startswith(missing_nodes_message(['A', 'B', 'C']))
     assert server_text[len(missing_nodes_message(['A', 'B', 'C'])):] == value['parity']
+
+
+def _node_json(script):
+    if not shutil.which('node'):
+        pytest.skip('Node unavailable')
+    done = subprocess.run(['node', '--input-type=module'], input=script.replace('__BASE__', json.dumps(JS.as_uri() + '/')),
+                          capture_output=True, text=True, encoding='utf-8')
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+_REPAIR_PRELUDE = r"""
+globalThis.window = { addEventListener() {}, removeEventListener() {}, localStorage: {getItem() {return null;}} };
+globalThis.localStorage = window.localStorage;
+class Node {
+    constructor(tag) { Object.assign(this, { tag, children: [], attrs: {}, dataset: {}, style: {}, listeners: {}, className: '', disabled: false, text: '' }); this.classList = { add() {}, toggle() {}, remove() {} }; }
+    append(...nodes) { this.children.push(...nodes); } replaceChildren(...nodes) { this.children = nodes; }
+    setAttribute(k, v) { this.attrs[k] = v; } removeAttribute(k) { delete this.attrs[k]; } getAttribute(k) { return this.attrs[k] ?? null; } addEventListener(k, f) { this.listeners[k] = f; }
+    removeEventListener() {} showModal() { this.open = true; } close() { this.open = false; } remove() { this.removed = true; } focus() { globalThis.focused = this; }
+    set textContent(v) { this.text = v; } get textContent() { return this.text + this.children.map(c => c.textContent ?? String(c)).join(''); }
+}
+globalThis.document = { body: new Node('body'), head: new Node('head'), createElement: tag => new Node(tag), querySelector() { return null; }, addEventListener() {}, removeEventListener() {}, activeElement: null };
+const { repairSummary, mountRepairDialog } = await import(__BASE__ + 'launcher_repair.js');
+const tick = () => new Promise(r => setTimeout(r, 0));
+"""
+
+
+def test_repair_summary_says_what_is_lost():
+    cases = {
+        'healthy': {'status': 'healthy', 'problems': []},
+        'unavailable': {'status': 'unrepairable', 'reason': 'unavailable', 'problems': []},
+        'unknown': {'status': 'unrepairable', 'reason': 'something_new', 'problems': []},
+        'damaged': {'status': 'damaged', 'problems': [
+            {'kind': 'history', 'outcome': 'entries_dropped', 'kept': 1, 'lost': 2},
+            *[{'kind': 'details', 'outcome': 'dropped', 'name': f'take{i}.mp4'} for i in range(7)],
+            {'kind': 'details', 'outcome': 'restored', 'name': 'back.mp4'},
+            {'kind': 'job', 'outcome': 'dropped'}, {'kind': 'unused', 'outcome': 'dropped'},
+            {'kind': 'leftover', 'outcome': 'set_aside', 'count': 2}]},
+    }
+    for outcome, kept, lost in (('restored', 3, 0), ('previous', 2, 0), ('previous', 2, 1),
+                                ('previous', None, 0), ('salvaged', 1, 4), ('emptied', 0, None)):
+        cases[f'{outcome}-{kept}-{lost}'] = {'status': 'damaged', 'problems': [
+            {'kind': 'history', 'outcome': outcome, 'kept': kept, 'lost': lost}]}
+    out = _node_json(_REPAIR_PRELUDE + f"const cases = {json.dumps(cases)};\n"
+                     "console.log(JSON.stringify(Object.fromEntries(Object.entries(cases).map(([k, v]) => [k, repairSummary(v)]))));")
+    assert out['healthy'] == {'lines': ['Nothing is missing or damaged.'], 'canRepair': False}
+    assert not out['unavailable']['canRepair'] and 'can’t be read right now' in out['unavailable']['lines'][0]
+    assert not out['unknown']['canRepair'] and 'backup' in out['unknown']['lines'][0]
+    assert out['damaged'] == {'canRepair': True, 'lines': [
+        'Prompt history: 2 entries are lost. 1 entry stays.',
+        '1 part is restored in full.',
+        '7 assets lose their generation details: take0.mp4, take1.mp4, take2.mp4, take3.mp4, take4.mp4 and 2 more. '
+        'The media and its place on the timeline stay.',
+        '1 Render Queue job is removed, because the settings can’t be found.',
+        '1 unused part is removed.',
+        '2 damaged unused files are set aside, so they can’t stop a save.']}
+    assert out['restored-3-0']['lines'] == ['Prompt history: restored in full.']
+    assert out['previous-2-1']['lines'] == [
+        'Prompt history: goes back to the version before (2 entries; 1 more can’t be found).']
+    assert out['previous-2-0']['lines'] == ['Prompt history: goes back to the version before (2 entries).']
+    assert out['previous-None-0']['lines'] == ['Prompt history: goes back to the version before.']
+    assert 'never saved' in out['salvaged-1-4']['lines'][0]
+    assert out['emptied-0-None']['lines'] == ['Prompt history: lost. It starts empty.']
+
+
+def test_every_reason_the_server_gives_has_its_own_sentence():
+    from server import project_repair
+    import inspect as source_of
+    import re
+    reasons = set(re.findall(r'(?:_Unrepairable|RepairRefused)\("([a-z_]+)"\)', source_of.getsource(project_repair)))
+    reasons |= set(re.findall(r'self\.reason = "([a-z_]+)"', source_of.getsource(project_repair)))
+    reasons -= {'healthy'}
+    text = (JS / 'launcher_repair.js').read_text(encoding='utf-8')
+    assert reasons and all(f'    {reason}: ' in text for reason in reasons), reasons
+
+
+def test_repair_dialog_repairs_only_the_plan_it_showed():
+    out = _node_json(_REPAIR_PRELUDE + r"""
+const log = []; let failRepair = true, digest = 'one';
+const damaged = () => ({ status: 'damaged', digest, problems: [{ kind: 'job', outcome: 'dropped' }] });
+mountRepairDialog({ name: 'P', check: async () => { log.push('check'); return damaged(); },
+    repair: async d => { log.push('repair ' + d); if (failRepair) throw new Error('The project changed since it was checked. Check it again.'); return { backup: 'state/x.bak' }; },
+    onClose: () => log.push('closed') });
+await tick(); await tick();
+const dialog = document.body.children[0], [, , body, error, actions] = dialog.children;
+const labels = () => actions.children.map(b => b.textContent), press = async label => { const b = actions.children.find(b => b.textContent === label); b.listeners.click({}); await tick(); await tick(); };
+const steps = [[labels(), globalThis.focused?.textContent]];
+await press('Repair'); steps.push([labels(), error.textContent, body.textContent]);
+digest = 'two'; failRepair = false;
+await press('Check again'); steps.push([labels(), error.textContent]);
+await press('Repair'); steps.push([labels(), body.textContent]);
+await press('Close');
+console.log(JSON.stringify({ log, steps, removed: !!dialog.removed }));
+""")
+    assert out['steps'][0] == [['Close', 'Repair'], 'Close']  # Enter never repairs by accident
+    assert out['steps'][1] == [['Close', 'Check again'], 'The project changed since it was checked. Check it again.', '']
+    assert out['steps'][2] == [['Close', 'Repair'], '']
+    assert out['steps'][3] == [['Close'], 'Repaired. The copy of project.json is state/x.bak in the project’s folder.']
+    assert out['log'] == ['check', 'repair one', 'check', 'repair two', 'closed'] and out['removed']
+
+
+def test_repair_dialog_ignores_an_answer_after_it_was_closed():
+    out = _node_json(_REPAIR_PRELUDE + r"""
+let answer; const closed = [];
+const close = mountRepairDialog({ name: 'P', check: () => new Promise(r => { answer = r; }), repair: async () => ({}), onClose: () => closed.push(1) });
+await tick(); close();
+const before = document.body.children[0].textContent;
+answer({ status: 'damaged', digest: 'x', problems: [{ kind: 'job', outcome: 'dropped' }] }); await tick(); await tick();
+console.log(JSON.stringify({ same: document.body.children[0].textContent === before, closed: closed.length }));
+""")
+    assert out == {'same': True, 'closed': 1}
+
+
+def test_repair_dialog_says_what_stays_undone_and_why_it_was_refused():
+    out = _node_json(_REPAIR_PRELUDE + r"""
+const answers = [{ backup: 'state/x.bak', left_in_place: ['a', 'b'], reopened: false }];
+let refuse = true;
+mountRepairDialog({ name: 'P', check: async () => ({ status: 'damaged', digest: 'd', problems: [{ kind: 'job', outcome: 'dropped' }] }),
+    repair: async () => { if (refuse) { const err = new Error('generic'); err.payload = { reason: 'no_locks' }; throw err; } return answers[0]; } });
+await tick(); await tick();
+const [, , body, error, actions] = document.body.children[0].children;
+const labels = () => actions.children.map(b => b.textContent), press = async label => { actions.children.find(b => b.textContent === label).listeners.click({}); await tick(); await tick(); };
+await press('Repair'); const refused = error.textContent;
+refuse = false; await press('Check again'); await press('Repair');
+console.log(JSON.stringify({ refused, body: body.textContent, labels: labels(), role: error.attrs.role }));
+""")
+    assert 'drive doesn’t support file locks' in out['refused'] and out['role'] == 'alert'
+    assert '2 damaged files couldn’t be set aside' in out['body'] and 'couldn’t be opened afterwards' in out['body']
+    assert out['labels'] == ['Close', 'Check again']
+
+
+def test_repair_dialog_can_be_left_while_it_checks_but_not_while_it_repairs():
+    out = _node_json(_REPAIR_PRELUDE + r"""
+let finish, repairs = 0, closed = 0;
+mountRepairDialog({ name: 'P', check: async () => ({ status: 'damaged', digest: 'd', problems: [{ kind: 'job', outcome: 'dropped' }] }),
+    repair: () => { repairs++; return new Promise(r => { finish = r; }); }, onClose: () => closed++ });
+const dialog = document.body.children[0], actions = dialog.children[4];
+const during = actions.children.map(b => [b.textContent, b.disabled]);
+await tick(); await tick();
+const go = actions.children.find(b => b.textContent === 'Repair');
+go.listeners.click({}); go.listeners.click({});
+const repairing = actions.children.map(b => [b.textContent, b.disabled]);
+dialog.listeners.cancel({ preventDefault() {} });
+const closedWhileRepairing = closed;
+finish({ backup: 'b', left_in_place: [], reopened: true }); await tick(); await tick();
+dialog.listeners.cancel({ preventDefault() {} });
+console.log(JSON.stringify({ during, repairing, repairs, closedWhileRepairing, closed }));
+""")
+    assert out['during'] == [['Close', False]]
+    assert out['repairing'] == [['Close', True], ['Repair', True]]
+    assert (out['repairs'], out['closedWhileRepairing'], out['closed']) == (1, 0, 1)
+
+
+def test_the_project_menu_offers_check_and_repair():
+    source = (JS / 'sdk_landing.js').read_text(encoding='utf-8')
+    assert "button('Check and repair…', () => { close(); checkAndRepair(project); }, { disabled: !!project.too_new })" in source
+    assert "{ digest }) }); void run(async () => { await refresh(); }); return result;" in source
+    assert '/storage`' in source and '${path}/check' in source and '${path}/repair' in source

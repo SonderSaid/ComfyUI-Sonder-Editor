@@ -17,6 +17,7 @@ import { mountProjects, thumbnailMode } from './launcher_projects.js';
 import { mountOpenBar } from './launcher_open_bar.js';
 import { NODE_PACKS_PATH, fetchNodePackMappings } from './node_pack_mappings.js';
 import { mountDialog, mountPopup, mountProjectDialog } from './launcher_dialog.js';
+import { mountRepairDialog } from './launcher_repair.js';
 import { mountProjectFormatControls } from './project_format_controls.js';
 
 let api, root, views = [], popup = null, popupAnchor = null, dialog = null, exitPollTimer = null, exitFlag = null;
@@ -310,10 +311,21 @@ function projectMenu(project, anchor) {
             }
         }, { disabled: project.too_new || project.unreadable }));
         menu.append(button('Show in folder', () => { close(); void run(() => call(`/sonder-editor/project/${encodeURIComponent(project.folder)}/reveal`, { method: 'POST' })); }, { disabled: !state.projectData.can_manage, title: state.projectData.can_manage ? 'Show in folder' : MACHINE_ONLY_MESSAGE }));
+        menu.append(button('Check and repair…', () => { close(); checkAndRepair(project); }, { disabled: !!project.too_new }));
         menu.append(button(project.hidden ? 'Unhide' : 'Hide', () => { close(); void run(() => setHidden('project', project.folder, !project.hidden)); }));
         if (project.linked) menu.append(button('Unlink…', () => showDialog({ title: 'Unlink project', help: `Remove the link to “${project.name}”? The project’s files stay in place.`, accept: 'Unlink', submit: async () => {
             await call('/sonder-editor/projects/unlink', { method: 'POST', ...json({ project_id: project.folder }) }); await refresh();
         } })));
+    });
+}
+function checkAndRepair(project) {
+    const path = `/sonder-editor/project/${encodeURIComponent(project.folder)}/storage`;
+    popup?.(); dialog?.();
+    dialog = mountRepairDialog({
+        name: project.name || project.folder,
+        check: () => call(`${path}/check`, {}, LIST_TIMEOUT_MS),
+        repair: async digest => { const result = await call(`${path}/repair`, { method: 'POST', ...json({ digest }) }); void run(async () => { await refresh(); }); return result; },
+        onClose: () => { dialog = null; },
     });
 }
 // New project: prefilled from the selected workflow's size and rate, else the editor's
