@@ -741,9 +741,9 @@ def test_a_member_being_deleted_is_not_offered_to_chip_creation_until_the_delete
 
 def test_a_gesture_made_while_a_refused_delete_was_queued_cannot_undo_the_delete_into_the_server(tmp_path):
     """Phase 2 audit #1: the cascade is painted at enqueue, so a gesture made in
-    the window would snapshot the painted scene as its Undo before-state. The
-    paint starts an ordered baseline, so that entry's before-state is what the
-    server held at its queue position instead."""
+    the window snapshots the painted scene at its press. Its entry's
+    before-state is replaced by its own write's `history_before`: what the
+    server held, read from no extra request (Undo across takes, Phase 2)."""
     from server.scene_history_merge import merge_scene_history
 
     result = run_library("""

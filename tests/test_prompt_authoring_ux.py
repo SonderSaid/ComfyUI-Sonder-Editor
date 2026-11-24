@@ -62,6 +62,13 @@ def _run_node(script: str):
         script = ("import { isEmptySceneDelta, sceneBeforeFromDelta } from "
                   + json.dumps((ROOT / "web/js/scene_history_delta.js").as_uri())
                   + ";" + chr(10)) + script
+    if ("QUEUED_HISTORY_NOTICE_DELAY_MS" in script
+            and "QUEUED_HISTORY_NOTICE_DELAY_MS =" not in script):
+        # The waiting notice's delay, as shipped, for a harness lifting it.
+        widget = _source("web/js/editor_widget.js")
+        line = next(row for row in widget.splitlines()
+                    if row.startswith("const QUEUED_HISTORY_NOTICE_DELAY_MS ="))
+        script = line + chr(10) + script
     if "projectErrorMessage(" in script:
         widget = _source("web/js/editor_widget.js")
         errors = widget[widget.index("const PROJECT_ERROR_MESSAGES"):
@@ -4824,11 +4831,14 @@ console.log(JSON.stringify({{stampedKept:q._undoStack.includes(stamped),
     }
 
 
-def test_queued_history_notification_is_single_and_tracks_depth():
-    widget = _source("web/js/editor_widget.js")
-    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
-    result = _run_node(f"""
-const events=[];
+# A fake clock for the waiting notice: `advance(ms)` fires every timer due.
+_NOTICE_HARNESS = """
+const events=[];let now=0;const timers=new Map();let nextTimer=1;
+globalThis.setTimeout=(fn,ms)=>{{const id=nextTimer++;timers.set(id,{{at:now+ms,fn}});return id;}};
+globalThis.clearTimeout=(id)=>{{timers.delete(id);}};
+const advance=(ms)=>{{const until=now+ms;for(;;){{
+  const due=[...timers].filter(([,t])=>t.at<=until).sort((a,b)=>a[1].at-b[1].at)[0];
+  if(!due)break;timers.delete(due[0]);now=due[1].at;due[1].fn();}}now=until;}};
 globalThis.notifyProgress=(options)=>{{events.push(["create",options]);return{{
   update:(patch)=>events.push(["update",patch]),
   dismiss:()=>events.push(["dismiss"]),
@@ -4837,21 +4847,201 @@ class Harness {{
 {helpers}
   constructor(){{this._queuedHistoryOperationCount=0;this._queuedHistoryNotification=null;}}
 }}
-const h=new Harness();const first=h._beginQueuedHistoryWait("undo");
+const h=new Harness();
+const kinds=()=>events.map((event)=>event[0]);
+"""
+
+
+def _notice_run(body):
+    widget = _source("web/js/editor_widget.js")
+    helpers = _method(widget, "_recordHistoryRefusal", "_setWidgetValue")
+    return _run_node(_NOTICE_HARNESS.format(helpers=helpers) + body)
+
+
+def test_queued_history_notification_is_single_and_tracks_depth():
+    result = _notice_run("""
+const first=h._beginQueuedHistoryWait("undo");
 const second=h._beginQueuedHistoryWait("redo");
+const early=[...kinds()];
+advance(300);
+const due=[...kinds()];
 h._endQueuedHistoryWait(first);h._endQueuedHistoryWait(second);
 h._endQueuedHistoryWait(second);
-console.log(JSON.stringify({{events,count:h._queuedHistoryOperationCount,
-  handle:h._queuedHistoryNotification}}));
+console.log(JSON.stringify({early,due,events,count:h._queuedHistoryOperationCount,
+  handle:h._queuedHistoryNotification}));
 """)
+    assert result["early"] == []
+    assert result["due"] == ["create"]
     assert result["count"] == 0
     assert result["handle"] is None
-    assert [event[0] for event in result["events"]] == [
-        "create", "update", "update", "dismiss"]
-    assert result["events"][0][1]["source"] == "history-operation-queued"
-    assert "1 history action" in result["events"][0][1]["message"]
-    assert "2 history actions" in result["events"][1][1]["message"]
-    assert "1 history action" in result["events"][2][1]["message"]
+    assert [event[0] for event in result["events"]] == ["create", "update", "dismiss"]
+    created = result["events"][0][1]
+    assert created["source"] == "history-operation-queued"
+    assert created["verb"] == "Waiting"
+    assert "2 history actions" in created["message"]
+    assert created["detail"] == "Undo will run in request order."
+    assert "1 history action " in result["events"][1][1]["message"]
+    assert result["events"][1][1]["detail"] == "Redo will run in request order."
+
+
+def test_a_quick_or_painted_history_action_raises_no_notice():
+    """Undo across takes, Phase 2: the busy count covers the press to the
+    finish, the notice only a step still unpainted after 300 ms."""
+    result = _notice_run("""
+const quick=h._beginQueuedHistoryWait("undo");
+advance(120);h._markQueuedHistoryRunning(quick);h._endQueuedHistoryWait(quick);
+advance(1000);
+const afterQuick=[...kinds()];
+const painted=h._beginQueuedHistoryWait("redo");
+advance(50);h._markQueuedHistoryRunning(painted);
+advance(100);h._markQueuedHistoryPainted(painted,true);
+const busyWhilePainted=h._queuedHistoryOperationCount;
+advance(5000);
+const afterPainted=[...kinds()];
+h._endQueuedHistoryWait(painted);
+console.log(JSON.stringify({afterQuick,busyWhilePainted,afterPainted,events:kinds(),
+  count:h._queuedHistoryOperationCount,timers:timers.size}));
+""")
+    assert result == {"afterQuick": [], "busyWhilePainted": 1, "afterPainted": [],
+                      "events": [], "count": 0, "timers": 0}
+
+
+def test_a_slow_unpainted_history_action_says_undoing_until_painted():
+    result = _notice_run("""
+const token=h._beginQueuedHistoryWait("undo");
+advance(10);h._markQueuedHistoryRunning(token);
+advance(289);
+const before=[...kinds()];
+advance(1);
+const shown=structuredClone(events.at(-1));
+h._markQueuedHistoryPainted(token,true);
+const afterPaint=[...kinds()];
+h._endQueuedHistoryWait(token);
+const redo=h._beginQueuedHistoryWait("redo");h._markQueuedHistoryRunning(redo);advance(300);
+const redoShown=structuredClone(events.at(-1));
+h._endQueuedHistoryWait(redo);
+console.log(JSON.stringify({before,shown,afterPaint,redoShown,events:kinds()}));
+""")
+    assert result["before"] == []
+    assert result["shown"][0] == "create"
+    assert result["shown"][1]["verb"] == "Undoing"
+    assert result["shown"][1]["message"] == "Saving to the project…"
+    assert result["shown"][1]["detail"] is None
+    assert result["afterPaint"] == ["create", "dismiss"]
+    assert result["redoShown"][1]["verb"] == "Redoing"
+    assert result["events"] == ["create", "dismiss", "create", "dismiss"]
+
+
+def test_a_queued_step_shows_waiting_then_undoing_once_it_runs_unpainted():
+    """Shown as queued, a step that starts keeps that wording for one more
+    delay: one that paints at once closes the notice without flipping it."""
+    result = _notice_run("""
+const token=h._beginQueuedHistoryWait("undo");
+advance(400);
+const waiting=structuredClone(events.at(-1));
+h._markQueuedHistoryRunning(token);
+const atStart=[...kinds()];
+advance(299);
+const held=[...kinds()];
+advance(1);
+const running=structuredClone(events.at(-1));
+h._endQueuedHistoryWait(token);
+const quick=h._beginQueuedHistoryWait("redo");
+advance(400);h._markQueuedHistoryRunning(quick);advance(100);
+h._markQueuedHistoryPainted(quick,true);advance(1000);h._endQueuedHistoryWait(quick);
+console.log(JSON.stringify({waiting,atStart,held,running,events:kinds(),timers:timers.size}));
+""")
+    assert result["waiting"][0] == "create"
+    assert result["waiting"][1]["message"] == "1 history action queued behind project writes…"
+    assert result["atStart"] == result["held"] == ["create"]
+    assert result["running"][0] == "update"
+    assert result["running"][1]["verb"] == "Undoing"
+    assert result["running"][1]["message"] == "Saving to the project…"
+    assert result["running"][1]["detail"] is None
+    # The quick one: shown as queued, started, painted at once: no flip.
+    assert result["events"] == ["create", "update", "dismiss", "create", "dismiss"]
+    assert result["timers"] == 0
+
+
+def test_a_painted_step_ahead_leaves_the_queued_one_counted_alone():
+    """One step applying and painted, one queued behind it: the notice counts
+    the queued one only, and names the operation that runs next."""
+    result = _notice_run("""
+const first=h._beginQueuedHistoryWait("undo");
+const second=h._beginQueuedHistoryWait("redo");
+h._markQueuedHistoryRunning(first);h._markQueuedHistoryPainted(first,true);
+advance(300);
+const shown=structuredClone(events.at(-1));
+h._endQueuedHistoryWait(first);h._markQueuedHistoryRunning(second);
+advance(300);
+const running=structuredClone(events.at(-1));
+h._endQueuedHistoryWait(second);
+console.log(JSON.stringify({shown,running,events:kinds()}));
+""")
+    assert result["shown"][1]["message"] == "1 history action queued behind project writes…"
+    assert result["shown"][1]["detail"] == "Redo will run in request order."
+    assert result["running"][1]["verb"] == "Redoing"
+    # Ending the first changes nothing shown, so it raises no update.
+    assert result["events"] == ["create", "update", "dismiss"]
+
+
+def test_a_prediction_taken_back_rearms_the_notice_instead_of_flashing_it():
+    """A refused prediction that finishes at once raises nothing; one whose
+    operation keeps applying is shown 300 ms later."""
+    result = _notice_run("""
+const refused=h._beginQueuedHistoryWait("undo");
+h._markQueuedHistoryRunning(refused);h._markQueuedHistoryPainted(refused,true);
+advance(1000);
+h._markQueuedHistoryPainted(refused,false);h._endQueuedHistoryWait(refused);
+advance(1000);
+const afterRefused=[...kinds()];
+const slow=h._beginQueuedHistoryWait("undo");
+h._markQueuedHistoryRunning(slow);h._markQueuedHistoryPainted(slow,true);
+advance(1000);
+h._markQueuedHistoryPainted(slow,false);
+advance(299);
+const justBefore=[...kinds()];
+advance(1);
+const shown=structuredClone(events.at(-1));
+h._endQueuedHistoryWait(slow);
+console.log(JSON.stringify({afterRefused,justBefore,shown,events:kinds()}));
+""")
+    assert result["afterRefused"] == []
+    assert result["justBefore"] == []
+    assert result["shown"][1]["message"] == "Saving to the project…"
+    assert result["events"] == ["create", "dismiss"]
+
+
+def test_a_refused_step_goes_quiet_and_a_closed_notice_returns_with_new_wording():
+    """A refused step's warning speaks for it: its rollback does not re-arm the
+    notice. A notice gone from the screen (closed by the author, or dismissed
+    by another editor sharing its source) comes back only when its wording
+    changes."""
+    result = _notice_run("""
+const refused=h._beginQueuedHistoryWait("undo");
+h._markQueuedHistoryRunning(refused);h._markQueuedHistoryPainted(refused,true);
+h._markQueuedHistoryPainted(refused,false);h._quietQueuedHistoryWait(refused);
+advance(5000);
+const afterRefusal=[...kinds()];
+h._endQueuedHistoryWait(refused);
+let alive=true;
+globalThis.notifyProgress=(options)=>{events.push(["create",options]);return{
+  update:(patch)=>events.push(["update",patch]),dismiss:()=>events.push(["dismiss"]),alive:()=>alive};};
+const slow=h._beginQueuedHistoryWait("undo");
+advance(300);
+alive=false;
+const again=h._beginQueuedHistoryWait("redo");advance(300);
+const sameWording=[...kinds()];alive=true;
+h._markQueuedHistoryRunning(slow);advance(300);
+const newWording=[...kinds()];
+h._endQueuedHistoryWait(slow);h._endQueuedHistoryWait(again);
+console.log(JSON.stringify({afterRefusal,sameWording,newWording,timers:timers.size}));
+""")
+    assert result["afterRefusal"] == []
+    # Two queued: the wording changed (1 -> 2 actions), so it is created again.
+    assert result["sameWording"] == ["create", "create"]
+    assert result["newWording"] == ["create", "create", "update"]
+    assert result["timers"] == 0
 
 
 def test_busy_undo_keeps_reserved_entry_stampable_until_queued_apply():
@@ -4865,6 +5055,8 @@ def test_busy_undo_keeps_reserved_entry_stampable_until_queued_apply():
     queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
     result = _run_node(f"""
 const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
+// Longer than this harness runs: the busy count is what it pins, not the notice.
+const QUEUED_HISTORY_NOTICE_DELAY_MS = 60000;
 globalThis.document={{activeElement:null}};globalThis.describeKeyboardDebugElement=()=>({{}});
 const warnings=[];globalThis.notifyInfo=()=>{{}};
 globalThis.notifyWarning=(message)=>warnings.push(message);globalThis.notifyError=()=>{{}};
@@ -4915,10 +5107,11 @@ console.log(JSON.stringify({{during,after:{{count:h._queuedHistoryOperationCount
     assert result["during"]["entryPending"] is True
     assert result["during"]["revision"] == 0
     assert result["during"]["count"] == 1
-    assert [event[0] for event in result["during"]["events"]] == ["create"]
+    # Busy from the press; the notice waits for its delay (Undo across takes).
+    assert result["during"]["events"] == []
     assert result["after"]["count"] == 0
     assert result["after"]["handle"] is None
-    assert [event[0] for event in result["after"]["events"]] == ["create", "dismiss"]
+    assert result["after"]["events"] == []
     assert result["after"]["restores"] == [
         {"target": "before", "expectedPost": "after"}]
     assert result["after"]["undo"] == 0

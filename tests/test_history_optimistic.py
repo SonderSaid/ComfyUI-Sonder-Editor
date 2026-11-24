@@ -433,6 +433,82 @@ def test_real_restore_failure_rolls_back_before_notice(operation, failure):
     """)
 
 
+# Undo across takes, Phase 2 (audit M3): the real step hands its waiting-notice
+# token to the queue slot, the paint, the drawn canonical scene and a refusal.
+_NOTICE_STEP = """
+        const w=makeHistoryWidget(), e=entry(), op=OPERATION, Op=op[0].toUpperCase()+op.slice(1);
+        Object.assign(w, {projectDir:'project', activeSceneId:'scene', _historyOperationSeq:0,
+            _queuedHistoryOperationCount:0, _queuedHistoryWaits:new Set(), _queuedHistoryNotification:null,
+            _historyStackRevision:0, _maxUndoSteps:50, _projectDirName:()=>'project'});
+        const tokens=[];
+        const begin=w._beginQueuedHistoryWait.bind(w);
+        w._beginQueuedHistoryWait=(operation)=>{const t=begin(operation);tokens.push(t);return t;};
+        const quiet=w._quietQueuedHistoryWait.bind(w); let quieted=0;
+        w._quietQueuedHistoryWait=(t)=>{if(t===tokens[0])quieted++;return quiet(t);};
+        const at={};
+        const flags=()=>({running:tokens[0].running,painted:tokens[0].painted});
+        w[`_${op}Stack`].push(e);
+"""
+
+
+@pytest.mark.parametrize('operation', ['undo', 'redo'])
+def test_a_pre_painted_step_marks_its_notice_painted_before_the_restore(operation):
+    _run_history_node(_NOTICE_STEP.replace("OPERATION", repr(operation)) + '''
+        w._historyMergeCapabilities=structuredClone(capabilities);
+        globalThis.fetch=async(url,init)=>{
+            if(url.endsWith('/restore-token')) return new Response(JSON.stringify({restore_token:'token',...capabilities}));
+            if(init?.method==='PUT') { at.put=flags(); return new Response(JSON.stringify({scene:e.snapshot})); }
+            return new Response(JSON.stringify({status:'pending'}));
+        };
+        await w[`_queue${Op}WithinGesture`](null);
+        assert.deepEqual(at.put,{running:true,painted:true});
+        assert.equal(tokens[0].active,false);
+        assert.equal(w._queuedHistoryOperationCount,0);
+        assert.equal(w._queuedHistoryNotification,null);
+        assert.equal(quieted,0);
+    ''')
+
+
+@pytest.mark.parametrize('operation', ['undo', 'redo'])
+def test_an_unpainted_step_counts_as_painted_once_the_canonical_scene_is_drawn(operation):
+    # No cached merge lists and a disproving token: nothing is predicted, so
+    # the step is unpainted until its answer is drawn.
+    _run_history_node(_NOTICE_STEP.replace("OPERATION", repr(operation)) + '''
+        globalThis.fetch=async(url,init)=>{
+            if(url.endsWith('/restore-token')) { at.token=flags();
+                return new Response(JSON.stringify({restore_token:'token',merged_write_fields:[],merged_derived_fields:[]})); }
+            if(init?.method==='PUT') { at.put=flags(); return new Response(JSON.stringify({scene:e.snapshot})); }
+            return new Response(JSON.stringify({status:'pending'}));
+        };
+        const set=w._setActiveScene.bind(w);
+        w._setActiveScene=(scene,options={})=>{set(scene,options);if(!options.optimisticHistory)at.drawn=flags();};
+        await w[`_queue${Op}WithinGesture`](null);
+        assert.deepEqual(at.token,{running:true,painted:false});
+        assert.deepEqual(at.put,{running:true,painted:false});
+        assert.equal(at.drawn.painted,false,'marked after the render, not before');
+        assert.equal(tokens[0].painted,true);
+        assert.equal(tokens[0].active,false);
+    ''')
+
+
+@pytest.mark.parametrize('operation', ['undo', 'redo'])
+def test_a_refused_step_takes_its_paint_back_and_goes_quiet(operation):
+    _run_history_node(_NOTICE_STEP.replace("OPERATION", repr(operation)) + '''
+        w._historyMergeCapabilities=structuredClone(capabilities);
+        globalThis.fetch=async(url,init)=>{
+            if(url.endsWith('/restore-token')) return new Response(JSON.stringify({restore_token:'token',...capabilities}));
+            if(init?.method==='PUT') { at.put=flags();
+                return new Response(JSON.stringify({error:'refused',code:'scene_merge_conflict'}),{status:400}); }
+            return new Response(JSON.stringify({status:'pending'}));
+        };
+        await w[`_queue${Op}WithinGesture`](null);
+        assert.deepEqual(at.put,{running:true,painted:true});
+        assert.equal(tokens[0].painted,false,'the rollback took the paint back');
+        assert.equal(quieted,1);
+        assert.equal(w._queuedHistoryNotification,null);
+    ''')
+
+
 def test_failed_paint_rebases_edit_authored_during_restore_window():
     _run_history_node("""
         const w=makeHistoryWidget(), e=entry();

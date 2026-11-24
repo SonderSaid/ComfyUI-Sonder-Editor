@@ -4160,7 +4160,9 @@ def test_failed_group_edit_cannot_enter_the_next_edits_undo_target(first_link):
 
     Only transport and rendering are replaced. Both failure orientations matter:
     Undo must neither resurrect a refused link nor delete a group whose unlink
-    failed. The original operation guards must remain authored values.
+    failed. The original operation guards must remain authored values. The
+    canonical pre-state is the second write's own `history_before` (Undo across
+    takes): no scene is read for it, even after a failure of unknown outcome.
     """
     _run_gesture_node(_LINK_SETUP + f"const firstLink = {str(first_link).lower()};" + """
         const w = linkWidget();
@@ -4181,9 +4183,15 @@ def test_failed_group_edit_cannot_enter_the_next_edits_undo_target(first_link):
             calls++;
             if (calls === 1) await new Promise((_resolve, reject) => { rejectFirst = reject; });
             const op = JSON.parse(init.body).operations[0];
+            const beforeGroups = structuredClone(server.linked_item_groups);
             server.linked_item_groups = op.type === 'unlink_items' ? []
                 : [{group_id:op.group_id, items:op.items.map(({type,id}) => ({type,id}))}];
-            return {payload:{scene:structuredClone(server)}};
+            // What the route's `history_before` says: the groups this commit started from.
+            const history_before = {v:1, fields:{}, absent:[], members:{linked_item_groups:{
+                order:beforeGroups.map((g) => g.group_id), fields:{}, absent:{},
+                removed:beforeGroups.filter((g) => !server.linked_item_groups
+                    .some((after) => after.group_id === g.group_id))}}};
+            return {payload:{scene:structuredClone(server), history_before}};
         };
         const first = firstLink ? w._createLinkGroupFromSelectionWithinGesture()
             : w._unlinkSelectedItemsWithinGesture();
@@ -4193,7 +4201,7 @@ def test_failed_group_edit_cannot_enter_the_next_edits_undo_target(first_link):
         rejectFirst(new Error('refused'));
         await Promise.all([first, second]);
         assert.equal(calls, 2);
-        assert.equal(reads, 2, 'unknown failure outcome resolves before the next slot');
+        assert.equal(reads, 0, 'the answer proves the pre-state; no baseline read');
         assert.equal(w._undoStack.length, 1);
         assert.deepEqual(w._undoStack[0].snapshot.linked_item_groups, original);
         assert.deepEqual(w._undoStack[0].postSnapshot.linked_item_groups, server.linked_item_groups);
@@ -4212,7 +4220,7 @@ def test_two_failed_group_predictions_return_to_the_pre_burst_groups():
     """)
 
 
-def test_link_ordering_does_not_rewrite_authored_guards():
+def test_a_link_keeps_its_authored_guards_and_takes_its_before_state_from_the_answer():
     _run_gesture_node(_LINK_SETUP + """
         const w = linkWidget();
         delete w._pushUndo; delete w._stampHistoryPostSnapshot; delete w._runSceneMutation;
@@ -4223,20 +4231,23 @@ def test_link_ordering_does_not_rewrite_authored_guards():
         w.activeScene.guide_frames=[guide];
         w.selectedItems=[w.selectedItems[0],{type:'guide', id:10,data:guide}];
         const server=structuredClone(w.activeScene); server.guide_frames[0].frame_index=99;
-        globalThis.fetch=async()=>new Response(JSON.stringify(server),{status:200});
+        let reads=0;
+        globalThis.fetch=async()=>{reads++; return new Response(JSON.stringify(server),{status:200});};
         w._runVersionedProjectMutation=async(_url,init)=>{
             const op=JSON.parse(init.body).operations[0];
             assert.equal(op.items[1].id,'g');
             assert.equal(op.items[1].expected.frame_index,10,'must refuse drift, not authorize it');
-            return {payload:{scene:server}};
+            // The server's before-state: the guide had already moved there.
+            return {payload:{scene:server,history_before:{v:1,fields:{},absent:[],members:{}}}};
         };
         await w._createLinkGroupFromSelectionWithinGesture();
+        assert.equal(reads,0,'no baseline read before the write');
         assert.equal(w._undoStack[0].snapshot.guide_frames[0].frame_index,99);
     """)
 
 
 
-def test_unlink_history_reads_the_servers_unknown_split_partition():
+def test_unlink_history_takes_the_servers_unknown_split_partition_from_its_answer():
     _run_gesture_node(_LINK_SETUP + """
         const w=linkWidget();
         delete w._pushUndo; delete w._stampHistoryPostSnapshot; delete w._runSceneMutation;
@@ -4248,13 +4259,16 @@ def test_unlink_history_reads_the_servers_unknown_split_partition():
         const canonical=structuredClone(w.activeScene);
         canonical.linked_item_groups=[{group_id:'server-right',items:
             [{type:'clip',id:'c1'},{type:'clip',id:'c2'}]}];
-        // A context for another scene must not suppress this scene's first read.
-        w._latestHistoryOrderContext={rebaseIntents:false,scenes:new Map([['other',{scene_id:'other'}]])};
         let reads=0;
         globalThis.fetch=async()=>{reads++; return new Response(JSON.stringify(canonical),{status:200});};
-        w._runVersionedProjectMutation=async()=>({payload:{scene:{...canonical,linked_item_groups:[]}}});
+        // The answer's `history_before` names the group the server held before
+        // the unlink; the editor never saw it.
+        w._runVersionedProjectMutation=async()=>({payload:{scene:{...canonical,linked_item_groups:[]},
+            history_before:{v:1,fields:{},absent:[],members:{linked_item_groups:{
+                order:['server-right'],fields:{},absent:{},
+                removed:structuredClone(canonical.linked_item_groups)}}}}});
         await w._unlinkSelectedItemsWithinGesture();
-        assert.equal(reads,1);
+        assert.equal(reads,0,'no baseline read before the write');
         assert.deepEqual(w._undoStack[0].snapshot.linked_item_groups,canonical.linked_item_groups);
         assert.deepEqual(w._undoStack[0].postSnapshot.linked_item_groups,[]);
     """)

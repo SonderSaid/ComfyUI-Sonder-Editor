@@ -270,8 +270,8 @@ Object.assign(w, {
   _promptContextProfiles:[], _promptContextCatalog:{},
   _activeMutationGesture:null, _timelineMutationDepth:0, _sceneMutationInvalidationSeq:0,
   _queueFetchSeq:0, isDragging:false,
-  // The shipped `onIdle`, so an ordered history context is dropped when the
-  // queue drains and the next wave pays its baseline read again, as it does live.
+  // The shipped `onIdle`, so a history order context is dropped when the
+  // queue drains, as it is live.
   _projectMutationQueue: new ProjectMutationQueue({ onIdle: () => {
     if (!w._historyOrderContextNeedsRetention?.(w._latestHistoryOrderContext)) {
       w._latestHistoryOrderContext = null;
@@ -610,36 +610,29 @@ def test_a_chain_opened_over_another_writers_paint_defers_instead_of_restoring(t
     assert result["open"] == 0
 
 
-def test_an_ordered_history_baseline_is_opted_into_not_inferred(tmp_path):
-    """The explicit option starts the queue-order baseline; nothing else does."""
-    result = run_item_panel("""
-    const contextOf = async (from, to, options) => {
-      w._latestHistoryOrderContext = null;
-      const run = w._runSceneMutation([{ type: 'update_reference_item', reference_item_id: 'item-1',
-        fields: { strength: to }, expected: { strength: from } }],
-        { key: 'k' + to, coalesce: false, refreshScenes: false, ...options });
-      const context = w._latestHistoryOrderContext;
-      await run;
-      return context ? { rebaseIntents: context.rebaseIntents, scene: context.scenes.has('scene') } : null;
-    };
-    const plain = await contextOf(1, 0.3, {});
-    const opted = await contextOf(0.3, 0.4, { orderedHistoryBaseline: true });
-    // An explicit context wins, as it did over the old inline trigger.
-    w._latestHistoryOrderContext = null;
+def test_a_panel_write_with_no_history_ahead_reads_nothing_first_and_starts_no_order_context(tmp_path):
+    """Undo across takes, Phase 2: the ordered baseline is gone. A panel edit
+    with no Undo or Redo ahead of it sends its write and nothing before it, and
+    leaves no history order context; its step's before-state is the server's,
+    from the write's own `history_before`."""
+    result = run_item_panel(_FIELDS + """
+    mount();
+    setStrength(10, 0.5);
+    const context = w._latestHistoryOrderContext;
+    await settle(12);
+    const entry = w._undoStack.at(-1);
+    // An explicit context still wins: a caller ordering its own write keeps it.
     const explicit = { operation: 'caller', scenes: new Map(), parent: null };
     await w._runSceneMutation([{ type: 'update_reference_item', reference_item_id: 'item-1',
-      fields: { strength: 0.5 }, expected: { strength: 0.4 } }], { key: 'k-explicit', coalesce: false,
-      refreshScenes: false, orderedHistoryBaseline: true, historyOrderContext: explicit });
-    const explicitKept = w._latestHistoryOrderContext === null;
-    // A write with no scene in its intent has no scene to order.
-    w._latestHistoryOrderContext = null;
-    await w._queueProjectMutation({ key: 'k-sceneless', coalesce: false, refreshScenes: false,
-      orderedHistoryBaseline: true, intent: { projectId: 'project', operations: [] },
-      run: async () => ({ payload: {} }) });
-    return { plain, opted, explicitKept, sceneless: w._latestHistoryOrderContext };
+      fields: { strength: 0.6 }, expected: { strength: 0.5 } }], { key: 'k-explicit', coalesce: false,
+      refreshScenes: false, historyOrderContext: explicit });
+    return { context: context ? context.operation : null, reads: sceneReads.length,
+      writes: sent.length, before: item('item-1', entry.snapshot).strength,
+      post: item('item-1', entry.postSnapshot).strength, label: entry.label,
+      explicitKept: w._latestHistoryOrderContext === null };
     """, tmp_path)
-    assert result == {"plain": None, "opted": {"rebaseIntents": False, "scene": True},
-                      "explicitKept": True, "sceneless": None}
+    assert result == {"context": None, "reads": 0, "writes": 2, "before": 1.0, "post": 0.5,
+                      "label": "change reference strength", "explicitKept": True}
 
 
 def test_the_item_write_state_is_replaced_on_project_change_and_destroy():
@@ -870,11 +863,10 @@ def test_a_refused_delete_keeps_the_previous_accepted_undo_step(tmp_path):
 
 
 def test_a_refused_delete_does_not_enter_the_next_edits_undo_snapshot(tmp_path):
-    """Plan test 12. The panel's delete opts into the queue-order history
-    baseline, so an edit queued behind it takes its before-snapshot from the
-    canonical scene at its queue position -- which still holds the row the
-    refused delete had painted away. Undoing that edit therefore cannot delete
-    the row."""
+    """Plan test 12. An edit queued behind a refused delete takes its
+    before-state from its own write's answer (`history_before`), which still
+    holds the row the refused delete had painted away, and reads no scene to do
+    it. Undoing that edit therefore cannot delete the row."""
     result = run_item_panel(_PANEL + """
     mount();
     hold();
@@ -893,7 +885,7 @@ def test_a_refused_delete_does_not_enter_the_next_edits_undo_snapshot(tmp_path):
     assert result["snapshotNow"] == ["item-1", "item-2", "item-4"]
     assert result["label"] == "change reference strength"
     assert result["rows"] == ["item-1", "item-2", "item-4"]
-    assert result["sceneReads"] >= 1
+    assert result["sceneReads"] == 0
 
 
 def test_a_project_switch_releases_an_in_flight_delete_hold(tmp_path):
@@ -1024,7 +1016,8 @@ def test_a_member_the_lane_cannot_take_is_refused_before_anything_is_sent(tmp_pa
 
 
 def test_a_refused_add_item_does_not_enter_the_next_edits_undo_snapshot(tmp_path):
-    """Plan test 12, Add half: panel staging opts into the ordered baseline too."""
+    """Plan test 12, Add half. The before-state is the server's, from the next
+    write's own `history_before`; no baseline read is needed (Undo across takes)."""
     result = run_item_panel(_PANEL + """
     mount();
     w.playhead = 80;
@@ -1511,7 +1504,8 @@ def test_a_failed_edit_in_a_focused_field_shows_the_saved_value_again(tmp_path):
 
 
 def test_a_refused_field_paint_does_not_enter_the_next_edits_undo_snapshot(tmp_path):
-    """Plan test 12, field half: the writer opts into the ordered baseline."""
+    """Plan test 12, field half: the next step's before-state comes from its own
+    write's `history_before`, which never holds the refused paint."""
     result = run_item_panel(_FIELDS + """
     mount();
     hold();
@@ -1773,6 +1767,32 @@ def test_a_timeline_append_behind_an_unpainted_member_edit_waits_and_succeeds(tm
     assert result["toasts"] == 0
 
 
+def test_a_refused_timeline_append_does_not_enter_the_next_edits_undo_snapshot(tmp_path):
+    """Undo across takes, Phase 2: a timeline Reference paint never had the
+    ordered baseline. A Library drop painted on a bar and then refused is in
+    the next gesture's press-time snapshot, and out of its step once that
+    step's write answers with `history_before`. No scene is read for it."""
+    result = run_item_panel(_MEMBERS + """
+    mount();
+    hold();
+    refuseNext('identity_mismatch');
+    const appending = w._appendReferenceMembers('item-2', { members: [drag('a')] });
+    setStrength(10, 0.6);
+    const atPush = order('item-2', w._undoStack.at(-1).snapshot);
+    await release();
+    await appending;
+    await settle(12);
+    const entry = w._undoStack.at(-1);
+    return { atPush, now: order('item-2', entry.snapshot), label: entry.label,
+      local: order('item-2'), server: order('item-2', await serverScene()), reads: sceneReads.length };
+    """, tmp_path)
+    assert result["atPush"] == ["member-c", "member-a"], "the paint was in the press-time snapshot"
+    assert result["now"] == ["member-c"]
+    assert result["label"] == "change reference strength"
+    assert result["local"] == result["server"] == ["member-c"]
+    assert result["reads"] == 0
+
+
 def test_the_timeline_delete_key_waits_for_an_unpainted_member_edit(tmp_path):
     """Its per-item guard names the members, which the answer is about to change."""
     result = run_item_panel(_MEMBERS + """
@@ -2019,9 +2039,9 @@ def test_the_delete_key_deletes_what_was_selected_when_pressed_not_after_the_wai
                       "selected": ["item-2"]}
 
 
-def test_an_append_pays_no_ordered_baseline_read_and_a_panel_edit_does(tmp_path):
-    """Audit finding 2: the append keeps the timeline's exposure rather than a
-    scene GET per drop; the panel's writers opt in (plan: three panel writers)."""
+def test_neither_an_append_nor_a_panel_edit_reads_the_scene_first(tmp_path):
+    """Undo across takes, Phase 2: with exact before-states from each write,
+    no Reference writer pays a scene read before its write."""
     result = run_item_panel(_MEMBERS + """
     mount();
     await w._appendReferenceMembers('item-2', { members: [drag('a')] });
@@ -2031,7 +2051,7 @@ def test_an_append_pays_no_ordered_baseline_read_and_a_panel_edit_does(tmp_path)
     await settle(4);
     return { afterAppend, afterPanelEdit: sceneReads.length };
     """, tmp_path)
-    assert result == {"afterAppend": 0, "afterPanelEdit": 1}
+    assert result == {"afterAppend": 0, "afterPanelEdit": 0}
 
 
 def test_clearing_a_saved_retention_is_saved(tmp_path):

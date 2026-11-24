@@ -25,6 +25,7 @@ a fresh `[Unreleased]` block.
   - Undo of the first text in a prompt channel removes the text, and Redo brings it back. Before, the text stayed and Redo was refused. The same goes for a Writing **Apply** that creates Subjects.
   - A Reference item or member you deleted from the Library is not brought back by an older step; a notice says what was left out.
   - Undo of a lane removal is refused when a take has landed on that lane since, instead of putting your clip on the take's lane.
+- Undo and Redo show the *Waiting* notice only when they are still not on the timeline after a moment, instead of on every press. One that is applying but not yet drawn says *Undoing* or *Redoing*.
 - A queue run that fails keeps its own error when the job could not be marked failed.
 
 ### Changed

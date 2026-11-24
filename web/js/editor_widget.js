@@ -96,6 +96,9 @@ const SESSION_DIAG_RING_MAX = 2048;
 // normal typing never flashes through an intermediate visual state.
 const PROMPT_STALE_VISUAL_DELAY_MS = 300;
 const PROMPT_TIMELINE_COMPILE_DELAY_MS = 180;
+// An Undo or Redo younger than this, or whose result is already painted, raises
+// no notice: a quick one would only flash it.
+const QUEUED_HISTORY_NOTICE_DELAY_MS = 300;
 const PROMPT_BAR_LABEL_MEMO = new WeakMap();
 
 if (typeof window !== "undefined" && !window.SONDER_DEBUG_SESSION) {
@@ -827,25 +830,21 @@ const REFERENCE_DROP_REFUSALS = {
 // per-field rollback chains; the key discriminator keeps each readable in the
 // queue and the session log.
 //
-// The panel and Set Reference to Selection opt into the ordered history
-// baseline. It costs a scene GET before the first write of every wave, which a
-// one-off menu action can afford; the append is mostly a timeline gesture,
-// which -- like the timeline's other Reference paints -- keeps today's exposure
-// (a Bug Tracker residual) rather than paying that read per drop.
+// None needs a history baseline of its own: a write's Undo before-state comes
+// from the write's answer (`history_before`), so a refused paint never enters a
+// later step (`durable_rules.md`, scene history).
 const REFERENCE_ITEM_WRITERS = Object.freeze({
     panel: Object.freeze({
         key: "reference-panel",
         failureMessage: "The Reference item change could not be saved.",
         refusalSource: "reference-panel-refused",
         rollbackDiag: "reference_item_rollback_deferred",
-        orderedHistoryBaseline: true,
     }),
     append: Object.freeze({
         key: "reference-append",
         failureMessage: "The Reference member could not be added.",
         refusalSource: "reference-stage-refused",
         rollbackDiag: "reference_append_rollback_deferred",
-        orderedHistoryBaseline: false,
     }),
     // Set Reference to Selection: a range write from the timeline menu.
     timeline: Object.freeze({
@@ -853,7 +852,6 @@ const REFERENCE_ITEM_WRITERS = Object.freeze({
         failureMessage: "The Reference item could not be retimed.",
         refusalSource: "reference-to-selection-refused",
         rollbackDiag: "reference_to_selection_rollback_deferred",
-        orderedHistoryBaseline: true,
     }),
 });
 
@@ -1318,7 +1316,9 @@ export class EditorWidget {
         this._historyOperationSeq = 0;
         this._latestHistoryOrderContext = null;
         this._queuedHistoryOperationCount = 0;
+        this._queuedHistoryWaits = new Set();
         this._queuedHistoryNotification = null;
+        this._queuedHistoryNoticeText = "";
 
         // Thumbnail strip cache: { assetId: { img: Image, frameWidth, numFrames, loaded } }
         this._thumbStripCache = {};
@@ -4327,10 +4327,11 @@ export class EditorWidget {
      *   * `mismatch` -- the painted result differs from the report;
      *   * `unconfirmed` (recorded by `_mutateReferences`) -- the answer was lost.
      *
-     *  The heal runs as the deferred replay's scenes read. The ordered history
-     *  baseline (`_historyOrderContextCascade`) is brought along: without it the
-     *  next ordered write's Undo entry would take the pre-cascade scene as its
-     *  before-state and an Undo would bring the deleted member back.
+     *  The heal runs as the deferred replay's scenes read. The history order
+     *  context of a queued Undo or Redo (`_historyOrderContextCascade`) is
+     *  brought along: without it a write queued behind that step would rebase
+     *  its intent and guards against the pre-cascade scene. (A step's own
+     *  before-state comes from its write's `history_before`.)
      *
      *  Thinned rows get a NEW `members` array: an acknowledged-value chain keeps
      *  `row.members` by reference, and the replacement is how its rollback sees
@@ -4487,32 +4488,9 @@ export class EditorWidget {
         cascade.sets = local;
         for (const hold of cascade.holds) state.cascadeHolds.add(hold);
         // This paint can still be refused, and it is now in the scene every
-        // later gesture snapshots for its Undo entry. Start (or join) the
-        // queue-order baseline for each painted scene, as a writer opting into
-        // `orderedHistoryBaseline` does: a gesture queued in this window then
-        // takes its before-state from what the server holds at its queue
-        // position, not from this paint (`durable_rules.md`, "An optimistic
-        // group edit can enter the next gesture's Undo target"). No intent is
-        // re-authored.
-        const paintedSceneIds = [...local].filter(([, entry]) =>
-            entry.removed.size || entry.thinned.size).map(([sceneId]) => sceneId);
-        if (paintedSceneIds.length) {
-            let context = this._latestHistoryOrderContext;
-            if (!context) {
-                context = this._beginHistoryOrderContext("ordered baseline", 0);
-                context.rebaseIntents = false;
-            }
-            for (const sceneId of paintedSceneIds) {
-                let hasBaseline = false;
-                for (let current = context; current; current = current.parent) {
-                    if (current.scenes?.has(sceneId) || current.ambiguousScenes?.has(sceneId)) {
-                        hasBaseline = true;
-                        break;
-                    }
-                }
-                if (!hasBaseline) context.scenes.set(sceneId, null);
-            }
-        }
+        // later gesture snapshots at its press. That copy never becomes a
+        // step's before-state: the step takes it from its own write's answer
+        // (`history_before`), which holds what the server had.
         return cascade;
     }
 
@@ -4698,11 +4676,12 @@ export class EditorWidget {
         }
     }
 
-    /** Bring the ordered history baseline along with a Library delete.
+    /** Bring the history order context along with a Library delete.
      *
-     *  A Library slot names no scene, so the queue neither tombstones nor
-     *  records an ordered scene for it, and the next ordered write would take
-     *  the pre-cascade scene as its Undo before-state. When the paint matched
+     *  Only a queued Undo or Redo opens a context. A Library slot names no
+     *  scene, so the queue neither tombstones nor records an ordered scene for
+     *  it, and a write queued behind that step would rebase its intent against
+     *  the pre-cascade scene. When the paint matched
      *  the route's report (`vouched`), each recorded scene is thinned by the
      *  same row rule -- a Library delete changes nothing else on a scene, so
      *  that IS the scene at this queue position, and no read is needed.
@@ -6428,14 +6407,6 @@ export class EditorWidget {
         historyOrderContext = undefined,
         stampHistory = true,
         historyFailureOwnedByCaller = false,
-        // An optimistic writer whose paint may be REFUSED, and which a later
-        // gesture's Undo snapshot could otherwise capture: start (or join) a
-        // queue-order history baseline for this scene before the write, so
-        // later before-snapshots come from canonical queue-position state.
-        // Ordinary edits keep their authored guards (`rebaseIntents: false`).
-        // Callers: explicit link/unlink and the Reference Lane Setup panel's
-        // staged-item writers (`durable_rules.md`, the link-optimism rule).
-        orderedHistoryBaseline = false,
     }) {
         // Invalidate any in-flight scenes GET when a mutation is enqueued.
         // Mutation invalidation is deliberately separate from fetch dispatch
@@ -6529,28 +6500,11 @@ export class EditorWidget {
         // position, not from the optimistic UI state visible before that
         // history action applies. Keep the exact history-order context with the
         // queue slot; coalescing keeps it with the slot's surviving entry.
-        let capturedHistoryOrderContext = historyOrderContext === undefined
+        // An edit with no history action ahead of it needs none: its Undo
+        // before-state comes from its own answer (`history_before`), so an
+        // optimistic paint refused meanwhile never enters it.
+        const capturedHistoryOrderContext = historyOrderContext === undefined
             ? (this._latestHistoryOrderContext || null) : historyOrderContext;
-        if (historyOrderContext === undefined && orderedHistoryBaseline && intent?.sceneId) {
-            // An optimistic paint enters later gestures' Undo snapshots even if
-            // its own save fails. Start an ordered baseline before this write,
-            // including any earlier split's server-only repartition. Reuse
-            // history's queue-position authority, but do NOT re-author guards:
-            // no Undo changed these intents.
-            if (!capturedHistoryOrderContext) {
-                capturedHistoryOrderContext = this._beginHistoryOrderContext("ordered baseline", 0);
-                capturedHistoryOrderContext.rebaseIntents = false;
-            }
-            const sceneId = String(intent.sceneId);
-            let hasBaseline = false;
-            for (let current = capturedHistoryOrderContext; current; current = current.parent) {
-                if (current.scenes?.has(sceneId) || current.ambiguousScenes?.has(sceneId)) {
-                    hasBaseline = true;
-                    break;
-                }
-            }
-            if (!hasBaseline) capturedHistoryOrderContext.scenes.set(sceneId, null);
-        }
         if (ownsSlotEntry && capturedHistoryOrderContext) {
             capturedHistoryEntry._historyOrderContext = capturedHistoryOrderContext;
         }
@@ -6624,7 +6578,7 @@ export class EditorWidget {
                     if (orderedBefore && queuedHistoryEntry && !queuedHistoryEntry.kind) {
                         queuedHistoryEntry.snapshot = structuredClone(orderedBefore);
                     }
-                    const orderedIntent = orderedBefore && queuedValue?.historyOrderContext?.rebaseIntents !== false
+                    const orderedIntent = orderedBefore
                         ? (this._rebaseSceneMutationIntentForHistory?.(
                             queuedValue?.payload, orderedBefore,
                             authoredScene) || queuedValue?.payload)
@@ -6752,7 +6706,6 @@ export class EditorWidget {
         historyOrderContext = undefined,
         stampHistory = true,
         historyFailureOwnedByCaller = false,
-        orderedHistoryBaseline = false,
     } = {}) {
         const context = this._snapshotProjectMutationContext();
         if (!context) return Promise.resolve(null);
@@ -6783,7 +6736,6 @@ export class EditorWidget {
             historyOrderContext,
             stampHistory,
             historyFailureOwnedByCaller,
-            orderedHistoryBaseline,
             run: async (queuedIntent, diagnostics) => {
                 // Derived HERE, not at enqueue: coalescing replaces the pending
                 // entry's intent, and a `merge` may combine operations from
@@ -8145,7 +8097,6 @@ export class EditorWidget {
                 refreshScenes: false,
                 historyEntry,
                 diagnostics,
-                orderedHistoryBaseline: true,
                 failureMessage: "The Reference item could not be deleted.",
                 failureDetail: (error) => error?.payload?.error || error?.message || null,
                 failureTier: "warning",
@@ -8375,7 +8326,6 @@ export class EditorWidget {
                 refreshScenes: false,
                 historyEntry,
                 diagnostics,
-                orderedHistoryBaseline: surface.orderedHistoryBaseline,
                 failureMessage: surface.failureMessage,
                 failureDetail: (error) => error?.payload?.error || error?.message || null,
                 failureTier: "warning",
@@ -14475,10 +14425,6 @@ export class EditorWidget {
                 coalesce: false,
                 refreshScenes: false,
                 historyEntry,
-                // Panel staging opts into queue-order Undo snapshots; the
-                // timeline's Reference paints keep today's exposure (a residual
-                // recorded with this change).
-                orderedHistoryBaseline: !allowLaneWrites,
                 // A member whose create was still saving at the drop, and was
                 // refused, is the one cause worth naming: the author saw it.
                 failureMessage: (error) => (error?.payload?.code || error?.code) === "item_not_found"
@@ -21414,7 +21360,6 @@ export class EditorWidget {
                     label: "link items",
                     coalesce: false,
                     historyEntry,
-                    orderedHistoryBaseline: true,
                     failureMessage: (error) => error?.message || "Link operation was refused.",
                 }
             );
@@ -21465,7 +21410,6 @@ export class EditorWidget {
                     label: "unlink items",
                     coalesce: false,
                     historyEntry,
-                    orderedHistoryBaseline: true,
                     failureMessage: (error) => error?.message || "Unlink operation was refused.",
                 }
             );
@@ -27669,6 +27613,7 @@ export class EditorWidget {
             if (queuedDiagnostics && typeof queuedDiagnostics === "object") {
                 queuedDiagnostics.queueWaitMs = queueWaitMs;
             }
+            this._markQueuedHistoryRunning?.(waitToken);
             if (typeof sessionDiagRecord === "function") {
                 sessionDiagRecord("history_operation_apply_start", {
                     operation: "undo", scene_id: entry.sceneId || "",
@@ -27737,7 +27682,7 @@ export class EditorWidget {
             }
             return this._runUndoWithinGesture(
                 queuedDiagnostics, entry, claimId, ownerToken,
-                oppositeReservation, historyOrderContext);
+                oppositeReservation, historyOrderContext, waitToken);
         };
 
         const queue = this._projectMutationQueue;
@@ -27780,7 +27725,7 @@ export class EditorWidget {
     async _runUndoWithinGesture(
         diagnostics = null, reservedEntry = null, claimId = null,
         ownerToken = null, oppositeReservation = null,
-        historyOrderContext = null) {
+        historyOrderContext = null, waitToken = null) {
         if (!reservedEntry && this._undoStack.length === 0) {
             this._recordHistoryRefusal?.("undo", "empty_stack", diagnostics);
             this._keyboardDebug("undo skipped: empty stack", {
@@ -27947,7 +27892,7 @@ export class EditorWidget {
             promptIdentityCreateIntents:
                 structuredClone(entry.promptIdentityCreateIntents || []),
         };
-        const historyPaint = { entry, responseVersion: null };
+        const historyPaint = { entry, responseVersion: null, waitToken };
         const priorAuxiliaryState = entry._ambiguousAuxiliaryState || {};
         let referencesApplied = priorAuxiliaryState.referencesApplied === true;
         let promptIdentityApplied = priorAuxiliaryState.promptIdentityApplied === true;
@@ -28026,6 +27971,9 @@ export class EditorWidget {
             }
         } catch (error) {
             this._rollbackHistoryOptimisticPaint(historyPaint);
+            // The step failed: its own warning speaks for it from here, through
+            // any compensation still to run.
+            this._quietQueuedHistoryWait?.(waitToken);
             // The source entry remains reserved in place until every durable
             // participant has completed. Keep it there while attempting
             // best-effort compensation so a second failure cannot erase the
@@ -28188,6 +28136,7 @@ export class EditorWidget {
             if (queuedDiagnostics && typeof queuedDiagnostics === "object") {
                 queuedDiagnostics.queueWaitMs = queueWaitMs;
             }
+            this._markQueuedHistoryRunning?.(waitToken);
             if (typeof sessionDiagRecord === "function") {
                 sessionDiagRecord("history_operation_apply_start", {
                     operation: "redo", scene_id: entry.sceneId || "",
@@ -28264,7 +28213,7 @@ export class EditorWidget {
             }
             return this._runRedoWithinGesture(
                 queuedDiagnostics, entry, claimId, ownerToken,
-                oppositeReservation, historyOrderContext);
+                oppositeReservation, historyOrderContext, waitToken);
         };
 
         const queue = this._projectMutationQueue;
@@ -28307,7 +28256,7 @@ export class EditorWidget {
     async _runRedoWithinGesture(
         diagnostics = null, reservedEntry = null, claimId = null,
         ownerToken = null, oppositeReservation = null,
-        historyOrderContext = null) {
+        historyOrderContext = null, waitToken = null) {
         if (!reservedEntry && this._undoStack.some((candidate) => candidate?.pending)) {
             const pendingEntry = this._undoStack.find((candidate) => candidate?.pending);
             this._recordHistoryRefusal?.("redo", "pending_entry", diagnostics, {
@@ -28472,7 +28421,7 @@ export class EditorWidget {
             promptIdentityCreateIntents:
                 structuredClone(entry.promptIdentityCreateIntents || []),
         };
-        const historyPaint = { entry, responseVersion: null };
+        const historyPaint = { entry, responseVersion: null, waitToken };
         const priorAuxiliaryState = entry._ambiguousAuxiliaryState || {};
         let referencesApplied = priorAuxiliaryState.referencesApplied === true;
         let promptIdentityApplied = priorAuxiliaryState.promptIdentityApplied === true;
@@ -28552,6 +28501,9 @@ export class EditorWidget {
             }
         } catch (error) {
             this._rollbackHistoryOptimisticPaint(historyPaint);
+            // The step failed: its own warning speaks for it from here, through
+            // any compensation still to run.
+            this._quietQueuedHistoryWait?.(waitToken);
             if (error?.restoreAmbiguous && error?.restoreToken) {
                 this._markHistoryOrderContextAmbiguous?.(
                     historyOrderContext, entry.sceneId, error.restoreToken, {
@@ -28795,6 +28747,8 @@ export class EditorWidget {
         this._pendingHistorySelection = state;
         this._renderTimeline();
         this._renderViewportFrame();
+        // The timeline shows the result: the waiting notice has nothing to add.
+        this._markQueuedHistoryPainted?.(state.waitToken, true);
         // This is a prediction superseded by adopt(), never proof of a merge.
         // Cost: target/rollback clones + _setActiveScene stringify + full scene render.
     }
@@ -28827,6 +28781,7 @@ export class EditorWidget {
     _rollbackHistoryOptimisticPaint(state) {
         if (!state?.painted) return;
         state.painted = false;
+        this._markQueuedHistoryPainted?.(state.waitToken, false);
         if (this._destroyed || this.projectDir !== state.projectDir
                 || this.activeSceneId !== state.sceneId) {
             this._finishHistoryOptimisticPaint(state);
@@ -28924,6 +28879,9 @@ export class EditorWidget {
             this._setActiveScene(scene);
             this._renderTimeline();
             this._renderViewportFrame();
+            // The timeline shows the result: whatever the step still does after
+            // this (its reverse entry, a Prompt Identity cleanup) needs no notice.
+            this._markQueuedHistoryPainted?.(historyPaint?.waitToken, true);
             this._keyboardDebug("restore render complete", {
                 sceneId,
                 activeSceneId: this.activeSceneId || "",
@@ -29192,42 +29150,145 @@ export class EditorWidget {
         });
     }
 
+    // An Undo or Redo is claimed at the press and then waits its turn on the
+    // project queue. Two things track it, deliberately apart:
+    // `_queuedHistoryOperationCount` is the busy count (scene switches, widget
+    // replays and the order-context chain read it) and covers every claimed
+    // operation from press to finish; the notice covers only the slow ones.
+    // An operation appears in it once it is QUEUED_HISTORY_NOTICE_DELAY_MS old
+    // and its result is neither painted nor done. Queued, it reads "N history
+    // actions queued behind project writes…"; applying with nothing painted
+    // yet, "Undoing" / "Redoing" over "Saving to the project…", so a slow
+    // unpainted step is never silent. The canonical scene drawn counts as
+    // painted (`adopt`); a refused step goes quiet, its warning says why.
+    // A step that starts while already shown as queued keeps that wording for
+    // one more delay (`applying`), so one that paints at once never flips the
+    // text just before the notice closes.
     _beginQueuedHistoryWait(operation = "history") {
-        const token = { active: true };
+        const token = {
+            active: true, operation: String(operation || "history"),
+            running: false, applying: false, painted: false, due: false,
+            timer: null, applyingTimer: null,
+        };
         this._queuedHistoryOperationCount = Math.max(
             0, Number(this._queuedHistoryOperationCount) || 0) + 1;
-        const count = this._queuedHistoryOperationCount;
-        const message = `${count} history action${count === 1 ? "" : "s"} queued behind project writes…`;
-        const detail = `${String(operation || "history").replace(/^./, (value) => value.toUpperCase())} will run in request order.`;
-        if (this._queuedHistoryNotification) {
-            this._queuedHistoryNotification.update({ message, detail, progress: null });
-        } else {
-            this._queuedHistoryNotification = notifyProgress({
-                verb: "Waiting",
-                message,
-                detail,
-                progress: null,
-                source: "history-operation-queued",
-            });
-        }
+        (this._queuedHistoryWaits ||= new Set()).add(token);
+        this._armQueuedHistoryWait(token);
         return token;
+    }
+
+    _armQueuedHistoryWait(token) {
+        clearTimeout(token.timer);
+        token.due = false;
+        token.timer = setTimeout(() => {
+            token.timer = null;
+            if (!token.active) return;
+            token.due = true;
+            this._refreshQueuedHistoryNotice();
+        }, QUEUED_HISTORY_NOTICE_DELAY_MS);
+    }
+
+    /** The operation left the queue and is applying. */
+    _markQueuedHistoryRunning(token) {
+        if (!token?.active || token.running) return;
+        token.running = true;
+        if (!token.due || token.painted) {
+            token.applying = true;
+            return;
+        }
+        token.applyingTimer = setTimeout(() => {
+            token.applyingTimer = null;
+            if (!token.active) return;
+            token.applying = true;
+            this._refreshQueuedHistoryNotice();
+        }, QUEUED_HISTORY_NOTICE_DELAY_MS);
+    }
+
+    /** The timeline shows the operation's result (`true`), or a prediction was
+     *  taken back while the operation still applies (`false`). */
+    _markQueuedHistoryPainted(token, painted) {
+        if (!token?.active) return;
+        if (painted) {
+            if (token.painted) return;
+            token.painted = true;
+            this._refreshQueuedHistoryNotice();
+            return;
+        }
+        if (!token.painted || token.quiet) return;
+        // Re-arm rather than show at once: a refusal that finishes in the same
+        // breath raises nothing, a slow continuation still does.
+        token.painted = false;
+        this._armQueuedHistoryWait(token);
+    }
+
+    /** The step's outcome is decided and reported elsewhere (a refusal): it
+     *  raises no notice for the work it still does. */
+    _quietQueuedHistoryWait(token) {
+        if (!token?.active || token.quiet) return;
+        token.quiet = true;
+        clearTimeout(token.timer);
+        clearTimeout(token.applyingTimer);
+        token.timer = null;
+        token.applyingTimer = null;
+        this._refreshQueuedHistoryNotice();
     }
 
     _endQueuedHistoryWait(token) {
         if (!token?.active) return;
         token.active = false;
+        clearTimeout(token.timer);
+        clearTimeout(token.applyingTimer);
+        token.timer = null;
+        token.applyingTimer = null;
+        this._queuedHistoryWaits?.delete(token);
         this._queuedHistoryOperationCount = Math.max(
             0, (Number(this._queuedHistoryOperationCount) || 0) - 1);
-        if (this._queuedHistoryOperationCount > 0) {
-            const count = this._queuedHistoryOperationCount;
-            this._queuedHistoryNotification?.update({
-                message: `${count} history action${count === 1 ? "" : "s"} queued behind project writes…`,
-                progress: null,
-            });
+        this._refreshQueuedHistoryNotice();
+    }
+
+    _refreshQueuedHistoryNotice() {
+        const waits = [...(this._queuedHistoryWaits || [])].filter((token) => token.active);
+        const shown = waits.filter((token) => token.due && !token.painted && !token.quiet);
+        if (!shown.length || this._destroyed) {
+            this._queuedHistoryNotification?.dismiss();
+            this._queuedHistoryNotification = null;
+            this._queuedHistoryNoticeText = "";
             return;
         }
-        this._queuedHistoryNotification?.dismiss();
-        this._queuedHistoryNotification = null;
+        const capitalized = (operation) => operation.replace(/^./, (value) => value.toUpperCase());
+        let options;
+        if (shown.some((token) => !token.applying)) {
+            const queued = waits.filter((token) => !token.applying);
+            const count = queued.length;
+            options = {
+                verb: "Waiting",
+                message: `${count} history action${count === 1 ? "" : "s"} queued behind project writes…`,
+                detail: `${capitalized(queued[0].operation)} will run in request order.`,
+            };
+        } else {
+            const operation = shown[0].operation;
+            const verb = operation === "undo" ? "Undoing"
+                : operation === "redo" ? "Redoing" : capitalized(operation);
+            options = { verb, message: "Saving to the project…", detail: null };
+        }
+        // Timers due together each refresh; only a change is worth an update.
+        const text = JSON.stringify(options);
+        if (this._queuedHistoryNotification && text === this._queuedHistoryNoticeText) return;
+        // Gone from the screen: the author closed it, or another editor sharing
+        // the source dismissed it. New wording is news, so it shows again.
+        if (this._queuedHistoryNotification?.alive?.() === false) {
+            this._queuedHistoryNotification = null;
+        }
+        this._queuedHistoryNoticeText = text;
+        if (this._queuedHistoryNotification) {
+            this._queuedHistoryNotification.update({ ...options, progress: null });
+        } else {
+            this._queuedHistoryNotification = notifyProgress({
+                ...options,
+                progress: null,
+                source: "history-operation-queued",
+            });
+        }
     }
 
     // ── Widget Value Helpers ───────────────────────────────────────────
@@ -30907,8 +30968,14 @@ export class EditorWidget {
         this._proxyMaintenanceDialog = null;
         clearTimeout(this._proxyOverviewTimer);
         TimelineCanvas._releaseTimelineLayerCache(this);
+        for (const token of this._queuedHistoryWaits || []) {
+            clearTimeout(token.timer);
+            clearTimeout(token.applyingTimer);
+        }
+        this._queuedHistoryWaits?.clear();
         this._queuedHistoryNotification?.dismiss();
         this._queuedHistoryNotification = null;
+        this._queuedHistoryNoticeText = "";
         this._queuedHistoryOperationCount = 0;
         this._clearStaleReplayState();
         this._promptContextPreviewToken = (this._promptContextPreviewToken || 0) + 1;
