@@ -1,7 +1,9 @@
-"""Single-server reader leases and deferred immutable-component maintenance.
+"""In-process reader leases and deferred immutable-component maintenance.
 
 No model is retained by the registry. Publication and lease acquisition use the
 project manager's lock; finalizers only enqueue work, never touch the filesystem.
+Leases protect this process's readers from its own sweeps. Another process's readers
+are protected by component retention, and its saves by the cross-process commit lock.
 """
 import copy
 import atexit

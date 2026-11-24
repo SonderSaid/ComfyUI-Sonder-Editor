@@ -207,7 +207,7 @@ def test_gc_keeps_current_previous_and_permanent_legacy_backup(tmp_path):
     for index in range(4):
         ps.stage_prompt_history(project, [{"hash": str(index)}])
         pm.save_project(project, notify=False)
-    removed = ps.collect_unreferenced_components(project.project_dir)
+    removed = ps.collect_unreferenced_components(project.project_dir, retention_seconds=0)
     assert removed
     assert ps.read_prompt_history(project.project_dir) == [{"hash": "3"}]
     assert list((path.parent / "state").glob("*.bak"))
@@ -530,7 +530,7 @@ def test_format_three_reader_and_mixed_retention_gc(tmp_path):
     orphan.write_bytes(b"orphan")
     unknown = path.parent / "state" / "unknown.json"
     unknown.write_bytes(b"keep")
-    assert ps.collect_unreferenced_components(project.project_dir) == [orphan.name]
+    assert ps.collect_unreferenced_components(project.project_dir, retention_seconds=0) == [orphan.name]
     assert unknown.exists()
     assert all((path.parent / item["path"]).exists() for item in legacy.values())
     raw["storage"]["format_version"] = 99
@@ -549,7 +549,7 @@ def test_format_one_history_reader_and_gc(tmp_path):
     path.write_text(json.dumps(raw), encoding="utf-8")
     loaded = pm.load_project(project.project_dir)
     assert ps.read_prompt_history(loaded) == history
-    ps.collect_unreferenced_components(project.project_dir)
+    ps.collect_unreferenced_components(project.project_dir, retention_seconds=0)
     raw["storage"]["format_version"] = 3
     path.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(ps.ProjectStorageError, match="history index"):

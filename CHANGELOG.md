@@ -11,6 +11,17 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+### Fixed
+- Two ComfyUI servers can have the same project open, for example one for editing and one for generating:
+  - Their saves no longer break the project, and an edit made from an older version is refused instead of overwriting the other server's save. Before, the project could stop opening, with the message that its stored data could not be read. Both servers need this version; 0.9.3 and older don't take part.
+  - A take that finishes while the other server is saving waits for it.
+  - If the other server doesn't let go, the save says *Another ComfyUI process is saving this project. Try again in a moment.*
+  - Favorites, names and folders still save without that check: one set at the moment a take lands can drop it from the project, on one server too.
+- A queue run that fails keeps its own error when the job could not be marked failed.
+
+### Changed
+- A project folder now holds an empty `project.lock` file. Stored details a project no longer uses are removed when you next use the project after a day, instead of within a minute.
+
 ## [0.9.3] - 2026-11-23
 
 ### Fixed

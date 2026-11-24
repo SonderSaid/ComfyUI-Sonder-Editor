@@ -32,13 +32,13 @@ def test_detached_copied_readers_keep_original_bytes_until_released(tmp_path):
     p.generation_queue = []
     pm.save_project(p, notify=False)
     pm.save_project(p, notify=False)
-    ps.collect_unreferenced_components(p.project_dir)
+    ps.collect_unreferenced_components(p.project_dir, retention_seconds=0)
     assert asset_path.is_file() and job_path.is_file()
     assert asset.generation_params == {"prompt": "original"}
     assert ps.hydrate_job(p, job).prompt_sections == [{"prompt": "original"}]
     del asset, job
     gc.collect()
-    removed = ps.collect_unreferenced_components(p.project_dir)
+    removed = ps.collect_unreferenced_components(p.project_dir, retention_seconds=0)
     assert asset_path.name in removed and job_path.name in removed
 
 
@@ -51,12 +51,12 @@ def test_stale_history_index_pins_transitive_entries(tmp_path):
     for i in range(3):
         ps.stage_prompt_history(p, [{"new": i}])
         pm.save_project(p, notify=False)
-    ps.collect_unreferenced_components(p.project_dir)
+    ps.collect_unreferenced_components(p.project_dir, retention_seconds=0)
     assert ps.read_prompt_history(stale) == [{"hash": "old", "future": "kept"}]
     assert child.is_file()
     del stale
     gc.collect()
-    assert child.name in ps.collect_unreferenced_components(p.project_dir)
+    assert child.name in ps.collect_unreferenced_components(p.project_dir, retention_seconds=0)
 
 
 def test_failed_publication_does_not_retarget_reader_lease(tmp_path, monkeypatch):
@@ -98,7 +98,9 @@ def test_background_collection_is_eventual_without_inline_io(tmp_path):
     p = sample(tmp_path)
     orphan = ps.publish_component(p.project_dir, "history_entry", {"orphan": True})
     orphan_path = Path(p.project_dir) / orphan["path"]
-    worker = StorageMaintenanceWorker(collect=ps.collect_unreferenced_components, interval=0.02)
+    worker = StorageMaintenanceWorker(
+        collect=lambda project_dir: ps.collect_unreferenced_components(project_dir, retention_seconds=0),
+        interval=0.02)
     worker.request(p.project_dir)
     assert orphan_path.is_file()
     worker.start()

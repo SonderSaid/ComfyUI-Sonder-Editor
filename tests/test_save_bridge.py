@@ -1678,6 +1678,56 @@ def test_group_commit_that_raised_before_writing_falls_back_per_entry(tmp_path, 
     runs.reset_for_tests()
 
 
+@pytest.mark.parametrize("base", [True, False])
+def test_group_commit_on_a_busy_project_waits_once_for_the_whole_group(tmp_path, monkeypatch, base):
+    """Another process held the project for the whole deadline: the entries are not
+    then tried one by one, each with a deadline of its own. The media stays."""
+    io_nodes, _ts, project_manager, project = _group_setup(tmp_path, monkeypatch, base=base)
+    commit = importlib.import_module(f"{TEST_PACKAGE}.server.project_commit")
+    busy_error = importlib.import_module(f"{TEST_PACKAGE}.server.project_file_lock").ProjectBusyError
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a")
+    _add_bridge(io_nodes, project, prompt, "b")
+    waits = []
+
+    def wait_once(save, deadline):
+        waits.append(deadline)
+        raise busy_error()
+
+    for module in (commit, io_nodes):
+        monkeypatch.setattr(module, "retry_while_busy", wait_once)
+    released = []
+    monkeypatch.setattr(io_nodes, "_release_bridge_entry_dir",
+                        lambda _project, staged: released.append(staged["entry"]["bridge_node_id"]))
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+    assert len(waits) == 1 and sorted(released) == ["a", "b"]
+    assert _load_saved_project(project_manager, project).assets == []
+    assert _media_pngs(project) == ["a_stem_0001.png", "b_stem_0001.png"]
+
+
+def test_group_commit_lands_once_a_busy_project_is_free(tmp_path, monkeypatch):
+    io_nodes, _ts, project_manager, project = _group_setup(tmp_path, monkeypatch)
+    commit = importlib.import_module(f"{TEST_PACKAGE}.server.project_commit")
+    busy_error = importlib.import_module(f"{TEST_PACKAGE}.server.project_file_lock").ProjectBusyError
+    real, attempts = commit.save_project, []
+
+    def busy_twice(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise busy_error()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(commit, "save_project", busy_twice)
+    prompt = {}
+    _add_bridge(io_nodes, project, prompt, "a")
+    _add_bridge(io_nodes, project, prompt, "b")
+    commits = _count_group_commits(monkeypatch, io_nodes)
+    io_nodes._finalize_prompt_bridges(_registry_key(io_nodes))
+    assert len(attempts) == 3 and len(commits) == 1
+    assert sorted(a.name for a in _load_saved_project(project_manager, project).assets) == [
+        "a_stem_0001.png", "b_stem_0001.png"]
+
+
 def test_group_placeholder_remap_reaches_every_entry_thumbnail(tmp_path, monkeypatch):
     """(base) Test 13: discovery sync registers a placeholder for the second
     entry's file between the group's load and its commit; the merge keeps the

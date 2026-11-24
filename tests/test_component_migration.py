@@ -136,22 +136,22 @@ def test_migration_gc_waits_for_retained_roots_and_detached_readers(tmp_path):
     detached = copy.deepcopy(stale.assets[0])
     legacy_paths = set(path.parent.joinpath("state").glob("*-*.json"))
     pm.save_project(project, notify=False)
-    ps.collect_unreferenced_components(project.project_dir)
+    ps.collect_unreferenced_components(project.project_dir, retention_seconds=0)
     assert all(item.exists() for item in legacy_paths)
     pm.save_project(project, notify=False)
-    ps.collect_unreferenced_components(project.project_dir)
+    ps.collect_unreferenced_components(project.project_dir, retention_seconds=0)
     assert all(item.exists() for item in legacy_paths)
     assert ps.read_prompt_history(stale) == history
     del stale
     gc.collect()
-    ps.collect_unreferenced_components(project.project_dir)
+    ps.collect_unreferenced_components(project.project_dir, retention_seconds=0)
     assert detached.generation_params["prompt"] == "original a"
     detached_path = path.parent / detached._generation_descriptor["path"]
     assert detached_path.exists()
     project_dir = project.project_dir
     del detached, project
     gc.collect()
-    ps.collect_unreferenced_components(project_dir)
+    ps.collect_unreferenced_components(project_dir, retention_seconds=0)
     assert not any(item.exists() for item in legacy_paths)
     ps.validate_storage(project_dir, json.loads(path.read_bytes()))
 
@@ -183,8 +183,8 @@ def test_failed_repack_preserves_old_root_and_collects_short_orphans(tmp_path, m
         pm.save_project(project, notify=False)
     assert path.read_bytes() == before and project._raw_data == shadow
     assert all(item.read_bytes() == payload for item, payload in old_files.items())
-    ps.collect_unreferenced_components(project.project_dir)
-    assert set((path.parent / "state").glob("*.json")) == set(old_files)
+    ps.collect_unreferenced_components(project.project_dir, retention_seconds=0)
+    assert set((path.parent / "state").glob("*.json")) - {path.parent / "state" / ps.RETENTION_FILENAME} == set(old_files)
 
 
 def test_identical_components_share_content_and_detached_lease(tmp_path):
@@ -201,11 +201,11 @@ def test_identical_components_share_content_and_detached_lease(tmp_path):
     pm.save_project(project, notify=False)
     pm.save_project(project, notify=False)
     shared = Path(project.project_dir) / descriptors[0]["path"]
-    ps.collect_unreferenced_components(project.project_dir)
+    ps.collect_unreferenced_components(project.project_dir, retention_seconds=0)
     assert shared.exists() and detached.generation_params == {"prompt": "shared"}
     del detached
     gc.collect()
-    assert shared.name in ps.collect_unreferenced_components(project.project_dir)
+    assert shared.name in ps.collect_unreferenced_components(project.project_dir, retention_seconds=0)
 
 
 def test_existing_shared_destination_corruption_fails_closed(tmp_path):
@@ -240,6 +240,6 @@ def test_first_component_save_at_183_character_directory(tmp_path, monkeypatch):
     old_backup = root / "state" / "legacy" / "old.json"
     old_backup.parent.mkdir()
     old_backup.write_bytes(b"prior backup")
-    ps.collect_unreferenced_components(project.project_dir)
+    ps.collect_unreferenced_components(project.project_dir, retention_seconds=0)
     assert backups[0].read_bytes() == original
     assert old_backup.read_bytes() == b"prior backup"

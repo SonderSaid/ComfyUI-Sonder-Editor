@@ -3089,6 +3089,7 @@ def test_load_project_repair_save_is_version_guarded_and_non_fatal(monkeypatch, 
         "expected_modified_at": project.modified_at,
         "bump_modified_at": False,
         "notify": False,
+        "lock_wait": 0,  # opportunistic: never waits for another process
     }]
 
 

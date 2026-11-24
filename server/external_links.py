@@ -265,7 +265,9 @@ def preview_link_target(raw_path: str) -> dict:
         if os.path.getsize(project_file) > PREVIEW_MAX_BYTES:
             return preview
         with open(project_file, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
+            text = handle.read()
+        # Parsed closed: an open handle fails another process's replace on Windows.
+        data = json.loads(text)
     except (OSError, ValueError):
         return preview
     if not isinstance(data, dict):

@@ -26,6 +26,7 @@ from ..server.take_placement import calculate_take_placement
 from ..server.timeline_state import effective_scene_fps
 from ..server import comfy_idle, external_links
 from ..server.atomic_io import atomic_replace
+from ..server.project_file_lock import ProjectBusyError
 from ..server.project_manager import ProjectVersionConflict, load_project, save_project
 from ..server.path_security import (
     PathSecurityError,
@@ -41,10 +42,12 @@ from ..server.path_security import (
     safe_route_token,
 )
 from ..server.project_commit import (
+    GENERATED_SAVE_BUSY_SECONDS,
     _copy_generated_asset_registration,
     _remap_generation_params,
     _same_path_placeholder_can_upgrade,
     created_ids_since,
+    retry_while_busy,
     save_generated_project,
     snapshot_item_ids,
 )
@@ -202,7 +205,7 @@ def _save_generated_project(project, base_modified_at: str = "", created_ids=Non
     if base_modified_at:
         committed = save_generated_project(project, str(base_modified_at), created_ids, auto_placement_ids=auto_placement_ids)
     else:
-        save_project(project)
+        retry_while_busy(lambda: save_project(project), time.monotonic() + GENERATED_SAVE_BUSY_SECONDS)
         committed = project
     for job_id in getattr(project, "_sonder_settle_after_save", None) or []:
         sdk_runs.settle_lease(getattr(project, "project_dir", ""), job_id)
@@ -1244,7 +1247,7 @@ def _failed_node_type(status) -> str:
 
 
 def _return_leased_job_to_pending(project_dir: str, job_id: str, note: str) -> bool:
-    """Return a job its run left ``running`` to ``pending``, retrying save conflicts."""
+    """Return a job its run left ``running`` to ``pending``, retrying contended saves."""
     for _attempt in range(3):
         project = load_project(project_dir)
         # Status lives on the root record; hydrating the job's frozen payload would
@@ -1259,9 +1262,9 @@ def _return_leased_job_to_pending(project_dir: str, job_id: str, note: str) -> b
         try:
             save_project(project, expected_modified_at=getattr(project, "modified_at", "") or None)
             return True
-        except ProjectVersionConflict:
+        except (ProjectVersionConflict, ProjectBusyError):
             continue
-    logger.warning("Could not return leased job %s to pending after save conflicts", job_id)
+    logger.warning("Could not return leased job %s to pending after contended saves", job_id)
     return False
 
 
@@ -2405,6 +2408,17 @@ def _finalize_bridge_group(entries: list[dict], outcome: str = "") -> None:
         if changed:
             settle_job_ids = list(getattr(project, "_sonder_settle_after_save", None) or [])
             committed_project = _save_generated_project(project, base_modified_at, created_ids=created_ids_since(_pre_item_ids, project))
+    except ProjectBusyError:
+        # Another process held the project for the whole wait. Each entry alone would
+        # wait as long again; the files are in media/ already, so only their
+        # registration is lost, as with any failed bridge commit.
+        for staged in staged_entries:
+            _log_bridge_failure(staged["entry"])
+            try:
+                _release_bridge_entry_dir(project, staged)
+            except Exception:
+                logger.exception("Releasing a bridge directory failed for prompt=%s", first.get("prompt_key"))
+        return
     except Exception:
         logger.warning(
             "Bridge group commit failed for prompt=%s project=%s; registering %d entries one by one",

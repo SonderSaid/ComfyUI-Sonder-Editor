@@ -36,14 +36,14 @@ def test_cas_validated_bytes_skip_parse_but_external_edit_is_parsed(tmp_path, mo
     from server import project_manager as pm
     project = create_legacy_project("Validated CAS", tmp_path)  # no storage: the parse-skipping path
     project = load_project(project.project_dir)
-    original_load = json.load
+    original_parse = pm._parse_project_text
     calls = []
 
-    def counted_load(handle):
+    def counted_parse(text):
         calls.append(True)
-        return original_load(handle)
+        return original_parse(text)
 
-    monkeypatch.setattr(json, "load", counted_load)
+    monkeypatch.setattr(pm, "_parse_project_text", counted_parse)
     save_project(project, expected_modified_at=project.modified_at, notify=False)
     assert not calls
     project_file = os.path.join(project.project_dir, "project.json")
@@ -146,14 +146,15 @@ def test_load_project_does_not_retry_malformed_json(monkeypatch):
         project_file = os.path.join(project.project_dir, "project.json")
         with open(project_file, "w", encoding="utf-8") as handle:
             handle.write("{")
+        from server import project_manager
         calls = {"count": 0}
-        original_load = json.load
+        original_parse = project_manager._parse_project_text
 
-        def counted_load(handle):
+        def counted_parse(text):
             calls["count"] += 1
-            return original_load(handle)
+            return original_parse(text)
 
-        monkeypatch.setattr(json, "load", counted_load)
+        monkeypatch.setattr(project_manager, "_parse_project_text", counted_parse)
         with pytest.raises(json.JSONDecodeError):
             load_project(project.project_dir)
         assert calls["count"] == 1

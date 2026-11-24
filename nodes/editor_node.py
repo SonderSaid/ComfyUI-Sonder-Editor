@@ -15,6 +15,7 @@ import numpy as np
 import torch
 import folder_paths
 
+from ..server.project_file_lock import ProjectBusyError
 from ..server.project_manager import ProjectVersionConflict, load_project, create_project, save_project
 from ..server.project_storage import PROJECT_STORAGE_UNREADABLE_MESSAGE, ProjectStorageError
 from ..server import external_links
@@ -775,6 +776,12 @@ class SonderEditor:
                     last_conflict = exc
                     proj = load_project(proj.project_dir)
                     break
+                except ProjectBusyError:
+                    # Another process held the project, so nothing was saved: the same
+                    # rule. Any other failure can follow the commit and keeps the lease.
+                    if lease_key:
+                        sdk_runs.settle_lease(getattr(proj, "project_dir", ""), job.job_id)
+                    raise
                 from ..server.project_storage import hydrate_job
                 return proj, hydrate_job(proj, job)
             else:
@@ -843,6 +850,8 @@ class SonderEditor:
             except ProjectVersionConflict as exc:
                 last_conflict = exc
                 proj = load_project(proj.project_dir)
+            except ProjectBusyError as exc:
+                last_conflict = exc  # nothing was saved: the same save again
         raise RuntimeError("Failed to mark queue job failed after concurrent editor saves.") from last_conflict
 
     @staticmethod
@@ -1871,10 +1880,15 @@ class SonderEditor:
                 # here is permanent — no later redaction reaches a value already on
                 # disk — so this is the one transport where the shaping has to happen
                 # before the write rather than at the response boundary.
-                self._mark_queue_job_failed(
-                    proj, queue_job,
-                    PROJECT_STORAGE_UNREADABLE_MESSAGE
-                    if isinstance(e, ProjectStorageError) else str(e))
+                try:
+                    self._mark_queue_job_failed(
+                        proj, queue_job,
+                        PROJECT_STORAGE_UNREADABLE_MESSAGE
+                        if isinstance(e, ProjectStorageError) else str(e))
+                except Exception:
+                    # The run failed for `e`, whatever marking the job ran into; the
+                    # run's release returns the job it still leases to pending.
+                    logger.exception("Could not mark queue job %s failed", getattr(queue_job, "job_id", ""))
             raise
 
     def _render_scene_frames(self, proj: TimelineProject, scene: Scene,

@@ -261,9 +261,9 @@ def test_thumbnail_work_never_creates_project_folders(base):
     project = project_with_clip(base)
     folder = name(project)
     # Strip every folder but media/ and the document: a minimal hand-made project.
-    for entry in os.listdir(project.project_dir):
-        if entry not in ("media", "project.json"):
-            shutil.rmtree(Path(project.project_dir) / entry)
+    for entry in Path(project.project_dir).iterdir():
+        if entry.name not in ("media", "project.json"):
+            shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
     before = sorted(p.name for p in Path(project.project_dir).iterdir())
     pm.load_project(project.project_dir, ensure_subdirs=False)
     worker = make_worker(render=fake_render())

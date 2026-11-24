@@ -2775,9 +2775,7 @@ def test_editor_to_bridge_marks_queue_complete_round_trip(tmp_path, monkeypatch)
     assert restored.generation_queue[0].result_asset_id == restored.assets[0].asset_id
 
 
-def test_execute_marks_missing_queued_scene_failed(tmp_path, monkeypatch):
-    editor_node = _import_editor_node(tmp_path, monkeypatch)
-
+def _execute_with_a_missing_queued_scene(editor_node, tmp_path, monkeypatch):
     queue_job = types.SimpleNamespace(
         job_id="job-1",
         scene_id="scene-missing",
@@ -2832,6 +2830,13 @@ def test_execute_marks_missing_queued_scene_failed(tmp_path, monkeypatch):
             }),
             unique_id="editor-1",
         )
+
+    return queue_job, save_states
+
+
+def test_execute_marks_missing_queued_scene_failed(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    queue_job, save_states = _execute_with_a_missing_queued_scene(editor_node, tmp_path, monkeypatch)
 
     assert save_states[0][0] == "running"
     assert save_states[-1][0] == "failed"
@@ -2979,6 +2984,59 @@ def test_consume_queue_job_retries_conflict_instead_of_live_fallback(tmp_path, m
     assert retry_job.status == "running"
     assert retry_job.base_modified_at == "new-version"
     assert calls == {"save": 2, "load": 1}
+
+
+@pytest.mark.parametrize("raised, leased_after", [("busy", False), ("after_commit", True)])
+def test_a_claim_whose_save_failed_keeps_its_lease_only_if_it_may_have_committed(
+        tmp_path, monkeypatch, raised, leased_after):
+    """Busy is raised before anything is saved, so the job on disk may be another
+    process's claim, which this run's release must not reset. Any other failure can
+    follow the commit, and then only this run's release returns the job."""
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(editor_node)
+    project = types.SimpleNamespace(
+        project_dir="dir-a", modified_at="v1",
+        generation_queue=[types.SimpleNamespace(job_id="job-a", status="pending", error="", progress=0.0)])
+    error = editor_node.ProjectBusyError() if raised == "busy" else OSError("directory sync failed")
+    saves = []
+
+    def save(proj, **_kwargs):
+        saves.append(1)
+        raise error
+
+    monkeypatch.setattr(editor_node, "save_project", save)
+    runs.open_release("5", "prompt-5")
+    node = editor_node.SonderEditor()
+    node._run_lease_key = "5"
+    with pytest.raises(OSError) as caught:
+        node._consume_queue_job(project)
+    assert caught.value is error and len(saves) == 1
+    assert runs.holds_lease("dir-a", "job-a") is leased_after
+    runs.reset_for_tests()
+
+
+def test_marking_a_failed_job_retries_a_busy_project(tmp_path, monkeypatch):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    job = types.SimpleNamespace(job_id="job-a", status="running", error="", progress=0.0)
+    project = types.SimpleNamespace(project_dir="dir-a", modified_at="v1", generation_queue=[job])
+    attempts = []
+
+    def save(proj, **_kwargs):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise editor_node.ProjectBusyError()
+
+    monkeypatch.setattr(editor_node, "save_project", save)
+    editor_node.SonderEditor()._mark_queue_job_failed(project, job, "render exploded")
+    assert len(attempts) == 3 and (job.status, job.error) == ("failed", "render exploded")
+
+
+def test_failing_to_mark_the_job_does_not_replace_the_runs_error(tmp_path, monkeypatch, caplog):
+    editor_node = _import_editor_node(tmp_path, monkeypatch)
+    monkeypatch.setattr(editor_node.SonderEditor, "_mark_queue_job_failed",
+                        lambda *_: (_ for _ in ()).throw(RuntimeError("another process held the project")))
+    _execute_with_a_missing_queued_scene(editor_node, tmp_path, monkeypatch)
+    assert "Could not mark queue job job-1 failed" in caplog.text
 
 
 def test_mark_queue_job_failed_skips_later_batch_siblings(tmp_path, monkeypatch):
@@ -4764,6 +4822,29 @@ def _open_leased_run(runs, key="5"):
     runs.open_release(key, "prompt-5")
     runs.note_project(key, "dir-a", ["proj-id", "Folder"])
     runs.take_lease(key, "dir-a", "job-a")
+
+
+def test_release_returns_a_job_once_a_busy_project_is_free(tmp_path, monkeypatch):
+    io_nodes = _import_io_nodes(tmp_path, monkeypatch)
+    runs = _fresh_sdk_runs(io_nodes)
+    job, loads, saves, _events = _release_fixture(io_nodes, monkeypatch, "running")
+    attempts = []
+
+    def busy_twice(_project, **kwargs):
+        job_status = job.status
+        attempts.append(job_status)
+        if len(attempts) < 3:
+            job.status = "running"  # each attempt reloads the stored job
+            raise io_nodes.ProjectBusyError()
+        saves.append(kwargs)
+
+    monkeypatch.setattr(io_nodes, "save_project", busy_twice)
+    _open_leased_run(runs)
+    io_nodes._release_prompt_run("5", types.SimpleNamespace(
+        status_str="error", messages=[("execution_interrupted", {})]))
+    assert attempts == ["pending"] * 3 and len(loads) == 3 and len(saves) == 1
+    assert job.status == "pending"
+    runs.reset_for_tests()
 
 
 def test_release_returns_a_failed_runs_job_to_pending_and_announces_it(tmp_path, monkeypatch):

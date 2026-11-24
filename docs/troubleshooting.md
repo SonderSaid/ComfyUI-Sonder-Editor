@@ -138,6 +138,21 @@ memory`, update ComfyUI and Sonder Editor.
 Update Sonder Editor to **0.6.0 or newer** to open a storage-format-3
 project. Keep the whole project folder, including `state/`, when moving it.
 
+### "Another ComfyUI process is saving this project"
+
+Another ComfyUI server has the project open and is saving it. Wait a moment
+and try again. If the message stays, restart the other server.
+
+If no other server is running, the project's drive may be refusing file
+locks. Move the project to a local drive.
+
+### A project stopped opening after two ComfyUI servers used it
+
+Restore the project folder from a backup. To keep it from happening again,
+update Sonder Editor on **every** server that opens the project to a version
+newer than **0.9.3**, then restart them. If the console says a project's
+filesystem has no file locks, open that project in one server at a time.
+
 ### A project won't open, save or extract on Windows
 
 Update Sonder Editor to **0.6.0 or newer**, which uses shorter file names.

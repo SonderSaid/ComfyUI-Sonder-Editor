@@ -1,6 +1,8 @@
 import logging
+import time
 from copy import deepcopy
 
+from .project_file_lock import ProjectBusyError
 from .project_manager import ProjectVersionConflict, load_project, save_project
 from .lane_registry import VARIABLE_LANE_DESCRIPTORS, allocate_take_lane
 from .timeline_state import LaneConfig, TimelineProject
@@ -375,6 +377,25 @@ def _merge_generated_outputs(current: TimelineProject, produced: TimelineProject
 # so a render's output is never lost to a transient 409.
 _GENERATED_SAVE_MERGE_RETRIES = 8
 
+# How long finished outputs wait for another ComfyUI process to let go of the project,
+# over every attempt of one commit.
+GENERATED_SAVE_BUSY_SECONDS = 120.0
+
+
+def retry_while_busy(save, deadline: float) -> None:
+    """Repeat the same save while another process holds the project.
+
+    Busy is raised before anything is published, so the identical call is safe, and it
+    commits everything on ``project``. The conflict merge must not stand in for it: that
+    copies only the items this run created.
+    """
+    while True:
+        try:
+            return save()
+        except ProjectBusyError:
+            if time.monotonic() >= deadline:
+                raise
+
 
 def save_generated_project(project: TimelineProject, base_modified_at: str = "", created_ids=None, auto_placement_ids=None) -> TimelineProject:
     """Save generated outputs without overwriting unrelated live editor changes.
@@ -391,13 +412,14 @@ def save_generated_project(project: TimelineProject, base_modified_at: str = "",
     The returned project may carry transient `_asset_id_remap` data when a
     conflict merge reconciles a generated asset onto an existing same-path
     auto-sync placeholder while preserving the placeholder's observed ID."""
+    busy_deadline = time.monotonic() + GENERATED_SAVE_BUSY_SECONDS
     if not base_modified_at:
-        save_project(project)
+        retry_while_busy(lambda: save_project(project), busy_deadline)
         setattr(project, "_asset_id_remap", {})
         return project
 
     try:
-        save_project(project, expected_modified_at=base_modified_at)
+        retry_while_busy(lambda: save_project(project, expected_modified_at=base_modified_at), busy_deadline)
         setattr(project, "_asset_id_remap", {})
         return project
     except ProjectVersionConflict as initial_exc:
@@ -416,7 +438,8 @@ def save_generated_project(project: TimelineProject, base_modified_at: str = "",
             raise last_exc
         if changed:
             try:
-                save_project(current, expected_modified_at=current.modified_at)
+                retry_while_busy(
+                    lambda: save_project(current, expected_modified_at=current.modified_at), busy_deadline)
             except ProjectVersionConflict as exc:
                 last_exc = exc
                 continue

@@ -1,20 +1,22 @@
 import json
 import copy
 import hashlib
-import io
 import os
 import logging
+import random
 import threading
 import time
 import uuid
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from typing import Callable
 
-from .atomic_io import atomic_replace
+from .atomic_io import atomic_replace_root as atomic_replace
 from . import external_links
 from . import project_storage
 from .pack_version import pack_version
 from .path_security import path_within
+from .project_file_lock import CONTENDED, HELD, ProjectBusyError, ProjectFileLock
 from .timeline_state import TimelineProject, project_prompt_fields_with_unknowns
 
 logger = logging.getLogger("sonder_editor")
@@ -44,6 +46,8 @@ _PROJECT_SAVED_HOOKS: list[Callable[[TimelineProject], None]] = []
 # as well as writers must wait off the event loop (blocking threshold is 0.5s).
 # Keyed by the canonicalized path so the output→Images symlink's two spellings (and any
 # `.`/case variance) map to ONE lock; otherwise the gate would not actually serialize.
+# It is in-process only. What writes or deletes durable state takes
+# `_project_commit_lock` instead, which adds the cross-process lock.
 _PROJECT_WRITE_LOCKS: dict[str, threading.Lock] = {}
 _PROJECT_WRITE_LOCKS_GUARD = threading.Lock()
 
@@ -65,8 +69,104 @@ def _project_write_lock(project_dir: str) -> threading.Lock:
         return lock
 
 
-def _read_project_json(project_file: str, *, signature_out=None, version_source=None) -> dict:
+# How long a save waits for another process's save or sweep. A holder that dies releases
+# the lock. A hold covers a whole commit, so it normally lasts about as long as a save
+# here; one that has to read every component from a cold hard disk can outlast this.
+COMMIT_LOCK_WAIT_SECONDS = 10.0
+_COMMIT_LOCK_POLL_SECONDS = 0.01
+_UNLOCKED_FILESYSTEMS_WARNED: set[str] = set()
+
+
+@contextmanager
+def _project_commit_lock(project_dir: str, *, wait: float = COMMIT_LOCK_WAIT_SECONDS):
+    """The write lock plus the cross-process lock. Yields whether the latter is held.
+
+    ``False`` means the filesystem has no locks: a save proceeds as it always has, and a
+    sweep must not run. Raises `ProjectBusyError` when another process holds the lock for
+    ``wait`` seconds, before anything was published.
+
+    While another process holds it, the thread lock is let go between attempts, so this
+    process's loads never wait on that process. ``wait`` counts only that time: waiting
+    behind this process's own saves is unbounded, as it is without a second process. The
+    attempts do not back off, because a growing interval starved one save for seconds.
+    """
+    thread_lock = _project_write_lock(project_dir)
+    waited = 0.0
+    while True:
+        thread_lock.acquire()
+        try:
+            file_lock = ProjectFileLock(project_dir)
+            outcome = file_lock.try_acquire()
+        except BaseException:
+            thread_lock.release()
+            raise
+        if outcome != CONTENDED:
+            break
+        thread_lock.release()
+        if waited >= wait:
+            raise ProjectBusyError()
+        pause = _COMMIT_LOCK_POLL_SECONDS * random.uniform(0.5, 1.5)
+        started = time.monotonic()
+        time.sleep(pause)
+        waited += time.monotonic() - started
+    try:
+        if outcome != HELD:
+            _warn_unlocked_filesystem(project_dir)
+        yield outcome == HELD
+    finally:
+        try:
+            file_lock.release()
+        finally:
+            thread_lock.release()
+
+
+def _warn_unlocked_filesystem(project_dir: str) -> None:
+    key = os.path.normcase(os.path.abspath(project_dir))
+    if key not in _UNLOCKED_FILESYSTEMS_WARNED:
+        _UNLOCKED_FILESYSTEMS_WARNED.add(key)
+        logger.warning(
+            "The filesystem of %s has no file locks: opening this project in two ComfyUI "
+            "processes at once is not safe, and its unused state files are never removed.",
+            project_dir)
+
+
+def project_held_elsewhere(project_dir: str) -> bool:
+    """Whether another process holds the project's lock right now. Advisory."""
+    try:
+        with _project_commit_lock(project_dir, wait=0):
+            return False
+    except ProjectBusyError:
+        return True
+    except OSError:
+        return False  # a folder the lock file cannot be opened in fails its own save
+
+
+def _next_modified_at(stored: str) -> str:
+    """A version token later than the stored one, also when the clock was set back.
+
+    The token is the compare-and-swap authority and the client's map is monotonic, so a
+    repeated or lower one would let a stale save pass or a fresh response be ignored.
+    """
+    now = datetime.now()
+    try:
+        previous = datetime.fromisoformat(stored)
+        if previous.tzinfo is None and previous >= now:
+            now = previous + timedelta(microseconds=1)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return now.isoformat()
+
+
+def _parse_project_text(text: str):
+    return json.loads(text)
+
+
+def _read_project_json(project_file: str, *, signature_out=None, version_source=None,
+                       log_unreadable: bool = True) -> dict:
     """Read one project file through a short Windows sharing-violation retry.
+
+    The handle is closed before parsing: while it is open another process's replace of
+    this file fails on Windows.
 
     The caller owns the canonical per-project lock when it participates in a
     load/save compare-and-swap.  The retry is intentionally PermissionError-
@@ -80,30 +180,30 @@ def _read_project_json(project_file: str, *, signature_out=None, version_source=
             time.sleep(delay)
         try:
             with open(project_file, "r", encoding="utf-8") as f:
-                if signature_out is None and version_source is None:
-                    return json.load(f)
                 text = f.read()
-                digest = hashlib.sha256(text.encode("utf-8")).digest()
-                known = getattr(version_source, "_validated_document", None)
-                # This is proof of byte-equivalence to a fully parsed/published
-                # document, never a second version authority. Changed bytes,
-                # including malformed JSON with a matching version, parse fully.
-                if known is not None and digest == known[0]:
-                    return {"modified_at": known[1]}
-                data = json.load(io.StringIO(text))
-                if signature_out is not None:
-                    signature_out.append((digest, str(data.get("modified_at", "") or "")))
-                return data
+            break
         except PermissionError as exc:
             if first_error is None:
                 first_error = exc
             if index == len(delays) - 1:
-                logger.error(
+                (logger.error if log_unreadable else logger.debug)(
                     "Project read remained unavailable after %d attempts: %s",
                     len(delays), project_file,
                 )
                 raise first_error
-    raise first_error  # pragma: no cover - loop always returns or raises
+    if signature_out is None and version_source is None:
+        return _parse_project_text(text)
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    known = getattr(version_source, "_validated_document", None)
+    # This is proof of byte-equivalence to a fully parsed/published
+    # document, never a second version authority. Changed bytes,
+    # including malformed JSON with a matching version, parse fully.
+    if known is not None and digest == known[0]:
+        return {"modified_at": known[1]}
+    data = _parse_project_text(text)
+    if signature_out is not None:
+        signature_out.append((digest, str(data.get("modified_at", "") or "")))
+    return data
 
 
 class ProjectVersionConflict(RuntimeError):
@@ -280,16 +380,21 @@ def save_project(
     bump_modified_at: bool = True,
     notify: bool = True,
     expected_absent: bool = False,
+    lock_wait: float = COMMIT_LOCK_WAIT_SECONDS,
 ) -> None:
+    """``lock_wait=0`` gives up at once (`ProjectBusyError`) when another process is
+    saving: for opportunistic writes only. It does not bound the thread lock."""
     project_file = os.path.join(project.project_dir, "project.json")
     if expected_modified_at is None:
         expected_modified_at = getattr(project, "_expected_modified_at", None) or None
-    # Serialize the read-version-check → tmp-write → atomic_replace as one critical
-    # section per project (see _project_write_lock). Raising ProjectVersionConflict
-    # releases the lock via the context manager. Diag + notify hooks run OUTSIDE the
-    # lock (below) — they broadcast / schedule cross-thread work and must not be held.
-    with _project_write_lock(project.project_dir):
+    # Serialize the read-version-check → publish → tmp-write → atomic_replace as one
+    # critical section per project, across processes (see _project_commit_lock).
+    # Raising ProjectVersionConflict releases the lock via the context manager. Diag +
+    # notify hooks run OUTSIDE the lock (below) — they broadcast / schedule cross-thread
+    # work and must not be held.
+    with _project_commit_lock(project.project_dir, wait=lock_wait):
         current_data = None
+        bare_current = None
         if expected_absent and os.path.exists(project_file):
             current_data = _read_project_json(project_file)
             raise ProjectVersionConflict(
@@ -299,9 +404,12 @@ def save_project(
         if expected_modified_at:
             current_data = _require_stored_version(
                 project, project_file, expected_modified_at)
+        elif os.path.isfile(project_file):
+            current_data = bare_current = _read_project_json(project_file)
 
         if bump_modified_at:
-            project.modified_at = datetime.now().isoformat()
+            project.modified_at = _next_modified_at(
+                current_data.get("modified_at", "") if isinstance(current_data, dict) else "")
         data = project.to_dict(include_internal=True)
         # Bare writers also re-read the root: a model loaded before migration
         # must never roll its frozen descriptors back to an inline layout.
@@ -311,7 +419,10 @@ def save_project(
                 or any(asset.get("generation_params") for asset in data.get("assets", []))
                 or "prompt_history" in data.get("metadata", {})
                 or (current_data and "storage" in current_data)):
-            current_data = _read_project_json(project_file) if os.path.isfile(project_file) else {}
+            if bare_current is not None:
+                current_data = bare_current
+            else:
+                current_data = _read_project_json(project_file) if os.path.isfile(project_file) else {}
             data = project_storage.assemble_for_save(
                 project, data, current_data, bump_modified_at=bump_modified_at,
                 new_project=expected_absent)

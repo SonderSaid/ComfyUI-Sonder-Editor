@@ -1,16 +1,34 @@
 """Immutable payload storage; project_manager owns the lock and commit point."""
 
+import contextlib
 import copy
+import errno
 import hashlib
 import json
+import logging
+import math
 import os
 import re
 import stat
+import time
 import uuid
 
 from .atomic_io import atomic_replace
 from .json_text import dumps_utf8
 from .path_security import project_state_path, project_state_root
+
+logger = logging.getLogger("sonder_editor")
+
+# What a component file can be called, in either spelling. Anything else in ``state/``
+# (backups, temporaries, the retention file) is not a component and is never swept.
+_COMPONENT_FILE = re.compile(
+    r"(?:(?:prompt_history|history_entry|(?:queue|provenance)_[0-9a-f]{64})-)?[0-9a-f]{64}\.json")
+
+# How long a component stays after a sweep first finds it unreferenced. Another process
+# can hold a model that still names it, and in-process leases cannot be seen from here.
+# A reader that holds one for longer fails closed when it opens it.
+COMPONENT_RETENTION_SECONDS = 24 * 60 * 60
+RETENTION_FILENAME = "retention.json"
 
 FROZEN_JOB_FIELDS = (
     "prompt_sections", "compiled_prompt_context", "reference_input_snapshots",
@@ -394,6 +412,23 @@ def publish_component(project_dir, name, value, *, format_version=2):
     return _publish_component_bytes(project_dir, name, payload, format_version=format_version)
 
 
+def _component_entries(state_root):
+    """``{name: stat}`` of the JSON files. A file that vanishes meanwhile is absent.
+
+    Another process's save or sweep can remove a temporary or an unused component while
+    this lists: on POSIX ``stat`` is a syscall, and an unrelated file must not fail a load.
+    """
+    found = {}
+    with os.scandir(state_root) as entries:
+        for entry in entries:
+            if entry.name.endswith(".json"):
+                try:
+                    found[entry.name] = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+    return found
+
+
 def validate_storage(project_dir, data):
     storage = storage_of(data)
     if storage is None:
@@ -404,8 +439,7 @@ def validate_storage(project_dir, data):
     state_root = project_state_root(project_dir, must_exist=True)
     if not state_root:
         raise ProjectStorageError("Project state directory is missing or invalid")
-    with os.scandir(state_root) as entries:
-        state_entries = {entry.name: entry.stat(follow_symlinks=False) for entry in entries}
+    state_entries = _component_entries(state_root)
     cache = {}
     def read(name, descriptor):
         path = descriptor_path(project_dir, name, descriptor, state_root=state_root)
@@ -442,17 +476,24 @@ def _read_history_component(project_dir, descriptor, format_version=None, *, rea
     if read is None:
         read = lambda name, desc: read_component(project_dir, name, desc)
     value = read("prompt_history", descriptor)
+    entries = _history_entry_descriptors(value, format_version)
+    if entries is None:
+        return value, []
+    return [read("history_entry", entry) for entry in entries], entries
+
+
+def _history_entry_descriptors(value, format_version=None):
+    """An index's child descriptors, or None for a format-1 history. Reads no child."""
     # Maintainer format-1 projects remain readable until their next history write.
     # Remove this branch only once that inventory has migrated to indexed history.
     if isinstance(value, list) and (format_version or 0) < 2:
-        return value, []
+        return None
     if (format_version == 1 or not isinstance(value, dict)
             or value.get("kind") != "prompt_history_index"
             or type(value.get("schema_version")) is not int or value["schema_version"] != 1
             or not isinstance(value.get("entries"), list)):
         raise ProjectStorageError("prompt_history: malformed or unsupported history index")
-    entries = value["entries"]
-    return [read("history_entry", entry) for entry in entries], entries
+    return value["entries"]
 
 
 def publish_history(project_dir, history, *, format_version=2):
@@ -728,45 +769,201 @@ def assemble_for_save(project, data, current, *, bump_modified_at, new_project=F
     data["storage"] = storage
     if repack:
         validate_storage(project.project_dir, data)
+    _keep_newly_referenced(project.project_dir, old, storage)
     return data
 
 
-def collect_unreferenced_components(project_dir):
-    """Maintenance worker/explicit sweep only; never inline in a load or save."""
-    from .project_manager import _project_write_lock, _read_project_json
+def _descriptor_name(project_dir, name, descriptor):
+    return os.path.basename(descriptor_path(project_dir, name, descriptor, state_root=""))
+
+
+def _referenced_names(project_dir, storage):
+    """The file names the stored document and this process's loaded models still need,
+    or None when an index that names more of them cannot be read.
+
+    Children come from the index alone: reading every child would let one unreadable
+    child unprotect its siblings.
+    """
+    from .project_storage_lifecycle import live_descriptors
+    leases = live_descriptors(project_dir)
+    needed = [(lease.name, lease.descriptor) for lease in leases]
+    for group in ("components", "recovery_previous", "authoring_previous"):
+        descriptors = storage.get(group, {})
+        if not isinstance(descriptors, dict):
+            raise ProjectStorageError(f"Invalid retained component set: {group}")
+        needed.extend(descriptors.items())
+    names, indexes = set(), {}
+    for name, descriptor in needed:
+        file_name = _descriptor_name(project_dir, name, descriptor)
+        names.add(file_name)
+        if name == "prompt_history":
+            indexes[file_name] = descriptor
+    for descriptor in indexes.values():
+        try:
+            names.update(_history_entry_names(project_dir, descriptor))
+        except ProjectStorageError:
+            logger.debug("Keeping every unused component of %s: a history index in use is unreadable",
+                         project_dir, exc_info=True)
+            return None
+    return names
+
+
+def _history_entry_names(project_dir, descriptor):
+    entries = _history_entry_descriptors(read_component(project_dir, "prompt_history", descriptor))
+    return {_descriptor_name(project_dir, "history_entry", entry) for entry in entries or []}
+
+
+def _retention_path(project_dir):
+    path = project_state_path(project_dir, RETENTION_FILENAME)
+    if not path:
+        raise ProjectStorageError("Component retention path is not contained")
+    return path
+
+
+def _read_retention(project_dir):
+    """``{file name: when a sweep first found it unreferenced}``. Only delays a deletion:
+    it never says what is referenced, so a missing or malformed one restarts the delay."""
+    try:
+        value = json.loads(_read_bytes(_retention_path(project_dir)))
+    except (FileNotFoundError, ValueError):
+        return {}
+    since = value.get("unreferenced_since") if isinstance(value, dict) and value.get("v") == 1 else None
+    if not isinstance(since, dict):
+        return {}
+    return {name: when for name, when in since.items()
+            if _COMPONENT_FILE.fullmatch(name) and type(when) in (int, float) and math.isfinite(when)}
+
+
+def _write_retention(project_dir, since):
+    publish_bytes(_retention_path(project_dir), json.dumps(
+        {"v": 1, "unreferenced_since": dict(sorted(since.items()))}, separators=(",", ":")).encode("utf-8"))
+
+
+def _keep_newly_referenced(project_dir, old, storage):
+    """Restart the retention of every component this save starts referencing.
+
+    Called inside the commit lock, before the root is replaced, and a failure fails the
+    save: a recorded time from an earlier unused period would otherwise let the component
+    go at once when it is next dropped. A save that fails afterwards only restarts a delay.
+    """
+    # Plain comparisons: both sides are validated or just published, and this runs on
+    # every save over every component.
+    before = {descriptor["path"] for descriptor in (old or {}).get("components", {}).values()}
+    started = [(name, descriptor) for name, descriptor in storage["components"].items()
+               if descriptor["path"] not in before]
+    if not started:
+        return
+    since = _read_retention(project_dir)
+    if not since:
+        return
+    names = set()
+    for name, descriptor in started:
+        names.add(_descriptor_name(project_dir, name, descriptor))
+        if name == "prompt_history":
+            names |= _history_entry_names(project_dir, descriptor)
+    if names & since.keys():
+        _write_retention(project_dir, {name: when for name, when in since.items() if name not in names})
+
+
+def collect_unreferenced_components(project_dir, *, retention_seconds=COMPONENT_RETENTION_SECONDS):
+    """Maintenance worker/explicit sweep only; never inline in a load or save.
+
+    Deletes components that sweeps have found unreferenced for ``retention_seconds``.
+    The first pass takes no cross-process lock and, when there is nothing to record or
+    delete, writes nothing. Otherwise the commit lock is taken without waiting and the
+    document must still be the bytes the first pass validated, so nothing is deleted
+    beside another process's save. Runs on activity only: an idle project is not
+    revisited when a delay expires.
+    """
+    from .project_manager import _project_commit_lock, _project_write_lock
+    root_path = os.path.join(project_dir, "project.json")
     with _project_write_lock(project_dir):
-        data = _read_project_json(os.path.join(project_dir, "project.json"))
+        root = _read_bytes(root_path)
+        data = json.loads(root)
         storage = storage_of(data)
         if not storage:
             return []
         validate_storage(project_dir, data)
-        keep = set()
-        from .project_storage_lifecycle import live_descriptors
-        leases = live_descriptors(project_dir)
-        leased = [(lease.name, lease.descriptor) for lease in leases]
-        for name, descriptor in leased:
-            keep.add(descriptor_path(project_dir, name, descriptor))
-            if name == "prompt_history":
-                _, entries = _read_history_component(project_dir, descriptor)
-                for child in entries:
-                    keep.add(descriptor_path(project_dir, "history_entry", child))
-        for group in ("components", "recovery_previous", "authoring_previous"):
-            descriptors = storage.get(group, {})
-            if not isinstance(descriptors, dict):
-                raise ProjectStorageError(f"Invalid retained component set: {group}")
-            for name, descriptor in descriptors.items():
-                keep.add(descriptor_path(project_dir, name, descriptor))
-                if name == "prompt_history":
-                    _, entries = _read_history_component(project_dir, descriptor)
-                    for child in entries:
-                        keep.add(descriptor_path(project_dir, "history_entry", child))
-        root = project_state_root(project_dir, must_exist=True)
+        unused = _unused_names(project_dir, storage)
+        if unused is None or not _sweep_has_work(unused, _read_retention(project_dir), retention_seconds):
+            return []
+    with contextlib.ExitStack() as stack:
+        try:
+            held = stack.enter_context(_project_commit_lock(project_dir, wait=0))
+        except OSError as exc:
+            # Busy or read-only: a later sweep does it. Anything else is a real failure.
+            if not _is_unwritable(exc):
+                raise
+            logger.debug("Skipped the component sweep of %s: %s", project_dir, exc)
+            return []
+        # Nothing protects a peer's save on a filesystem without locks, and a document
+        # that changed since the first pass was not validated.
+        if not held or _read_bytes(root_path) != root:
+            return []
+        unused = _unused_names(project_dir, storage)
+        if unused is None:
+            return []
+        now = time.time()
+        recorded = _read_retention(project_dir)
+        # A time from the future (the clock was set back) restarts.
+        since = {name: when if (when := recorded.get(name, now)) <= now else now for name in unused}
         removed = []
-        for entry in os.scandir(root):
-            if not re.fullmatch(r"(?:(?:prompt_history|history_entry|(?:queue|provenance)_[0-9a-f]{64})-)?[0-9a-f]{64}\.json", entry.name):
+        for name in sorted(name for name, when in since.items() if when <= now - retention_seconds):
+            path = project_state_path(project_dir, name)
+            if not path:
                 continue
-            path = project_state_path(project_dir, entry.name)
-            if path and path not in keep and entry.is_file(follow_symlinks=False):
+            try:
                 os.remove(path)
-                removed.append(entry.name)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                if not _is_unwritable(exc):
+                    raise
+                continue  # open in another process, or a read-only folder: a later sweep
+            removed.append(name)
+        # One write, after the deletions, so a full disk can still be freed. A record that
+        # outlives its file is dropped by the next sweep or by a save using that name.
+        remaining = {name: when for name, when in since.items() if name not in removed}
+        if remaining != recorded:
+            try:
+                _write_retention(project_dir, remaining)
+            except OSError as exc:
+                if not _is_unwritable(exc):
+                    raise
+                logger.debug("Could not record the component sweep of %s: %s", project_dir, exc)
         return removed
+
+
+def _is_unwritable(exc):
+    """A folder that cannot be written right now. A later sweep may; it is no failure."""
+    return isinstance(exc, PermissionError) or exc.errno in (
+        errno.EROFS, errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC))
+
+
+def _read_bytes(path):
+    """Through the short sharing-violation retry ``_read_project_json`` uses."""
+    for delay in (0.015, 0.035, 0.075, None):
+        try:
+            with open(path, "rb") as handle:
+                return handle.read()
+        except PermissionError:
+            if delay is None:
+                raise
+            time.sleep(delay)
+
+
+def _unused_names(project_dir, storage):
+    """Component files nothing needs, or None when that cannot be known. Caller holds
+    the project lock."""
+    needed = _referenced_names(project_dir, storage)
+    if needed is None:
+        return None
+    root = project_state_root(project_dir, must_exist=True)
+    return {name for name, info in _component_entries(root).items()
+            if name not in needed and _COMPONENT_FILE.fullmatch(name) and stat.S_ISREG(info.st_mode)}
+
+
+def _sweep_has_work(unused, recorded, retention_seconds):
+    now = time.time()
+    return unused != recorded.keys() or any(
+        when > now or when <= now - retention_seconds for when in recorded.values())

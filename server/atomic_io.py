@@ -10,13 +10,13 @@ bounded retry, since the colliding handle is almost always transient (a real
 ``os.replace`` completes in microseconds).
 
 Our own concurrent writers (the ComfyUI render worker, the bridge daemon thread,
-``asyncio.to_thread`` workers, and the event-loop routes) are now serialized by a
-per-project lock in ``project_manager.save_project``, so this ``atomic_replace``
-succeeds on the first attempt in the common case; the backoff below is exercised
-only by *external* handle holders (antivirus, the Search Indexer, an external
-viewer) that no in-process lock can coordinate with. Because our writers no longer
-collide, that per-project lock is held for ~one uncontended save (low-ms) and does
-not stall the event loop. The bounded backoff here is ~375 ms worst case — far
+``asyncio.to_thread`` workers, and the event-loop routes) are serialized by the
+per-project commit lock in ``project_manager.save_project``, across processes too, so
+this ``atomic_replace`` succeeds on the first attempt in the common case. The backoff
+is exercised by handle holders outside that lock: antivirus, the Search Indexer, an
+external viewer, and another ComfyUI process reading ``project.json``, since loads
+take no cross-process lock. Because our writers do not collide, the lock is held for
+one save, and never on the event loop. The bounded backoff here is ~375 ms worst case — far
 under the 30 s session TTL — and zero on the uncontended common path.
 """
 
@@ -31,6 +31,8 @@ logger = logging.getLogger("sonder_editor")
 # 5 attempts ⇒ 4 inter-attempt sleeps of 25/50/100/200 ms ≈ 375 ms worst case.
 ATOMIC_REPLACE_RETRIES = 5
 ATOMIC_REPLACE_BASE_DELAY = 0.025  # seconds
+# project.json can be held open by another process for a whole cold read (≈1.6 s total).
+ROOT_REPLACE_RETRIES = 7
 
 
 def atomic_replace(src, dst, *, retries=ATOMIC_REPLACE_RETRIES, base_delay=ATOMIC_REPLACE_BASE_DELAY):
@@ -67,3 +69,8 @@ def atomic_replace(src, dst, *, retries=ATOMIC_REPLACE_RETRIES, base_delay=ATOMI
         retries, src, dst, last_exc,
     )
     raise last_exc
+
+
+def atomic_replace_root(src, dst):
+    """``atomic_replace`` for ``project.json``, with the longer budget."""
+    atomic_replace(src, dst, retries=ROOT_REPLACE_RETRIES)

@@ -285,8 +285,8 @@ LOCK_LEAVES = {
     "load_project", "save_project", "list_projects", "create_project",
     "hydrate_job", "hydrate_asset", "read_component", "read_prompt_history",
     "read_asset_provenance_batch", "read_asset_search_metadata_batch",
-    "collect_unreferenced_components",
-    "_project_write_lock", "generation_params",
+    "collect_unreferenced_components", "project_held_elsewhere", "retry_while_busy",
+    "_project_write_lock", "_project_commit_lock", "generation_params",
 }
 
 # Deliberately left on the default pool: these are mostly ffmpeg, and running them on

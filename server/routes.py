@@ -63,6 +63,7 @@ from .frozen_reference import (
     FrozenReferenceSnapshotError,
     decode_frozen_reference_catalog,
 )
+from .project_file_lock import PROJECT_BUSY_MESSAGE, ProjectBusyError
 from .project_storage import PROJECT_STORAGE_UNREADABLE_MESSAGE, ProjectStorageError
 from .project_storage_lifecycle import run_project_io
 from .render_cache import (
@@ -80,10 +81,13 @@ from .upload_streaming import (
     receive_project_upload,
 )
 from .project_manager import (
+    COMMIT_LOCK_WAIT_SECONDS,
     ProjectVersionConflict,
+    _read_project_json,
     create_project,
     load_project,
     project_conflict_projection,
+    project_held_elsewhere,
     save_project,
     verify_project_version,
     list_projects,
@@ -512,9 +516,10 @@ async def _project_error_middleware(request: web.Request, handler):
     editor headers and CSP — and a raise that escapes entirely is answered by aiohttp
     outside the application, as `text/plain` on a force-closed connection.
 
-    Two arms today: a version conflict, which is an ordinary outcome of versioned
-    mutations, and durable storage the server cannot read, which is not the caller's
-    fault and whose message can carry an absolute filesystem path.
+    Three arms today: a version conflict, which is an ordinary outcome of versioned
+    mutations; another ComfyUI process holding the project, which a retry clears; and
+    durable storage the server cannot read, which is not the caller's fault and whose
+    message can carry an absolute filesystem path.
     """
     try:
         return await handler(request)
@@ -554,6 +559,12 @@ async def _project_error_middleware(request: web.Request, handler):
         # here would not, and versioned mutations make 409 an ordinary outcome rather
         # than an edge case.
         return _apply_sonder_security_headers(request, response)
+    except ProjectBusyError:
+        # Nothing was published. A handler that catches OSError or Exception around its
+        # save answers first, with this same path-free message, as it does for any
+        # contended save.
+        return _apply_sonder_security_headers(request, web.json_response(
+            {"error": PROJECT_BUSY_MESSAGE, "code": "project_busy"}, status=503))
     except ProjectStorageError:
         # The server cannot read its own durable state. That is a server error, not a
         # malformed request, and the message can carry an absolute filesystem path — so
@@ -9457,7 +9468,11 @@ def _sync_media_folder(
     return changed
 
 
-def _save_versioned_sync_phase(project: TimelineProject, sync_fn, reload_project) -> TimelineProject:
+def _save_versioned_sync_phase(project: TimelineProject, sync_fn, reload_project, *,
+                               lock_wait: float = 0) -> TimelineProject:
+    """Run one sync phase and save it. While another ComfyUI process holds the project
+    the save is skipped and the committed document returned, so nothing acts on changes
+    that were never saved; the next sync finds them again."""
     for _attempt in range(3):
         base_modified_at = str(getattr(project, "modified_at", "") or "")
         changed = sync_fn(project)
@@ -9469,14 +9484,21 @@ def _save_versioned_sync_phase(project: TimelineProject, sync_fn, reload_project
             # #279). A bump here re-arms the WS→/assets refresh loop (~10/sec churn) AND
             # spuriously 409s in-flight save-node commits (their expected_modified_at goes
             # stale mid-render). Discovered assets re-surface on the next load.
-            save_project(project, expected_modified_at=base_modified_at, bump_modified_at=False, notify=False)
+            save_project(project, expected_modified_at=base_modified_at, bump_modified_at=False,
+                         notify=False, lock_wait=lock_wait)
             return project
         except ProjectVersionConflict:
             project = reload_project()
+        except ProjectBusyError:
+            return reload_project()
     base_modified_at = str(getattr(project, "modified_at", "") or "")
     changed = sync_fn(project)
     if changed:
-        save_project(project, expected_modified_at=base_modified_at, bump_modified_at=False, notify=False)
+        try:
+            save_project(project, expected_modified_at=base_modified_at, bump_modified_at=False,
+                         notify=False, lock_wait=lock_wait)
+        except ProjectBusyError:
+            return reload_project()
     return project
 
 
@@ -9510,6 +9532,11 @@ def _sync_media_folder_versioned(
     # snapshot after the non-destructive scan/repair phase instead of against a
     # request object that may have spent seconds ffprobing.
     project = reload_project()
+    # It deletes before it saves, so it does not start while another process is saving,
+    # and its save gets the full wait.
+    if (any(getattr(asset, "trashed_at", "") for asset in project.assets)
+            and project_held_elsewhere(project.project_dir)):
+        return project
     return _save_versioned_sync_phase(
         project,
         lambda sync_project: _purge_expired_trashed_assets(
@@ -9518,6 +9545,7 @@ def _sync_media_folder_versioned(
             max_size_mb=trash_max_size_mb,
         ),
         reload_project,
+        lock_wait=COMMIT_LOCK_WAIT_SECONDS,
     )
 
 
@@ -9652,9 +9680,8 @@ def _find_project_dir_in_base(base_dir: str, requested_id: str) -> str:
         if not os.path.isfile(pfile):
             continue
         try:
-            with open(pfile, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if _project_file_matches_request(data, requested_id, safe_entry):
+            data = _read_project_json(pfile, log_unreadable=False)
+            if isinstance(data, dict) and _project_file_matches_request(data, requested_id, safe_entry):
                 return entry_path
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             logger.debug("Skipping unreadable project index at %s: %s", pfile, exc)
@@ -9826,8 +9853,9 @@ def _load_project_from_request(request: web.Request, *, repair_missing_frames: b
                 expected_modified_at=loaded_modified_at,
                 bump_modified_at=False,
                 notify=False,
+                lock_wait=0,
             )
-        except (ProjectVersionConflict, PermissionError) as exc:
+        except (ProjectVersionConflict, PermissionError) as exc:  # ProjectBusyError included
             logger.debug("Skipped contended total_source_frames repair save for %s: %s", project_dir, exc)
 
     _validate_request_project_version(request, project)
@@ -10771,7 +10799,9 @@ class _StagedMediaBatch:
         """
         try:
             with open(os.path.join(self._project_dir, "project.json"), "rb") as handle:
-                data = json.load(handle)
+                payload = handle.read()
+            # Parsed closed: an open handle fails another process's replace on Windows.
+            data = json.loads(payload)
         except (OSError, ValueError):
             logger.warning("Could not read %s to decide a staged-media rollback",
                            self._project_dir, exc_info=True)
