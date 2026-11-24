@@ -435,8 +435,11 @@ def test_the_sentinel_never_reaches_the_model_or_the_clipboard():
             withSentinel: copy("line\n" + ZW), plain: copy("line") }));
     """)
     assert result["pasted"] == "abcx\ny"
+    # The sentinel in the serialized selection is what makes the copy the
+    # editor's; the text written is the model span the range covers (offsets
+    # 0-2), the same span a cut deletes, never the serializer's string.
     assert result["withSentinel"] == {"prevented": True,
-                                      "written": ["text/plain", "line\n"]}
+                                      "written": ["text/plain", "ab"]}
     assert result["plain"] == {"prevented": False, "written": None}
 
 
@@ -446,12 +449,12 @@ def test_an_emptied_last_line_placeholder_is_not_read_as_a_second_newline():
             { type: "text", node_id: "t", text: "She stops\nlast" }] } });
         const span = spanOf(editor, "t");
         // What Chromium leaves after the last line's text is deleted: the
-        // break, then a placeholder <br> that innerText reads as another "\n".
+        // break, then a placeholder <br> the structural reader reads as
+        // another "\n".
         span.childNodes.length = 0;
         const text = document.createTextNode("She stops\n");
         span.appendChild(text);
         span.appendChild(document.createElement("br"));
-        span.innerText = "She stops\n\n";
         place(text, 10);
         for (const handler of editor._handlers.input) handler({});
         // A real second break followed by the placeholder keeps the real one.
@@ -461,7 +464,6 @@ def test_an_emptied_last_line_placeholder_is_not_read_as_a_second_newline():
         keptSpan.childNodes.length = 0;
         keptSpan.appendChild(document.createTextNode("a\n\n"));
         keptSpan.appendChild(document.createElement("br"));
-        keptSpan.innerText = "a\n\n\n";
         for (const handler of kept._handlers.input) handler({});
         console.log(JSON.stringify({ value: editor.value, kept: kept.value }));
     """)

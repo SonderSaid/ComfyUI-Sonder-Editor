@@ -1,6 +1,6 @@
 // Browser drivers shared by run.mjs and clipboard.mjs. Each driver opens a
 // page and exposes: evaluate(expression) -> JSON value, key(name, {ctrl, shift}),
-// drag(fromPoint, toPoint), newTab(url) -> a tab with the same evaluate/key and
+// drag(fromPoint, toPoint), click(point), newTab(url) -> a tab with the same evaluate/key and
 // bringToFront(), and close(). `{ skip }` means the browser or driver is missing.
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
@@ -26,13 +26,18 @@ const BIDI_KEYS = { Delete: "\ue017", Backspace: "\ue003", Tab: "\ue004", Contro
     Enter: "\ue007", Escape: "\ue00c", End: "\ue010", Home: "\ue011", ArrowLeft: "\ue012", ArrowUp: "\ue013",
     ArrowRight: "\ue014", ArrowDown: "\ue015" };
 
-export async function firefoxDriver(url, { headed = false } = {}) {
+// `activeWindow` makes a headless Firefox treat its window as the active one
+// (focus and blur then behave as in a foreground window), through a
+// chrome-scope script the remote agent allows only with system access.
+export async function firefoxDriver(url, { headed = false, activeWindow = false } = {}) {
     if (!existsSync(FIREFOX)) return { skip: `Firefox not found at ${FIREFOX} (set FIREFOX_BIN)` };
     if (typeof WebSocket !== "function") return { skip: "this Node has no global WebSocket (Node 22+)" };
     const profile = mkdtempSync(join(tmpdir(), "sonder-chip-ff-"));
     const port = 9300 + Math.floor(Math.random() * 500);
     const firefox = spawn(FIREFOX, [...(headed ? [] : ["-headless"]), "-no-remote", "-profile", profile,
-        "--remote-debugging-port", String(port), "about:blank"], { windowsHide: !headed });
+        ...(activeWindow ? ["--remote-allow-system-access"] : []),
+        "--remote-debugging-port", String(port), "about:blank"], { windowsHide: !headed,
+        env: { ...process.env, ...(activeWindow ? { MOZ_REMOTE_ALLOW_SYSTEM_ACCESS: "1" } : {}) } });
     let socket;
     for (let i = 0; i < 80 && !socket; i += 1) {
         if (firefox.exitCode !== null) return { skip: `Firefox exited ${firefox.exitCode}` };
@@ -86,12 +91,29 @@ export async function firefoxDriver(url, { headed = false } = {}) {
                     ...[0.25, 0.5, 0.75, 1].map((k) => move(Math.round(a.x + (b.x - a.x) * k),
                         Math.round(a.y + (b.y - a.y) * k), 65)), { type: "pointerUp", button: 0 }]);
             },
+            click: async (p) => {
+                await actions("pointer", "mouse", [{ type: "pointerMove", x: p.x, y: p.y, duration: 0 },
+                    { type: "pointerDown", button: 0 }, { type: "pointerUp", button: 0 }]);
+            },
             bringToFront: () => send("browsingContext.activate", { context }),
         };
     };
-    const { contexts: [{ context }] } = await send("browsingContext.getTree");
+    // With system access the tree can list a privileged context first, so the
+    // page gets a tab of its own there.
+    const { context } = activeWindow ? await send("browsingContext.create", { type: "tab" })
+        : (await send("browsingContext.getTree")).contexts[0];
     await send("browsingContext.setViewport", { context, viewport: { width: 900, height: 700 } });
     await send("browsingContext.navigate", { context, url, wait: "complete" });
+    if (activeWindow) {
+        const { contexts: [{ context: chrome }] } = await send("browsingContext.getTree", { "moz:scope": "chrome" });
+        const active = await send("script.evaluate", { expression: "(()=>{Services.focus.activeWindow=window;"
+            + "window.gBrowser.selectedBrowser.focus();return Services.focus.activeWindow===window;})()",
+        awaitPromise: true, target: { context: chrome } });
+        if (active.type !== "success" || !active.result.value) {
+            socket.close(); firefox.kill();
+            return { skip: "could not activate the headless Firefox window" };
+        }
+    }
     return {
         name: "firefox", version: `${capabilities.browserName} ${capabilities.browserVersion}`,
         ...tab(context),
@@ -124,6 +146,7 @@ export async function chromiumDriver(url, { headed = false } = {}) {
                 await page.mouse.move(Math.round(a.x + (b.x - a.x) * k), Math.round(a.y + (b.y - a.y) * k), { steps: 3 });
             await page.mouse.up();
         },
+        click: (p) => page.mouse.click(p.x, p.y),
         bringToFront: () => page.bringToFront(),
     });
     const page = await context.newPage();

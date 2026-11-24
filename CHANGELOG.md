@@ -18,6 +18,8 @@ a fresh `[Unreleased]` block.
   - **+ Queue**, **+ Batch** and **Queue Prompt Sections** send the job after it, so the job gets the new text, and each job keeps the range you clicked.
 - One **Save** in the prompt bar sends once, and text the server refused is not sent again until you change it or press **Save** or **Retry**.
 - A prompt save that can't be sent because its scene is no longer open or its lane is locked now says so, instead of doing nothing.
+- Typing in a long, wrapped prompt on Firefox 159 no longer saves it shorter or drops a final `@mention`.
+- Some selections and caret positions on an `@mention` could make Delete, Backspace, Enter or paste act on more than the mention, or on a chip beside it; they now act exactly where the selection or caret is. A writing aid also wraps a selection that ends on a mention instead of inserting in front of it.
 
 ## [0.9.2] - 2026-11-23
 

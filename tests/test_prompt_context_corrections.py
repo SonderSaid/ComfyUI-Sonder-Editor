@@ -722,7 +722,12 @@ class N {
   // held one text node and nothing else — and became a crash the moment a
   // live `@handle` put text nodes beside element children.
   get children(){ return this.childNodes.filter((c) => c && c.tagName); }
-  set textContent(v){ this.childNodes.length = 0; this._text = String(v ?? ""); }
+  // Setting it makes one Text child, as a browser does (none for ""). A stored
+  // string was invisible to code that walks child nodes, such as the editor's
+  // structural text reader.
+  set textContent(v){ this.childNodes.length = 0; this._text = "";
+    const value = String(v ?? "");
+    if (value) this.appendChild({ nodeType: 3, nodeValue: value }); }
   appendChild(c){ this.childNodes.push(c); c.parentElement=this;
     if (c.tagName === "OPTION") this.options.push(c); return c; }
   insertBefore(c, ref){
@@ -4566,9 +4571,8 @@ def test_a_live_handle_is_painted_without_entering_the_document():
     """)
     # The handle is marked; the address is not.
     assert result["marked"] == ["@KWoman"], result
-    # `display:inline` is mandatory, not cosmetic: `readDom` reads `innerText`,
-    # which injects a line break for a block-level child box, so an
-    # inline-block handle would persist a newline into the prose per keystroke.
+    # `display:inline` keeps the handle in the line's flow. It no longer guards
+    # the text: `readDom` reads structure, never layout (`authoredWalk`).
     assert all("display:inline;" in css for css in result["css"]), result
     # And the model is untouched prose.
     assert result["roundTrip"] == "she meets @KWoman and bob@example here", result

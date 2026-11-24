@@ -1792,6 +1792,139 @@ function editorCss(compact) {
         font:11px/1.4 system-ui,sans-serif;outline:none;`;
 }
 
+// ── Authored text, read by structure ─────────────────────────────────────
+// Elements whose content is never prose: nothing the author can see, or a
+// chip's own markup carried inside a span by a native drop.
+const NON_PROSE_TAGS = new Set(["STYLE", "SCRIPT", "TEMPLATE", "NOSCRIPT"]);
+// Judged by tag, never by computed style, so reading stays layout-free. Only
+// the native fallbacks (an uncancellable line break, a drop) put these in a span.
+const BLOCK_TAGS = new Set(["DIV", "P", "LI", "UL", "OL", "DL", "DT", "DD", "H1", "H2", "H3",
+    "H4", "H5", "H6", "BLOCKQUOTE", "PRE", "HR", "ADDRESS", "SECTION", "ARTICLE", "ASIDE",
+    "HEADER", "FOOTER", "NAV", "MAIN", "FIGURE", "FIGCAPTION",
+    "TABLE", "THEAD", "TBODY", "TFOOT", "TR", "CAPTION"]);
+const CELL_TAGS = new Set(["TD", "TH"]);
+// Source whitespace between table parts is not cell text.
+const TABLE_PART_TAGS = new Set(["TABLE", "THEAD", "TBODY", "TFOOT", "TR"]);
+
+/**
+ * The authored text under `host` and, given a DOM point, its offset in it.
+ *
+ * The ONE reader of a text span, for the model (`readDom`) and for positions
+ * (`selectionBoundary`, chip adjacency). It walks structure and never reads
+ * layout: `innerText` was read here, and Firefox 159 answered it from line
+ * boxes it had not yet updated after a keystroke in a wrapped field, so the
+ * model — and the save — lost up to the tail of the prompt (bug tracker,
+ * Mozilla bug 2080799).
+ *
+ * Only `host`'s descendants count, never `host` itself, as with `innerText`:
+ * a padding `<br>` left directly under the editor reads as nothing.
+ *   - text: its characters, without U+200B;
+ *   - `<br>`: `\n`;
+ *   - decorations, non-prose tags, `hidden` and nested chip markup: skipped;
+ *   - block tags: one line break between content, none at either end;
+ *     table cells: a tab between cells;
+ *   - anything else (a handle mark, an inline wrapper): its children.
+ *
+ * A point is `{ container, offset }` as a Range reports it: a character
+ * offset in a text node, a CHILD INDEX in an element. An element point counts
+ * the text before that child, so (handle mark, 1) is the end of the handle,
+ * not the end of the span. A point the walk never reaches (inside skipped
+ * content) reads as the end.
+ */
+function authoredWalk(host, point = null) {
+    let out = "";
+    let pending = "";
+    let mark = null;
+    const emit = (text) => {
+        if (!text) return;
+        if (pending === "\n" && out && !out.endsWith("\n")) out += "\n";
+        else if (pending === "\t" && out) out += "\t";
+        pending = "";
+        out += text;
+    };
+    // A pending boundary at the point is counted as already emitted: the
+    // caret at the start of a block sits after its break. The final clamp
+    // drops it again when no content follows.
+    const atPoint = () => {
+        const breaks = pending === "\n" ? Boolean(out) && !out.endsWith("\n")
+            : pending === "\t" && Boolean(out);
+        mark = out.length + (breaks ? 1 : 0);
+    };
+    const wanted = point ? Math.max(0, Number(point.offset) || 0) : 0;
+    // A point on or inside something the walk does not enter (a `<br>`, a
+    // decoration, skipped markup) sits where that thing sits, not at the end:
+    // read as the end, a Delete there reached the chip after the span.
+    const pointIn = (element) => Boolean(point) && mark === null
+        && (element === point.container || Boolean(element.contains?.(point.container)));
+    const visit = (node) => {
+        const children = node?.childNodes || [];
+        for (let index = 0; index <= children.length; index += 1) {
+            // An element point past the last child is the element's end.
+            if (point && mark === null && node === point.container
+                && index === Math.min(wanted, children.length)) atPoint();
+            if (index === children.length) break;
+            const child = children[index];
+            if (child?.nodeType === Node.TEXT_NODE) {
+                const value = String(child.nodeValue || "");
+                if (node !== host && TABLE_PART_TAGS.has(String(node.tagName || "").toUpperCase())
+                    && !value.trim()) {
+                    if (point && mark === null && child === point.container) atPoint();
+                    continue;
+                }
+                if (point && mark === null && child === point.container) {
+                    emit(value.slice(0, wanted).replaceAll("\u200b", ""));
+                    atPoint();
+                    emit(value.slice(wanted).replaceAll("\u200b", ""));
+                } else {
+                    emit(value.replaceAll("\u200b", ""));
+                }
+                continue;
+            }
+            if (!(child instanceof HTMLElement)) continue;
+            const tag = String(child.tagName || "").toUpperCase();
+            if (child.dataset?.sonderDecoration != null || NON_PROSE_TAGS.has(tag)
+                // `hidden` as attribute too: `hidden="until-found"` reads as a string.
+                || child.hidden === true || child.getAttribute?.("hidden") != null
+                || child.dataset?.nodeType === "attachment") {
+                if (pointIn(child)) atPoint();
+                continue;
+            }
+            if (tag === "BR") {
+                if (pointIn(child)) atPoint();
+                emit("\n");
+                continue;
+            }
+            const block = BLOCK_TAGS.has(tag);
+            if (block) pending = "\n";
+            else if (CELL_TAGS.has(tag) && CELL_TAGS.has(
+                String(child.previousElementSibling?.tagName || "").toUpperCase())
+                && pending !== "\n") pending = "\t";
+            visit(child);
+            if (block) pending = "\n";
+        }
+    };
+    visit(host);
+    return { text: out, offset: point ? Math.min(mark ?? out.length, out.length) : null };
+}
+
+/** The authored text of a span or stray editor child (see `authoredWalk`). */
+export function promptSpanAuthoredText(host) {
+    return authoredWalk(host).text;
+}
+
+/**
+ * Whether a text span still has the shape `render()` paints: text nodes and
+ * non-empty handle marks holding only text. Anything else — a `<br>`, a
+ * block, a wrapper, an emptied mark, dropped markup — came from a native edit,
+ * and the caret code reads positions in the painted shape.
+ */
+function isPaintedTextSpan(span) {
+    return [...(span?.childNodes || [])].every((child) => child?.nodeType === Node.TEXT_NODE
+        || (child instanceof HTMLElement && child.dataset?.sonderPromptHandle === "1"
+            && child.childNodes.length > 0
+            && [...child.childNodes].every((inner) => inner?.nodeType === Node.TEXT_NODE)));
+}
+
 function selectionPoint(root) {
     const selection = globalThis.getSelection?.();
     if (!selection?.rangeCount) return null;
@@ -1847,13 +1980,20 @@ const promptContextModalOpen = () =>
 const PROMPT_MAC = /Mac|iPhone|iPad|iPod/.test(String(globalThis.navigator?.platform || ""));
 const promptAuthoredText = (node) => String(node?.nodeValue || "").replaceAll("\u200b", "");
 
-/** Authored characters inside `node` (decorations skipped), or "" for a chip. */
+/**
+ * Authored characters inside `node` (decorations skipped), or "" for a chip,
+ * by the same structural rules as the model's reader (`authoredWalk`).
+ */
 function promptAuthoredTextWithin(node) {
     if (!node) return "";
     if (node.nodeType === Node.TEXT_NODE) return promptAuthoredText(node);
+    if (!(node instanceof HTMLElement)) return "";
     if (promptDecoration(node)) return "";
     if (node.dataset?.nodeType === "attachment") return "";
-    return [...(node.childNodes || [])].map(promptAuthoredTextWithin).join("");
+    const tag = String(node.tagName || "").toUpperCase();
+    if (tag === "BR") return "\n";
+    if (NON_PROSE_TAGS.has(tag) || node.hidden === true || node.getAttribute?.("hidden") != null) return "";
+    return authoredWalk(node).text;
 }
 
 /** Authored characters after DOM position (`container`, `offset`) inside `host`. */
@@ -2107,7 +2247,7 @@ export function createPromptDocumentEditor({
      *  tracker records what a mis-resolved one produced last time: text
      *  inserted at position 0, landing inside chip spans.
      *
-     *  Decorations are skipped for the same reason `textWithoutDecorations`
+     *  Decorations are skipped for the same reason `authoredWalk`
      *  skips them: they are host chrome and their characters are not the
      *  author's.
      */
@@ -2123,18 +2263,18 @@ export function createPromptDocumentEditor({
         walk(element);
         return out;
     };
-    /** Logical offset of a DOM position, measured across the whole node span. */
-    const logicalOffsetWithin = (host, container, rawOffset) => {
-        let total = 0;
-        for (const textNode of spanTextNodes(host)) {
-            const value = String(textNode.nodeValue || "");
-            if (textNode === container) {
-                return total + value.slice(0, Math.max(0, rawOffset))
-                    .replaceAll("\u200b", "").length;
-            }
-            total += value.replaceAll("\u200b", "").length;
-        }
-        return total;
+    /**
+     * Logical offset of a DOM position inside a node span, and the span's
+     * logical length, by the same walk `readDom` reads the text with.
+     *
+     * The ONE mapping for a position inside a text span. Two copies used to
+     * snap an ELEMENT position to 0 or to the span's end, so a range ending
+     * at (handle mark, 1) deleted every word after the handle, and Backspace
+     * at (handle mark, 0) deleted the chip before the span (bug tracker).
+     */
+    const spanOffsetAt = (host, container, rawOffset) => {
+        const { text, offset } = authoredWalk(host, { container, offset: rawOffset });
+        return { offset, length: text.length };
     };
     /** The DOM position a logical offset names inside a node span. */
     const domPositionWithin = (host, wanted) => {
@@ -2171,17 +2311,12 @@ export function createPromptDocumentEditor({
         const direct = directNodeFor(container);
         if (direct) {
             if (direct.dataset.nodeType === "text") {
-                const logicalLength = String(direct.textContent || "").replaceAll("\u200b", "").length;
-                // ACROSS the span. `logicalTextOffset` measured within one
-                // text node, which was the same thing while a span held
-                // exactly one; with a handle marked live it holds several,
-                // and a caret after the handle reported the offset inside
-                // the trailing run instead of the offset in the prose.
-                const logicalOffset = container?.nodeType === Node.TEXT_NODE
-                    ? logicalOffsetWithin(direct, container, offset)
-                    : (Number(offset) > 0 ? logicalLength : 0);
-                return { node_id: direct.dataset.nodeId || "",
-                    offset: Math.max(0, Math.min(logicalLength, logicalOffset)) };
+                // ACROSS the span, for a text node and an element alike: a
+                // handle marked live gives the span several children, and a
+                // caret after the handle is the offset in the prose, not in
+                // one run.
+                const { offset: logicalOffset } = spanOffsetAt(direct, container, offset);
+                return { node_id: direct.dataset.nodeId || "", offset: logicalOffset };
             }
             return { node_id: direct.dataset.nodeId || "", offset: Number(offset) > 0 ? 1 : 0 };
         }
@@ -2198,7 +2333,9 @@ export function createPromptDocumentEditor({
                 if (!(candidate instanceof HTMLElement)) continue;
                 if (candidate.dataset.sonderDecoration === "1") continue;
                 if (candidate.dataset.nodeId) return candidate;
-                return null;
+                // Not a model node (a stray `<br>` or wrapper a native edit
+                // left): step over it like a decoration, rather than drop the
+                // caret.
             }
             return null;
         };
@@ -2209,7 +2346,7 @@ export function createPromptDocumentEditor({
         const previous = modelSibling(childOffset - 1, -1);
         if (previous instanceof HTMLElement && previous.dataset.nodeId) {
             const logicalLength = previous.dataset.nodeType === "text"
-                ? String(previous.textContent || "").replaceAll("\u200b", "").length : 1;
+                ? authoredWalk(previous).text.length : 1;
             return { node_id: previous.dataset.nodeId, offset: logicalLength };
         }
         return null;
@@ -2462,10 +2599,8 @@ export function createPromptDocumentEditor({
      * which is why every caret site below walks a subtree instead of reading
      * `firstChild`.
      *
-     * `display:inline` is mandatory, not cosmetic: `readDom` reads `innerText`,
-     * which inserts a line break for any block-level child box, so an
-     * inline-block handle would persist a newline into the author's prose on
-     * every keystroke.
+     * `display:inline` keeps the handle in the line's flow. It no longer
+     * guards the text: `readDom` reads structure, never layout (`authoredWalk`).
      */
     /**
      * What the current model would paint as handles, as a comparable string.
@@ -2488,11 +2623,9 @@ export function createPromptDocumentEditor({
         .join("|");
     const paintTextSpan = (span, text, { last = false } = {}) => {
         // Every run is an explicit Text node, including the unmarked ones and
-        // including the no-handles case. Assigning `textContent` would be
-        // shorter, but it leaves the span's characters in a place the offset
-        // walker below cannot see — a browser materializes a Text node for it
-        // and the test DOM stores a string, so the two would disagree about
-        // where a caret is. One shape, both environments.
+        // including the no-handles case: explicit nodes are the one shape the
+        // offset walker and the reader rely on, in a browser and in the test
+        // DOM alike.
         const runs = promptHandleMentions(text);
         let cursor = 0;
         for (const run of runs) {
@@ -2501,10 +2634,8 @@ export function createPromptDocumentEditor({
             }
             const mark = document.createElement("span");
             mark.dataset.sonderPromptHandle = "1";
-            // `display:inline` is mandatory, not cosmetic: `readDom` reads
-            // `innerText`, which injects a line break for any block-level child
-            // box, so an inline-block handle would persist a newline into the
-            // author's prose on every keystroke.
+            // Inline, so the handle stays in the line's flow (presentation
+            // only: `readDom` reads structure, never layout).
             mark.style.cssText = `display:inline;color:${CHIP_PALETTE.text};`;
             mark.appendChild(document.createTextNode(text.slice(run.start, run.end)));
             span.appendChild(mark);
@@ -2723,26 +2854,38 @@ export function createPromptDocumentEditor({
         }
         return cursor?.dataset?.nodeType === "attachment" ? cursor : null;
     };
-    const textWithoutDecorations = (element) => {
-        if (!element.querySelector?.("[data-sonder-decoration]")) {
-            return String(element.innerText || element.textContent || "")
-                .replaceAll("\u200b", "");
-        }
-        const clone = element.cloneNode(true);
-        for (const stray of clone.querySelectorAll("[data-sonder-decoration]")) {
-            stray.remove();
-        }
-        return String(clone.innerText || clone.textContent || "")
-            .replaceAll("\u200b", "");
-    };
     // Ids the last `readDom` minted for bare top-level text nodes — the ones a
     // browser leaves beside a chip, which no span id can name — so a caret
     // inside one can be carried into the model that read produced.
     let bareTextNodeIds = new WeakMap();
     const isBareTextNode = (container) => container?.nodeType === Node.TEXT_NODE
         && container.parentElement === editor;
-    /** `selectionBoundary`, plus a caret in a bare text node the last read named. */
+    /** The editor child holding `container`, when the last read minted its id. */
+    const strayHolding = (container) => {
+        let node = container?.nodeType === Node.TEXT_NODE ? container.parentElement : container;
+        while (node && node !== editor && node.parentElement !== editor) node = node.parentElement;
+        return node && node !== editor && bareTextNodeIds.has(node) ? node : null;
+    };
+    /** `selectionBoundary`, plus a caret in a bare text node or stray element the last read named. */
     const boundaryAcrossBareNodes = (container, offset) => {
+        const stray = strayHolding(container);
+        if (stray) {
+            return { node_id: bareTextNodeIds.get(stray),
+                offset: authoredWalk(stray, { container, offset }).offset };
+        }
+        if (container === editor) {
+            // A caret beside a stray child: name that child, which `render()`
+            // turns into a span with the same id.
+            const at = Math.max(0, Math.min(editor.childNodes.length, Number(offset) || 0));
+            const after = editor.childNodes[at];
+            const before = editor.childNodes[at - 1];
+            if (after && !isBareTextNode(after) && bareTextNodeIds.has(after)) {
+                return { node_id: bareTextNodeIds.get(after), offset: 0 };
+            }
+            if (before && !isBareTextNode(before) && bareTextNodeIds.has(before)) {
+                return { node_id: bareTextNodeIds.get(before), offset: authoredWalk(before).text.length };
+            }
+        }
         if (!isBareTextNode(container)) return selectionBoundary(container, offset);
         const nodeId = bareTextNodeIds.get(container);
         if (nodeId) {
@@ -2783,6 +2926,9 @@ export function createPromptDocumentEditor({
             .map((node) => node.attachment_id));
         const next = [];
         bareTextNodeIds = new WeakMap();
+        // A native edit left a shape `render()` does not paint (see
+        // `isPaintedTextSpan`, and any element that is not a model node).
+        let reshaped = false;
         for (const child of [...editor.childNodes]) {
             if (child.nodeType === Node.TEXT_NODE) {
                 const value = String(child.nodeValue || "").replaceAll("\u200b", "");
@@ -2804,17 +2950,25 @@ export function createPromptDocumentEditor({
                 if (child.dataset.capabilityId) node.capability_id = child.dataset.capabilityId;
                 next.push(node);
             } else {
-                let text = textWithoutDecorations(child);
+                // By structure, never `innerText` (see `authoredWalk`).
+                let text = authoredWalk(child).text;
+                if (child.dataset.nodeType !== "text" || !isPaintedTextSpan(child)) reshaped = true;
+                // A stray element (a drop, a browser's wrapper or padding
+                // `<br>` directly under the editor) has no id a bookmark can
+                // name; mint one, as for a bare text node, so the caret inside
+                // it survives the render that absorbs it.
+                const nodeId = child.dataset.nodeId || uid();
+                if (!child.dataset.nodeId) bareTextNodeIds.set(child, nodeId);
                 // Chromium keeps an emptied last line alive with a placeholder
-                // `<br>`, which `innerText` reads as a second `\n`: deleting a
-                // final line's text stored a phantom newline. A `<br>` after
-                // text that already ends in a break is that placeholder, never
-                // content — the trailing-break sentinel stands in for it.
+                // `<br>`, read as a second `\n`: deleting a final line's text
+                // stored a phantom newline. A `<br>` after text that already
+                // ends in a break is that placeholder, never content — the
+                // trailing-break sentinel stands in for it.
                 const tail = child.childNodes?.[child.childNodes.length - 1];
                 if ((tail?.nodeName || tail?.tagName) === "BR" && text.endsWith("\n\n")) {
                     text = text.slice(0, -1);
                 }
-                next.push({ type: "text", node_id: child.dataset.nodeId || uid(), text });
+                next.push({ type: "text", node_id: nodeId, text });
             }
         }
         model = normalizePromptDocument({ nodes: next });
@@ -2841,8 +2995,12 @@ export function createPromptDocumentEditor({
         // measured through the ids just minted: `render()`'s own bookmark
         // cannot name a bare node, dropped the caret, and the next keystroke
         // landed at the start of the document.
+        //
+        // A reshaped span renders at once too. Its text was read by structure,
+        // but caret positions are resolved in the painted shape, so leaving a
+        // `<br>` or wrapper in place puts the next caret off by what it adds.
         const signature = handlePaintSignature();
-        if (signature !== paintedHandleSignature || trailingSentinelMissing()) {
+        if (signature !== paintedHandleSignature || trailingSentinelMissing() || reshaped) {
             render(bookmarkAcrossBareNodes());
         }
     };
@@ -3283,7 +3441,10 @@ export function createPromptDocumentEditor({
             const text = String(globalThis.getSelection?.()?.toString?.() ?? "");
             if (!text.includes(ZERO_WIDTH)) return;
             event.preventDefault();
-            event.clipboardData.setData("text/plain", text.split(ZERO_WIDTH).join(""));
+            // The written text comes from the same model span a cut deletes,
+            // not from the selection's serializer.
+            event.clipboardData.setData("text/plain",
+                content.map((node) => node.text).join(""));
             if (cut && ownedRange()) deleteSpan(span);
             return;
         }
@@ -3491,16 +3652,11 @@ export function createPromptDocumentEditor({
                 // adjacency died wherever a handle sat beside a chip.
                 const host = directNodeFor(range.startContainer);
                 if (host?.dataset?.nodeType === "text") {
-                    const length = String(host.textContent || "").replaceAll("\u200b", "").length;
-                    // Measured across the span for the same reason: a
-                    // raw offset of 0 inside a trailing run is not the
-                    // start of the prose. An ELEMENT container carries a
-                    // child index rather than a character offset, which is
-                    // the same distinction `selectionBoundary` makes.
-                    const at = range.startContainer?.nodeType === Node.TEXT_NODE
-                        ? logicalOffsetWithin(
-                            host, range.startContainer, range.startOffset)
-                        : (Number(range.startOffset) > 0 ? length : 0);
+                    // Measured across the span by the shared mapping: a raw
+                    // offset of 0 inside a trailing run is not the start of
+                    // the prose, and (handle mark, 0) is not either.
+                    const { offset: at, length } = spanOffsetAt(
+                        host, range.startContainer, range.startOffset);
                     if (event.key === "Backspace" && at === 0) {
                         chip = adjacentModelElement(host, "previous");
                     } else if (event.key === "Delete" && at >= length) {
@@ -4121,7 +4277,7 @@ export function promptInsertionBookmark(editor) {
  * Dialogue means "wrap these words", so the live range is kept and its text
  * pre-fills `{text}`.
  *
- * The range is only usable when it stays inside a single text node. A selection
+ * The range is only usable when it stays inside a single model text node. A selection
  * spanning a chip would otherwise contribute that chip's rendered label as
  * prose and then be replaced by the insert, destroying the attachment; those
  * fall back to the collapsed caret and insert without wrapping.
@@ -4146,14 +4302,21 @@ export function promptSelectionSnapshot(editor) {
         const span = element?.closest?.("[data-node-id]") || null;
         return span?.dataset?.nodeType === "text" ? span : null;
     };
+    // Either end may be an ELEMENT position (a browser can end a selection on
+    // a handle mark): the bookmark maps both through the shared span mapping,
+    // so "both ends name this span" is the test, and the text is the model's.
     const startSpan = nodeSpanFor(range.startContainer);
+    const spanId = startSpan?.dataset?.nodeId || "";
     const single = startSpan
         && startSpan === nodeSpanFor(range.endContainer)
-        && range.startContainer?.nodeType === Node.TEXT_NODE
-        && range.endContainer?.nodeType === Node.TEXT_NODE;
+        && bookmark.start?.node_id === spanId && bookmark.end?.node_id === spanId;
     if (!single) return { bookmark: promptInsertionBookmark(editor), text: "" };
+    const node = editor.promptDocument?.nodes?.find((value) => value.node_id === spanId);
+    if (node?.type !== "text") return { bookmark: promptInsertionBookmark(editor), text: "" };
+    const [from, to] = [Number(bookmark.start.offset) || 0, Number(bookmark.end.offset) || 0]
+        .sort((a, b) => a - b);
     // Chips are rendered with zero-width markers; they are structure, not prose.
-    const text = String(range.toString() || "").replaceAll("\u200b", "");
+    const text = node.text.slice(from, to).replaceAll("\u200b", "");
     if (!text) return { bookmark: promptInsertionBookmark(editor), text: "" };
     return { bookmark, text };
 }
