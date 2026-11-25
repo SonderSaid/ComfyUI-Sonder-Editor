@@ -931,7 +931,7 @@ def test_real_lane_config_coalescing_reports_last_gesture_and_three_intents():
         };
         await Promise.all([false,true,false].map(hidden => w._saveLaneConfig({
             type:'video',laneIndex:0,customName:'V1',hidden,
-        })));
+        }, {settings: ['hidden']})));
         assert.equal(starts().length, 3);
         assert.equal(sent.length, 1);
         const h = new Headers(sent[0].init.headers);
@@ -1244,7 +1244,8 @@ def test_the_lane_removal_guard_matches_its_contract():
     import test_scene_mutation_registration as registration
 
     source = (ROOT / "web" / "js" / "editor_widget.js").read_text(encoding="utf-8")
-    guard = _method(source, "_laneRemovalGuard", "_applyLocalRemoveLane")
+    guard = "\n".join([_method(source, "_laneRemovalGuard", "_applyLocalRemoveLane"),
+                       _method(source, "_laneIdAt", "_newLaneIds")])
     registry_url = (ROOT / "web" / "js" / "lane_registry.js").as_uri()
     scene = """
         const scene = {
@@ -1996,18 +1997,19 @@ def _lane_config_burst(body: str) -> str:
             w._pushUndo('toggle track lock');
             const next = !targets[0].locked;
             for (const target of targets) target.locked = next;
-            pending.push(w._saveLaneConfigWithinGesture(targets));
+            pending.push(w._saveLaneConfigWithinGesture(targets, {settings: ['locked']}));
         };
         // A lane rename, as `_startLaneRename` saves it: its own Undo step.
         const rename = (target, name) => {
             target.customName = name;
-            pending.push(w._saveLaneConfigWithinGesture([target], {undoLabel: 'rename lane'}));
+            pending.push(w._saveLaneConfigWithinGesture([target],
+                {undoLabel: 'rename lane', settings: ['name']}));
         };
         // A lane-config save that owns no Undo step. No gesture does this since
         // L4c; the queue's handling of one is still pinned below.
         const saveWithoutEntry = (target, name) => {
             target.customName = name;
-            pending.push(w._saveLaneConfigWithinGesture([target]));
+            pending.push(w._saveLaneConfigWithinGesture([target], {settings: ['name']}));
         };
         const tick = () => new Promise(r => setTimeout(r, 0));
         const settle = async () => {
@@ -2209,7 +2211,7 @@ def test_a_lane_rename_on_enter_saves_once_with_its_own_undo_step():
         input.value = 'New';
         key('Enter');
         listeners.blur();
-        assert.deepEqual(saves, [['New', {undoLabel: 'rename lane'}]]);
+        assert.deepEqual(saves, [['New', {undoLabel: 'rename lane', settings: ['name']}]]);
         assert.equal(removed, 1, 'the input is removed once');
     """))
 
@@ -2229,7 +2231,7 @@ def test_clearing_a_lane_name_still_saves():
     _run_gesture_node(_lane_rename_input("""
         input.value = '';
         key('Enter');
-        assert.deepEqual(saves, [['', {undoLabel: 'rename lane'}]]);
+        assert.deepEqual(saves, [['', {undoLabel: 'rename lane', settings: ['name']}]]);
     """))
 
 

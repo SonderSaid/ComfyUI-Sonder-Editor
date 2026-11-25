@@ -229,11 +229,7 @@ def _refine(name: str, operation: dict) -> dict | None:
         if descriptor.fixed_config_attr:
             return _decision(op_type, DURABLE, True,
                              f"lane_type {lane_type!r} is a fixed-config lane")
-        if not descriptor.recipe_attr:
-            return _decision(op_type, POSITIONAL, False,
-                             f"lane_type {lane_type!r} has no recipe_attr, so its "
-                             "`expected` is never compared")
-        return None
+        return None         # a variable family: the declared `promoted_by` decides
     raise KeyError(name)
 
 

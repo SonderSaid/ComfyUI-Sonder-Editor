@@ -79,7 +79,8 @@ def test_every_lane_the_editor_adds_is_named():
 
 
 def test_the_removal_guard_names_the_lane():
-    result = _run_node(_harness(("_laneRemovalGuard", "_applyLocalRemoveLane"), scene={
+    result = _run_node(_harness(("_laneRemovalGuard", "_applyLocalRemoveLane"),
+                                ("_laneIdAt", "_newLaneIds"), scene={
         "video_lane_count": 2, "video_lane_configs": [{"lane_id": "v0"}, {"name": "x"}],
         "reference_lane_count": 1, "reference_lane_configs": [{"lane_id": "not this"}],
         "reference_lane_recipes": [{"lane_id": "r0"}],
@@ -88,6 +89,136 @@ console.log(JSON.stringify([h._laneRemovalGuard("video", 0), h._laneRemovalGuard
   h._laneRemovalGuard("audio", 0), h._laneRemovalGuard("reference", 0)]));
 """)
     assert [guard.get("lane_id") for guard in result] == ["v0", None, None, "r0"]
+
+
+def test_every_lane_setting_write_names_its_lane():
+    """Lock, rename and hide; bulk and single; media, Reference and fixed. Each sends
+    only what its gesture changed, and paints only that."""
+    result = _run_node(_harness(
+        ("_laneIdAt", "_newLaneIds"),
+        ("_saveLaneConfigWithinGesture", "_trackLaneRecipeWrite"),
+        ("_applyHeaderVisibilityBulkWithinGesture", "_startLaneRename"),
+        ("_defaultLaneConfig", "_trackConfigForFixedType"),
+        scene={
+            "video_lane_count": 2, "video_lane_configs": [
+                {"lane_id": "v0"}, {"lane_id": "v1", "name": "kept", "color": "#kept"}],
+            "guide_track_config": {"name": "kept"},
+            "audio_lane_count": 1, "audio_lane_configs": [{}],
+            "motion_driver_lane_count": 1, "motion_driver_lane_configs": [{"lane_id": "d0"}],
+            "reference_lane_count": 1, "reference_lane_configs": [{"lane_id": "not this"}],
+            "reference_lane_recipes": [{"lane_id": "r0"}],
+        }) + """
+globalThis.sessionDiagRecord = () => {};
+globalThis.coalesceSceneMutationIntents = () => {};
+Object.assign(h, {
+  projectDir: "p", activeSceneId: "scene", sent: [],
+  _laneTypeForEntry: (e) => descriptorFor(e.type)?.laneType || "",
+  _pushUndo: () => ({}), _discardUndoEntry() {}, _reconcileSelection() {}, _updateToolbar() {}, _renderTimeline() {}, _buildTrackLayout() {},
+  _renderViewportFrame() {}, _renderSceneAfterLocalMutation() {}, _clearPlaybackWarmOverlay() {},
+  _isLaneVisibilityControlDisabled: () => false, _trackVisibilityState: () => "visible",
+  _fetchScenes() { throw new Error('the gesture failed'); },
+  _buildLinkedMuteOperations: () => ({ operations: [], targets: [] }),
+  _planHeaderUnmute: () => ({ operations: [], targets: [] }),
+  async _runSceneMutation(operations) { this.sent.push(operations); return { payload: { results: [] } }; },
+});
+const entry = (type, laneIndex) => ({ type, laneIndex, customName: "n", locked: true, hidden: false,
+  color: "#fallback" });
+const entries = [entry("video", 1), entry("audio", 0), entry("motion_driver", 0),
+                 entry("reference", 0), entry("guides", 0)];
+await h._saveLaneConfigWithinGesture(entries, { settings: ["locked"] });
+await h._saveLaneConfigWithinGesture(entries, { settings: ["name"] });
+const painted = structuredClone([h.activeScene.video_lane_configs[1], h.activeScene.guide_track_config]);
+await h._applyHeaderVisibilityBulkWithinGesture(entries, true);
+await h._saveLaneConfigWithinGesture([entry("reference", 0)], { recipePatch: null });
+console.log(JSON.stringify({ sent: h.sent.map((ops) => ops.map((op) =>
+  [op.lane_type, op.lane_index, op.expected?.lane_id ?? null])),
+  fields: h.sent.map((ops) => ops.map((op) => op.fields)), painted,
+  hidden: [h.activeScene.video_lane_configs[1], h.activeScene.guide_track_config] }));
+""")
+    expected = [["video", 1, "v1"], ["audio", 0, None], ["motion_driver", 0, "d0"],
+                ["reference", 0, "r0"], ["guide", 0, None]]
+    assert result["sent"][:3] == [expected] * 3
+    assert result["fields"][:3] == [[{"locked": True}] * 5, [{"name": "n"}] * 5, [{"hidden": True}] * 5]
+    assert result["fields"][3] == [{}], "a recipe write carries no setting"
+    lane = {"lane_id": "v1", "name": "n", "color": "#kept", "locked": True}
+    assert result["painted"] == [lane, {"name": "n", "locked": True}]
+    assert result["hidden"] == [{**lane, "hidden": True},
+                                {"name": "n", "locked": True, "hidden": True}]
+
+
+def test_every_lane_save_says_what_it_changed():
+    """A save that names no setting and carries no recipe would write nothing."""
+    calls = []
+    for path in ("web/js/editor_widget.js", "web/js/editor_reference_panel.js"):
+        source = _source(path)
+        for match in re.finditer(r"\._saveLaneConfig(?:WithinGesture)?\(", source):
+            calls.append(source[match.start():match.start() + 420].split(";")[0])
+    calls = [call for call in calls if "(...args)" not in call]
+    assert len(calls) == 5
+    for call in calls:
+        assert "settings: [" in call or "expectedLaneId" in call, call
+
+
+def test_a_rename_and_a_lane_menu_act_on_the_lane_they_were_opened_on():
+    """A refresh moves lanes while the input or the menu is open. Both used to act on
+    whatever lane had taken the number, with that lane's own id vouching for it."""
+    result = _run_node(_harness(
+        ("_laneIdAt", "_newLaneIds"), ("_liveLaneEntry", "_laneTypeForEntry"),
+        ("_startLaneRename", "_laneIdentityFailureMessage"),
+        ("_laneHeaderContextMenuItems", "_itemContextMenuItems"),
+        scene={"video_lane_count": 3, "video_lane_configs": [
+            {"lane_id": "a"}, {"lane_id": "b"}, {"lane_id": "c"}]}) + """
+const { TRACK_TYPE, laneCountFor, laneItemsForType, laneLabel } = await import(%s);
+const inputs = [];
+globalThis.document = { body: { appendChild() {} }, createElement: () => {
+  const input = { style: {}, on: {}, addEventListener(name, f) { this.on[name] = f; }, focus() {},
+                  select() {}, remove() {} };
+  inputs.push(input); return input; } };
+const out = { saved: [], toasts: [], calls: [] };
+Object.assign(h, {
+  timelineCanvas: { getBoundingClientRect: () => ({ left: 0, top: 0 }) }, scrollY: 0, _labelW: 10,
+  _trackY: () => 0, _trackH: () => 10, _renderTimeline() {}, _selectedLanes: [],
+  _showToast: (text) => out.toasts.push(text), _isLaneTrackType: () => true,
+  _isLaneLocked: () => false, _isLaneSelected: () => false, _laneRemovalMoveTarget: () => 0,
+  _saveLaneConfig: (entries, options) => out.saved.push(
+    [entries.map((e) => [e.laneIndex, e.customName]), options.settings]),
+});
+for (const name of ["_removeLane", "_removeLaneWithItems", "_removeLaneDeletingItems", "_deleteItemsInLane"]) {
+  h[name] = (type, index) => out.calls.push([name, index]);
+}
+const layout = () => { h._trackLayout = h.activeScene.video_lane_configs.map((c, laneIndex) => ({
+  type: "video", laneIndex, label: "", customName: "" })); };
+const lanes = (...ids) => { h.activeScene.video_lane_count = ids.length;
+  h.activeScene.video_lane_configs = ids.map((lane_id) => ({ lane_id })); layout(); };
+lanes("a", "b", "c");
+const rename = (...after) => {
+  h._startLaneRename(1);
+  lanes(...after);
+  const input = inputs.at(-1);
+  input.value = "for b";
+  input.on.blur();
+  lanes("a", "b", "c");
+};
+rename("a", "b", "c"); rename("b", "c"); rename("a", "c");
+h.activeScene.video_lane_configs.forEach((c) => delete c.lane_id);
+rename("", "", "");
+const clips = [{ clip_id: "x", track_index: 1, role: "render" }];
+for (const filled of [false, true]) for (const after of [["b", "c"], ["a", "c"]]) {
+  lanes("a", "b", "c");
+  h.activeScene.clips = filled ? clips : [];
+  const menu = h._laneHeaderContextMenuItems(1, 0, 0);
+  lanes(...after);
+  for (const item of menu) if (/Remove|Delete/.test(item.label)) item.action();
+}
+console.log(JSON.stringify(out));
+""" % json.dumps(REGISTRY))
+    assert result["saved"] == [
+        [[[1, "for b"]], ["name"]],        # nothing moved
+        [[[0, "for b"]], ["name"]],        # b moved: followed
+        [[[1, "for b"]], ["name"]]]        # no ids known: where it was
+    assert result["toasts"].count("That lane is no longer there.") == 1 + 1 + 3
+    assert result["calls"] == [["_removeLane", 0], ["_removeLaneWithItems", 0],
+                               ["_removeLaneDeletingItems", 0], ["_deleteItemsInLane", 0]]
 
 
 def test_a_take_drop_compares_settings_and_the_ids_both_reads_know():

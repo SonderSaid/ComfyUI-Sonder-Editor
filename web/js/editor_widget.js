@@ -6314,6 +6314,8 @@ export class EditorWidget {
                 break;
             }
             case "update_lane_config":
+                // Its authored `expected.lane_id` stays, as the server's check on
+                // the lane this finds.
                 if (laneSpecs[operation.lane_type]) {
                     operation.lane_index = rebaseLaneIndex(
                         operation.lane_type, operation.lane_index);
@@ -7427,11 +7429,23 @@ export class EditorWidget {
         }
     }
 
+    /** The durable id of the lane at `laneIndex`: a Reference lane's recipe holds it, a
+     *  media lane's config. Blank for a fixed track and for a lane with none yet. */
+    _laneIdAt(scene, descriptor, laneIndex) {
+        if (!descriptor?.variable) return "";
+        const owners = scene?.[descriptor.recipeAttr || descriptor.configsField];
+        return String((Array.isArray(owners) ? owners[laneIndex] : null)?.lane_id || "").trim();
+    }
+
     /** Ids for the media lanes a `set_lane_count` to `count` would add, for the operation
      *  (`lane_ids`) and its paint (`_applyLocalSetLaneCount`) to share: the lane then has
      *  the id the project will store before the write lands, so the next gesture on it
      *  can name it. None for a Reference lane, whose recipe id the server mints. Lanes
-     *  adopted from configs kept past the count already have theirs. */
+     *  adopted from configs kept past the count already have theirs.
+     *
+     *  A server older than lane ids ignores them and mints none, so until its answer
+     *  replaces the paint a lane write can name an id it will not compare. Accepted:
+     *  it takes a page newer than its running server, and a save race in that moment. */
     _newLaneIds(laneType, count) {
         const descriptor = descriptorFor(laneType);
         if (!descriptor?.variable || descriptor.recipeAttr) return [];
@@ -7553,10 +7567,7 @@ export class EditorWidget {
                 hidden: config?.hidden === true,
             },
         };
-        const recipes = descriptor?.recipeAttr ? scene?.[descriptor.recipeAttr] : null;
-        const laneId = descriptor?.recipeAttr
-            ? String((Array.isArray(recipes) ? recipes : [])[laneIndex]?.lane_id || "")
-            : String(config?.lane_id || "");
+        const laneId = this._laneIdAt(scene, descriptor, laneIndex);
         if (laneId) guard.lane_id = laneId;
         return guard;
     }
@@ -12461,7 +12472,7 @@ export class EditorWidget {
                         this._pushUndo("toggle track lock");
                         const nextLocked = !entry.locked;
                         for (const target of bulkEntries) target.locked = nextLocked;
-                        this._saveLaneConfig(bulkEntries);
+                        this._saveLaneConfig(bulkEntries, { settings: ["locked"] });
                         break;
                     }
                     case "hide":
@@ -13459,8 +13470,20 @@ export class EditorWidget {
             const descriptor = descriptorFor(entry.type);
             const laneCount = laneCountFor(this.activeScene, entry.type);
             const label = descriptor.menuLabel;
+            // The menu can stay open across a refresh that moves lanes, so an entry
+            // acts on the lane it was opened on, wherever that is now.
+            const laneId = this._laneIdAt(this.activeScene, descriptor, entry.laneIndex || 0);
+            const onLane = (act) => () => {
+                const live = this._liveLaneEntry(entry, laneId);
+                if (!live) {
+                    this._showToast("That lane is no longer there.");
+                    return undefined;
+                }
+                return act(live);
+            };
 
-            menuItems.push({ label: "Rename Lane", action: () => this._startLaneRename(layoutIdx) });
+            menuItems.push({ label: "Rename Lane", action: onLane((live) =>
+                this._startLaneRename(this._trackLayout.indexOf(live))) });
             menuItems.push({ label: `Add ${label} Lane`, action: () => this._addLane(entry.type) });
             // Gated on the DESCRIPTOR, not the track type. Lane order
             // means something different in every family — video lane
@@ -13512,14 +13535,14 @@ export class EditorWidget {
                         ? "locked"
                         : (this._isLaneLocked(entry.type, moveTarget) ? `lane ${moveTarget + 1} locked` : "");
                     menuItems.push(lockedOr(`Delete ${label} Lane and Move Items`, moveLockNote,
-                        () => this._removeLaneWithItems(entry.type, entry.laneIndex)));
+                        onLane((live) => this._removeLaneWithItems(live.type, live.laneIndex))));
                     menuItems.push(lockedOr(`Delete ${label} Lane and Items`, laneLocked ? "locked" : "",
-                        () => this._removeLaneDeletingItems(entry.type, entry.laneIndex)));
+                        onLane((live) => this._removeLaneDeletingItems(live.type, live.laneIndex))));
                     menuItems.push(lockedOr(`Delete Items in ${label} Lane`, laneLocked ? "locked" : "",
-                        () => this._deleteItemsInLane(entry.type, entry.laneIndex)));
+                        onLane((live) => this._deleteItemsInLane(live.type, live.laneIndex))));
                 } else {
                     menuItems.push(lockedOr(`Remove ${label} Lane`, laneLocked ? "locked" : "",
-                        () => this._removeLane(entry.type, entry.laneIndex)));
+                        onLane((live) => this._removeLane(live.type, live.laneIndex))));
                 }
             }
         }
@@ -15556,7 +15579,9 @@ export class EditorWidget {
         // owes its own Ctrl+Z. A merged slot keeps only its oldest undo entry,
         // so merging them would fold both lanes into one step.
         const laneKey = targets
-            .map((target) => `${this._laneTypeForEntry(target) || target.type}:${target.laneIndex || 0}`)
+            .map((target) => `${this._laneTypeForEntry(target) || target.type}:${
+                this._laneIdAt(this.activeScene, descriptorFor(target.type), target.laneIndex || 0)
+                || target.laneIndex || 0}`)
             .sort()
             .join(",");
         const visibilitySeq = (this._headerVisibilitySeq || 0) + 1;
@@ -15601,21 +15626,18 @@ export class EditorWidget {
             const laneType = this._laneTypeForEntry(target);
             if (!laneType) continue;
             const laneIndex = target.laneIndex || 0;
-            const fields = {
-                name: target.customName || "",
-                color: target.color || "",
-                locked: !!target.locked,
-                hidden: !!target.hidden,
-            };
-            const laneId = String(sceneRef?.[descriptorFor(laneType)?.recipeAttr]?.[laneIndex]?.lane_id || "").trim();
+            // Only what this gesture changes, as `_saveLaneConfigWithinGesture`.
+            const fields = { hidden: !!target.hidden };
+            const laneId = this._laneIdAt(sceneRef, descriptorFor(target.type), laneIndex);
             operations.push({ type: "update_lane_config", lane_type: laneType, lane_index: laneIndex, fields,
                 ...(laneId ? { expected: { lane_id: laneId } } : {}),
             });
             const cfg = { ...fields };
-            if (laneType === "guide") sceneRef.guide_track_config = cfg;
-            else if (laneType === "prompt") sceneRef.prompt_track_config = cfg;
-            else if (laneType === "prompt_global") sceneRef.global_prompt_track_config = cfg;
-            else {
+            if (laneType === "guide") sceneRef.guide_track_config = { ...sceneRef.guide_track_config, ...cfg };
+            else if (laneType === "prompt") sceneRef.prompt_track_config = { ...sceneRef.prompt_track_config, ...cfg };
+            else if (laneType === "prompt_global") {
+                sceneRef.global_prompt_track_config = { ...sceneRef.global_prompt_track_config, ...cfg };
+            } else {
                 const listKey = descriptorFor(target.type)?.configsField;
                 const list = Array.isArray(sceneRef[listKey]) ? sceneRef[listKey] : [];
                 while (list.length <= laneIndex) list.push(this._defaultLaneConfig());
@@ -15635,6 +15657,7 @@ export class EditorWidget {
             await this._runSceneMutation(operations, {
                 key: `scene:${this.activeSceneId}:header-visibility:${laneKey}`,
                 label: "toggle track visibility",
+                failureMessage: (error) => this._laneIdentityFailureMessage(error),
                 // Its own stable key, plus the SHARED merge. Sharing
                 // `scene:<id>:lane-config` instead would merge a visibility
                 // toggle with an unrelated rename, and the mute operations
@@ -15700,7 +15723,11 @@ export class EditorWidget {
             this._buildTrackLayout();
         } catch (error) {
             if (visibilitySeq === this._headerVisibilitySeq) {
-                await this._fetchScenes({ ignoreMutationGate: true, reason: "header_visibility_error" });
+                // An ungated GET would replace the paint of a write still queued; the
+                // queue's failure handler has deferred a refresh for once it drains.
+                if (!this._hasPendingProjectMutations()) {
+                    await this._fetchScenes({ ignoreMutationGate: true, reason: "header_visibility_error" });
+                }
                 this._buildTrackLayout();
             }
         }
@@ -15712,6 +15739,8 @@ export class EditorWidget {
     /** Start inline rename for a lane header */
     _startLaneRename(layoutIdx) {
         const entry = this._trackLayout[layoutIdx];
+        // A refresh can move lanes while the input is open; the name is for this one.
+        const laneId = this._laneIdAt(this.activeScene, descriptorFor(entry.type), entry.laneIndex || 0);
         const canvas = this.timelineCanvas;
         const rect = canvas.getBoundingClientRect();
         const headerW = this._labelW; // already scaled by _scaleTrackHeaders
@@ -15748,9 +15777,14 @@ export class EditorWidget {
             try {
                 const newName = input.value.trim();
                 if (save && newName !== (entry.customName || "")) {
-                    entry.customName = newName;
-                    entry.label = laneLabel(this.activeScene, entry.type, entry.laneIndex, newName);
-                    this._saveLaneConfig([entry], { undoLabel: "rename lane" });
+                    const live = this._liveLaneEntry(entry, laneId);
+                    if (!live) {
+                        this._showToast("That lane is no longer there.");
+                        return;
+                    }
+                    live.customName = newName;
+                    live.label = laneLabel(this.activeScene, live.type, live.laneIndex, newName);
+                    this._saveLaneConfig([live], { undoLabel: "rename lane", settings: ["name"] });
                     this._renderTimeline();
                 }
             } finally {
@@ -15770,6 +15804,22 @@ export class EditorWidget {
         document.body.appendChild(input);
         input.focus();
         input.select();
+    }
+
+    /** Why a lane write was refused, when its lane is not where it was drawn. */
+    _laneIdentityFailureMessage(error) {
+        return (error?.payload?.code || error?.code) === "identity_mismatch"
+            ? "Lanes changed elsewhere before your edit saved — timeline restored." : undefined;
+    }
+
+    /** The timeline's entry for the lane `entry` was drawn for, by the id it had then:
+     *  null when the lane is gone. A lane with no id is taken to be where it was. */
+    _liveLaneEntry(entry, laneId) {
+        const descriptor = descriptorFor(entry.type);
+        return (this._trackLayout || []).find((candidate) => candidate?.type === entry.type
+            && (laneId
+                ? this._laneIdAt(this.activeScene, descriptor, candidate.laneIndex || 0) === laneId
+                : (candidate.laneIndex || 0) === (entry.laneIndex || 0))) || null;
     }
 
     /** Backend lane_type for a _trackLayout entry (note GUIDES is "guides"
@@ -15797,11 +15847,16 @@ export class EditorWidget {
      *
      * `undoLabel` makes this save own its Undo step, pushed here -- after the
      * early exits and before the optimistic paint, so its snapshot is the state
-     * the save changes. Every lane-family write needs one: a lane family is one
-     * atomic bundle in `server/scene_history_merge.py`, so a write no entry
-     * reverses leaves every earlier lane entry unrestorable, and the next Undo
-     * is refused and stays on top. The lock toggle pushes its own entry before
-     * calling, so it passes none.
+     * the save changes. Every lane write needs one: a write no entry reverses
+     * leaves that lane's setting differing from every earlier entry's, and the
+     * next Undo of it is refused and stays on top. The lock toggle pushes its own
+     * entry before calling, so it passes none.
+     *
+     * `settings` names the entry's settings this gesture changed (`"name"`,
+     * `"locked"`, `"hidden"`), and only those are sent: the rest of the entry is what was
+     * painted, and a write that names its lane is sent again after losing a save
+     * race, so re-sending them would put back what another writer just changed. A
+     * colour is never sent; the entry's is the palette's fallback.
      *
      * What the save does to a Reference lane's recipe is the caller's to say.
      * A lock, rename or hide writes none: they used to re-send the painted
@@ -15819,7 +15874,7 @@ export class EditorWidget {
      */
     async _saveLaneConfigWithinGesture(changedEntries, {
         expectedLaneId = "", undoLabel = "", rollbackRecipe = false, quietCodes = [],
-        recipePatch = null,
+        recipePatch = null, settings = [],
     } = {}) {
         if (!this.activeScene || !this.projectDir) return;
         // Only entries that write: pushing an entry clears Redo and can trim the
@@ -15830,9 +15885,9 @@ export class EditorWidget {
         const sceneId = this.activeSceneId;
         const sceneRef = this.activeScene;
         const undoEntry = undoLabel ? this._pushUndo(undoLabel) : null;
-        // A lane's durable id where one is known; positional families and lanes
-        // without a known id keep their index. Distinct lanes that occupy the
-        // same index across a reorder must not erase each other's edits.
+        // A lane's durable id where one is known; fixed tracks and lanes without a
+        // known id keep their index. Distinct lanes that occupy the same index at
+        // different moments must not erase each other's edits.
         const laneConfigKey = (op) => (op.expected?.lane_id
             ? `${op.lane_type}:lane:${op.expected.lane_id}`
             : `${op.lane_type}:index:${op.lane_index || 0}`);
@@ -15846,9 +15901,13 @@ export class EditorWidget {
             const laneType = this._laneTypeForEntry(e);
             if (!laneType) continue;
             const laneIndex = e.laneIndex || 0;
-            const configFields = { name: e.customName || "", color: e.color || "", locked: !!e.locked, hidden: !!e.hidden };
+            const configFields = {
+                ...(settings.includes("name") ? { name: e.customName || "" } : {}),
+                ...(settings.includes("locked") ? { locked: !!e.locked } : {}),
+                ...(settings.includes("hidden") ? { hidden: !!e.hidden } : {}),
+            };
             const descriptor = descriptorFor(e.type);
-            const storedLaneId = String(sceneRef?.[descriptorFor(laneType)?.recipeAttr]?.[laneIndex]?.lane_id || "").trim();
+            const storedLaneId = this._laneIdAt(sceneRef, descriptor, laneIndex);
             // One caller identity names one lane: a multi-entry call cannot say
             // which of its entries the id belongs to, so it gets none.
             const callerLaneId = descriptor?.recipeAttr && entries.length === 1
@@ -15890,11 +15949,11 @@ export class EditorWidget {
             if (!patchPlan) {
                 const cfg = { ...configFields };
                 if (laneType === "guide") {
-                    sceneRef.guide_track_config = cfg;
+                    sceneRef.guide_track_config = { ...sceneRef.guide_track_config, ...cfg };
                 } else if (laneType === "prompt") {
-                    sceneRef.prompt_track_config = cfg;
+                    sceneRef.prompt_track_config = { ...sceneRef.prompt_track_config, ...cfg };
                 } else if (laneType === "prompt_global") {
-                    sceneRef.global_prompt_track_config = cfg;
+                    sceneRef.global_prompt_track_config = { ...sceneRef.global_prompt_track_config, ...cfg };
                 } else {
                     const listKey = descriptor?.configsField;
                     const list = Array.isArray(sceneRef[listKey]) ? sceneRef[listKey] : [];
@@ -15933,7 +15992,7 @@ export class EditorWidget {
             }
             return code === "unknown_reference_recipe"
                 ? "That custom recipe no longer exists. The lane keeps its previous recipe."
-                : "lane config failed — timeline restored.";
+                : this._laneIdentityFailureMessage(error) || "lane config failed — timeline restored.";
         };
         let saving;
         try {

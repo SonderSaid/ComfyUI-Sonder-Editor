@@ -513,23 +513,24 @@ def test_a_positional_row_needs_an_identity_the_server_compares():
 
 
 def test_update_lane_config_is_decided_per_lane_family():
-    """§1c's per-field partiality, at runtime.
-
-    `_apply_lane_config` compares `expected.lane_id` only when the descriptor has
-    a `recipe_attr`. A fixed-config lane never reads `lane_index`; a variable
-    family without a recipe has its `expected` discarded.
+    """`_apply_lane_config` compares `expected.lane_id` for every variable family, so
+    a replay that names its lane lands on it or is refused. A fixed-config lane never
+    reads `lane_index`.
     """
     out = _evidence_for("""[
         { type: 'update_lane_config', lane_type: 'guide', fields: { hidden: true } },
         { type: 'update_lane_config', lane_type: 'prompt', fields: { locked: true } },
         { type: 'update_lane_config', lane_type: 'video', lane_index: 2, fields: {},
-          expected: { lane_id: 'not-compared' } },
+          expected: { lane_id: 'V2' } },
+        { type: 'update_lane_config', lane_type: 'audio', lane_index: 2, fields: {} },
+        { type: 'update_lane_config', lane_type: 'motion_driver', lane_index: 2, fields: {},
+          expected: { lane_id: '' } },
         { type: 'update_lane_config', lane_type: 'reference', lane_index: 2, fields: {},
           expected: { lane_id: 'L1' } },
         { type: 'update_lane_config', lane_type: 'reference', lane_index: 2, fields: {} }
     ]""")
     flags = ['"retryable":true' in line for line in out.splitlines() if line.strip()]
-    assert flags == [True, True, False, True, False]
+    assert flags == [True, True, True, False, False, True, False]
 
 
 def test_a_lane_count_field_degrades_update_scene_fields():

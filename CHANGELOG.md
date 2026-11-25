@@ -26,6 +26,8 @@ a fresh `[Unreleased]` block.
   - A Reference item or member you deleted from the Library is not brought back by an older step; a notice says what was left out.
   - A lane you added, removed or moved can be undone and redone after a take lands: your lane and its clips come back where they were, and the take keeps its own lane. Before, the step was refused and blocked the ones before it, or put your clip on the take's lane. It is still refused while something else is on the lane it would remove.
 - A lane edit made right after Undo is no longer dropped, and a lane removal can no longer reach a take's lane, when a take the editor had not shown yet landed meanwhile.
+- A lane's name, lock or visibility never lands on another lane when lanes changed meanwhile, including a rename left open, and a take that lands while it saves no longer undoes it.
+- Locking, renaming or hiding a lane changes only that: it no longer fixes the lane's automatic colour, or puts back a lock or name changed elsewhere.
 - Undo and Redo show the *Waiting* notice only when they are still not on the timeline after a moment, instead of on every press. One that is applying but not yet drawn says *Undoing* or *Redoing*.
 - A queue run that fails keeps its own error when the job could not be marked failed.
 

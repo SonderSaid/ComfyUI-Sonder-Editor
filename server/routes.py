@@ -2863,22 +2863,27 @@ def _apply_lane_config(project: TimelineProject, scene: Scene, op: dict) -> dict
     elif descriptor is not None and descriptor.variable:
         lane_index = _mutation_int(op.get("lane_index", 0), "lane_index", 0)
         if lane_index < 0 or lane_index >= _scene_lane_count(scene, lane_type):
+            if not descriptor.recipe_attr and isinstance(op.get("expected"), dict):
+                _require_media_lane_id(None, op["expected"].get("lane_id"))
             _mutation_error(f"Lane index out of range: {lane_index}", 404, "item_not_found")
         config = _lane_config(scene, lane_type, lane_index)
     else:
         _mutation_error(f"Unknown lane type: {lane_type}", 400)
-    if descriptor.recipe_attr and "expected" in op:
-        # Unlike move_lane, config writes bootstrap recipe-less default lanes
-        # and lanes minted earlier in this batch, whose id the client cannot
-        # know yet. Expected stays optional until every lane has a durable id
-        # at creation and no caller writes before it can read one.
-        recipes = getattr(scene, descriptor.recipe_attr)
-        lane_id = str(recipes[lane_index].lane_id or "")
+    if descriptor.variable and "expected" in op:
+        # Unlike move_lane, config writes bootstrap recipe-less default Reference
+        # lanes and lanes minted earlier in this batch, whose id the client cannot
+        # know yet, and a page older than media lane ids sends none. Expected stays
+        # optional until every lane has a durable id at creation, no caller writes
+        # before it can read one, and no such page can still be open.
         expected = op["expected"]
-        if (not isinstance(expected, dict) or not lane_id
-                or expected.get("lane_id") != lane_id):
-            _mutation_error("Reference lane identity mismatch", 409,
-                            "identity_mismatch")
+        wanted = expected.get("lane_id") if isinstance(expected, dict) else None
+        if descriptor.recipe_attr:
+            lane_id = str(getattr(scene, descriptor.recipe_attr)[lane_index].lane_id or "")
+            if not lane_id or wanted != lane_id:
+                _mutation_error("Reference lane identity mismatch", 409,
+                                "identity_mismatch")
+        else:
+            _require_media_lane_id(config, wanted)
     result = {"type": "update_lane_config", "lane_type": lane_type, "lane_index": lane_index}
     # A recipe field edit names only the keys it writes, guarded per key, so a
     # write queued behind a failed one cannot re-commit the failed value
@@ -3440,6 +3445,20 @@ def _normalized_lane_config(config) -> dict:
     }
 
 
+def _require_media_lane_id(config, wanted) -> None:
+    """Refuse when a caller that named its media lane by id is not looking at it.
+
+    Nothing or a blank names none. Any other value is compared, as the retry tables
+    (`_is_blank`) take any other value for a name.
+    """
+    if wanted is None or (isinstance(wanted, str) and not wanted.strip()):
+        return
+    if wanted != getattr(config, "lane_id", ""):
+        _mutation_error(
+            "Lanes changed elsewhere, so this lane number no longer refers "
+            "to the same lane.", 409, "identity_mismatch")
+
+
 def _validate_lane_removal_identity(scene: Scene, descriptor, lane_index: int,
                                     current_count: int, expected) -> None:
     """Refuse a removal whose lane index no longer names the lane it named.
@@ -3505,12 +3524,9 @@ def _validate_lane_removal_identity(scene: Scene, descriptor, lane_index: int,
             "to the same lane.", 409, "identity_mismatch")
 
     if not descriptor.recipe_attr:
-        wanted = str(expected.get("lane_id") or "")
-        actual = configs[lane_index].lane_id if 0 <= lane_index < len(configs) else ""
-        if wanted and wanted != actual:
-            _mutation_error(
-                "Lanes changed elsewhere, so this lane number no longer refers "
-                "to the same lane.", 409, "identity_mismatch")
+        _require_media_lane_id(
+            configs[lane_index] if 0 <= lane_index < len(configs) else None,
+            expected.get("lane_id"))
         return
     recipes = getattr(scene, descriptor.recipe_attr, None) or []
     stored = (str(getattr(recipes[lane_index], "lane_id", "") or "")

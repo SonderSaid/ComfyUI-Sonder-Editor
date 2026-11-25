@@ -10416,7 +10416,8 @@ console.log(JSON.stringify({{changed:Object.keys(host.calls[0].operations.at(-1)
 
 def test_lane_config_emitters_use_scene_identity_and_merge_by_durable_lane():
     widget = _source("web/js/editor_widget.js")
-    save = _method(widget, "async _saveLaneConfigWithinGesture", "async _addLane")
+    save = (_method(widget, "async _saveLaneConfigWithinGesture", "async _addLane")
+            + _method(widget, "_laneIdAt", "_newLaneIds"))
     registry = (ROOT / "web/js/lane_registry.js").as_uri()
     coalescing = (ROOT / "web/js/scene_mutation_coalescing.js").as_uri()
     result = _run_node(f"""
@@ -10437,23 +10438,28 @@ const scene = laneId => ({{reference_lane_count:1,
 const entry = name => ({{type:'reference', laneIndex:0, customName:name,
   referenceRecipe:{{media_kind:'image', recipe_id:'', recipe:{{}}}}}});
 h.activeScene=scene('lane-a');
-await h._saveLaneConfigWithinGesture(entry('A'));
+const settings=["name"];
+await h._saveLaneConfigWithinGesture(entry('A'),{{settings}});
 h.activeScene=scene('lane-b');
-await h._saveLaneConfigWithinGesture(entry('B'));
+await h._saveLaneConfigWithinGesture(entry('B'),{{settings}});
 const merge=h.calls[0].options.merge;
 const merged=merge(h.calls[0],h.calls[1]);
 // Same durable lane moved to a different index replaces its prior config.
 const sameLane=merge(h.calls[0], {{operations:[{{...h.calls[0].operations[0],lane_index:1,
   fields:{{name:'A latest'}}}}]}});
 h.activeScene=scene('');
-await h._saveLaneConfigWithinGesture(entry('Default'));
+await h._saveLaneConfigWithinGesture(entry('Default'),{{settings}});
 h.activeScene={{video_lane_count:1,video_lane_configs:[{{}}]}};
-await h._saveLaneConfigWithinGesture({{type:'video',laneIndex:0,customName:'Video'}});
+await h._saveLaneConfigWithinGesture({{type:'video',laneIndex:0,customName:'Video'}},{{settings}});
+h.activeScene={{video_lane_count:1,video_lane_configs:[{{lane_id:'v0'}}]}};
+await h._saveLaneConfigWithinGesture({{type:'video',laneIndex:0,customName:'Video',color:'#fallback',
+  locked:true,hidden:true}},{{settings}});
 console.log(JSON.stringify({{expected:h.calls.slice(0,2).map(c=>c.operations[0].expected),
   merged:merged.operations.map(op=>op.fields.name),
   sameLane:sameLane.operations,
   bootstrapExpected:h.calls[2].operations[0].expected ?? null,
-  videoExpected:h.calls[3].operations[0].expected ?? null}}));
+  videoExpected:h.calls[3].operations[0].expected ?? null,
+  named:h.calls[4].operations[0]}}));
 """)
     assert result["expected"] == [{"lane_id": "lane-a"}, {"lane_id": "lane-b"}]
     assert result["merged"] == ["A", "B"]
@@ -10462,6 +10468,8 @@ console.log(JSON.stringify({{expected:h.calls.slice(0,2).map(c=>c.operations[0].
     assert result["sameLane"][0]["lane_index"] == 1
     assert result["bootstrapExpected"] is None
     assert result["videoExpected"] is None
+    assert result["named"]["expected"] == {"lane_id": "v0"}
+    assert result["named"]["fields"] == {"name": "Video"}, "only what the gesture changed"
 
 
 def test_reference_config_bootstrap_and_move_barrier_use_real_queue_adapter():
@@ -10470,6 +10478,7 @@ def test_reference_config_bootstrap_and_move_barrier_use_real_queue_adapter():
         _method(widget, "_queueProjectMutation", "_runSceneMutation"),
         _method(widget, "_runSceneMutation", "_acceptPromptAttachmentConfiguration"),
         _method(widget, "async _saveLaneConfigWithinGesture", "async _addLane"),
+        _method(widget, "_laneIdAt", "_newLaneIds"),
         _method(widget, "_applyLocalSetLaneCount", "_applyLocalMoveLane"),
         _method(widget, "_trimLocalLaneConfigs", "_compactEmptyMediaLaneLocal"),
     ])
@@ -10536,9 +10545,9 @@ const entry=(index,name) => ({{type:'reference',laneIndex:index,customName:name,
   referenceRecipe:{{lane_id:'client-draft',media_kind:'image'}}}});
 // A first panel recipe save reconciles the canonical id before the second.
 const sequential=new Harness(make());
-await sequential._saveLaneConfigWithinGesture(entry(0,'first'));
+await sequential._saveLaneConfigWithinGesture(entry(0,'first'),{{settings:['name']}});
 assert.equal(sequential.activeScene.reference_lane_recipes[0].lane_id,'server-0');
-await sequential._saveLaneConfigWithinGesture(entry(0,'second'));
+await sequential._saveLaneConfigWithinGesture(entry(0,'second'),{{settings:['name']}});
 assert.equal(sequential.calls[1].expected.lane_id,'server-0');
 assert.equal(sequential.server.reference_lane_configs[0].name,'second');
 // Creation is pending: local recipes must not pretend their ids are durable.
@@ -10549,7 +10558,7 @@ await Promise.resolve();
 pending._applyLocalSetLaneCount('reference',2);
 const create=pending._runSceneMutation([{{type:'set_lane_count',lane_type:'reference',count:2}}],
   {{key:'create',coalesce:false}});
-const edit=pending._saveLaneConfigWithinGesture(entry(1,'queued rename'));
+const edit=pending._saveLaneConfigWithinGesture(entry(1,'queued rename'),{{settings:['name']}});
 assert.equal(pending.activeScene.reference_lane_recipes[1].lane_id,'');
 release();await Promise.all([block,create,edit]);
 assert.equal(pending.calls[1].expected,undefined);
@@ -10562,12 +10571,12 @@ const moved=new Harness(scene);let unblock;
 const blocker=moved._projectMutationQueue.enqueue({{key:'blocked',coalesce:false,
   run:async()=>await new Promise(resolve=>unblock=resolve)}});
 await Promise.resolve();
-const first=moved._saveLaneConfigWithinGesture(entry(0,'A edit'));
+const first=moved._saveLaneConfigWithinGesture(entry(0,'A edit'),{{settings:['name']}});
 const move=moved._runSceneMutation([{{type:'move_lane',lane_type:'reference',from_index:0,to_index:1,
   expected:{{from_lane_id:'a',to_lane_id:'b'}}}}],{{key:'move',coalesce:false}});
 moved.activeScene.reference_lane_recipes.reverse();
 moved.activeScene.reference_lane_configs.reverse();
-const second=moved._saveLaneConfigWithinGesture(entry(0,'B edit'));
+const second=moved._saveLaneConfigWithinGesture(entry(0,'B edit'),{{settings:['name']}});
 unblock();await Promise.all([blocker,first,move,second]);
 assert.deepEqual(moved.calls.map(op=>op.type),['update_lane_config','move_lane','update_lane_config']);
 assert.deepEqual(moved.server.reference_lane_configs.map(c=>c.name),['B edit','A edit']);

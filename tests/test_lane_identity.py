@@ -327,6 +327,161 @@ def test_removing_a_lane_names_it_by_id(family, sent, status):
         assert _ids(scene, family) == before
 
 
+@media
+@pytest.mark.parametrize(("sent", "refused"), [
+    ("own", False), ("other", True), ("", False), (None, False), ("absent", False)])
+def test_a_lane_setting_names_its_lane_by_id(family, sent, refused):
+    """A lock, rename, hide or colour written by position can land on the lane that took
+    the position: here another page removed lane 0 and added one."""
+    scene = Scene.from_dict(_legacy_scene(family))
+    stale = _ids(scene, family)[1]
+    _batch(scene, {"type": "remove_lane", "lane_type": family, "lane_index": 0,
+                   "item_policy": "require_empty",
+                   "expected": {"lane_count": 3, "config": BLANK}})
+    _batch(scene, {"type": "set_lane_count", "lane_type": family, "count": 3})
+    write = {"type": "update_lane_config", "lane_type": family, "lane_index": 1,
+             "fields": {"name": "N", "locked": True, "hidden": True, "color": "#fff"},
+             "expected": {"lane_id": _ids(scene, family)[1] if sent == "own" else
+                          stale if sent == "other" else sent}}
+    if sent == "absent":                       # a page older than lane ids
+        del write["expected"]
+    before = scene.to_dict()
+    if refused:
+        with pytest.raises(routes.ProjectMutationRequestError) as exc:
+            _batch(scene, write)
+        assert (exc.value.status, exc.value.code) == (409, "identity_mismatch")
+        assert scene.to_dict() == before, "a refusal writes nothing"
+    else:
+        _batch(scene, write)
+        saved = scene.to_dict()[f"{family}_lane_configs"][1]
+        assert saved["name"] == "N" and saved["lane_id"] == _ids(before, family)[1]
+
+
+@pytest.mark.parametrize("operation", ["remove_lane", "update_lane_config"])
+@pytest.mark.parametrize("value", [{"a": 1}, ["x"], 5, True, "x" * 10_000, 0, False, [], {}])
+def test_a_malformed_lane_id_is_refused_not_a_crash(operation, value):
+    scene = Scene.from_dict(_legacy_scene())
+    with pytest.raises(routes.ProjectMutationRequestError) as exc:
+        _batch(scene, {"type": operation, "lane_type": "video", "lane_index": 1, "fields": {},
+                       "item_policy": "require_empty",
+                       "expected": {"lane_count": 3, "config": BLANK, "lane_id": value}})
+    assert (exc.value.status, exc.value.code) == (409, "identity_mismatch")
+
+
+class _Race:
+    """One write through the real commit loop, another writer saving in between."""
+
+    def __init__(self, monkeypatch, tmp_path, family, count=2):
+        self.module = _load_route_module(monkeypatch)
+        self.project = project_manager.create_project("ZZ-lane-race", base_dir=str(tmp_path))
+        scene = Scene.from_dict(_legacy_scene(family, count=count))
+        scene.clips.append(ClipReference(clip_id="mine", timeline_end_frame=8, muted=True))
+        self.project.scenes = [scene]
+        project_manager.save_project(self.project)
+        self.ids = _ids(scene, family)
+        self.family, self.other, self.raced = family, None, 0
+        real_save = self.module.save_project
+
+        def racing_save(current, **kwargs):
+            if not self.raced:
+                self.raced += 1
+                other = project_manager.load_project(self.project.project_dir)
+                self.other(other.scenes[0])
+                project_manager.save_project(other)
+            return real_save(current, **kwargs)
+
+        monkeypatch.setattr(self.module, "save_project", racing_save)
+        monkeypatch.setattr(self.module, "_load_project_from_request",
+                            lambda request, **kw: project_manager.load_project(self.project.project_dir))
+
+    def write(self, *operations, other):
+        self.other = other
+        request = DummyRequest(match_info={"project_id": "project", "scene_id": "scene-1"})
+        _, payload = self.module._apply_scene_mutations_sync(request, "scene-1", list(operations))
+        return payload
+
+    def lane(self, **fields):
+        return {"type": "update_lane_config", "lane_type": self.family, "lane_index": 1,
+                "fields": fields, "expected": {"lane_id": self.ids[1]}}
+
+    @property
+    def scene(self):
+        assert self.raced
+        return project_manager.load_project(self.project.project_dir).scenes[0].to_dict()
+
+
+def _take_lands(scene):
+    scene.clips.append(ClipReference(clip_id="take", timeline_end_frame=8))
+
+
+@media
+@pytest.mark.parametrize("named", [True, False])
+def test_a_lane_setting_survives_a_save_race_only_when_it_names_its_lane(
+        family, named, monkeypatch, tmp_path):
+    """A take lands between this write's load and its save. Named, the write is applied
+    to the document that holds the take; by position it is refused, as before."""
+    race = _Race(monkeypatch, tmp_path, family)
+    operation = race.lane(locked=True)
+    if named:
+        payload = race.write(operation, other=_take_lands)
+        # The step's before-state is the attempt that committed: the take is in both.
+        assert "clips" not in payload["history_before"]["members"]
+        assert payload["history_before"]["fields"].keys() == {f"{family}_lane_configs"}
+    else:
+        del operation["expected"]
+        with pytest.raises(project_manager.ProjectVersionConflict):
+            race.write(operation, other=_take_lands)
+    assert [clip["clip_id"] for clip in race.scene["clips"]] == ["mine", "take"]
+    assert race.scene[f"{family}_lane_configs"][1]["locked"] is named
+
+
+@media
+def test_a_raced_lane_setting_keeps_another_writers_setting_on_that_lane(
+        family, monkeypatch, tmp_path):
+    """The editor sends only what its gesture changed, so the retry puts nothing back."""
+    race = _Race(monkeypatch, tmp_path, family)
+    def lock(scene):
+        getattr(scene, f"{family}_lane_configs")[1].locked = True
+    race.write(race.lane(name="Mine"), other=lock)
+    row = race.scene[f"{family}_lane_configs"][1]
+    assert (row["name"], row["locked"]) == ("Mine", True)
+
+
+@media
+@pytest.mark.parametrize("removed", [0, 1])
+def test_a_raced_lane_setting_never_lands_on_the_lane_that_took_its_number(
+        family, removed, monkeypatch, tmp_path):
+    race = _Race(monkeypatch, tmp_path, family, count=3)
+    def remove(scene):
+        getattr(scene, f"{family}_lane_configs").pop(removed)
+        setattr(scene, f"{family}_lane_count", 2)
+    with pytest.raises(race.module.ProjectMutationRequestError) as exc:
+        race.write(race.lane(name="Mine"), other=remove)
+    assert (exc.value.status, exc.value.code) == (409, "identity_mismatch")
+    assert [row["name"] for row in race.scene[f"{family}_lane_configs"]] == ["", ""]
+
+
+@media
+def test_a_named_lane_past_the_last_one_is_refused_as_moved(family):
+    scene = Scene.from_dict(_legacy_scene(family, count=1))
+    write = {"type": "update_lane_config", "lane_type": family, "lane_index": 4,
+             "fields": {"name": "x"}}
+    for expected, code in (({"lane_id": "gone-lane"}, "identity_mismatch"), (None, "item_not_found")):
+        with pytest.raises(routes.ProjectMutationRequestError) as exc:
+            _batch(scene, {**write, **({"expected": expected} if expected else {})})
+        assert exc.value.code == code
+
+
+def test_a_raced_visibility_toggle_is_applied_whole(monkeypatch, tmp_path):
+    """A header toggle sends its lane with the items it unmutes: all or nothing."""
+    race = _Race(monkeypatch, tmp_path, "video")
+    race.write(race.lane(hidden=False),
+               {"type": "update_clip", "clip_id": "mine", "fields": {"muted": False}},
+               other=_take_lands)
+    assert [(clip["clip_id"], clip["muted"]) for clip in race.scene["clips"]] == [
+        ("mine", False), ("take", False)]
+
+
 @pytest.mark.parametrize(("wanted", "stale"), [
     ({}, False), ({"lane_id": "ID"}, False), ({"lane_id": "gone"}, True),
     ({"name": "other"}, True), (None, False), ({"future": 1}, False)])

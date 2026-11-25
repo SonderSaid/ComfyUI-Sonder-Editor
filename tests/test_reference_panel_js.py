@@ -967,7 +967,7 @@ def test_a_lock_before_a_recipe_edit_is_sent_keeps_both():
     await tick();
     edit('Maximum members', 5);
     const lock = {...w._trackLayout[0], locked: true};
-    w._saveLaneConfig([lock]);
+    w._saveLaneConfig([lock], {settings: ['locked']});
     await release();
     await drain();
     return {ops: recipeWrites().map((ops) => ops.map((op) => op.fields)),
@@ -977,7 +977,7 @@ def test_a_lock_before_a_recipe_edit_is_sent_keeps_both():
     assert result["server"] == {"max": 5, "locked": True}
     assert result["ops"] == [
         [{"reference_recipe_patch": {"hard": {"max_members": 5}}}],
-        [{"name": "", "color": "", "locked": True, "hidden": False}],
+        [{"locked": True}],
     ]
 
 
@@ -995,7 +995,7 @@ def test_a_lock_joining_a_pending_template_switch_keeps_the_template():
       && n.options.some((o) => o.value === 'preset:sheet'));
     select.value = 'preset:sheet';
     select.dispatch('change');
-    w._saveLaneConfig([{...w._trackLayout[0], locked: true}]);
+    w._saveLaneConfig([{...w._trackLayout[0], locked: true}], {settings: ['locked']});
     await release();
     await drain();
     return {writes: recipeWrites().length, recipeId: server.reference_lane_recipes[0].recipe_id,
@@ -1016,7 +1016,7 @@ def test_a_refused_patch_does_not_take_a_lock_queued_beside_it():
     edit('Maximum members', 5);
     await tick();
     edit('Maximum members', 6);
-    w._saveLaneConfig([{...w._trackLayout[0], locked: true}]);
+    w._saveLaneConfig([{...w._trackLayout[0], locked: true}], {settings: ['locked']});
     await fail();
     await drain();
     await tick();
@@ -1074,8 +1074,9 @@ def test_save_as_custom_waits_for_a_field_edit_still_saving():
 def test_lock_and_rename_do_not_send_the_recipe():
     """They re-sent the whole painted recipe, re-committing any pending edit."""
     result = _run_recipe_panel("""
-    w._saveLaneConfig([{...w._trackLayout[0], locked: true}]);
-    w._saveLaneConfig([{...w._trackLayout[0], customName: 'Renamed'}], {undoLabel: 'rename lane'});
+    w._saveLaneConfig([{...w._trackLayout[0], locked: true}], {settings: ['locked']});
+    w._saveLaneConfig([{...w._trackLayout[0], customName: 'Renamed'}],
+      {undoLabel: 'rename lane', settings: ['name']});
     await drain();
     return {ops: recipeWrites().map((ops) => ops.map((op) => op.fields)),
       lane: server.reference_lane_recipes[0]};
@@ -1095,7 +1096,7 @@ def test_without_the_capability_a_field_edit_sends_the_whole_recipe():
     await drain();
     return recipeWrites().map((ops) => ops.map((op) => Object.keys(op.fields).sort()));
     """)
-    assert result == [[["color", "hidden", "locked", "name", "reference_recipe"]]]
+    assert result == [[["reference_recipe"]]]
 
 
 def test_a_server_that_ignores_the_patch_is_treated_as_a_refusal():
@@ -1121,7 +1122,7 @@ def test_a_server_that_ignores_the_patch_is_treated_as_a_refusal():
     assert result["entriesAfterIgnored"] == 0
     assert result["ignored"] == 1
     assert any("not saved" in message for message in result["messages"])
-    assert result["second"] == ["color", "hidden", "locked", "name", "reference_recipe"]
+    assert result["second"] == ["reference_recipe"]
     assert result["server"]["frame_step"] == 9 and result["server"]["max_members"] == 4
 
 

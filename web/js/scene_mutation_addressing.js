@@ -368,13 +368,13 @@ export const SCENE_MUTATION_ADDRESSING = freeze({
         addressing: POSITIONAL,
         promotedBy: freeze([guard("expected", {
             identifying: ["lane_id"], validator: "_apply_lane_config" })]),
-        evidence: "Per-field partiality, exactly as §1c warns: `_apply_lane_config` "
-            + "compares `expected.lane_id` ONLY when the lane descriptor has a "
-            + "`recipe_attr`, which today is `reference` alone. A fixed-config lane "
-            + "type never reads `lane_index` at all — it is addressed by `lane_type` "
-            + "— and a variable family without a recipe has its `expected` ignored "
-            + "outright, so sending one there buys nothing. Expected stays optional "
-            + "by design for bootstrap callers (`durable_rules.md`), which is why a "
+        evidence: "`_apply_lane_config` compares `expected.lane_id` with the id of the "
+            + "lane AT `lane_index` for every variable family (a Reference lane's is "
+            + "its recipe's, a media lane's its config's) and writes nothing on a "
+            + "mismatch, so a replay that names its lane lands on it or is refused. A "
+            + "fixed-config lane type never reads `lane_index` at all — it is "
+            + "addressed by `lane_type`. Expected stays optional by design for "
+            + "bootstrap callers and older pages (`durable_rules.md`), which is why a "
             + "blank id degrades rather than refuses.",
         refine(operation) {
             const laneType = String(operation?.lane_type || "");
@@ -392,13 +392,7 @@ export const SCENE_MUTATION_ADDRESSING = freeze({
                         + "`_apply_lane_config` writes "
                         + `\`${descriptor.fixedConfigField}\` and never reads \`lane_index\`` };
             }
-            if (!descriptor.recipeAttr) {
-                return { addressing: POSITIONAL, retryable: false,
-                    reason: `lane_type "${laneType}" has no recipe_attr, so `
-                        + "`_apply_lane_config` skips the identity comparison entirely "
-                        + "and any `expected` sent is discarded" };
-            }
-            return null;    // reference: the declared `promotedBy` decides
+            return null;    // a variable family: the declared `promotedBy` decides
         },
     }),
 

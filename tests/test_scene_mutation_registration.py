@@ -2195,8 +2195,9 @@ GUARD_CONTRACTS = {
         "`_require_prompt_mutation_contract` runs first but only checks that the "
         "keys are PRESENT, so it is not a second comparison."),
     "update_lane_config": (_FIXED, frozenset({"lane_id", "reference_recipe_fields"}),
-        "`_apply_lane_config`, guarded only when the lane descriptor has a "
-        "`recipe_attr`, on lane_id, and -- for a recipe patch -- on each patched "
+        "`_apply_lane_config`, guarded for every variable lane family on lane_id "
+        "(a Reference lane's recipe's, a media lane's config's), and -- for a "
+        "recipe patch -- on each patched "
         "key's prior in `reference_recipe_fields`, which `_reference_recipe_patch` "
         "requires and `_patched_reference_lane_recipe` compares. The deliberate "
         "bootstrap tolerance -- expected stays optional -- is owned by "

@@ -2247,7 +2247,7 @@ def test_a_lane_locked_during_the_wait_refuses_before_the_paint(tmp_path):
     // header's own lock path (its write queues behind the held one).
     w._pushUndo('toggle track lock');
     w._trackLayout[0].locked = true;
-    w._saveLaneConfig([w._trackLayout[0]]);
+    w._saveLaneConfig([w._trackLayout[0]], {settings: ['locked']});
     await release();
     await deleting;
     await settle(8);
