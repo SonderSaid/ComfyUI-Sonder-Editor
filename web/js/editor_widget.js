@@ -1314,6 +1314,7 @@ export class EditorWidget {
         this._historyStackRevision = 0;
         this._historyCommitRevisionByEntry = new WeakMap();
         this._historyOperationSeq = 0;
+        this._refusedHistoryStep = null;
         this._latestHistoryOrderContext = null;
         this._queuedHistoryOperationCount = 0;
         this._queuedHistoryWaits = new Set();
@@ -1604,6 +1605,7 @@ export class EditorWidget {
                         // actionable as soon as ownership moves to this id.
                         this._undoStack = [];
                         this._redoStack = [];
+                        this._releaseRefusedHistoryStep?.();
                         this.activeSceneId = sceneId;
                     }
                 }
@@ -2216,6 +2218,7 @@ export class EditorWidget {
             // Clear undo/redo on scene switch (snapshots are scene-specific)
             this._undoStack = [];
             this._redoStack = [];
+            this._releaseRefusedHistoryStep?.();
             // Drop stale prompt-usage highlight (sets are keyed by start_frame
             // and would otherwise falsely match the new scene's sections).
             this._promptUsedSections = new Set();
@@ -25137,14 +25140,14 @@ export class EditorWidget {
             // ── Undo / Redo ──
             if (ctrl && normalizedKey === "z" && !shift) {
                 debugUndoRouting("consume undo", { branch: "undo" });
-                void this._undo();
+                void this._undo({ repeat: e.repeat });
                 return true;
             }
             if (ctrl && (normalizedKey === "y" || (normalizedKey === "z" && shift))) {
                 debugUndoRouting("consume redo", {
                     branch: normalizedKey === "y" ? "redo-y" : "redo-shift-z",
                 });
-                void this._redo();
+                void this._redo({ repeat: e.repeat });
                 return true;
             }
 
@@ -27615,10 +27618,10 @@ export class EditorWidget {
         this._renderTimeline();
     }
 
-    async _undo() {
+    async _undo({ repeat = false } = {}) {
         // Claim synchronously inside the gesture, then let the shared project
         // queue serialize the apply behind every earlier user action.
-        return this._runUndo();
+        return this._runUndo({ repeat });
     }
 
     _finishHistoryOperation(waitToken = null) {
@@ -27645,15 +27648,16 @@ export class EditorWidget {
         return true;
     }
 
-    async _runUndo() {
+    async _runUndo({ repeat = false } = {}) {
         if (typeof this._withMutationGesture === "function") {
             return this._withMutationGesture(
-                "undo", (diagnostics) => this._queueUndoWithinGesture(diagnostics));
+                "undo", (diagnostics) => this._queueUndoWithinGesture(
+                    diagnostics, { repeat }));
         }
-        return this._queueUndoWithinGesture(null);
+        return this._queueUndoWithinGesture(null, { repeat });
     }
 
-    _queueUndoWithinGesture(diagnostics = null) {
+    _queueUndoWithinGesture(diagnostics = null, { repeat = false } = {}) {
         const stack = this._undoStack || [];
         const hasPendingHistoryCommit = () => typeof this._hasPendingHistoryCommit === "function"
             ? this._hasPendingHistoryCommit()
@@ -27674,11 +27678,20 @@ export class EditorWidget {
             });
             return Promise.resolve(false);
         }
+        // A held key never skips: the next press on this step drops it, so it must
+        // be one the author made after the notice.
+        if (repeat && this._refusedHistoryStep?.entry === entry) {
+            this._recordHistoryRefusal?.("undo", "held_key_on_refused_step", diagnostics, {
+                sceneId: entry.sceneId || "", label: entry.label || "",
+            });
+            return Promise.resolve(false);
+        }
         const queueBusy = this._hasPendingProjectMutations?.() === true;
         if (hasPendingHistoryCommit() && !queueBusy) {
             this._recordHistoryRefusal?.("undo", "stalled_pending_entry", diagnostics, {
                 sceneId: entry.sceneId || "", label: entry.label || "",
             });
+            this._releaseRefusedHistoryStep?.();
             notifyWarning("Undo is waiting on an unresolved Prompt Apply. Reopen Apply and save or discard that draft first.",
                 { source: "undo-stalled-pending" });
             return Promise.resolve(false);
@@ -27726,6 +27739,7 @@ export class EditorWidget {
                 this._recordHistoryRefusal?.("undo", gate, queuedDiagnostics, {
                     sceneId: entry.sceneId || "", label: entry.label || "",
                 });
+                this._releaseRefusedHistoryStep?.();
                 notifyWarning(message, { source });
                 return false;
             };
@@ -27808,6 +27822,7 @@ export class EditorWidget {
                 sceneId: entry.sceneId || "", label: entry.label || "",
                 error: error?.message || String(error),
             });
+            this._releaseRefusedHistoryStep?.();
             notifyWarning(error?.message || "Undo could not be queued.",
                 { source: "undo-queue-failed" });
             this._deferProjectBackedRefresh?.(["scenes"], "history_undo_error");
@@ -27849,6 +27864,8 @@ export class EditorWidget {
         }
         const entry = reservedEntry || this._undoStack.pop();
         const queuedClaim = !!reservedEntry;
+        const refusedBefore = this._takeRefusedHistoryStep(entry);
+        const revisionAtStart = Number(this._historyStackRevision) || 0;
         const restoreEntryAfterFailure = () => {
             if (!queuedClaim) this._undoStack.push(entry);
         };
@@ -28128,17 +28145,11 @@ export class EditorWidget {
                     compensationErrors.push(compensationError);
                 }
             }
-            const recoveryDetail = compensationErrors.length
-                ? ` Recovery also failed: ${compensationErrors.map((value) =>
-                    value?.message || String(value)).join("; ")}` : "";
-            this._recordHistoryRefusal?.("undo", "restore_failed", diagnostics, {
-                sceneId: entry.sceneId || "", label: entry.label || "",
-                error: error?.message || String(error),
-                compensation_errors: compensationErrors.map((value) =>
-                    value?.message || String(value)),
+            this._reportFailedHistoryStep({
+                operation: "undo", stack: this._undoStack, entry, claimId, error,
+                refusedBefore, revisionAtStart, compensationErrors, diagnostics,
+                legsLeft: referencesApplied || promptIdentityApplied,
             });
-            notifyWarning(`${error?.message || "Undo was refused."}${recoveryDetail}`,
-                { source: "undo-refused" });
             if (referencesApplied || promptIdentityApplied) {
                 entry._ambiguousAuxiliaryState = {
                     referencesApplied,
@@ -28158,21 +28169,99 @@ export class EditorWidget {
         });
     }
 
-    async _redo() {
+    // ── Skipping a refused step ──
+    // A step refused for a real conflict stays on top, and refusing it forever
+    // would put every step under it out of reach. So the second press in a row on
+    // it tries once more and, refused again, drops it. "In a row" is the mark:
+    // taken by whichever step runs next, released by any other refused press, a
+    // pushed edit (a click that moves nothing pushes one too) or a change of scene,
+    // so a step met again later warns again before it is dropped.
+
+    /** Take the mark as a step starts; true when this very step was just refused. */
+    _takeRefusedHistoryStep(entry) {
+        const refused = this._refusedHistoryStep;
+        if (!refused) return false;
+        this._releaseRefusedHistoryStep({ dismiss: refused.entry === entry });
+        return refused.entry === entry;
+    }
+
+    /** Drop the mark; its notice must not go on offering a skip. */
+    _releaseRefusedHistoryStep({ dismiss = false } = {}) {
+        const refused = this._refusedHistoryStep;
+        if (!refused) return;
+        this._refusedHistoryStep = null;
+        if (dismiss) refused.notice?.dismiss?.();
+        else refused.notice?.update?.({ message: refused.message });
+    }
+
+    /** Report a step whose restore failed, dropping it when this press skips it. */
+    _reportFailedHistoryStep({ operation, stack, entry, claimId, error, refusedBefore,
+        revisionAtStart, compensationErrors, legsLeft, diagnostics }) {
+        const verb = operation === "redo" ? "Redo" : "Undo";
+        const errorText = (value) => value?.message || String(value);
+        // Only a refusal that wrote nothing, and leaves nothing written. Anything
+        // else (a lost answer, a network failure, a leg that could not be taken
+        // back) still needs this entry to recover.
+        const conflict = !legsLeft
+            && ["scene_merge_conflict", "scene_merge_invalid"].includes(error?.code);
+        const index = stack.indexOf(entry);
+        // A `project_dependencies` step puts back whole project lists, so it is safe
+        // only once every step above it that wrote them has been reversed. Retire
+        // when that step reverses its own records by id.
+        const heldByOrder = !!(entry.referenceOperations?.length || entry.promptIdentityChange
+                || entry.promptIdentityCreateIntents?.length)
+            && stack.slice(0, Math.max(index, 0)).some(
+                (below) => below?.kind === "project_dependencies");
+        const skippable = conflict && index >= 0 && !heldByOrder
+            && (!claimId || entry.claimedBy === claimId);
+        const skipped = skippable && refusedBefore;
+        this._recordHistoryRefusal?.(operation, "restore_failed", diagnostics, {
+            sceneId: entry.sceneId || "", label: entry.label || "",
+            error: errorText(error),
+            entry_discarded: skipped,
+            compensation_errors: compensationErrors.map(errorText),
+        });
+        if (skipped) {
+            stack.splice(index, 1);
+            notifyInfo(`Skipped: ${entry.label || "change"}.`, {
+                detail: `It was not ${operation === "redo" ? "redone" : "undone"}.`,
+                source: `${operation}-skipped`,
+            });
+            return;
+        }
+        const recoveryDetail = compensationErrors.length
+            ? ` Recovery also failed: ${compensationErrors.map(errorText).join("; ")}` : "";
+        const message = `${error?.message || `${verb} was refused.`}${recoveryDetail}`;
+        // The offer holds only while this is the step the next press reaches, with
+        // no edit made while it was out (one made after a Redo stands on the other
+        // stack) and the editor still open.
+        if (!skippable || this._destroyed || index !== stack.length - 1
+                || (Number(this._historyStackRevision) || 0) !== revisionAtStart) {
+            notifyWarning(message, { source: `${operation}-refused` });
+            return;
+        }
+        const notice = notifyWarning(
+            `${message}${/[.!?]$/.test(message) ? "" : "."} Press ${verb} again to skip it.`,
+            { source: `${operation}-refused` });
+        this._refusedHistoryStep = { entry, message, notice };
+    }
+
+    async _redo({ repeat = false } = {}) {
         // Redo uses the same FIFO claim/apply split as Undo while preserving
         // its pending Undo-side transaction check inside the queue item.
-        return this._runRedo();
+        return this._runRedo({ repeat });
     }
 
-    async _runRedo() {
+    async _runRedo({ repeat = false } = {}) {
         if (typeof this._withMutationGesture === "function") {
             return this._withMutationGesture(
-                "redo", (diagnostics) => this._queueRedoWithinGesture(diagnostics));
+                "redo", (diagnostics) => this._queueRedoWithinGesture(
+                    diagnostics, { repeat }));
         }
-        return this._queueRedoWithinGesture(null);
+        return this._queueRedoWithinGesture(null, { repeat });
     }
 
-    _queueRedoWithinGesture(diagnostics = null) {
+    _queueRedoWithinGesture(diagnostics = null, { repeat = false } = {}) {
         const queueBusy = this._hasPendingProjectMutations?.() === true;
         const pendingUndoEntry = (this._undoStack || []).find(
             (candidate) => candidate?.pending);
@@ -28184,6 +28273,7 @@ export class EditorWidget {
                 sceneId: pendingUndoEntry.sceneId || "",
                 label: pendingUndoEntry.label || "",
             });
+            this._releaseRefusedHistoryStep?.();
             notifyWarning("Redo is waiting on an unresolved Prompt Apply. Reopen Apply and save or discard that draft first.",
                 { source: "redo-stalled-pending" });
             return Promise.resolve(false);
@@ -28202,6 +28292,15 @@ export class EditorWidget {
                 activeSceneId: this.activeSceneId || "",
                 undoDepth: this._undoStack?.length || 0,
                 redoDepth: stack.length,
+            });
+            return Promise.resolve(false);
+        }
+
+        // A held key never skips: the next press on this step drops it, so it must
+        // be one the author made after the notice.
+        if (repeat && this._refusedHistoryStep?.entry === entry) {
+            this._recordHistoryRefusal?.("redo", "held_key_on_refused_step", diagnostics, {
+                sceneId: entry.sceneId || "", label: entry.label || "",
             });
             return Promise.resolve(false);
         }
@@ -28249,6 +28348,7 @@ export class EditorWidget {
                 this._recordHistoryRefusal?.("redo", gate, queuedDiagnostics, {
                     sceneId: entry.sceneId || "", label: entry.label || "",
                 });
+                this._releaseRefusedHistoryStep?.();
                 notifyWarning(message, { source });
                 return false;
             };
@@ -28339,6 +28439,7 @@ export class EditorWidget {
                 sceneId: entry.sceneId || "", label: entry.label || "",
                 error: error?.message || String(error),
             });
+            this._releaseRefusedHistoryStep?.();
             notifyWarning(error?.message || "Redo could not be queued.",
                 { source: "redo-queue-failed" });
             this._deferProjectBackedRefresh?.(["scenes"], "history_redo_error");
@@ -28378,6 +28479,8 @@ export class EditorWidget {
         }
         const entry = reservedEntry || this._redoStack.pop();
         const queuedClaim = !!reservedEntry;
+        const refusedBefore = this._takeRefusedHistoryStep(entry);
+        const revisionAtStart = Number(this._historyStackRevision) || 0;
         const restoreEntryAfterFailure = () => {
             if (!queuedClaim) this._redoStack.push(entry);
         };
@@ -28677,17 +28780,12 @@ export class EditorWidget {
                     compensationErrors.push(compensationError);
                 }
             }
-            const recoveryDetail = compensationErrors.length
-                ? ` Recovery also failed: ${compensationErrors.map((value) =>
-                    value?.message || String(value)).join("; ")}` : "";
-            this._recordHistoryRefusal?.("redo", "restore_failed", diagnostics, {
-                sceneId: entry.sceneId || "", label: entry.label || "",
-                error: error?.message || String(error),
-                compensation_errors: compensationErrors.map((value) =>
-                    value?.message || String(value)),
+            this._reportFailedHistoryStep({
+                operation: "redo", stack: this._redoStack, entry, claimId, error,
+                refusedBefore, revisionAtStart, compensationErrors, diagnostics,
+                legsLeft: referencesApplied || promptIdentityApplied
+                    || promptIdentityCreatesApplied.length > 0,
             });
-            notifyWarning(`${error?.message || "Redo was refused."}${recoveryDetail}`,
-                { source: "redo-refused" });
             if (referencesApplied || promptIdentityApplied
                     || promptIdentityCreatesApplied.length
                     || promptIdentityCreatesResolved) {
@@ -29226,6 +29324,8 @@ export class EditorWidget {
     }
 
     _clearRedoForNewEdit({ preserveFutureReservations = false } = {}) {
+        // Undo now reverses this edit, so the notice offering a skip is stale.
+        this._releaseRefusedHistoryStep?.();
         // A new edit invalidates ordinary Redo history. A queued Redo owns its
         // reserved entry, so preserve it long enough to fail visibly at apply
         // if this edit changed the history revision after its claim.
@@ -31077,6 +31177,7 @@ export class EditorWidget {
         this._queuedHistoryNotification?.dismiss();
         this._queuedHistoryNotification = null;
         this._queuedHistoryNoticeText = "";
+        this._releaseRefusedHistoryStep?.();
         this._queuedHistoryOperationCount = 0;
         this._clearStaleReplayState();
         this._promptContextPreviewToken = (this._promptContextPreviewToken || 0) + 1;

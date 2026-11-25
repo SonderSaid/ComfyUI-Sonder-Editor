@@ -3510,11 +3510,13 @@ console.log(JSON.stringify({{fetches,warnings,undo:h._undoStack.length,
 def test_redo_builds_inverse_from_restore_response_not_active_scene():
     widget = _source("web/js/editor_widget.js")
     redo = _method(widget, "_redo", "_restoreScene")
+    refused = _method(widget, "_takeRefusedHistoryStep", "_redo")
     result = _run_node(f"""
 globalThis.document={{activeElement:null}};
 globalThis.describeKeyboardDebugElement=()=>({{}});
 globalThis.notifyWarning=()=>{{}};globalThis.notifyInfo=()=>{{}};
 class Harness {{
+{refused}
 {redo}
   constructor() {{
     this.activeSceneId="scene";this.activeScene={{scene_id:"scene",items:["stale"]}};

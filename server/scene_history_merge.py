@@ -60,7 +60,7 @@ class SceneMergeConflict(Exception):
         self.conflicts = copy.deepcopy(conflicts)
         paths = ", ".join(str(item.get("path") or "scene") for item in conflicts[:3])
         suffix = "" if len(conflicts) <= 3 else f" and {len(conflicts) - 3} more"
-        reload = (" Its lanes cannot be told apart: reload the editor."
+        reload = (" Its lanes cannot be told apart until the editor is reloaded."
                   if any(item.get("code") == "lane_identity_missing" for item in conflicts)
                   else "")
         super().__init__(f"Scene changed elsewhere at {paths}{suffix}.{reload}")

@@ -607,7 +607,7 @@ def test_lanes_that_cannot_be_told_apart_refuse_the_step(family, side):
         scenes = {"base": base, "target": target, "stored": stored}
         scenes[side] = _without_ids(scenes[side], family)
         base, target, stored = scenes["base"], scenes["target"], scenes["stored"]
-    with pytest.raises(SceneMergeConflict, match="reload the editor") as exc:
+    with pytest.raises(SceneMergeConflict, match="until the editor is reloaded") as exc:
         merge_scene_history(base, target, stored)
     assert exc.value.conflicts[0]["path"] == f"{family}_lane_family"
 
