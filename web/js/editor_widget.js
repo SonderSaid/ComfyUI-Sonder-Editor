@@ -5987,35 +5987,40 @@ export class EditorWidget {
             locked: value?.locked === true,
             hidden: value?.hidden === true,
         });
+        // A Reference lane is named by its recipe, a media lane by its config.
+        const laneIdAt = (scene, spec, index) => {
+            const owners = scene?.[spec.recipes || spec.configs];
+            return String((Array.isArray(owners) ? owners[index] : null)?.lane_id || "");
+        };
         const laneAnchor = (scene, laneType, laneIndex) => {
             const spec = laneSpecs[laneType];
             const index = Number(laneIndex);
             if (!spec || !Number.isInteger(index) || index < 0
                     || index >= laneCount(scene, laneType)) return null;
-            const recipe = spec.recipes && Array.isArray(scene?.[spec.recipes])
-                ? scene[spec.recipes][index] : null;
-            const recipeId = String(recipe?.lane_id || "");
             const config = Array.isArray(scene?.[spec.configs])
                 ? (scene[spec.configs][index] || {}) : {};
             return {
-                recipeId,
+                laneId: laneIdAt(scene, spec, index),
                 config: stableConfigString(normalizedLaneConfig(config)),
             };
         };
         // Membership is lane content, not lane identity. In particular a queued
         // Undo may move an item out of the destination selected by a later drag;
-        // following that item would silently redirect the drag. Reference lanes
-        // have durable recipe lane ids. Other variable lanes have only their
-        // normalized config, which is accepted only when it is unique.
+        // following that item would silently redirect the drag. A lane is the one
+        // with its id, and a media lane without one is never matched by its
+        // settings: a take's lane has the same default settings as a lane history
+        // just removed. A Reference lane painted before its recipe has an id may
+        // still match one unique config, because nothing outside history adds
+        // Reference lanes and the server compares the id it stores.
         const findLaneByAnchor = (scene, laneType, anchor) => {
-            if (!anchor) return -1;
+            if (!anchor || (!anchor.laneId && !laneSpecs[laneType]?.recipes)) return -1;
             const total = laneCount(scene, laneType);
             const candidates = [];
             for (let index = 0; index < total; index += 1) {
                 candidates.push(laneAnchor(scene, laneType, index));
             }
-            const matches = anchor.recipeId
-                ? (candidate) => candidate?.recipeId === anchor.recipeId
+            const matches = anchor.laneId
+                ? (candidate) => candidate?.laneId === anchor.laneId
                 : (candidate) => candidate?.config === anchor.config;
             const found = [];
             for (let index = 0; index < total; index += 1) {
@@ -6023,21 +6028,19 @@ export class EditorWidget {
             }
             return found.length === 1 ? found[0] : -1;
         };
-        // Whether history reordered this lane family rather than only resizing it.
-        // Compares durable lane ids position by position; a family without them
-        // reports false, which preserves the equal-count shortcut exactly as it
-        // behaved before lane move existed.
+        // Whether the same numbers now name other lanes: one moved, or history removed
+        // a lane and a take brought another. Compares lane ids position by position. A
+        // blank authored media lane facing a stored one counts as changed; a blank
+        // Reference lane is one painted before its recipe has an id.
         const laneOrderChanged = (laneType, count) => {
             const spec = laneSpecs[laneType];
-            if (!spec?.recipes || !authoredScene) return false;
-            const idsOf = (scene) => {
-                const list = Array.isArray(scene?.[spec.recipes]) ? scene[spec.recipes] : [];
-                return list.slice(0, count).map((value) => String(value?.lane_id || ""));
-            };
-            const authoredIds = idsOf(authoredScene);
-            const orderedIds = idsOf(orderedScene);
-            if (authoredIds.length !== orderedIds.length) return true;
-            return authoredIds.some((laneId, index) => laneId && laneId !== orderedIds[index]);
+            if (!spec || !authoredScene) return false;
+            for (let index = 0; index < count; index += 1) {
+                const authored = laneIdAt(authoredScene, spec, index);
+                const ordered = laneIdAt(orderedScene, spec, index);
+                if (authored !== ordered && (authored || !spec.recipes)) return true;
+            }
+            return false;
         };
         const rebaseLaneIndex = (laneType, laneIndex) => {
             const index = Number(laneIndex);
@@ -6048,17 +6051,11 @@ export class EditorWidget {
             // New lanes are append-only. Preserve their offset from the authored
             // tail when an earlier history action restored or removed lanes.
             if (index >= authoredCount) return orderedCount + (index - authoredCount);
-            // With equal counts every numeric slot USED to be stable, because
-            // lane topology only ever changed through add/remove. Move Lane
-            // Up/Down broke that premise for movable families: a swap leaves the
-            // count identical while every index means a different lane.
-            // `update_lane_config` keeps its authored expected.lane_id through
-            // this rebase as a check on the resolved target; `remove_lane` and
-            // item lane_index fields still have no lane identity guard, so a
-            // pass-through index could delete or rewrite the OTHER lane. Fall through to the anchor whenever the authored
-            // and ordered lane-id sequences actually disagree; when they agree —
-            // every case that existed before — the shortcut still applies, so no
-            // scene lacking durable ids starts refusing.
+            // An equal count does not mean equal lanes: a swap keeps it, and so does
+            // a lane history removed plus a take's lane the author had not seen. Item
+            // lane_index fields still have no lane identity guard, so a number passed
+            // through could rewrite the OTHER lane. Follow the lane's id whenever the
+            // authored and ordered sequences disagree.
             if (authoredCount === orderedCount
                     && !laneOrderChanged(laneType, authoredCount)) {
                 return index;
@@ -6338,10 +6335,10 @@ export class EditorWidget {
                     // removal, turning a retarget that just succeeded into a 409.
                     //
                     // `config` and `lane_id` are deliberately NOT restated. They
-                    // are the authored evidence of which lane was meant, and
-                    // `findLaneByAnchor` resolved the new index BY that config —
-                    // so re-snapshotting them would make the guard compare the
-                    // rebase's own answer against itself and it could never fire.
+                    // are the authored evidence of which lane was meant, so
+                    // re-snapshotting them from the lane the rebase found would
+                    // make the guard compare the rebase's own answer against
+                    // itself and it could never fire.
                     // That is the same reason `move_lane` keeps its authored
                     // lane ids through a rebase.
                     if (operation.expected
@@ -7430,12 +7427,34 @@ export class EditorWidget {
         }
     }
 
-    _applyLocalSetLaneCount(laneType, count) {
+    /** Ids for the media lanes a `set_lane_count` to `count` would add, for the operation
+     *  (`lane_ids`) and its paint (`_applyLocalSetLaneCount`) to share: the lane then has
+     *  the id the project will store before the write lands, so the next gesture on it
+     *  can name it. None for a Reference lane, whose recipe id the server mints. Lanes
+     *  adopted from configs kept past the count already have theirs. */
+    _newLaneIds(laneType, count) {
+        const descriptor = descriptorFor(laneType);
+        if (!descriptor?.variable || descriptor.recipeAttr) return [];
+        const configs = this.activeScene?.[descriptor.configsField];
+        const missing = Math.max(0, (parseInt(count, 10) || 1)
+            - (Array.isArray(configs) ? configs.length : 0));
+        return Array.from({ length: missing }, () =>
+            globalThis.crypto?.randomUUID?.().replaceAll("-", "")
+            || `lane${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`);
+    }
+
+    _applyLocalSetLaneCount(laneType, count, laneIds = []) {
         if (!this.activeScene) return;
         count = Math.max(1, parseInt(count, 10) || 1);
         const descriptor = descriptorFor(laneType);
         if (!descriptor?.variable) return;
         this.activeScene[descriptor.countField] = count;
+        if (laneIds.length) {
+            const configs = Array.isArray(this.activeScene[descriptor.configsField])
+                ? this.activeScene[descriptor.configsField] : [];
+            for (const laneId of laneIds) configs.push(this._defaultLaneConfig({ lane_id: laneId }));
+            this.activeScene[descriptor.configsField] = configs;
+        }
         this.activeScene[descriptor.configsField] = this._trimLocalLaneConfigs(
             this.activeScene[descriptor.configsField] || [], -1, count,
         );
@@ -7497,19 +7516,15 @@ export class EditorWidget {
      * because the first version of this guard shipped with only the weaker one
      * and an audit disproved it with a working counterexample:
      *
-     *   - `config`, the lane's normalized settings. This is the identity
-     *     `durable_rules.md` already names for families with no durable id, and
-     *     `findLaneByAnchor` below already resolves by it during a rebase. It is
-     *     what catches a permutation that leaves the lane COUNT unchanged — a
-     *     remove plus an add restores the count while shifting every index above
-     *     the removal.
+     *   - `config`, the lane's normalized settings: what is left to catch a
+     *     permutation that keeps the COUNT when no id is known.
      *   - `lane_count`, compared server-side as a FLOOR rather than for
      *     equality. `set_lane_count` appends and `remove_lane` deletes in place,
      *     so a family that only grew cannot have moved this caller's lane;
      *     demanding equality would refuse a concurrent append in which nothing
      *     moved at all.
-     *   - `lane_id` for `reference`, the only movable family, which settles the
-     *     case identical configs cannot. A blank id is the bootstrap case
+     *   - `lane_id`, the lane's durable id, which settles the case identical
+     *     configs cannot. A blank Reference id is the bootstrap case
      *     `_apply_lane_config` tolerates, and `move_lane` refuses to swap a
      *     blank-id lane, so such a lane cannot be reordered behind this caller.
      *
@@ -7539,8 +7554,9 @@ export class EditorWidget {
             },
         };
         const recipes = descriptor?.recipeAttr ? scene?.[descriptor.recipeAttr] : null;
-        const laneId = Array.isArray(recipes)
-            ? String(recipes[laneIndex]?.lane_id || "") : "";
+        const laneId = descriptor?.recipeAttr
+            ? String((Array.isArray(recipes) ? recipes : [])[laneIndex]?.lane_id || "")
+            : String(config?.lane_id || "");
         if (laneId) guard.lane_id = laneId;
         return guard;
     }
@@ -14825,16 +14841,20 @@ export class EditorWidget {
         const laneCountOperations = [];
         const videoCountField = descriptorFor(TRACK_TYPE.VIDEO).countField;
         const audioCountField = descriptorFor(TRACK_TYPE.AUDIO).countField;
+        const newLaneIds = {
+            video: this._newLaneIds("video", laneCountFields[videoCountField] || 0),
+            audio: this._newLaneIds("audio", laneCountFields[audioCountField] || 0),
+        };
         if (Object.hasOwn(laneCountFields, videoCountField)) {
             laneCountOperations.push({
                 type: "set_lane_count", lane_type: "video",
-                count: laneCountFields[videoCountField],
+                count: laneCountFields[videoCountField], lane_ids: newLaneIds.video,
             });
         }
         if (Object.hasOwn(laneCountFields, audioCountField)) {
             laneCountOperations.push({
                 type: "set_lane_count", lane_type: "audio",
-                count: laneCountFields[audioCountField],
+                count: laneCountFields[audioCountField], lane_ids: newLaneIds.audio,
             });
         }
 
@@ -14845,7 +14865,8 @@ export class EditorWidget {
             for (const trackType of [TRACK_TYPE.VIDEO, TRACK_TYPE.AUDIO]) {
                 const countField = descriptorFor(trackType).countField;
                 if (laneCountFields[countField]) {
-                    this.activeScene[countField] = laneCountFields[countField];
+                    this._applyLocalSetLaneCount(trackType, laneCountFields[countField],
+                        newLaneIds[variableLaneTypeFor(trackType)]);
                 }
             }
             this._buildTrackLayout();
@@ -14996,6 +15017,9 @@ export class EditorWidget {
                 if (clipResult?.take_restoration?.removed_audio_lane === true
                         && this.activeScene[audioCountField] === targetAudioLane + 1) {
                     this.activeScene[audioCountField] = targetAudioLane;
+                    // With the id it was painted with: the next lane added must not
+                    // adopt one the server has not got.
+                    (this.activeScene.audio_lane_configs || []).splice(targetAudioLane);
                     this._buildTrackLayout();
                 }
                 this._renderSceneAfterLocalMutation();
@@ -15112,8 +15136,22 @@ export class EditorWidget {
         return now.fps === baseline.fps
             && now.video_lane_count === baseline.video_lane_count
             && now.audio_lane_count === baseline.audio_lane_count
-            && JSON.stringify(now.video_lane_configs) === JSON.stringify(baseline.video_lane_configs)
-            && JSON.stringify(now.audio_lane_configs) === JSON.stringify(baseline.audio_lane_configs);
+            && this._sameLanes(now.video_lane_configs, baseline.video_lane_configs, now.video_lane_count)
+            && this._sameLanes(now.audio_lane_configs, baseline.audio_lane_configs, now.audio_lane_count);
+    }
+
+    /** Whether two reads of one family's configs name the same lanes: the settings, and
+     *  the ids where both reads have one. */
+    _sameLanes(left, right, count) {
+        for (let index = 0; index < count; index += 1) {
+            const [a, b] = [left?.[index] || {}, right?.[index] || {}];
+            if (String(a.name || "") !== String(b.name || "")
+                || String(a.color || "") !== String(b.color || "")
+                || (a.locked === true) !== (b.locked === true)
+                || (a.hidden === true) !== (b.hidden === true)
+                || (a.lane_id && b.lane_id && a.lane_id !== b.lane_id)) return false;
+        }
+        return true;
     }
 
     /** Resolve a dropped take before anything is painted.
@@ -15273,7 +15311,8 @@ export class EditorWidget {
         }
 
         this._pushUndo("convert clip role");
-        this._applyLocalSetLaneCount(laneType, nextCount);
+        const laneIds = this._newLaneIds(laneType, nextCount);
+        this._applyLocalSetLaneCount(laneType, nextCount, laneIds);
         Object.assign(clip, body);
         // `oldState` was captured before THIS gesture's local apply, so it is the
         // pre-burst clip only for the head of a coalesced group. A later sibling
@@ -15283,7 +15322,7 @@ export class EditorWidget {
         try {
             await this._runSceneMutation(
                 [
-                    { type: "set_lane_count", lane_type: laneType, count: nextCount },
+                    { type: "set_lane_count", lane_type: laneType, count: nextCount, lane_ids: laneIds },
                     { type: "update_clip", clip_id: clipId, fields: body },
                 ],
                 {
@@ -15338,15 +15377,17 @@ export class EditorWidget {
             const laneType = variableLaneTypeFor(trackType);
             const newCount = laneCountFor(this.activeScene, trackType) + 1;
             const newLane = newCount - 1;
-            operations.push({ type: "set_lane_count", lane_type: laneType, count: newCount });
+            const laneIds = this._newLaneIds(laneType, newCount);
+            operations.push({ type: "set_lane_count", lane_type: laneType, count: newCount, lane_ids: laneIds });
             operations.push({ type: "update_clip", clip_id: hit.id, fields: { track_index: newLane } });
-            localApply = { laneType, newCount, field: "track_index", newLane };
+            localApply = { laneType, newCount, laneIds, field: "track_index", newLane };
         } else if (hit.type === "audio") {
             const newCount = laneCountFor(this.activeScene, TRACK_TYPE.AUDIO) + 1;
             const newLane = newCount - 1;
-            operations.push({ type: "set_lane_count", lane_type: "audio", count: newCount });
+            const laneIds = this._newLaneIds("audio", newCount);
+            operations.push({ type: "set_lane_count", lane_type: "audio", count: newCount, lane_ids: laneIds });
             operations.push({ type: "update_audio_track", track_id: hit.id, fields: { lane_index: newLane } });
-            localApply = { laneType: "audio", newCount, field: "lane_index", newLane };
+            localApply = { laneType: "audio", newCount, laneIds, field: "lane_index", newLane };
         }
         if (!operations.length) return;
         // Before the paint: the route refuses moving an item off a locked lane.
@@ -15361,7 +15402,7 @@ export class EditorWidget {
         // lane field is the only thing left, and it is a single assignment, so
         // it stays inline rather than earning a named helper.
         const row = this._findSceneItemBySelection(hit.type, hit.id)?.data || hit.data;
-        this._applyLocalSetLaneCount(localApply.laneType, localApply.newCount);
+        this._applyLocalSetLaneCount(localApply.laneType, localApply.newCount, localApply.laneIds);
         if (row) row[localApply.field] = localApply.newLane;
         this._renderSceneAfterLocalMutation();
 
@@ -16187,11 +16228,12 @@ export class EditorWidget {
         const nextCount = laneCountFor(this.activeScene, trackType) + 1;
         const undoLabel = "add lane";
         this._pushUndo(undoLabel);
-        this._applyLocalSetLaneCount(laneType, nextCount);
+        const laneIds = this._newLaneIds(laneType, nextCount);
+        this._applyLocalSetLaneCount(laneType, nextCount, laneIds);
         this._renderSceneAfterLocalMutation({ viewport: false });
         try {
             await this._runSceneMutation(
-                [{ type: "set_lane_count", lane_type: laneType, count: nextCount }],
+                [{ type: "set_lane_count", lane_type: laneType, count: nextCount, lane_ids: laneIds }],
                 {
                     key: `scene:${this.activeSceneId}:${laneType}-lane-count`,
                     label: "add lane",

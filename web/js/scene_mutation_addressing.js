@@ -345,22 +345,17 @@ export const SCENE_MUTATION_ADDRESSING = freeze({
     remove_lane: freeze({ addressing: POSITIONAL,
         evidence: "Guarded, and deliberately NOT promoted by that guard. "
             + "`_validate_lane_removal_identity` requires `expected` and compares "
-            + "the lane's normalized `config` plus a `lane_count` FLOOR, plus "
-            + "`lane_id` for `reference`. The identity `durable_rules.md` names for "
-            + "a family with no durable id is *one unique exact normalized-config "
-            + "match*, and this guard does not check uniqueness — it compares the "
-            + "config sitting AT the index. On a fresh project every lane's config "
-            + "is the default, so the anchor distinguishes nothing, and a retry "
-            + "fires only when the document HAS moved, which is exactly when it "
-            + "cannot. Counterexample: three default video lanes, this caller "
-            + "removes lane 1 while another writer removes lane 0 and appends one — "
-            + "floor 3 >= 3 passes, default config equals default config, and the "
-            + "replay deletes the lane that inherited the index along with the "
+            + "the lane's normalized `config` plus a `lane_count` FLOOR, plus the "
+            + "lane's `lane_id`. For a media lane the id is compared only when "
+            + "sent, because a page older than lane ids sends none, and without it "
+            + "default lanes cannot be told apart: three default video lanes, this "
+            + "caller removes lane 1 while another writer removes lane 0 and appends "
+            + "one — floor 3 >= 3 passes, default config equals default config, and "
+            + "a replay deletes the lane that inherited the index along with the "
             + "clip on it. Refusing costs one lane delete during a render; "
-            + "replaying costs work the user cannot see. The guard is still worth "
-            + "having against the FIRST attempt, where the caller did read the "
-            + "document it names. Promote this only when the guard resolves by a "
-            + "unique match, or when the write carries a version precondition." }),
+            + "replaying costs work the user cannot see. With the id a replay would "
+            + "be refused rather than wrong, so nothing is gained by one: the index "
+            + "is never re-resolved." }),
     move_lane: freeze({ addressing: POSITIONAL,
         promotedBy: freeze([guard("expected", {
             identifying: ["from_lane_id", "to_lane_id"],
@@ -413,7 +408,8 @@ export const SCENE_MUTATION_ADDRESSING = freeze({
             + "(`count: nextCount`, `count: laneIndex + 1`). "
             + "`_set_scene_lane_count` pops configs and recipes down to it, so "
             + "replaying against a document another writer grew deletes the lane it "
-            + "added. Nothing in the request names which lanes the caller meant." }),
+            + "added. `lane_ids` names the lanes being ADDED, never the ones the "
+            + "caller believes exist." }),
     update_lane_configs: freeze({ addressing: COLLECTION,
         evidence: "`_apply_lane_configs`, the legacy positional whole-array "
             + "replacement, compares nothing. No client emits it; the entry exists so "

@@ -465,6 +465,9 @@ def save_project(
         if bump_modified_at:
             project.modified_at = _next_modified_at(
                 current_data.get("modified_at", "") if isinstance(current_data, dict) else "")
+        # Every lane a writer created (a take, an export, a batch) is saved with an id.
+        for scene in project.scenes:
+            scene.identify_new_lanes()
         data = project.to_dict(include_internal=True)
         # Bare writers also re-read the root: a model loaded before migration
         # must never roll its frozen descriptors back to an inline layout.

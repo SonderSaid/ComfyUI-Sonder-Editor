@@ -4256,10 +4256,9 @@ def test_remove_lane_catches_a_permutation_that_leaves_the_count_unchanged(
 
     A remove plus an add restores the lane count while shifting every index
     above the removal, so a count-equality guard accepted a stale removal and
-    destroyed a clip on a lane the caller never named. The config anchor --
-    the identity `durable_rules.md` names for families with no durable id, and
-    the one `findLaneByAnchor` already resolves by on the client -- is what
-    catches it.
+    destroyed a clip on a lane the caller never named. For a page older than
+    lane ids, which sends none, the config is what catches it here; lanes with
+    the same settings need the id (`test_lane_identity.py`).
     """
     route_module = _load_route_module(monkeypatch)
     scene = Scene(scene_id="scene-1", name="Scene")

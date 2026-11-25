@@ -371,7 +371,9 @@ class _Server:
         monkeypatch.setattr(self.routes, "save_project", lambda project, **kwargs: None)
 
     def reload(self):
+        """Save and load: a lane created since has its id from then on."""
         scene = self.project.scenes[0]
+        scene.identify_new_lanes()
         self.project.scenes[0] = Scene.from_dict(_wire(scene.to_dict()))
 
     @property

@@ -8,7 +8,7 @@ import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 
 _MISSING = object()
@@ -60,7 +60,10 @@ class SceneMergeConflict(Exception):
         self.conflicts = copy.deepcopy(conflicts)
         paths = ", ".join(str(item.get("path") or "scene") for item in conflicts[:3])
         suffix = "" if len(conflicts) <= 3 else f" and {len(conflicts) - 3} more"
-        super().__init__(f"Scene changed elsewhere at {paths}{suffix}.")
+        reload = (" Its lanes cannot be told apart: reload the editor."
+                  if any(item.get("code") == "lane_identity_missing" for item in conflicts)
+                  else "")
+        super().__init__(f"Scene changed elsewhere at {paths}{suffix}.{reload}")
 
 
 def _same(left: Any, right: Any) -> bool:
@@ -72,6 +75,8 @@ def _same(left: Any, right: Any) -> bool:
 def _describe(value: Any) -> Any:
     if value is _MISSING:
         return {"absent": True}
+    if isinstance(value, LaneRef):
+        return {"lane": value.lane_id} if value.lane_id is not None else {"past_lanes": value.past}
     if isinstance(value, dict):
         return {key: _describe(item) for key, item in value.items()}
     if isinstance(value, list):
@@ -119,64 +124,6 @@ def _merge_value(result: dict, key: str, base: dict, target: dict, stored: dict,
     _conflict(conflicts, path or key, base_value, target_value, stored_value)
 
 
-def _bundle(document: dict, keys: tuple[str, ...]) -> dict:
-    return {key: document.get(key, _MISSING) for key in keys}
-
-
-def _same_bundle(left: dict, right: dict) -> bool:
-    return all(_same(left[key], right[key]) for key in left)
-
-
-def _append_tolerant_bundle(keys: tuple[str, ...], base_value: dict,
-                            target_value: dict, stored_value: dict) -> dict | None:
-    """The lane family to write when lanes were only APPENDED since ``base``.
-
-    Take placement (timeline export's Place as take, generated takes) raises a
-    lane count and pads the index-parallel lists at the end, outside history.
-    Compared as one value, that made every earlier lane step's Undo and Redo
-    refuse and stay on top. When the step keeps the lane count and stored is
-    exactly ``base`` plus lanes at the end, no existing lane moved, so the step
-    is written over the existing lanes and the appended ones are kept. Any
-    other shape returns None and still refuses: a step that adds or removes a
-    lane, and a concurrent removal, move or edit of an existing lane.
-
-    Retire with the per-lane history merge the roadmap owns.
-    """
-    count_key, *list_keys = keys
-    counts = [value[count_key] for value in (base_value, target_value, stored_value)]
-    if any(isinstance(count, bool) or not isinstance(count, int) for count in counts):
-        return None
-    base_count, target_count, stored_count = counts
-    if base_count != target_count or stored_count <= base_count:
-        return None
-    lists = []
-    for key in list_keys:
-        base_list, target_list, stored_list = (
-            base_value[key], target_value[key], stored_value[key])
-        if base_list is _MISSING and target_list is _MISSING and stored_list is _MISSING:
-            continue
-        if not all(isinstance(value, list) for value in (base_list, target_list, stored_list)):
-            return None
-        if len(target_list) != len(base_list) or len(stored_list) < len(base_list):
-            return None
-        lists.append((key, base_list, target_list, stored_list))
-    # The existing lanes read as `base` (the step still to apply) or, on a
-    # retry whose first attempt committed, already as `target` -- a no-op, as
-    # the plain merge treats stored == target. A mix of the two is a conflict.
-    if all(_same(stored_list[:len(base_list)], base_list)
-           for _, base_list, _, stored_list in lists):
-        merged = {count_key: stored_count}
-        for key in list_keys:
-            merged[key] = stored_value[key]
-        for key, base_list, target_list, stored_list in lists:
-            merged[key] = [*target_list, *stored_list[len(base_list):]]
-        return merged
-    if all(_same(stored_list[:len(target_list)], target_list)
-           for _, _, target_list, stored_list in lists):
-        return dict(stored_value)
-    return None
-
-
 # Each lane family's members: (count field, collection, id, lane index, clip role).
 _LANE_MEMBERS = (
     ("video_lane_count", "clips", "clip_id", "track_index", "render"),
@@ -184,60 +131,270 @@ _LANE_MEMBERS = (
     ("audio_lane_count", "audio_tracks", "track_id", "lane_index", None),
     ("reference_lane_count", "reference_items", "reference_item_id", "lane_index", None),
 )
+_LANE_COLLECTIONS = {
+    collection: (id_field, index_field, {
+        row_role: row_count for row_count, row_collection, _, _, row_role in _LANE_MEMBERS
+        if row_collection == collection})
+    for _, collection, id_field, index_field, _ in _LANE_MEMBERS
+}
 
 
-def _family_member_lanes(scene: dict, count_key: str) -> dict:
-    for count_field, collection, id_field, index_field, role in _LANE_MEMBERS:
-        if count_field == count_key:
-            members = scene.get(collection)
-            return {
-                str(member.get(id_field) or ""): member.get(index_field, 0)
-                for member in (members if isinstance(members, list) else [])
-                if isinstance(member, dict)
-                and (role is None or str(member.get("role") or "render") == role)}
-    return {}
+def _lane_families() -> dict:
+    """(conflict path, fields) of each lane family by its count field."""
+    return {keys[0]: (path, keys) for path, keys in MERGED_WRITE_FIELDS["bundle"]}
 
 
-def _lanes_are_identified(keys: tuple[str, ...], family: dict) -> bool:
-    """Whether the family's lanes carry durable ids (Reference recipes do)."""
-    recipes = family.get("reference_lane_recipes", _MISSING)
-    if not isinstance(recipes, list) or len(recipes) != family[keys[0]]:
-        return False
-    ids = [str(recipe.get("lane_id") or "") if isinstance(recipe, dict) else ""
-           for recipe in recipes]
-    return all(ids) and len(set(ids)) == len(ids)
+class LaneRef(NamedTuple):
+    """Where a timeline item stands, while a step is merged: on the lane with this id,
+    or this far past its family's last lane (an item tolerated on a missing lane)."""
+    family: str
+    lane_id: str | None
+    past: int = 0
+
+    def __deepcopy__(self, memo):
+        return self
 
 
-def _merge_bundle(result: dict, keys: tuple[str, ...], base: dict, target: dict,
-                  stored: dict, conflicts: list[dict], path: str) -> None:
-    base_value = _bundle(base, keys)
-    target_value = _bundle(target, keys)
-    if all(value is _MISSING for value in base_value.values()) and all(
-            value is _MISSING for value in target_value.values()):
+class _Lanes:
+    """One side's lane family, or an unidentified one (``ids`` is None)."""
+
+    def __init__(self, document: dict, keys: tuple[str, ...]):
+        count_key, configs_key, *recipe_keys = keys
+        self.values = {key: document.get(key, _MISSING) for key in keys}
+        self.ids, self.index, self.configs, self.recipes = None, {}, {}, {}
+        self.count = document.get(count_key, _MISSING)
+        configs = document.get(configs_key)
+        recipes = document.get(recipe_keys[0]) if recipe_keys else None
+        if (isinstance(self.count, bool) or not isinstance(self.count, int) or self.count < 0
+                or not isinstance(configs, list) or len(configs) < self.count
+                or (recipe_keys and (not isinstance(recipes, list) or len(recipes) < self.count))):
+            return
+        owners = recipes if recipe_keys else configs
+        ids = [str(row.get("lane_id") or "") if isinstance(row, dict) else ""
+               for row in owners[:self.count]]
+        if (not all(ids) or len(set(ids)) != len(ids)
+                or not all(isinstance(row, dict) for row in configs[:self.count])):
+            return
+        self.ids = ids
+        self.index = {lane_id: index for index, lane_id in enumerate(ids)}
+        self.configs = dict(zip(ids, configs))
+        self.recipes = dict(zip(ids, recipes)) if recipe_keys else {}
+        self.spare_configs = configs[self.count:]
+        self.spare_recipes = recipes[self.count:] if recipe_keys else []
+
+    def lane(self, lane_id):
+        """Everything one lane holds, or ``_MISSING``."""
+        if lane_id not in self.index:
+            return _MISSING
+        return {"config": self.configs[lane_id], "recipe": self.recipes.get(lane_id)}
+
+    def without_config_ids(self) -> dict:
+        def plain(value):
+            return [{key: item for key, item in row.items() if key != "lane_id"}
+                    if isinstance(row, dict) else row for row in value]
+        return {key: plain(value) if key.endswith("_configs") and isinstance(value, list)
+                else value for key, value in self.values.items()}
+
+
+def lane_identities(document: dict, count_key: str) -> list[str] | None:
+    """The ids of one family's lanes in order, or None when they do not name them."""
+    return _Lanes(document, _lane_families()[count_key][1]).ids
+
+
+def _lane_family_of(collection: str, member: dict) -> str | None:
+    families = _LANE_COLLECTIONS[collection][2]
+    if None in families:
+        return families[None]
+    # An unknown role belongs to neither family, as the writers that shift lane
+    # indices treat it: its number is left alone.
+    return families.get(str(member.get("role") or "render"))
+
+
+def _with_lane_refs(document: dict, families: dict[str, _Lanes]) -> dict:
+    """``document`` with the items of ``families`` naming lanes instead of numbers.
+
+    Only the rows that change are copied, and only one level: the rest is shared."""
+    result = dict(document)
+    for collection, (_, index_field, _) in _LANE_COLLECTIONS.items():
+        rows = document.get(collection)
+        if not isinstance(rows, list):
+            continue
+        named = []
+        for row in rows:
+            family = _lane_family_of(collection, row) if isinstance(row, dict) else None
+            lanes = families.get(family)
+            index = row.get(index_field) if lanes is not None else None
+            if isinstance(index, int) and not isinstance(index, bool) and index >= 0:
+                ref = (LaneRef(family, lanes.ids[index]) if index < lanes.count
+                       else LaneRef(family, None, index - lanes.count))
+                row = {**row, index_field: ref}
+            named.append(row)
+        result[collection] = named
+    return result
+
+
+def _keep_unmoved_past_items(base: dict, target: dict, base_raw: dict, target_raw: dict) -> None:
+    """An item past the last lane on both sides, at one number, was not moved: only the
+    lane count under it changed."""
+    for collection, (id_field, index_field, _) in _LANE_COLLECTIONS.items():
+        def rows(document):
+            members = document.get(collection)
+            return {str(row.get(id_field) or ""): (position, row) for position, row in enumerate(members)
+                    if isinstance(row, dict)} if isinstance(members, list) else {}
+        base_rows, raw_rows = rows(base), rows(base_raw)
+        target_raw_rows = rows(target_raw)
+        for member_id, (position, row) in rows(target).items():
+            if member_id not in base_rows:
+                continue
+            before, after = base_rows[member_id][1].get(index_field), row.get(index_field)
+            if (isinstance(before, LaneRef) and isinstance(after, LaneRef)
+                    and before.lane_id is None and after.lane_id is None
+                    and before.family == after.family
+                    and raw_rows[member_id][1].get(index_field)
+                    == target_raw_rows[member_id][1].get(index_field)):
+                target[collection][position] = {**row, index_field: before}
+
+
+def _merge_lane_order(base: _Lanes, target: _Lanes, stored: _Lanes, kept: list[str],
+                      conflicts: list[dict], path: str) -> list[str]:
+    """Stored's order of ``kept`` lanes, with the step's own reorder of them applied."""
+    common = [lane_id for lane_id in kept if lane_id in base.index and lane_id in target.index]
+    before = sorted(common, key=base.index.get)
+    after = sorted(common, key=target.index.get)
+    if before == after or common == after:
+        return kept
+    if common != before:
+        _conflict(conflicts, f"{path}.order", before, after, common)
+        return kept
+    moved = iter(after)
+    places = set(common)
+    return [next(moved) if lane_id in places else lane_id for lane_id in kept]
+
+
+def _place_returning_lanes(order: list[str], target: _Lanes) -> list[str]:
+    """Put each lane only target has beside the neighbour it had there."""
+    order = list(order)
+    present = set(order)
+    for index, lane_id in enumerate(target.ids):
+        if lane_id in present:
+            continue
+        before = next((value for value in reversed(target.ids[:index]) if value in present), None)
+        after = next((value for value in target.ids[index + 1:] if value in present), None)
+        if before is not None:
+            at = order.index(before) + 1
+        else:
+            at = order.index(after) if after is not None else len(order)
+        order.insert(at, lane_id)
+        present.add(lane_id)
+    return order
+
+
+def _merge_lane_family(result: dict, keys: tuple[str, ...], base: _Lanes, target: _Lanes,
+                       stored: _Lanes, conflicts: list[dict], path: str) -> list[str]:
+    """Apply the step to stored's lanes one by one; returns the merged order of ids."""
+    if base.values == target.values:
+        return stored.ids
+    lanes = {lane_id: copy.deepcopy(stored.lane(lane_id)) for lane_id in stored.ids}
+    for lane_id in [*base.ids, *(value for value in target.ids if value not in base.index)]:
+        lane_path = f"{path}[{lane_id}]"
+        before, after, now = base.lane(lane_id), target.lane(lane_id), stored.lane(lane_id)
+        if _same(before, after) or _same(now, after):
+            continue
+        if before is _MISSING or after is _MISSING or now is _MISSING:
+            if not _same(now, before):
+                _conflict(conflicts, lane_path, before, after, now)
+            elif after is _MISSING:
+                lanes.pop(lane_id, None)
+            else:
+                lanes[lane_id] = copy.deepcopy(after)
+            continue
+        lanes[lane_id]["config"] = _merge_dict_fields(
+            before["config"], after["config"], now["config"], conflicts, lane_path)
+        _merge_value(lanes[lane_id], "recipe", before, after, now, conflicts,
+                     f"{lane_path}.recipe")
+
+    kept = [lane_id for lane_id in stored.ids if lane_id in lanes]
+    order = _merge_lane_order(base, target, stored, kept, conflicts, path)
+    order = [lane_id for lane_id in _place_returning_lanes(order, target)
+             if lane_id in lanes]
+    if not order:
+        _conflict(conflicts, path, "at least one lane", "at least one lane", "no lanes")
+        return order
+
+    count_key, configs_key, *recipe_keys = keys
+    result[count_key] = len(order)
+    columns = [(configs_key, "config", "spare_configs")]
+    if recipe_keys:
+        columns.append((recipe_keys[0], "recipe", "spare_recipes"))
+    spares = []
+    for _, _, spare_name in columns:
+        before, after, spare = (getattr(side, spare_name) for side in (base, target, stored))
+        # Settings kept past the last lane are no lane yet. A clash keeps stored's.
+        spares.append(after if before != after and spare == before else spare)
+    # One a lane has since taken over is not kept beside it: its id, in the list that
+    # holds this family's ids, is one of the lanes'.
+    adopted = {index for index, row in enumerate(spares[-1]) if isinstance(row, dict)
+               and str(row.get("lane_id") or "") in lanes}
+    for (key, part, _), spare in zip(columns, spares):
+        result[key] = [lanes[lane_id][part] for lane_id in order] + copy.deepcopy(
+            [row for index, row in enumerate(spare) if index not in adopted])
+    return order
+
+
+def _merge_unidentified_family(base: _Lanes, target: _Lanes, stored: _Lanes,
+                               conflicts: list[dict], path: str) -> None:
+    """A side whose lanes have no ids: a page older than the server, or damaged data.
+
+    Values cannot tell two default lanes apart, so a step that changes the family is
+    refused, unless stored already reads as its result and no lane came or went.
+    """
+    before, after, now = (side.without_config_ids() for side in (base, target, stored))
+    if before == after or (now == after and _same(base.count, target.count)):
         return
-    stored_value = _bundle(stored, keys)
-    if _same_bundle(target_value, base_value):
-        return
-    # A step that changes the lane count and what stands on its lanes cannot trust a
-    # match by value: with default configs, a lane it removed and a take's lane appended
-    # since look the same, and the step's clip would land on the take's lane. A retry
-    # of a restore that committed is refused too, where its receipt is no longer known.
-    # Retire with the per-lane history merge the roadmap owns.
-    if _same_bundle(stored_value, target_value) and (
-            _same(base_value[keys[0]], target_value[keys[0]])
-            or _lanes_are_identified(keys, stored_value)
-            or _family_member_lanes(base, keys[0]) == _family_member_lanes(target, keys[0])):
-        return
-    if _same_bundle(stored_value, base_value):
-        for key in keys:
-            _apply_value(result, key, target_value[key])
-        return
-    appended = _append_tolerant_bundle(keys, base_value, target_value, stored_value)
-    if appended is not None:
-        for key in keys:
-            _apply_value(result, key, appended[key])
-        return
-    _conflict(conflicts, path, base_value, target_value, stored_value)
+    _conflict(conflicts, path, base.values, target.values, stored.values)
+    conflicts[-1]["code"] = "lane_identity_missing"
+
+
+def _lane_refs_to_numbers(result: dict, target: dict, stored: dict, merged: dict[str, list[str]],
+                          sides: dict[str, tuple], conflicts: list[dict]) -> None:
+    """Give every item its lane's number again, refusing one whose lane is gone."""
+    reference = "reference_lane_count"
+    final_recipes = (_Lanes(result, _lane_families()[reference][1]).recipes
+                     if reference in sides else {})
+    for collection, (id_field, index_field, _) in _LANE_COLLECTIONS.items():
+        rows = result.get(collection)
+        if not isinstance(rows, list):
+            continue
+        before, after = ({str(row.get(id_field) or ""): row.get(index_field)
+                          for row in (side.get(collection) or []) if isinstance(row, dict)}
+                         if isinstance(side.get(collection), list) else {}
+                         for side in (stored, target))
+        for row in rows:
+            ref = row.get(index_field) if isinstance(row, dict) else None
+            if not isinstance(ref, LaneRef):
+                continue
+            member_id = str(row.get(id_field) or "")
+            path = f"{collection}[{member_id}].{index_field}"
+            order = merged[ref.family]
+            if ref.lane_id is None:
+                row[index_field] = len(order) + ref.past
+            elif ref.lane_id in order:
+                row[index_field] = order.index(ref.lane_id)
+            else:
+                _conflict(conflicts, path, after.get(member_id, _MISSING),
+                          after.get(member_id, _MISSING), before.get(member_id, _MISSING))
+                continue
+            if collection != "reference_items" or ref.lane_id is None:
+                continue
+            # A lane's media kind may change only while the lane is empty, so an item
+            # stands on a kind it was placed for: the step's, or the stored one.
+            _, target_lanes, stored_lanes = sides[ref.family]
+            kind = final_recipes.get(ref.lane_id, {}).get("media_kind")
+            placed = [lanes.recipes[ref.lane_id].get("media_kind")
+                      for lanes, refs in ((target_lanes, after), (stored_lanes, before))
+                      if ref.lane_id in lanes.recipes and refs.get(member_id) == ref]
+            if placed and kind not in placed:
+                _conflict(conflicts, f"{path}.media_kind", placed[0], placed[0], kind)
 
 
 def _index_members(raw: Any, key: str, path: str,
@@ -413,68 +570,6 @@ def _validate_duration_sentinels(base: dict, target: dict, stored: dict,
                       stored_member)
 
 
-def _validate_lane_shrink_members(result: dict, base: dict, target: dict,
-                                  stored: dict, conflicts: list[dict]) -> None:
-    """Refuse a history-owned shrink that would strand concurrent members."""
-    for count_field, collection, id_field, index_field, role in _LANE_MEMBERS:
-        try:
-            base_count = int(base.get(count_field))
-            target_count = int(target.get(count_field))
-            stored_count = int(stored.get(count_field))
-            result_count = int(result.get(count_field))
-        except (TypeError, ValueError):
-            continue
-        # Only guard the shrink this merge is applying. Existing over-cap data
-        # remains tolerated when the operation does not own a lane reduction.
-        if (base_count <= target_count or stored_count != base_count
-                or result_count != target_count):
-            continue
-
-        base_items = {
-            str(member.get(id_field) or ""): member
-            for member in base.get(collection, [])
-            if isinstance(member, dict) and member.get(id_field)
-        }
-        target_items = {
-            str(member.get(id_field) or ""): member
-            for member in target.get(collection, [])
-            if isinstance(member, dict) and member.get(id_field)
-        }
-        stored_items = {
-            str(member.get(id_field) or ""): member
-            for member in stored.get(collection, [])
-            if isinstance(member, dict) and member.get(id_field)
-        }
-        for member in result.get(collection, []):
-            if not isinstance(member, dict):
-                continue
-            member_role = str(member.get("role") or "render")
-            if role is not None and member_role != role:
-                continue
-            member_id = str(member.get(id_field) or "")
-            try:
-                lane_index = int(member.get(index_field, 0))
-            except (TypeError, ValueError):
-                continue
-            if not member_id or lane_index < target_count:
-                continue
-            target_member = target_items.get(member_id)
-            try:
-                target_index = int(target_member.get(index_field, 0)) \
-                    if target_member is not None else -1
-            except (TypeError, ValueError):
-                target_index = -1
-            if target_member is not None and target_index >= target_count:
-                continue
-            _conflict(
-                conflicts,
-                f"{collection}[{member_id}].{index_field}",
-                base_items.get(member_id, _MISSING),
-                target_member if target_member is not None else _MISSING,
-                stored_items.get(member_id, member),
-            )
-
-
 def _restore_removed_document_mirrors(result: dict, target: dict, stored: dict) -> None:
     """The text mirror of a prompt document the merge removed becomes the target's.
 
@@ -599,8 +694,22 @@ def merge_scene_history(base: dict, target: dict, stored: dict) -> dict:
     if not all(isinstance(value, dict) for value in (base, target, stored)):
         raise TypeError("Scene history merge inputs must be objects")
 
-    result = copy.deepcopy(stored)
     conflicts: list[dict] = []
+    # A lane number means a different lane on each side once lanes come, go or move,
+    # so items are merged by lane id and numbered again afterwards.
+    families, sides = _lane_families(), {}
+    for count_key, (path, keys) in families.items():
+        family = tuple(_Lanes(document, keys) for document in (base, target, stored))
+        if all(lanes.ids is not None for lanes in family):
+            sides[count_key] = family
+        else:
+            _merge_unidentified_family(*family, conflicts, path)
+    raw_base, raw_target = base, target
+    base, target, stored = (
+        _with_lane_refs(document, {key: family[side] for key, family in sides.items()})
+        for side, document in enumerate((base, target, stored)))
+    _keep_unmoved_past_items(base, target, raw_base, raw_target)
+    result = copy.deepcopy(stored)
 
     for field in MERGED_WRITE_FIELDS["scalar"]:
         _merge_value(result, field, base, target, stored, conflicts)
@@ -627,10 +736,11 @@ def merge_scene_history(base: dict, target: dict, stored: dict) -> dict:
                           mapping_fields=mapping_fields)
     _restore_removed_document_mirrors(result, target, stored)
 
-    for path, keys in MERGED_WRITE_FIELDS["bundle"]:
-        _merge_bundle(result, keys, base, target, stored, conflicts, path)
-
-    _validate_lane_shrink_members(result, base, target, stored, conflicts)
+    merged_lanes = {
+        count_key: _merge_lane_family(result, families[count_key][1], *family,
+                                      conflicts, families[count_key][0])
+        for count_key, family in sides.items()}
+    _lane_refs_to_numbers(result, target, stored, merged_lanes, sides, conflicts)
     _validate_duration_sentinels(base, target, stored, conflicts)
     if conflicts:
         raise SceneMergeConflict(conflicts)

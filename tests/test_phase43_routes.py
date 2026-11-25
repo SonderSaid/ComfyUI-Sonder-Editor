@@ -1635,7 +1635,7 @@ def test_scene_restore_rejects_invalid_merged_scene(case, tmp_path, monkeypatch)
 
     assert response.status == 409
     assert payload["code"] == (
-        "scene_merge_conflict" if case == "lane" else "scene_merge_invalid")
+        "scene_merge_conflict" if case in ("lane", "empty_lane") else "scene_merge_invalid")
     assert saves == []
 
 
@@ -2038,7 +2038,12 @@ def test_duplicate_scene_route_deep_copies_scene_and_regenerates_child_ids(tmp_p
         "fps",
         "saved_selections",
     ]:
-        assert payload[key] == source.to_dict()[key]
+        # The source here was built, not loaded, so its lanes have no ids to copy.
+        copied = payload[key]
+        if key.endswith("_lane_configs"):
+            copied = [{name: value for name, value in row.items() if name != "lane_id"}
+                      for row in copied]
+        assert copied == source.to_dict()[key]
     assert payload["clips"][0]["source_path"] == source.clips[0].source_path
     assert payload["clips"][0]["role"] == source.clips[0].role
     assert payload["audio_tracks"][0]["source_path"] == source.audio_tracks[0].source_path

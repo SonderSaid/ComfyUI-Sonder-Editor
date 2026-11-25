@@ -38,11 +38,16 @@ def _run(cases):
     if not node:
         pytest.skip("node is required for browser module tests")
     widget = (ROOT / "web/js/editor_widget.js").read_text(encoding="utf-8")
-    methods = _method(widget, "_handleAssetDropWithinGesture", "_firstAvailableLane")
+    methods = "\n".join([
+        _method(widget, "_handleAssetDropWithinGesture", "_firstAvailableLane"),
+        _method(widget, "_newLaneIds", "_applyLocalMoveLane"),
+        _method(widget, "_trimLocalLaneConfigs", "_compactEmptyMediaLaneLocal"),
+        _method(widget, "_defaultLaneConfig", "_defaultReferenceLaneRecipe"),
+    ])
     lanes = (ROOT / "web/js/lane_registry.js").as_uri()
     restoration = (ROOT / "web/js/take_restoration.js").as_uri()
     script = f"""
-const {{TRACK_TYPE, descriptorFor, laneCountFor, laneAcceptsAssetType}} = await import({json.dumps(lanes)});
+const {{TRACK_TYPE, descriptorFor, laneCountFor, laneAcceptsAssetType, variableLaneTypeFor}} = await import({json.dumps(lanes)});
 const {{restoreTakeGeometry, takeAudioCovers, takeRestorationSource, TAKE_RESTORATION_REASONS}} =
   await import({json.dumps(restoration)});
 const notices = [];
@@ -111,7 +116,7 @@ for (const c of cases) {{
     ...(c.payloadProvenance ? {{_provenance: {{revision: "rev", params: c.params}}}} : {{}})}};
   await h._handleAssetDropWithinGesture(asset, c.cursor ?? 100, c.rawY ?? 0, "seq", null);
   out.push({{sent: h.sent, painted: h.painted, notices: [...notices], detailCalls, refreshes: h.refreshes,
-    audioLanes: h.activeScene.audio_lane_count}});
+    audioLanes: h.activeScene.audio_lane_count, audioConfigs: h.activeScene.audio_lane_configs}});
 }}
 console.log(JSON.stringify(out));
 """
@@ -228,7 +233,11 @@ def test_the_audio_lane_the_server_removed_leaves_the_painted_timeline_too():
         {"params": TAKE, "payloadProvenance": True, "warnings": [warning], "removedLane": True},
     ])
     assert kept["audioLanes"] == 2  # the ruler drop added a lane the server kept
-    assert removed["audioLanes"] == 1
+    [count] = [op for op in kept["sent"][0]["operations"]
+               if op["type"] == "set_lane_count" and op["lane_type"] == "audio"]
+    assert kept["audioConfigs"][1]["lane_id"] == count["lane_ids"][0]
+    # With its painted id: the next lane added must not adopt one the server has not got.
+    assert removed["audioLanes"] == 1 and removed["audioConfigs"] == [{"name": "A"}]
 
 
 def test_the_setting_defaults_on_and_keeps_a_stored_off():

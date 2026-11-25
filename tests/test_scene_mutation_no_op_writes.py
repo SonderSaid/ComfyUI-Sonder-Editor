@@ -224,8 +224,14 @@ def test_a_legacy_short_lane_array_is_not_rewritten_at_rest(project_fixture):
     project = load_project(project_fixture.project_dir)
     scene = project.scenes[0]
     scene.video_lane_count = 3
-    scene.video_lane_configs = [LaneConfig()]
     save_project(project, notify=False)
+    # A save gives every lane a config and an id, so the older shape is written by hand.
+    path = project_fixture.project_file
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+    document["scenes"][0]["video_lane_configs"] = [LaneConfig().to_dict()]
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle)
     assert len(project_fixture.stored()["scenes"][0]["video_lane_configs"]) == 1
     before = _version_and_mtime(project_fixture)
 

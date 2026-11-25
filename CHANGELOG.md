@@ -24,7 +24,8 @@ a fresh `[Unreleased]` block.
   - A take that landed around the edit, or another server's change, is no longer removed along with it. Redo no longer hides such a take until it finishes.
   - Undo of the first text in a prompt channel removes the text, and Redo brings it back. Before, the text stayed and Redo was refused. The same goes for a Writing **Apply** that creates Subjects.
   - A Reference item or member you deleted from the Library is not brought back by an older step; a notice says what was left out.
-  - Undo of a lane removal is refused when a take has landed on that lane since, instead of putting your clip on the take's lane.
+  - A lane you added, removed or moved can be undone and redone after a take lands: your lane and its clips come back where they were, and the take keeps its own lane. Before, the step was refused and blocked the ones before it, or put your clip on the take's lane. It is still refused while something else is on the lane it would remove.
+- A lane edit made right after Undo is no longer dropped, and a lane removal can no longer reach a take's lane, when a take the editor had not shown yet landed meanwhile.
 - Undo and Redo show the *Waiting* notice only when they are still not on the timeline after a moment, instead of on every press. One that is applying but not yet drawn says *Undoing* or *Redoing*.
 - A queue run that fails keeps its own error when the job could not be marked failed.
 

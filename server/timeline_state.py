@@ -8,7 +8,9 @@ import os
 from typing import Any
 
 from . import prompt_context, prompt_live_context, prompt_payload, prompt_tokens
-from .lane_registry import VARIABLE_LANE_DESCRIPTORS, pad_lane_configs, pad_lane_recipes
+from .lane_registry import (
+    VARIABLE_LANE_DESCRIPTORS, assign_loaded_lane_ids, mint_lane_ids, pad_lane_configs,
+    pad_lane_recipes)
 from .reference_resolution import REFERENCE_OUTPUT_NAMES
 
 logger = logging.getLogger("sonder_editor")
@@ -243,16 +245,11 @@ def _preserve_scene_unknown_fields(raw: Any, canonical: dict) -> dict:
     result["global_attachments"] = _overlay_unknown_attachments(
         raw_scene.get("global_attachments"), canonical.get("global_attachments", []))
 
-    # These records have no durable id; their list position is their identity.
-    for field_name in (
-        "video_lane_configs",
-        "motion_driver_lane_configs",
-        "audio_lane_configs",
-        "reference_lane_configs",
-        "saved_selections",
-    ):
-        result[field_name] = _overlay_unknown_positional_records(
-            raw_scene.get(field_name), canonical.get(field_name, []))
+    # These records have no durable id; their list position is their identity. Lane
+    # configs are not here: each carries its own unknown fields (`LaneConfig.extra`),
+    # so removing or moving a lane cannot hand them to its neighbour.
+    result["saved_selections"] = _overlay_unknown_positional_records(
+        raw_scene.get("saved_selections"), canonical.get("saved_selections", []))
 
     for field_name in (
         "batch_config",
@@ -1671,25 +1668,76 @@ class BatchConfig:
 
 @dataclass
 class LaneConfig:
-    """Per-lane display/behavior settings."""
+    """Per-lane display/behavior settings, and a media lane's identity.
+
+    `lane_id` names one video, Driver or audio lane for as long as it exists. Blank
+    means the lane was created since the scene was loaded: loading gives every lane
+    an id (`assign_loaded_lane_ids`), and a save gives one to every lane still blank
+    (`Scene.identify_new_lanes`). A Reference lane's identity is its recipe's `lane_id`, and a
+    fixed track has none, so on those a stored `lane_id` is unknown data.
+
+    0.9.3 and older keep the ids by list position, so such a server removing a lane
+    shifts them. That only matters while it and a newer server edit one project at
+    once: an id has to hold for as long as an editor's Undo stack, which is in memory.
+    """
     name: str = ""          # Custom name (empty = use default "V0", "A1" etc.)
     color: str = ""         # Hex color (empty = use palette default)
     locked: bool = False    # Prevent edits
     hidden: bool = False    # Hidden from viewport (video) / muted (audio)
+    lane_id: str = ""
+    # Stored fields this version does not know. They live on the lane, so they move
+    # and go with it.
+    extra: dict = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "color": self.color, "locked": self.locked, "hidden": self.hidden}
+        result = copy.deepcopy(self.extra)
+        result.update(name=self.name, color=self.color, locked=self.locked, hidden=self.hidden)
+        if self.lane_id:
+            result["lane_id"] = self.lane_id
+        return result
 
     @classmethod
-    def from_dict(cls, data: dict) -> "LaneConfig":
+    def from_dict(cls, data: dict, *, identified: bool = False) -> "LaneConfig":
+        """`identified` reads `lane_id` as this lane's identity (a media lane)."""
         if not isinstance(data, dict):
             data = {}
+        modeled = {"name", "color", "locked", "hidden"}
+        lane_id = ""
+        if identified:
+            modeled.add("lane_id")
+            lane_id = str(data.get("lane_id") or "").strip()
         return cls(
             name=data.get("name", ""),
             color=data.get("color", ""),
             locked=data.get("locked", False),
             hidden=data.get("hidden", False),
+            lane_id=lane_id,
+            extra={key: copy.deepcopy(value) for key, value in data.items()
+                   if key not in modeled},
         )
+
+
+    def take_settings(self, other: "LaneConfig") -> "LaneConfig":
+        """The four settings of another config, keeping this lane's identity and
+        unknown fields: a request names settings, never a lane or a stored field."""
+        self.name, self.color = other.name, other.color
+        self.locked, self.hidden = other.locked, other.hidden
+        return self
+
+
+def replace_lane_configs(scene, descriptor, raw_configs) -> None:
+    """Replace one lane family's settings from a whole array, by position.
+
+    A lane the array covers keeps its identity and unknown fields, whatever the array
+    says; a lane past a shorter array is left alone.
+    """
+    configs = getattr(scene, descriptor.configs_attr)
+    for index, raw in enumerate(raw_configs if isinstance(raw_configs, list) else []):
+        incoming = LaneConfig.from_dict(raw)
+        if index < len(configs):
+            configs[index].take_settings(incoming)
+        else:
+            configs.append(LaneConfig().take_settings(incoming))
 
 
 # ---------------------------------------------------------------------------
@@ -1871,6 +1919,13 @@ class Scene:
         self.global_attachments = prompt_context.normalize_attachments(
             self.global_attachments)
         self._refresh_global_mirror()
+
+    def identify_new_lanes(self) -> None:
+        """Give every lane created since this scene was loaded its id, before it is saved
+        or answered: a lane named only by its position can be taken for another."""
+        pad_lane_configs(self, LaneConfig)
+        pad_lane_recipes(self, ReferenceLaneRecipe)
+        mint_lane_ids(self)
 
     def _refresh_global_mirror(self) -> None:
         """Recompute the label-free `prompt` mirror from `global_channels`."""
@@ -2201,7 +2256,7 @@ class Scene:
                 scene,
                 descriptor.configs_attr,
                 [
-                    LaneConfig.from_dict(config)
+                    LaneConfig.from_dict(config, identified=not descriptor.recipe_attr)
                     for config in data.get(descriptor.configs_attr, [])
                 ],
             )
@@ -2211,20 +2266,27 @@ class Scene:
         ]
         pad_lane_configs(scene, LaneConfig)
         pad_lane_recipes(scene, ReferenceLaneRecipe)
+        # Retain until no saved scene can hold a media lane without an id.
+        assign_loaded_lane_ids(scene, lambda identity, seen: _deterministic_reference_id(
+            scene.scene_id, identity, seen))
         # Loading a recipe-less default scene must give a GET and the following
         # mutation the same identity, even before any write has persisted it.
-        # Keep every authored id; only absent ids use this deterministic seed.
+        # Keep every authored id; only an absent or repeated one uses this
+        # deterministic seed. Two lanes with one id cannot be told apart, and
+        # every step that changes the family would be refused.
         # Retain until no saved scene can lack a lane recipe/id. This is an
         # in-memory load repair, never a rewrite at rest.
         raw_recipes = data.get("reference_lane_recipes", [])
         seen_lane_ids = {str(recipe.get("lane_id") or "") for recipe in raw_recipes
                          if isinstance(recipe, dict) and recipe.get("lane_id")}
+        taken_lane_ids = set()
         for index, recipe in enumerate(scene.reference_lane_recipes):
             raw_recipe = raw_recipes[index] if index < len(raw_recipes) else {}
-            if not str(raw_recipe.get("lane_id") or ""):
+            if not str(raw_recipe.get("lane_id") or "") or recipe.lane_id in taken_lane_ids:
                 recipe.lane_id = _deterministic_reference_id(
                     scene.scene_id, f"reference-lane/{index}", seen_lane_ids)
                 seen_lane_ids.add(recipe.lane_id)
+            taken_lane_ids.add(recipe.lane_id)
         # No setup-binding repair: Reference lane membership is derived from
         # each recipe's declared model input, so there is nothing stale to
         # rebind.  A Base setup record is loaded and preserved as authored.

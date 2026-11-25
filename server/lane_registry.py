@@ -5,6 +5,7 @@ timeline data model so routes, render/export code, and nodes can consume the
 same persisted-field contract without creating an import cycle.
 """
 
+import uuid
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Callable
@@ -202,6 +203,39 @@ def pad_lane_configs(scene, factory: Callable[[], object]) -> None:
         configs = getattr(scene, descriptor.configs_attr)
         count = getattr(scene, descriptor.count_attr)
         pad_config_list(configs, count, factory)
+
+
+def identified_lane_descriptors() -> tuple[LaneDescriptor, ...]:
+    """The families whose lanes are named by `LaneConfig.lane_id` (the rest, by recipe)."""
+    return tuple(descriptor for descriptor in VARIABLE_LANE_DESCRIPTORS
+                 if not descriptor.recipe_attr)
+
+
+def assign_loaded_lane_ids(scene, identify: Callable[[str, set], str]) -> None:
+    """Give each media lane of a loaded scene that has no id, or a repeated one, the
+    same id on every load, in memory only. Only for a lane that came from storage: a
+    lane created since is new, and an id derived from its position could be one a
+    removed lane had (`mint_lane_ids`).
+    """
+    for descriptor in identified_lane_descriptors():
+        configs = getattr(scene, descriptor.configs_attr)
+        stored = {config.lane_id for config in configs if config.lane_id}
+        taken = set()
+        for index, config in enumerate(configs):
+            if not config.lane_id or config.lane_id in taken:
+                config.lane_id = identify(
+                    f"{descriptor.lane_type}-lane/{index}", stored | taken)
+            taken.add(config.lane_id)
+
+
+def mint_lane_ids(scene) -> None:
+    """Give every media lane created since the scene was loaded its own new id."""
+    for descriptor in identified_lane_descriptors():
+        taken = set()
+        for config in getattr(scene, descriptor.configs_attr):
+            if not config.lane_id or config.lane_id in taken:
+                config.lane_id = uuid.uuid4().hex
+            taken.add(config.lane_id)
 
 
 def pad_lane_recipes(scene, factory: Callable[[], object]) -> None:

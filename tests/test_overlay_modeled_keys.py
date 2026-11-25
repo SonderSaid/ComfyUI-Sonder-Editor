@@ -471,8 +471,11 @@ _CENSUS = [
      [GuideFrame.from_dict, GuideFrame.to_dict], ()),
     ("batch config", lambda raw: _member(BatchConfig, raw), {},
      [BatchConfig.from_dict, BatchConfig.to_dict], ()),
+    # A lane config carries every stored key it does not model (`LaneConfig.extra`), so
+    # each probed key is emitted. No overlay can restore a cleared one: lane lists have
+    # none, and on a fixed track a stored `lane_id` is unknown data.
     ("lane config", lambda raw: _member(LaneConfig, raw), {},
-     [LaneConfig.from_dict, LaneConfig.to_dict], ()),
+     [LaneConfig.from_dict, LaneConfig.to_dict], ("LaneConfig", "lane_id")),
     ("prompt section", lambda raw: _member(PromptSection, raw),
      {"prompt_id": "p", "start_frame": 0, "end_frame": 10},
      [PromptSection.from_dict, PromptSection.to_dict], ()),

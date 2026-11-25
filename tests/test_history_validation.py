@@ -26,8 +26,16 @@ def restore_case(monkeypatch, tmp_path, base, target, stored):
     return response.status, _response_json(response), project
 
 
+def test_a_family_without_lanes_is_invalid(monkeypatch):
+    """The merge refuses to empty a family itself; this is what stored damage meets."""
+    module = _load_route_module(monkeypatch)
+    with pytest.raises(module.ProjectMutationRequestError) as exc:
+        module._validate_scene_history_merge(Scene(video_lane_count=0))
+    assert exc.value.code == "lane_family_empty"
+
+
 @pytest.mark.parametrize("case,code", [
-    ("empty_lane", "lane_family_empty"), ("prompt", "prompt_overlap"),
+    ("prompt", "prompt_overlap"),
     ("guide", "guide_frame_duplicate"),
 ])
 def test_history_refusal_discloses_invariant_and_participants(case, code, tmp_path, monkeypatch):
@@ -69,6 +77,10 @@ def test_ordinary_linked_prompt_validation_still_refuses_duration_overflow(monke
 def test_declared_write_contract_drives_executor(monkeypatch, category, field, before, after):
     base = {field: before}
     target = {field: after}
+    if category == "bundle":
+        for scene in (base, target):
+            scene["video_lane_configs"] = [
+                {"lane_id": f"v{index}"} for index in range(scene[field])]
     assert field in history_merge.scene_history_write_fields()
     assert history_merge.merge_scene_history(base, target, base)[field] == after
     # Removing a rule must remove its write, not only its advertised capability.
@@ -112,13 +124,14 @@ def test_scene_restore_of_a_lane_lock_keeps_a_take_lane_appended_since(tmp_path,
     from server.lane_registry import ensure_lane_index
     from server.timeline_state import ClipReference, LaneConfig
 
-    base_scene = Scene(scene_id="scene-1", duration_frames=24, video_lane_count=2,
-                       video_lane_configs=[LaneConfig(locked=True), LaneConfig()])
-    base = base_scene.to_dict()
+    base = Scene.from_dict(Scene(
+        scene_id="scene-1", duration_frames=24, video_lane_count=2,
+        video_lane_configs=[LaneConfig(locked=True), LaneConfig()]).to_dict()).to_dict()
     target = copy.deepcopy(base)
     target["video_lane_configs"][0]["locked"] = False
     stored_scene = Scene.from_dict(copy.deepcopy(base))
     ensure_lane_index(stored_scene, "video", 2, LaneConfig)
+    stored_scene.identify_new_lanes()
     stored_scene.clips.append(ClipReference(
         clip_id="take", timeline_start_frame=0, timeline_end_frame=8, track_index=2))
 

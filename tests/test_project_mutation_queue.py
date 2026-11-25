@@ -1323,14 +1323,13 @@ def test_a_rebased_lane_removal_keeps_its_guard_true():
         {rebase}
         }}
         const h = new Harness();
-        // Named configs on purpose: with a changed lane count `rebaseLaneIndex`
-        // falls through to the anchor, which refuses an ambiguous match. Blank
-        // configs would make every lane identical and throw before the guard is
-        // reached -- a real refusal, but not what this test is about.
+        // Identified lanes on purpose: with a changed lane count `rebaseLaneIndex`
+        // follows the lane's id, and a lane without one is refused before the
+        // guard is reached -- a real refusal, but not what this test is about.
         const scene = (video) => ({{
             scene_id: 'scene', video_lane_count: video, audio_lane_count: 1,
             video_lane_configs: Array.from({{ length: video }},
-                (_value, index) => ({{ name: `v${{index}}` }})),
+                (_value, index) => ({{ lane_id: `v${{index}}` }})),
             clips: [], audio_tracks: [], prompt_sections: [], guide_frames: [],
             reference_items: [],
         }});
@@ -2570,6 +2569,11 @@ def test_a_clip_role_burst_behind_a_queued_undo_keeps_every_authored_lane():
         releaseUndo();
         await Promise.all([undo, ...pending]);
         assert.equal(sent.length, 1, 'the four conversions are one write');
+        const counts = sent[0].filter((op) => op.type === 'set_lane_count');
+        assert.deepEqual(counts.map((op) => [op.lane_type, op.count, op.lane_ids.length]),
+            [['motion_driver', 1, 0], ['video', 3, 1], ['motion_driver', 1, 0], ['video', 4, 1]],
+            'a rebased count keeps the id of the lane it adds');
+        assert.equal(new Set(counts.flatMap((op) => op.lane_ids)).size, 2);
         assert.equal(server.video_lane_count, 4,
             'the lane the Undo restored plus both lanes the burst appended');
         assert.equal(server.clips[0].role, 'render');

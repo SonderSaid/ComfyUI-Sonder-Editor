@@ -100,6 +100,7 @@ from .scene_history_merge import (
     SceneRestoreReceiptStore,
     drop_missing_reference_members,
     has_durable_scene_restore_receipt,
+    lane_identities,
     merge_scene_history,
     remember_durable_scene_restore_receipt,
 )
@@ -135,7 +136,7 @@ from .session_registry import (
 )
 from .timeline_state import (
     TimelineProject, Asset, Scene, GuideFrame, PromptSection, AudioTrack,
-    ClipReference, LaneConfig, GenerationJob, ReferenceEntity, ReferenceMember,
+    ClipReference, LaneConfig, replace_lane_configs, GenerationJob, ReferenceEntity, ReferenceMember,
     ReferenceItem, ReferenceLaneRecipe,
     REFERENCE_CLASSES, REFERENCE_KINDS, REFERENCE_TAG_NAMESPACE,
     REFERENCE_TAG_FAMILIES, REFERENCE_TAG_PRESETS,
@@ -1097,15 +1098,32 @@ def _scene_lane_count(scene: Scene, lane_type: str) -> int:
     return max(1, int(getattr(scene, descriptor.count_attr) or 1))
 
 
-def _set_scene_lane_count(scene: Scene, lane_type: str, count: int) -> None:
+_LANE_ID_PATTERN = re.compile(r"[0-9A-Za-z_-]{8,64}")
+
+
+def _usable_new_lane_ids(descriptor, offered) -> list[str]:
+    """The ids an editor offered for media lanes it is adding, where they can be used.
+
+    Naming the lanes lets the editor's own paint, and the next gesture on a lane it has
+    just added, address the lane the project will store. A malformed one becomes blank;
+    a blank or repeated one is minted with the rest (`identify_new_lanes`).
+    """
+    if descriptor.recipe_attr or not isinstance(offered, list):
+        return []
+    return [value if isinstance(value, str) and _LANE_ID_PATTERN.fullmatch(value) else ""
+            for value in offered]
+
+
+def _set_scene_lane_count(scene: Scene, lane_type: str, count: int, lane_ids=None) -> None:
     count = max(1, int(count))
     descriptor = variable_descriptor(lane_type)
     if descriptor is None:
         _mutation_error(f"Unknown lane type: {lane_type}", 400)
     setattr(scene, descriptor.count_attr, count)
     configs = getattr(scene, descriptor.configs_attr)
+    offered = iter(_usable_new_lane_ids(descriptor, lane_ids))
     while len(configs) < count:
-        configs.append(LaneConfig())
+        configs.append(LaneConfig(lane_id=next(offered, "")))
     while len(configs) > count:
         configs.pop()
     if descriptor.recipe_attr:
@@ -2701,9 +2719,9 @@ def _apply_lane_configs(scene: Scene, fields: dict) -> None:
         attr = descriptor.configs_attr if descriptor.variable else descriptor.fixed_config_attr
         if attr and attr in fields:
             if descriptor.variable:
-                setattr(scene, attr, [LaneConfig.from_dict(config) for config in fields[attr]])
+                replace_lane_configs(scene, descriptor, fields[attr])
             else:
-                setattr(scene, attr, LaneConfig.from_dict(fields[attr]))
+                getattr(scene, attr).take_settings(LaneConfig.from_dict(fields[attr]))
         if descriptor.variable and descriptor.recipe_attr and descriptor.recipe_attr in fields:
             _replace_reference_lane_recipes(
                 scene, fields[descriptor.recipe_attr])
@@ -2711,9 +2729,10 @@ def _apply_lane_configs(scene: Scene, fields: dict) -> None:
 
 
 def _replace_reference_lane_recipes(scene: Scene, raw_recipes) -> None:
-    """Replace aligned recipes without losing or orphaning lane identity."""
+    """Replace aligned recipes without losing, orphaning or repeating lane identity."""
     previous = list(scene.reference_lane_recipes)
     incoming = []
+    taken = set()
     for index, raw_recipe in enumerate(
             raw_recipes if isinstance(raw_recipes, list) else []):
         raw_value = dict(raw_recipe) if isinstance(raw_recipe, dict) else {}
@@ -2721,7 +2740,11 @@ def _replace_reference_lane_recipes(scene: Scene, raw_recipes) -> None:
             if index < len(previous) else ""
         if not str(raw_value.get("lane_id") or "") and old_lane_id:
             raw_value["lane_id"] = old_lane_id
-        incoming.append(ReferenceLaneRecipe.from_dict(raw_value))
+        recipe = ReferenceLaneRecipe.from_dict(raw_value)
+        if recipe.lane_id in taken:
+            recipe.lane_id = ReferenceLaneRecipe().lane_id
+        taken.add(recipe.lane_id)
+        incoming.append(recipe)
     scene.reference_lane_recipes = incoming
 
 
@@ -3134,7 +3157,7 @@ def _scene_history_content_violations(scene):
                                              (scene.reference_items, "reference", "reference_item_id")):
         for item in collection:
             lane_type, lane = _media_item_lane(item)
-            # Backstop for the residue not covered by _validate_lane_shrink_members.
+            # Backstop for the residue `merge_scene_history` does not refuse itself.
             if lane < 0 or lane >= _scene_lane_count(scene, lane_type):
                 yield _history_violation(f"{item_type}_lane_missing", "Timeline item is on a missing lane",
                                          item_type, getattr(item, id_field), None, lane_type, lane,
@@ -3155,11 +3178,30 @@ def _scene_history_content_violations(scene):
     yield from _prompt_target_overlap_violations(scene, targets)
 
 
-def _history_violation_identity(violation):
+def _history_lane_ids(scene) -> dict:
+    """Lane ids by lane type for a `Scene` or a scene dict, None where lanes have none."""
+    document = scene if isinstance(scene, dict) else {
+        key: value for descriptor in VARIABLE_LANE_DESCRIPTORS
+        for key, value in (
+            (descriptor.count_attr, getattr(scene, descriptor.count_attr)),
+            (descriptor.configs_attr, [row.to_dict() for row in getattr(scene, descriptor.configs_attr)]),
+            (descriptor.recipe_attr, [row.to_dict() for row in getattr(scene, descriptor.recipe_attr)]
+             if descriptor.recipe_attr else None)) if key}
+    return {descriptor.lane_type: lane_identities(document, descriptor.count_attr)
+            for descriptor in VARIABLE_LANE_DESCRIPTORS}
+
+
+def _history_violation_identity(violation, lane_ids=None):
+    """What makes two violations the same one. With `lane_ids` the lane is named by id
+    (or by how far past the last lane it is), because a merge renumbers lanes."""
     details = violation["details"]
+    lane = details["lane_index"]
+    ids = (lane_ids or {}).get(details["lane_type"])
+    if ids is not None and isinstance(lane, int) and lane >= 0:
+        lane = ids[lane] if lane < len(ids) else ("past", lane - len(ids))
     return (violation["code"], frozenset(value for value in
             (details["item_id"], details["other_item_id"]) if value is not None),
-            details["lane_type"], details["lane_index"])
+            details["lane_type"], lane)
 
 
 _HISTORY_PARTICIPANT_TYPES = {
@@ -3170,8 +3212,11 @@ _HISTORY_PARTICIPANT_TYPES = {
 }
 
 
-def _history_violation_in_source(violation, raw, indexes):
-    """Re-evaluate only participating members, without rebuilding/mutating Scene."""
+def _history_violation_in_source(violation, raw, indexes, merged_lane_ids=None):
+    """Re-evaluate only participating members, without rebuilding/mutating Scene.
+
+    Each side's lanes are read in its own numbering; by number where either side's
+    lanes have no ids."""
     if not isinstance(raw, dict):
         return False
     details = violation["details"]
@@ -3190,8 +3235,15 @@ def _history_violation_in_source(violation, raw, indexes):
         if any(member is None for member in members):
             return False
         setattr(source, collection, [member_type.from_dict(copy.deepcopy(member)) for member in members])
-    identity = _history_violation_identity(violation)
-    return any(_history_violation_identity(candidate) == identity
+    lane_type = details["lane_type"]
+    if "lane_ids" not in indexes:
+        indexes["lane_ids"] = _history_lane_ids(raw)
+    merged_ids = (merged_lane_ids or {}).get(lane_type)
+    raw_ids = indexes["lane_ids"].get(lane_type)
+    if merged_ids is None or raw_ids is None:
+        merged_ids = raw_ids = None
+    identity = _history_violation_identity(violation, {lane_type: merged_ids})
+    return any(_history_violation_identity(candidate, {lane_type: raw_ids}) == identity
                for candidate in _scene_history_content_violations(source))
 
 
@@ -3201,16 +3253,17 @@ def _validate_scene_history_merge(scene: Scene, target_scene=None, stored_scene=
     for violation in _scene_history_coherence_violations(scene):
         _raise_history_violation(violation)
     indexes = ({}, {})
+    merged_lane_ids = _history_lane_ids(scene)
     checked = set()
     for violation in _scene_history_content_violations(scene):
         identity = _history_violation_identity(violation)
         if identity in checked:
             continue
         checked.add(identity)
-        # Identity is participants + lane, not geometry. An already overlapping
+        # Identity is participants + lane id, not geometry. An already overlapping
         # pair may overlap differently after restore. Expiry: revisit only once
         # editing prevents overlaps AND a migration clears existing conflicts.
-        if any(_history_violation_in_source(violation, raw, cache)
+        if any(_history_violation_in_source(violation, raw, cache, merged_lane_ids)
                for raw, cache in zip((target_scene, stored_scene), indexes)):
             continue
         _raise_history_violation(violation)
@@ -3371,12 +3424,11 @@ LANE_INDEX_FROM_SERVER_STATE = object()
 
 
 def _normalized_lane_config(config) -> dict:
-    """A lane config reduced to the four fields that identify it.
+    """A lane config reduced to its four settings.
 
-    Mirrors `normalizedLaneConfig` in `editor_widget.js`, which
-    `findLaneByAnchor` already uses to resolve a non-reference lane during a
-    history rebase. Same four fields, same coercions, so the two sides cannot
-    disagree about whether a lane is the one the caller saw.
+    Mirrors `normalizedLaneConfig` in `editor_widget.js`. Same four fields, same
+    coercions, so the two sides cannot disagree about whether a lane still has the
+    settings the caller saw. Which lane it is, is its `lane_id`.
     """
     getter = (config.get if isinstance(config, dict)
               else lambda key, default=None: getattr(config, key, default))
@@ -3393,15 +3445,11 @@ def _validate_lane_removal_identity(scene: Scene, descriptor, lane_index: int,
     """Refuse a removal whose lane index no longer names the lane it named.
 
     A lane index is positional and `remove_lane` deletes, so a stale index does
-    not misfire quietly -- it destroys the wrong lane and everything on it. Two
-    pieces of evidence, because neither alone is enough and the first draft of
-    this guard shipped with only the weaker one:
+    not misfire quietly -- it destroys the wrong lane and everything on it. Three
+    pieces of evidence; the first two are all a page older than lane ids sends:
 
-      * **The lane's normalized config**, which is the identity
-        `durable_rules.md` and `architecture.md` already name for families
-        without a durable id -- "one unique exact normalized-config match" -- and
-        which `findLaneByAnchor` already resolves by on the client. This is what
-        catches a permutation that leaves the count unchanged.
+      * **The lane's normalized config**, which catches a permutation that leaves
+        the count unchanged when the lanes have different settings.
       * **A lane-count floor.** A family that only GREW cannot have moved this
         caller's lane: `_set_scene_lane_count` appends and `remove_lane` deletes
         in place, so no existing index shifts when lanes are added. A family that
@@ -3409,24 +3457,16 @@ def _validate_lane_removal_identity(scene: Scene, descriptor, lane_index: int,
         compared as `current < wanted`, never for equality -- equality would
         refuse a concurrent append in which nothing moved at all.
 
-      * `reference` additionally carries a durable `lane_id`. It is the only
-        `lane_movable` family, so it is the only one that can be permuted at
-        equal count *and* identical configs, and its id settles that outright.
-        Blank ids are tolerated exactly as `_apply_lane_config` tolerates them --
-        a lane minted earlier in this same batch has no id the caller could have
-        read -- and `_move_media_lane` refuses to swap a blank-id lane, so such a
-        lane cannot be reordered behind the caller's back.
-
-    **Known residual, stated rather than implied.** Two lanes of a non-reference
-    family with identical configs are indistinguishable to this guard: a removal
-    below them followed by an append restores the count and matches the config,
-    and the wrong lane is deleted. That is not closable from the request -- the
-    model holds no other lane identity. `_apply_scene_mutations_sync` now
-    commits against the version it loaded, which refuses a removal whose
-    document moved between that load and the commit; it does not close this,
-    because the lane the author meant is only pinned when the client's
-    `If-Match` is the version its document was read at. The bug tracker carries
-    the rest.
+      * **The lane's durable `lane_id`**, which settles what neither can: lanes with
+        identical configs. For `reference` (the one movable family) a stored id
+        must be named. For the media families the id is compared when the caller
+        sends one, because a page older than lane ids sends none; such a page
+        keeps only the two checks above. Make it mandatory when no editor that
+        predates `LaneConfig.lane_id` can still be open.
+        Blank Reference ids are tolerated exactly as `_apply_lane_config`
+        tolerates them -- a lane minted earlier in this same batch has no id the
+        caller could have read -- and `_move_media_lane` refuses to swap a
+        blank-id lane, so such a lane cannot be reordered behind the caller's back.
 
     Deliberately NOT guarded on the items the lane holds. Membership is lane
     content, not lane identity (`durable_rules.md`): an ordinary concurrent item
@@ -3465,6 +3505,12 @@ def _validate_lane_removal_identity(scene: Scene, descriptor, lane_index: int,
             "to the same lane.", 409, "identity_mismatch")
 
     if not descriptor.recipe_attr:
+        wanted = str(expected.get("lane_id") or "")
+        actual = configs[lane_index].lane_id if 0 <= lane_index < len(configs) else ""
+        if wanted and wanted != actual:
+            _mutation_error(
+                "Lanes changed elsewhere, so this lane number no longer refers "
+                "to the same lane.", 409, "identity_mismatch")
         return
     recipes = getattr(scene, descriptor.recipe_attr, None) or []
     stored = (str(getattr(recipes[lane_index], "lane_id", "") or "")
@@ -5601,8 +5647,8 @@ def _validate_take_restoration_lanes(scene: Scene, expected: dict, batch_start: 
     reads the take's record, and that read can advance the shared version
     without the scene being adopted, so the server compares what the drop saw:
     each family's lane count before this batch added any, and the config of a
-    target lane that already existed. Any difference refuses as stale; a
-    reorder of two lanes with identical configs is indistinguishable here.
+    target lane that already existed, with its id where the drop knew one. Any
+    difference refuses as stale.
     """
     baseline = expected.get("lane_baseline")
     if not isinstance(baseline, dict):
@@ -5616,9 +5662,12 @@ def _validate_take_restoration_lanes(scene: Scene, expected: dict, batch_start: 
             continue
         if lane_index < count:
             wanted = baseline.get(f"{lane_type}_lane_config")
-            actual = _lane_config(scene, lane_type, lane_index).to_dict()
             # No config on record is a default lane, as `_lane_config` pads it.
-            if LaneConfig.from_dict(wanted if isinstance(wanted, dict) else {}).to_dict() != actual:
+            wanted = wanted if isinstance(wanted, dict) else {}
+            actual = _lane_config(scene, lane_type, lane_index)
+            wanted_id = str(wanted.get("lane_id") or "")
+            if (_normalized_lane_config(wanted) != _normalized_lane_config(actual)
+                    or (wanted_id and actual.lane_id and wanted_id != actual.lane_id)):
                 stale.append(f"{lane_type}_lane_config")
     if stale:
         _mutation_error("The timeline's lanes changed since the take was dropped; the timeline was refreshed.",
@@ -6119,7 +6168,8 @@ def _apply_scene_mutation_operation(project: TimelineProject, scene: Scene, op: 
         return _apply_lane_config(project, scene, op)
     if op_type == "set_lane_count":
         lane_type = str(op.get("lane_type", ""))
-        _set_scene_lane_count(scene, lane_type, max(1, _mutation_int(op.get("count"), "count")))
+        _set_scene_lane_count(scene, lane_type, max(1, _mutation_int(op.get("count"), "count")),
+                              op.get("lane_ids"))
         return {"type": op_type, "lane_type": lane_type}
     if op_type == "remove_lane":
         _remove_media_lane(
@@ -6570,6 +6620,8 @@ def _apply_scene_mutation_batch(project: TimelineProject, scene_id: str,
     ]
     _validate_media_bounds_after_batch(scene, operations, overlaps_before)
     _validate_single_driver_per_lane(scene)
+    # Before the comparison and the response: both must hold the ids that are saved.
+    scene.identify_new_lanes()
 
     committed = scene_before is None or scene.to_dict() != scene_before
     # Not writing is not the same as having nothing to check: a skipped write
@@ -14935,19 +14987,18 @@ if routes is not None:
                     max(1, int(body[descriptor.count_attr])),
                 )
             if descriptor.configs_attr in body:
-                setattr(
-                    scene,
-                    descriptor.configs_attr,
-                    [LaneConfig.from_dict(config) for config in body[descriptor.configs_attr]],
-                )
+                replace_lane_configs(scene, descriptor, body[descriptor.configs_attr])
             if descriptor.recipe_attr and descriptor.recipe_attr in body:
                 _replace_reference_lane_recipes(scene, body[descriptor.recipe_attr])
         if "guide_track_config" in body:
-            scene.guide_track_config = LaneConfig.from_dict(body["guide_track_config"])
+            scene.guide_track_config.take_settings(
+                LaneConfig.from_dict(body["guide_track_config"]))
         if "prompt_track_config" in body:
-            scene.prompt_track_config = LaneConfig.from_dict(body["prompt_track_config"])
+            scene.prompt_track_config.take_settings(
+                LaneConfig.from_dict(body["prompt_track_config"]))
         if "global_prompt_track_config" in body:
-            scene.global_prompt_track_config = LaneConfig.from_dict(body["global_prompt_track_config"])
+            scene.global_prompt_track_config.take_settings(
+                LaneConfig.from_dict(body["global_prompt_track_config"]))
         if "width" in body:
             scene.width = int(body["width"])
         if "height" in body:
@@ -15196,7 +15247,7 @@ if routes is not None:
                 _validate_scene_history_link_groups(merged_dict)
                 merged_scene = Scene.from_dict(merged_dict)
                 _validate_scene_history_merge(merged_scene, step_target, stored_scene)
-            except (TypeError, ValueError) as exc:
+            except (AttributeError, TypeError, ValueError) as exc:
                 exc = ProjectMutationRequestError(
                     f"Merged scene data is invalid: {exc}", 409,
                     "scene_merge_invalid")

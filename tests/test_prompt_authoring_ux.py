@@ -5370,9 +5370,9 @@ class Harness {{
   _schedulePostMutationSceneRefresh(){{}}
 }}
 const authored={{scene_id:"scene",video_lane_count:1,
-  video_lane_configs:[{{name:"B",locked:false}}],clips:[]}};
+  video_lane_configs:[{{lane_id:"B",locked:false}}],clips:[]}};
 const ordered={{scene_id:"scene",video_lane_count:2,
-  video_lane_configs:[{{name:"A",locked:false}},{{name:"B",locked:false}}],clips:[]}};
+  video_lane_configs:[{{lane_id:"A",locked:false}},{{lane_id:"B",locked:false}}],clips:[]}};
 const historyEntry={{sceneId:"scene",label:"undo",snapshot:authored}};
 const context={{scenes:new Map([["scene",ordered]])}};
 const intent={{sceneId:"scene",operations:[
@@ -5456,18 +5456,21 @@ def test_production_media_drops_rebase_behind_history_and_stamp_batch_scene():
         _method(widget, "_historyExpectedProjection", "_queueProjectMutation"),
         _method(widget, "_queueProjectMutation", "_runSceneMutation"),
         _method(widget, "_beginHistoryOrderContext", "_captureProjectDependencies"),
-        _method(widget, "_discardUndoEntry", "_trimLocalLaneConfigs"),
+        _method(widget, "_discardUndoEntry", "_compactEmptyMediaLaneLocal"),
+        _method(widget, "_newLaneIds", "_applyLocalMoveLane"),
+        _method(widget, "_defaultLaneConfig", "_defaultReferenceLaneRecipe"),
     ])
     queue_url = (ROOT / "web/js/project_mutation_queue.js").as_uri()
     lanes_url = (ROOT / "web/js/lane_registry.js").as_uri()
     result = _run_node(f"""
 const {{ProjectMutationQueue}}=await import({json.dumps(queue_url)});
-const {{TRACK_TYPE,descriptorFor,laneCountFor,laneAcceptsAssetType}}=await import({json.dumps(lanes_url)});
+const {{TRACK_TYPE,descriptorFor,laneCountFor,laneAcceptsAssetType,variableLaneTypeFor}}=await import({json.dumps(lanes_url)});
 globalThis.notifyError=()=>{{}};globalThis.notifyWarning=()=>{{}};globalThis.notifyInfo=()=>{{}};
 globalThis.api={{apiURL:value=>value}};
-const configs=[{{name:"B"}},{{name:"C"}},{{name:"Target"}}];
+const configs=[{{lane_id:"B"}},{{lane_id:"C"}},{{lane_id:"Target"}}];
 const base={{scene_id:"scene",video_lane_count:3,audio_lane_count:3,motion_driver_lane_count:3,
-  video_lane_configs:configs,audio_lane_configs:configs,motion_driver_lane_configs:configs,
+  video_lane_configs:configs,audio_lane_configs:structuredClone(configs),
+  motion_driver_lane_configs:structuredClone(configs),
   clips:[{{clip_id:"FirstScene",track_index:2,timeline_start_frame:0,timeline_end_frame:24}}],audio_tracks:[]}};
 class Harness {{
 {methods}
@@ -5497,7 +5500,9 @@ class Harness {{
   _findAssetById(){{return this.asset;}} _mediaTimelineFrames(){{return 24;}}
   _defaultMotionDriverStrength(){{return 1;}} _defaultFitMode(){{return "contain";}}
   _defaultCropPosition(){{return "center";}}
-  _renderSceneAfterLocalMutation(){{}} _buildTrackLayout(){{}} _renderTimeline(){{}}
+  _renderSceneAfterLocalMutation(){{}} _renderTimeline(){{}}
+  _buildTrackLayout(){{this.paintedIds??=["video","audio"].map(type=>
+    this.activeScene[type+"_lane_configs"].at(-1).lane_id);}}
   _deferProjectBackedRefresh(){{}} _schedulePostMutationSceneRefresh(){{}}
   _reconcileActiveSceneFromMutation(result){{
     this.activeScene=structuredClone(result.payload.scene);return true;}}
@@ -5543,6 +5548,7 @@ for(const structural of [false,true])for(const mode of ["video","dual","audio","
     intent:{{sceneId:"scene",projectId:"project",operations:[]}},
     run:async()=>({{payload:{{scene:structuredClone(h.server)}}}})}});
   outcomes.push({{mode,structural,beforeRelease,events:h.events,body:h.sent[0],reads,
+    painted:h.paintedIds,
     stamped:!!h.dropEntry.postSnapshot,
     baselineHasCreated:[...next.snapshot.clips,...next.snapshot.audio_tracks]
       .some(item=>(item.clip_id||item.track_id)==="created")}});
@@ -5569,6 +5575,10 @@ console.log(JSON.stringify(outcomes));
             assert create["fields"]["audio_lane_index"] == index
             assert [op["type"] for op in row["body"]["operations"]] == [
                 "set_lane_count", "set_lane_count", "create_clip"]
+            # The lanes are painted with the ids the batch offers.
+            assert [op["lane_ids"] for op in row["body"]["operations"][:2]] == [
+                [lane_id] for lane_id in row["painted"]]
+            assert all(row["painted"])
         else:
             assert len(row["body"]["operations"]) == 1
         assert row["reads"] == 0
@@ -5737,9 +5747,9 @@ const operations=[
 const equal=new Harness()._rebaseSceneMutationIntentForHistory(
   {{sceneId:"scene",operations}},ordered,authored).operations;
 const structuralAuthored={{scene_id:"scene",video_lane_count:1,
-  video_lane_configs:[{{name:"B",locked:false}}],clips:[]}};
+  video_lane_configs:[{{lane_id:"B",locked:false}}],clips:[]}};
 const structuralOrdered={{scene_id:"scene",video_lane_count:2,
-  video_lane_configs:[{{name:"A",locked:false}},{{locked:false,name:"B"}}],clips:[]}};
+  video_lane_configs:[{{lane_id:"A",locked:false}},{{locked:true,lane_id:"B"}}],clips:[]}};
 const structural=new Harness()._rebaseSceneMutationIntentForHistory(
   {{sceneId:"scene",operations:[{{type:"create_clip",fields:{{track_index:0}}}}]}},
   structuralOrdered,structuralAuthored).operations[0];
@@ -5846,7 +5856,7 @@ const ops=()=>[
   {{type:"remove_lane",lane_type:"reference",lane_index:1,item_policy:"require_empty"}},
   {{type:"update_lane_config",lane_type:"reference",lane_index:1,fields:{{name:"x"}}}},
   {{type:"create_reference_item",fields:{{lane_index:1}}}},
-  // A family with no durable ids must be untouched by the new branch.
+  // A server older than lane ids: untouched at an equal count.
   {{type:"create_audio_track",fields:{{lane_index:1}}}},
 ];
 const moved=new Harness()._rebaseSceneMutationIntentForHistory(
@@ -6267,11 +6277,7 @@ console.log(JSON.stringify({{sent,stillNeedsRead,reads,failedKept:h._undoStack.i
 def test_lane_rebase_matches_a_lane_an_earlier_history_action_emptied():
     """Dragging an item back into the lane a queued undo just emptied.
 
-    The authored anchor carries the item ids the lane held; the ordered lane is
-    now empty. Matching item ids and config in parallel makes this structurally
-    unmatchable - no clause can fire - so the most likely post-undo gesture
-    refuses. The config is the lane's only surviving handle and must be reached
-    as a fallback.
+    What a lane holds is not which lane it is, and neither are its settings.
     """
     widget = _source("web/js/editor_widget.js")
     rebase = _method(widget, "_historyExpectedProjection", "_queueProjectMutation")
@@ -6281,9 +6287,9 @@ class Harness {{
 }}
 const h=new Harness();
 const authored={{scene_id:"scene",video_lane_count:1,
-  video_lane_configs:[{{name:"L"}}],clips:[{{clip_id:"c1",track_index:0}}]}};
+  video_lane_configs:[{{lane_id:"L"}}],clips:[{{clip_id:"c1",track_index:0}}]}};
 const ordered={{scene_id:"scene",video_lane_count:2,
-  video_lane_configs:[{{name:"A"}},{{name:"L"}}],clips:[]}};
+  video_lane_configs:[{{lane_id:"A"}},{{lane_id:"L",name:"renamed"}}],clips:[]}};
 const intent={{sceneId:"scene",operations:[
   {{type:"update_lane_config",lane_type:"video",lane_index:0,fields:{{locked:true}}}}
 ]}};
@@ -6331,29 +6337,44 @@ class Harness {{
 }}
 const h=new Harness();
 const authored={{scene_id:"scene",video_lane_count:1,
-  video_lane_configs:[{{name:"B",locked:false}}],clips:[]}};
+  video_lane_configs:[{{lane_id:"B",locked:false}}],clips:[]}};
 const ordered={{scene_id:"scene",video_lane_count:2,
-  video_lane_configs:[{{name:"A",locked:false}},{{name:"B",locked:false}}],clips:[]}};
+  video_lane_configs:[{{lane_id:"A",locked:false}},{{lane_id:"B",locked:false}}],clips:[]}};
 const intent={{sceneId:"scene",operations:[
   {{type:"update_lane_config",lane_type:"video",lane_index:0,fields:{{locked:true}}}},
   {{type:"remove_lane",lane_type:"video",lane_index:0,item_policy:"require_empty"}},
   {{type:"set_lane_count",lane_type:"video",count:2}}
 ]}};
 const rebased=h._rebaseSceneMutationIntentForHistory(intent,ordered,authored);
-let ambiguity="";
-try {{
-  h._rebaseSceneMutationIntentForHistory(intent,
-    {{...ordered,video_lane_configs:[{{}},{{}}]}},
-    {{...authored,video_lane_configs:[{{}}]}});
-}} catch(error) {{ ambiguity=error.message; }}
-console.log(JSON.stringify({{rebased,original:intent,ambiguity}}));
+const refusal=(orderedConfigs,authoredConfigs)=>{{
+  try {{
+    h._rebaseSceneMutationIntentForHistory(intent,
+      {{...ordered,video_lane_count:orderedConfigs.length,video_lane_configs:orderedConfigs}},
+      {{...authored,video_lane_count:authoredConfigs.length,video_lane_configs:authoredConfigs}});
+    return "";
+  }} catch(error) {{ return error.message; }}
+}};
+const refusals=[
+  refusal([{{}},{{}}],[{{}}]),                                  // no ids anywhere
+  refusal([{{lane_id:"A"}},{{lane_id:"C"}}],[{{lane_id:"B"}}]), // the lane is gone
+  // One count, other lanes: Undo took B away and a take brought T. The settings match,
+  // and matching them would delete the take's lane.
+  refusal([{{lane_id:"T"}}],[{{lane_id:"B"}}]),
+  // Painted without an id: never matched to a lane by its settings.
+  refusal([{{lane_id:"T"}}],[{{}}]),
+  refusal([{{name:"A"}},{{name:"B"}}],[{{name:"B"}}]),
+];
+const unnamed=refusal([{{}}],[{{}}]);  // one count, a server older than lane ids
+console.log(JSON.stringify({{rebased,original:intent,refusals,unnamed}}));
 """)
     operations = result["rebased"]["operations"]
     assert operations[0]["lane_index"] == 1
     assert operations[1]["lane_index"] == 1
     assert operations[2]["count"] == 3
     assert result["original"]["operations"][0]["lane_index"] == 0
-    assert "could no longer be identified" in result["ambiguity"]
+    assert len(result["refusals"]) == 5
+    assert all("could no longer be identified" in text for text in result["refusals"])
+    assert result["unnamed"] == ""
 
 
 def test_parent_history_ambiguity_dominates_descendant_scene_and_history_apply_waits():

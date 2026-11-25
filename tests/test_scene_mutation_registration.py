@@ -2290,17 +2290,15 @@ GUARD_CONTRACTS = {
     "remove_lane": (_FIXED, frozenset({"lane_count", "config", "lane_id"}),
         "`_remove_media_lane` calls `_validate_lane_removal_identity`, which "
         "requires `expected` and compares three things. `config` is the lane's "
-        "normalized settings through `_normalized_lane_config`, the identity "
-        "durable_rules.md already names for families with no durable id and the "
-        "one `findLaneByAnchor` resolves by on the client; it is what catches a "
-        "permutation that leaves the count unchanged. `lane_count` is compared "
+        "normalized settings through `_normalized_lane_config`; it catches a "
+        "permutation that leaves the count unchanged when no id was sent and the "
+        "lanes have different settings. `lane_count` is compared "
         "as a FLOOR -- a family that only grew cannot have moved the caller's "
         "lane, because `_set_scene_lane_count` appends -- so demanding equality "
         "would refuse a concurrent append in which nothing moved. `lane_id` "
-        "settles `reference`, the only movable family, and a blank stored id is "
-        "tolerated as `_apply_lane_config` tolerates it. Known residual, stated "
-        "in the validator: two non-reference lanes with identical configs are "
-        "indistinguishable, which only a document version precondition closes."),
+        "settles the rest: `reference` must name a stored one (a blank stored id "
+        "is tolerated as `_apply_lane_config` tolerates it), and a media lane's "
+        "is compared when sent, because a page older than lane ids sends none."),
     "split_reference_item": (_FIXED, frozenset({
         "reference_item_id", "start_frame", "end_frame", "resolved_end_frame"}),
         "`_apply_split_reference_item` calls `_require_expected` with those four "

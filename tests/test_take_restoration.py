@@ -308,6 +308,7 @@ def test_lost_audio_places_the_video_and_removes_only_the_lane_this_batch_added(
     scene = project.get_scene("s1")
     # A retained config past the lane count, which the batch's count change drops.
     scene.audio_lane_configs = [LaneConfig(name="A1"), LaneConfig(name="retained", hidden=True)]
+    scene.identify_new_lanes()
     before = copy.deepcopy(scene.audio_lane_configs)
     _committed, payload = _ruler_restore(project, scene, project.get_asset("v1"),
                                          _geometry([17, 30, 40, 20, 33]))
