@@ -57,15 +57,14 @@ it switches scenes.
 
 ## One project in two ComfyUI servers
 
-If more than one ComfyUI server opens the same projects, for example one for
-editing and one for generating, turn on **Settings ▸ Server ▸ Share Projects
-Between ComfyUI Servers** in every one of them before you open a project in
-more than one. **Settings** is the gear at the right of the timeline toolbar.
-A server with the setting off doesn't take part.
+If more than one ComfyUI server opens the same projects, for example two
+servers generating takes for different scenes of one project, turn on
+**Settings ▸ Server ▸ Share Projects Between ComfyUI Servers** in every one of
+them before you open a project in more than one. **Settings** is the gear at
+the right of the timeline toolbar.
 
-The setting needs a drive that supports file locks, which is any local drive.
-Two computers opening one project on a network drive may not be protected, so
-keep shared projects on a local drive.
+Keep shared projects on a local drive: the setting needs file locks, and two
+computers opening a project on a network drive may not be protected.
 
 ## Screen layout
 

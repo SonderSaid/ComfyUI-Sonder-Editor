@@ -1814,7 +1814,7 @@ function showSettingsPanel() {
         serverSection,
         "shareProjectsBetweenServers",
         "Share Projects Between ComfyUI Servers",
-        "Turn this on in every ComfyUI server that opens the same projects, for example one for editing and one for generating, before opening a project in more than one. It needs a drive that supports file locks, which is any local drive. Leave it off if only this server opens them.",
+        "Turn this on in every ComfyUI server that opens the same projects, for example two servers generating takes for different scenes of one project, before opening a project in more than one. It needs a drive that supports file locks, which is any local drive. Leave it off if only this server opens them.",
         () => this._serverSettings?.share_projects_between_servers === true,
         (checked) => {
             Promise.resolve(this._setShareProjectsBetweenServers(checked)).catch(() => {});

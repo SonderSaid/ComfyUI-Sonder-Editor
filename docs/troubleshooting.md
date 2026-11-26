@@ -148,24 +148,24 @@ Projects Between ComfyUI Servers**. If one does, move the project to a local
 drive. See
 [One project in two ComfyUI servers](editor-basics.md#one-project-in-two-comfyui-servers).
 
-### A project stopped opening after two ComfyUI servers used it
+### "This project's stored data could not be read"
 
 1. Close the project on every server.
 2. Open the Launcher, right-click the project and choose
    **Check and repair…**.
 3. Read what would be lost, then press **Repair**. A copy of `project.json` is
-   saved first. If there is no **Repair** button, the dialog says what to do
-   instead.
+   saved first.
 
-To keep it from happening again, see
-[One project in two ComfyUI servers](editor-basics.md#one-project-in-two-comfyui-servers).
+If two ComfyUI servers used the project, see
+[One project in two ComfyUI servers](editor-basics.md#one-project-in-two-comfyui-servers)
+to keep it from happening again.
 
 ### "The server settings file can't be read"
 
 The editor's **Settings ▸ Server** settings live in
 `ComfyUI/user/sonder-editor/settings.json`. Fix the file's JSON, or delete it
 to turn both settings off, then restart ComfyUI. Until then, external project
-links stay off and projects are saved as if shared between servers.
+links stay off.
 
 ### A project won't open, save or extract on Windows
 
