@@ -151,6 +151,22 @@ Click **Manage** at the top right of the Controls tab. Click **Done** to leave.
 <p align="center"><em>Making a Draft choice: it mutes the detail pass
 and sets <strong>Steps</strong>; the unticked Controls stay out of it.</em></p>
 
+If every node in a group is **Enabled**, **Muted** or **Bypassed** when you
+tick its switch's **In this choice**, the choice sets every node in that group
+each time you click it, including nodes you add to the group later. For
+example, a **Mask Off** choice also bypasses a node you add to the mask group.
+A node you move out of the group keeps its own state.
+
+If the group's nodes are set differently (**Mixed**), the choice sets each of
+those nodes as you left them. Once you add a node to that group or move one
+out, the choice is greyed out until you update it:
+
+1. On the canvas, set each node in the group the way the choice should leave it.
+2. Click **Manage**, then click the choice.
+3. Click **Update from current values**.
+
+Do the same after you rebind the switch to another group.
+
 To change a choice later, click it in **Manage**. The Controls first take that
 choice's values, as its button in the **Modes** table would, so what you see
 is what the choice holds. Then:

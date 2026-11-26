@@ -467,6 +467,11 @@ def _execution_member(member: Any) -> dict | None:
         if (not isinstance(modes, dict) or not 1 <= len(modes) <= MAX_EXECUTION_MEMBERS
                 or any(_root_path(path) is None or mode not in EXECUTION_MODES for path, mode in modes.items())):
             return None
+        if "group_id" in member:
+            group_id = _whole(member["group_id"])
+            if isinstance(group_id, bool) or not isinstance(group_id, int) or abs(group_id) > 2 ** 31:
+                return None
+            return {"group_id": group_id, "modes": dict(modes)}
         return {"modes": dict(modes)}
     node = member.get("node")
     if member.get("mode") not in EXECUTION_MODES or not isinstance(node, dict):

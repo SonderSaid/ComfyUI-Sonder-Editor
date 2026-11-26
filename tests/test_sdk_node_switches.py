@@ -308,6 +308,32 @@ MUTED = {"mode": "muted", "class_type": "KSampler"}
 STALE = {"5": {"mode": "muted", "class_type": "RemovedNode"}}
 
 
+def test_retained_legacy_group_choice_follows_growth_and_rejects_a_rebind(world):
+    install(world, template())
+    session = open_session(world)
+    legacy = {"name": "Skip group", "members": {}, "execution": {"both": {"modes": {"6": "muted"}}}}
+    sdk_templates.update_control_values(world.template_id, lambda data: data["presets"].update(skip=legacy))
+    assert "group_id" not in sdk_templates.read_control_values(world.template_id)["presets"]["skip"]["execution"]["both"]
+    install(world, grown())
+    before = sdk_templates.read_control_values(world.template_id)["seq"]
+    view = change(world, session, {"preset:skip:apply": True})["view"]
+    assert view["presets"][0]["state"] == "match"
+    stored = sdk_templates.read_control_values(world.template_id)
+    assert stored["seq"] == before + 1 and set(stored["node_modes"]) == {"6", "7", "9"}
+    exported = sdk_templates.control_manifest_of(json.loads(sdk_templates.export_curated(world.template_id)))
+    assert exported["presets"]["skip"]["execution"]["both"]["group_id"] == 4
+    generate(world, session)
+    assert not {"6", "7", "9"} & set(world.client.submitted[-1])
+    changed = grown()
+    manifest = json.loads(changed["8"]["inputs"]["manifest"])
+    manifest["execution"]["controls"]["both"]["target"]["group_id"] = 5
+    changed["8"]["inputs"]["manifest"] = json.dumps(manifest)
+    install(world, changed)
+    with pytest.raises(SdkError) as refused:
+        change(world, session, {"preset:skip:apply": True})
+    assert "rebound" in refused.value.payload()["rejected"][0]["reason"]
+
+
 def test_a_node_added_to_a_switch_follows_its_recorded_state(world):
     install(world, template())
     session = open_session(world)

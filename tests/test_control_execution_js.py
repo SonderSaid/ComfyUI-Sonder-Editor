@@ -196,6 +196,10 @@ def test_python_js_reader_parity(tmp_path):
         "junk": {"name": "J", "members": {}, "execution": {"a": {"mode": "x", "node": {"path": "6", "class_type": "K"}},
                                                            "b": {"modes": {"a:b": "muted"}}}},
         "over": {"name": "O", "members": {f"b{i}": {"value": 1} for i in range(63)}, "execution": {"g": {"modes": {"1": "muted", "2": "muted"}}}},
+        "pinned": {"name": "P", "members": {}, "execution": {"g": {"modes": {"1": "muted"}, "group_id": 0}}},
+        "bad_id": {"name": "P", "members": {}, "execution": {"g": {"modes": {"1": "muted"}, "group_id": True}}},
+        "whole_id": {"name": "W", "members": {}, "execution": {"g": {"modes": {"1": "muted"}, "group_id": 7.0}}},
+        "far_id": {"name": "F", "members": {}, "execution": {"g": {"modes": {"1": "muted"}, "group_id": 2 ** 31 + 1}}},
         "empty_exec": {"name": "E", "members": {}, "execution": {}},
     }
     sections = [None, {"v": 2}, "x", {"controls": {"a": {"target": {"kind": "node"}}}},
@@ -318,6 +322,42 @@ assert.equal(c.properties.sonderExecution, undefined);
 assert.equal(JSON.parse(relay.widgets[0].value).execution.controls.new, undefined);
 // Only the named candidate travels with the batch.
 assert.deepEqual(calls.findLast(c => c.changes?.['execution:new:expose']).execution_candidates.map(x => x.path ?? x.group_id), ['5']);
+''', tmp_path)
+
+
+def test_rebinding_pins_legacy_captures_in_the_same_manifest_edit(tmp_path):
+    run_host(r'''
+const saved = JSON.parse(relay.widgets[0].value);
+saved.presets = {skip: {name:'Skip', members:{}, execution:{g:{modes:{'3':'muted'}}}},
+                 mixed: {name:'Mixed', members:{}, execution:{g:{modes:{'3':'muted','4':'enabled'}}}},
+                 known: {name:'Known', members:{}, execution:{g:{group_id:5, modes:{'3':'muted'}}}}};
+relay.widgets[0].value = JSON.stringify(saved);
+root.groups = [];
+group(root,9,[0,0,100,100],'Replacement');
+const result = await host.applyChanges({'execution:g:rebind':{candidate:{kind:'group',group_id:9}}});
+assert.equal(result.ok,true,JSON.stringify(result));
+const after = JSON.parse(relay.widgets[0].value);
+assert.equal(after.presets.skip.execution.g.group_id,7);
+assert.equal(after.presets.mixed.execution.g.group_id,7);
+// A capture that already names its group keeps it.
+assert.equal(after.presets.known.execution.g.group_id,5);
+assert.equal(after.execution.controls.g.target.group_id,9);
+assert.equal(captures,2);
+''', tmp_path)
+
+
+def test_rebinding_a_group_switch_to_a_node_pins_legacy_captures(tmp_path):
+    run_host(r'''
+const saved = JSON.parse(relay.widgets[0].value);
+saved.presets = {skip: {name:'Skip', members:{}, execution:{g:{modes:{'3':'muted'}}}}};
+relay.widgets[0].value = JSON.stringify(saved);
+root.groups = [];
+add(root,'KSampler',5,{rect:[300,300,20,20],widgets:[widget('steps',1)],inputs:['steps']});
+const result = await host.applyChanges({'execution:g:rebind':{candidate:{kind:'node',path:'5'}}});
+assert.equal(result.ok,true,JSON.stringify(result));
+const after = JSON.parse(relay.widgets[0].value);
+assert.equal(after.presets.skip.execution.g.group_id,7);
+assert.equal(after.execution.controls.g.target.kind,'node');
 ''', tmp_path)
 
 

@@ -533,6 +533,16 @@ def replace_template(template_id: str, raw: bytes, *, source_name: str = "", val
         data = read_control_values(template_id)
         old_manifest = control_manifest_of(parse_template_bytes(_read_bytes(json_path)))
         new_manifest = control_manifest_of(prompt)
+        # Retained app copies may predate group identity. Pin those captures while
+        # the outgoing template is available; remove when all captures carry group_id.
+        for preset in data.get("presets", {}).values():
+            execution = preset.get("execution") if isinstance(preset, dict) else None
+            if not isinstance(execution, dict):
+                continue
+            for eid, member in execution.items():
+                target = old_manifest["execution"].get(eid, {}).get("target", {})
+                if target.get("kind") == "group" and isinstance(member, dict) and "modes" in member:
+                    member.setdefault("group_id", target["group_id"])
         old_presets, new_presets = old_manifest['presets'], new_manifest['presets']
         presets_kept = sum(1 for identity, entry in data.get("presets", {}).items()
                            if isinstance(entry, dict) and identity in new_presets
@@ -1198,7 +1208,7 @@ def _unusable_choice_needs(choice_id: Any, view: dict, prompt: dict, node_lookup
     """What an ``unavailable`` or ``refused`` choice lacks, from its members: its
     own reason says to repair it in Manage even when the answer is an install.
     None when its members don't show one; its reason then stands alone."""
-    definitions = view.get("_presets") or {}
+    definitions = control_presets.live_group_presets(view, view.get("_presets") or {})
     preset = definitions.get(choice_id)
     if not preset:
         return None

@@ -300,6 +300,10 @@ function executionMember(member) {
         const entries = Object.entries(modes);
         if (entries.length < 1 || entries.length > MAX_EXECUTION_MEMBERS
             || entries.some(([path, mode]) => !rootPath(path) || !EXECUTION_MODES.includes(mode))) return null;
+        if (Object.hasOwn(member, "group_id")) {
+            if (!Number.isInteger(member.group_id) || Math.abs(member.group_id) > 2 ** 31) return null;
+            return {group_id: member.group_id, modes: {...modes}};
+        }
         return {modes: {...modes}};
     }
     const node = member.node;

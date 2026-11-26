@@ -15,6 +15,7 @@ a fresh `[Unreleased]` block.
 - **Check and repair…** in the Launcher's project menu finds missing or damaged stored parts of a project that won't open, says what a repair would lose, and repairs it after saving a copy of `project.json`.
 
 ### Fixed
+- A choice in **Modes** that sets a whole group to **Enabled**, **Muted** or **Bypassed** now sets every node in the group when you click it, including nodes added after you made the choice. Choices made with earlier versions do this too. A choice that sets the group's nodes differently is greyed out after a node joins or leaves the group, until you update it.
 - Two ComfyUI servers can have the same project open, for example one for editing and one for generating:
   - Their saves no longer break the project, and an edit made from an older version is refused instead of overwriting the other server's save. Before, the project could stop opening, with the message that its stored data could not be read. Both servers need this version; 0.9.3 and older don't take part.
   - A take that finishes while the other server is saving waits for it.

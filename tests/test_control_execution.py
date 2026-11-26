@@ -330,7 +330,7 @@ def test_capture_switch_modes_with_identity_and_exact_group_members():
     entry = cleaned["preset:p:create"]
     assert entry["members"] == {"steps": {"value": "20"}}
     assert entry["execution"] == {"a": {"mode": "enabled", "node": {"path": "6", "class_type": "KSampler"}},
-                                  "g": {"modes": {"6": "enabled", "8": "enabled"}}}
+                                  "g": {"group_id": 2, "modes": {"6": "enabled", "8": "enabled"}}}
     assert cm.read_presets({"p": entry})["p"]["execution"] == entry["execution"]
     only = cp.validate_preset_changes(view, {"preset:q:create": {"name": "Q", "members": [], "execution": ["a"]}},
                                       prompt=prompt, structural="canvas")
@@ -358,7 +358,7 @@ def test_apply_expands_values_and_modes_into_one_batch():
 def test_matching_drift_and_conflicts():
     view, _ = preset_view({"p": skip_preset(node_mode="enabled", group_modes={"6": "enabled", "8": "enabled"})})
     assert view["presets"][0]["state"] == "match"
-    drifted, _ = preset_view({"p": skip_preset(group_modes={"6": "muted"})})
+    drifted, _ = preset_view({"p": skip_preset(group_modes={"6": "muted", "12": "enabled"})})
     row = drifted["presets"][0]
     assert row["state"] == "unavailable" and "g" in row["unavailable"]
     assert "changed since this choice was captured. Update the choice" in row["reason"]
@@ -366,6 +366,42 @@ def test_matching_drift_and_conflicts():
     assert "a" in moved["presets"][0]["unavailable"]
     # A node one switch mutes and its group bypasses: unreadable, never half-applied.
     assert "p" not in cm.read_presets({"p": skip_preset(group_modes={"6": "bypassed", "8": "muted"})})
+
+
+def test_uniform_capture_follows_group_and_pinned_identity_survives_same_members():
+    for capture in ({"modes": {"99": "bypassed"}}, {"group_id": 2, "modes": {"99": "bypassed"}}):
+        preset = {"name": "Mask Off", "members": {}, "execution": {"g": capture}}
+        view, prompt = preset_view({"off": preset})
+        edits, errors = cp.validate_preset_changes(view, {"preset:off:apply": True}, prompt=prompt, structural="canvas")
+        assert not errors and edits == {"execution:g:modes": {"6": "bypassed", "8": "bypassed"}}
+        assert view["_presets"]["off"]["execution"]["g"] == capture
+    view, prompt = preset_view({"off": {**preset, "execution": {"g": {"group_id": 3, "modes": {"6": "bypassed", "8": "bypassed"}}}}})
+    edits, errors = cp.validate_preset_changes(view, {"preset:off:apply": True}, prompt=prompt, structural="canvas")
+    assert not edits and "rebound" in errors[0]["reason"]
+
+
+def test_live_overlap_and_budget_recover_without_recapture():
+    group = {"name": "Off", "members": {}, "execution": {"g": {"modes": {"99": "muted"}}}}
+    node = {"name": "First", "members": {}, "execution": {"a": {"mode": "enabled", "node": {"path": "6", "class_type": "KSampler"}}}}
+    cases = [
+        ({"off": {**group, "execution": {**group["execution"], **node["execution"]}}}, "two different ways"),
+        ({"off": {**group, "includes": ["first"]}, "first": node}, "sets a Control"),
+    ]
+    for presets, reason in cases:
+        view, prompt = preset_view(presets)
+        assert reason in view["presets"][0]["reason"]
+        assert not cp.validate_preset_changes(view, {"preset:off:apply": True}, prompt=prompt, structural="canvas")[0]
+        switch = next(d for d in view["execution"] if d["execution_id"] == "g")
+        switch["members"] = [m for m in switch["members"] if m["path"] != "6"]
+        assert not cp.validate_preset_changes(view, {"preset:off:apply": True}, prompt=prompt, structural="canvas")[1]
+
+    view, prompt = preset_view({"off": {**group, "members": {"steps": {"value": "20"}}}})
+    switch = next(d for d in view["execution"] if d["execution_id"] == "g")
+    switch["members"] = [{**switch["members"][0], "path": str(i)} for i in range(64)]
+    states = lambda: cd.preset_states(view, view["_presets"], prompt=prompt)[0]
+    assert "more than 64 settings and nodes" in states()["reason"]
+    switch["members"].pop()
+    assert states()["state"] == "differs"
 
 
 def test_effects_budget_counts_distinct_nodes():

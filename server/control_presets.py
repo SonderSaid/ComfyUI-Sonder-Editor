@@ -25,14 +25,40 @@ def _switches(view):
     return {d["execution_id"]: d for d in view.get("execution", []) or []}
 
 
+def live_group_presets(view, definitions):
+    """Resolve uniform captures against this view only. Authoring always keeps the saved map."""
+    switches = _switches(view)
+    result = dict(definitions)
+    for pid, preset in definitions.items():
+        replacements = {}
+        for eid, member in (preset.get("execution") or {}).items():
+            modes = member.get("modes")
+            switch = switches.get(eid, {})
+            if (not modes or len(set(modes.values())) != 1 or switch.get("kind") != "group"
+                    or switch.get("status") != "ok" or not switch.get("members")
+                    or member.get("group_id", switch.get("group_id")) != switch.get("group_id")):
+                continue
+            # Old captures have no group_id. This fallback expires when workflows and
+            # app copies lacking it are no longer supported; reads never rewrite them.
+            mode = next(iter(modes.values()))
+            current = {node["path"]: mode for node in switch["members"]}
+            if current != modes:
+                replacements[eid] = {**member, "modes": current}
+        if replacements:
+            result[pid] = {**preset, "execution": {**preset["execution"], **replacements}}
+    return result
+
+
 def _drifted(descriptor, member):
     """The switch no longer sets what the preset captured: other group members,
     or its anchor now on another node. Applying would guess, so it is refused
     until the preset is updated."""
     members = descriptor.get("members") or []
     if "modes" in member:
-        return {m["path"] for m in members} != set(member["modes"])
-    return (len(members) != 1 or members[0]["path"] != member["node"]["path"]
+        return (descriptor.get("kind") != "group"
+                or ("group_id" in member and member["group_id"] != descriptor.get("group_id"))
+                or {m["path"] for m in members} != set(member["modes"]))
+    return (descriptor.get("kind") == "group" or len(members) != 1 or members[0]["path"] != member["node"]["path"]
             or members[0].get("class_type") != member["node"]["class_type"])
 
 
@@ -198,6 +224,13 @@ def expand_choice(view, definitions, categories, identity, *, own_only=False, ho
             if part_id == identity:
                 return {}, text, unavailable
             return {}, f"Included {_quote(definitions, part_id)}: {text}", []
+        effects = cm.execution_effects(part.get("execution") or {})
+        if effects is None:
+            return {}, (f"{_quote(definitions, part_id)} now sets one node two different ways. Move the node out of "
+                        "one group, or untick one of those switches in Manage."), []
+        if _targets(part) > cm.MAX_PRESET_TARGETS:
+            return {}, (f"{_quote(definitions, part_id)} now sets more than 64 settings and nodes. Move nodes out of "
+                        "its groups, or untick Controls in Manage."), []
         changes.update(part_changes)
     return changes, "", []
 
@@ -225,8 +258,18 @@ def _reason(view, identities, preset=None):
     members = (preset or {}).get("execution") or {}
     drifted = [i for i in identities if i in members and switches.get(i, {}).get("status") == "ok"
                and not switches[i].get("read_only") and _drifted(switches[i], members[i])]
-    others = [i for i in identities if i not in drifted]
+    rebound = [i for i in drifted if "modes" in members[i] and
+               (switches[i].get("kind") != "group" or ("group_id" in members[i]
+                and members[i]["group_id"] != switches[i].get("group_id")))]
+    failed_groups = [i for i in identities if i not in drifted and i in members and
+                     "modes" in members[i] and switches.get(i, {}).get("reason")]
+    others = [i for i in identities if i not in drifted and i not in failed_groups]
+    drifted = [i for i in drifted if i not in rebound]
     parts = []
+    for i in rebound:
+        parts.append(f"“{labels[i]}” was rebound to another node or group. Update the choice in Manage.")
+    for i in failed_groups:
+        parts.append(f"“{labels[i]}”: {switches[i]['reason']}")
     if others:
         parts.append("Unavailable Controls: " + ", ".join(labels.get(i, i) for i in others) + ". Repair them in Manage.")
     if drifted:
@@ -352,6 +395,7 @@ def preset_projection(view, presets, categories=None, *, origins=None, category_
     bindings = {d["binding_id"]: d for d in view.get("bindings", [])}
     switches = _switches(view)
     homes = home_categories(categories)
+    presets = live_group_presets(view, presets)
     built, conditions, own_conditions = {}, {}, {}
 
     def holds(preset, cleaned):
@@ -432,7 +476,7 @@ def _capture_execution(view, identities, previous=None):
             raise cd.ControlValueError(_reason(view, [eid]))
         members = descriptor["members"]
         if descriptor["kind"] == "group":
-            result[eid] = {"modes": {m["path"]: m["mode"] for m in members}}
+            result[eid] = {"group_id": descriptor["group_id"], "modes": {m["path"]: m["mode"] for m in members}}
         else:
             result[eid] = {"mode": members[0]["mode"], "node": {"path": members[0]["path"], "class_type": members[0]["class_type"]}}
     return result
@@ -572,7 +616,8 @@ def validate_preset_changes(view, changes, *, prompt=None, structural=None, inve
                 if not existing:
                     raise cd.ControlValueError("This choice no longer exists. Open Manage.")
                 # Its own members and every included choice's: one batch.
-                expanded, reason, _ = expand_choice(view, definitions, categories, identity, own_only=own_only)
+                live = live_group_presets(view, definitions)
+                expanded, reason, _ = expand_choice(view, live, categories, identity, own_only=own_only)
                 if reason:
                     raise cd.ControlValueError(reason)
                 # Values and modes validate and land as one batch: one native
@@ -655,7 +700,8 @@ def _inclusion_refusals(view, changes, sources, definitions, categories, start):
     parsed = {target: cd.parse_target(target) for target in changes}
     reset = {p[1] for p in parsed.values() if p and p[0] == "preset" and p[2] == "reset"}
     category_reset = any(p and p[0] == "preset_category" and p[2] == "reset" for p in parsed.values())
-    before = inclusion_problems(view.get("_presets", {}), start)
+    before = inclusion_problems(live_group_presets(view, view.get("_presets", {})), start)
+    definitions = live_group_presets(view, definitions)
     added = {(parent, rule, other): message for (parent, rule, other), message in inclusion_problems(definitions, categories).items()
              if (parent, rule, other) not in before and parent not in reset and other not in reset
              and not (category_reset and rule in ("category", "shared_category"))}

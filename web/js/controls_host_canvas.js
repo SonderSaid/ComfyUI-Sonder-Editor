@@ -470,6 +470,14 @@ export function createCanvasControlsHost({app, api, getEditorNode,
                 if (!live || live.status === "ok") throw new Error("Only a switch that is off can be rebound.");
                 manifestOps.push(m => {
                     if (!table(m)[id]) throw new Error("This switch is no longer in the workflow.");
+                    const prior = table(m)[id].target;
+                    if (prior.kind === "group" && (target.kind !== "group" || target.group_id !== prior.group_id)) {
+                        // Pin legacy captures before their switch moves. Remove when all captures carry group_id.
+                        for (const preset of Object.values(m.presets || {})) {
+                            const member = preset?.execution?.[id];
+                            if (member?.modes && !Object.hasOwn(member, "group_id")) member.group_id = prior.group_id;
+                        }
+                    }
                     table(m)[id].target = target;
                 });
                 anchors.push(() => dropExecutionAnchors(root, id));
