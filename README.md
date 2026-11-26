@@ -1,6 +1,6 @@
 # ComfyUI-Sonder-Editor
 
-**Version 0.9.3** — see the [CHANGELOG](CHANGELOG.md) for release notes.
+**Version 0.9.4** — see the [CHANGELOG](CHANGELOG.md) for release notes.
 
 Sonder Editor is a timeline-based video editing studio for ComfyUI, built for
 iterative long-form video.
@@ -259,8 +259,8 @@ adapters, grouped under the `Sonder`, `Sonder/IO`, `Sonder/Logic`, and
 
 ## Requirements
 
-- **ComfyUI** — 0.9.3 was validated on ComfyUI **0.45.0** with frontend
-  **1.58.5**. That is what this release was tested against, not a minimum;
+- **ComfyUI** — 0.9.4 was validated on ComfyUI **0.46.0** with frontend
+  **1.59.15**. That is what this release was tested against, not a minimum;
   other versions are expected to work. The V3 nodes listed under Nodes load
   only on builds that provide `comfy_api`. A View pane's **Run** needs ComfyUI
   0.42.0 or newer; on older builds it doesn't show.

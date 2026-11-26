@@ -11,6 +11,8 @@ a fresh `[Unreleased]` block.
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-11-26
+
 ### Added
 - **Settings ▸ Server ▸ Share Projects Between ComfyUI Servers**, off by default, for running two ComfyUI servers on the same projects.
 - **Check and repair…** in the Launcher's project menu finds missing or damaged stored parts of a project that won't open, says what a repair would lose, and repairs it after saving a copy of `project.json`.
