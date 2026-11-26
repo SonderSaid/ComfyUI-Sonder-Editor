@@ -8,6 +8,10 @@ user, temp and input folders under a temporary directory, so no existing project
 opened. Run it with any Python that can import the pack's server package; the servers
 use the ComfyUI folder's venv. Exits non-zero when a check fails.
 
+Both servers have **Share Projects Between ComfyUI Servers** on (written into each one's
+user folder before it starts, then confirmed over HTTP); ``--one-server`` leaves it off,
+the default a single server runs with.
+
 Both servers enqueue jobs (version-checked writes) and load the project throughout.
 ``--bare`` adds favorite writes, which have no version check, and only reports their
 losses: one server loses those too (run ``--one-server`` to compare).
@@ -84,6 +88,11 @@ class Servers:
             folders = {kind: root / f"{kind}{port}" for kind in ("user", "temp", "input")}
             for folder in folders.values():
                 folder.mkdir()
+            if not args.one_server:
+                settings = folders["user"] / "sonder-editor" / "settings.json"
+                settings.parent.mkdir(parents=True)
+                settings.write_text(json.dumps({"version": 1, "share_projects_between_servers": True}),
+                                    encoding="utf-8")
             self.logs[port] = root / f"server{port}.log"
             self.processes[port] = subprocess.Popen(
                 [str(python), "main.py", "--port", str(port), "--cpu", "--disable-auto-launch", "--offline",
@@ -120,6 +129,13 @@ def request(port, project, method, path, body=None):
         return error.code, error.read()[:200].decode("utf-8", "replace")
     except (OSError, ValueError) as error:
         return 0, repr(error)[:160]
+
+
+def sharing(port):
+    """What the server says about Share Projects Between ComfyUI Servers."""
+    call = urllib.request.Request(f"http://127.0.0.1:{port}/sonder-editor/server-settings")
+    with urllib.request.urlopen(call, timeout=30) as answer:
+        return json.loads(answer.read())["share_projects_between_servers"]
 
 
 def broken_components(project_dir, document):
@@ -159,6 +175,9 @@ def run(args, root):
                 if time.time() > deadline or servers.processes[port].poll() is not None:
                     raise SystemExit(f"server {port} did not start: {servers.logs[port].read_text()[-800:]}")
                 time.sleep(1)
+            if sharing(port) is args.one_server:
+                raise SystemExit(f"server {port} has Share Projects Between ComfyUI Servers "
+                                 f"{'on' if args.one_server else 'off'}")
         ports = list(servers.processes)
         end = time.time() + args.seconds
         statuses, acknowledged, favorites = {}, {port: [] for port in PORTS}, []

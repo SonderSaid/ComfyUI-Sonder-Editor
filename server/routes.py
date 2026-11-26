@@ -64,6 +64,7 @@ from .frozen_reference import (
     decode_frozen_reference_catalog,
 )
 from .project_file_lock import PROJECT_BUSY_MESSAGE, ProjectBusyError
+from . import project_file_lock
 from .project_storage import PROJECT_STORAGE_UNREADABLE_MESSAGE, ProjectStorageError
 from .project_storage_lifecycle import run_project_io
 from .render_cache import (
@@ -165,6 +166,7 @@ from .lane_registry import (
 from .thumbnail_service import ensure_thumbnail, generate_thumbnail_strip, generate_waveform_data
 from .timeline_export import ExportAlreadyRunning, TimelineExportManager
 from . import external_links
+from . import server_settings
 from .request_locality import MACHINE_ONLY_MESSAGE, is_loopback_request, local_only_response
 from . import prompt_channel_templates
 from . import prompt_context
@@ -12551,12 +12553,41 @@ if routes is not None:
     # linking one and turning links on. Removing trust (turning links off, unlinking)
     # stays allowed from anywhere. `can_manage` lets every editor mode and the Launcher
     # disable those controls up front with the same sentence.
+    #
+    # Share Projects Between ComfyUI Servers is open to any client, in both directions: it
+    # grants no trust (unlike links), and turning it on touches only the projects folder,
+    # whose drive it checks. A remote editor can already delete projects. Don't harmonise
+    # it with the links rule.
+    def _server_settings_payload(request, values=None):
+        values = values or server_settings.current()
+        return {
+            "allow_external_project_links": values[server_settings.LINKS_KEY],
+            "share_projects_between_servers": values[server_settings.SHARING_KEY],
+            "can_manage": is_loopback_request(request),
+        }
+
+    def _check_projects_drive():
+        """``project_file_lock.probe_locks`` on the projects folder, created first."""
+        base_dir = _configured_base_dir()
+        if not base_dir:
+            return project_file_lock.PROBE_FAILED, "no projects folder is configured"
+        try:
+            os.makedirs(base_dir, exist_ok=True)
+        except OSError as exc:
+            return project_file_lock.PROBE_FAILED, f"could not create {base_dir}: {exc}"
+        outcome, detail = project_file_lock.probe_locks(base_dir)
+        return outcome, f"{base_dir}: {detail}" if detail else ""
+
+    def _check_projects_drive_unless_shared():
+        """Turning sharing on checks the drive; it is already on, nothing to check. Off the
+        event loop: a settings read can wait on a write's retries."""
+        if server_settings.sharing_enabled():
+            return project_file_lock.PROBE_OK, ""
+        return _check_projects_drive()
+
     @routes.get("/sonder-editor/server-settings")
     async def api_get_server_settings(request: web.Request) -> web.Response:
-        return web.json_response({
-            "allow_external_project_links": external_links.is_enabled(),
-            "can_manage": is_loopback_request(request),
-        })
+        return web.json_response(_server_settings_payload(request))
 
     @routes.put("/sonder-editor/server-settings")
     async def api_update_server_settings(request: web.Request) -> web.Response:
@@ -12565,21 +12596,47 @@ if routes is not None:
         except json.JSONDecodeError:
             return _json_error("Invalid JSON body", 400)
 
-        if not isinstance(body, dict) or not isinstance(body.get("allow_external_project_links"), bool):
-            return _json_error("allow_external_project_links must be a boolean", 400)
-        if body["allow_external_project_links"] and not is_loopback_request(request):
+        keys = server_settings.KEYS
+        if (not isinstance(body, dict) or not any(key in body for key in keys)
+                or any(key in body and not isinstance(body[key], bool) for key in keys)):
+            return _json_error(
+                "Send allow_external_project_links, share_projects_between_servers or both, as booleans", 400)
+        changes = {key: body[key] for key in keys if key in body}
+        # Every check runs before the one settings write, so a refusal changes nothing.
+        if changes.get(server_settings.LINKS_KEY) and not is_loopback_request(request):
             return local_only_response(MACHINE_ONLY_MESSAGE)
+        if changes.get(server_settings.SHARING_KEY):
+            outcome, detail = await asyncio.to_thread(_check_projects_drive_unless_shared)
+            if outcome != project_file_lock.PROBE_OK:
+                # The path stays in the log: the answer can go to another machine.
+                logger.warning("Share Projects Between ComfyUI Servers was not turned on (%s): %s",
+                               outcome, detail)
+                if outcome == project_file_lock.PROBE_UNSUPPORTED:
+                    return web.json_response({
+                        "ok": False, "code": "locks_unsupported",
+                        "error": "The projects folder is on a drive that doesn't support file locks, so "
+                                 "projects shared between ComfyUI servers can't be protected there."},
+                        status=409)
+                return web.json_response({
+                    "ok": False, "code": "lock_check_failed",
+                    "error": "Couldn't check file locks in the projects folder, so the setting stayed "
+                             "off. The ComfyUI console says why."},
+                    status=500)
         try:
-            await asyncio.to_thread(external_links.set_enabled, body["allow_external_project_links"])
-        except external_links.LinkError as exc:
-            return _json_error(str(exc), exc.status)
-        except OSError as exc:
+            values = await asyncio.to_thread(server_settings.update, changes)
+        except server_settings.SettingsUnreadable:
+            logger.warning("Sonder server settings were not changed: %s cannot be read",
+                           server_settings.settings_path())
+            return web.json_response({
+                "ok": False, "code": "settings_unreadable",
+                "error": "The server settings file can't be read, so nothing was changed."}, status=500)
+        except server_settings.SettingsUnavailable:
+            return _json_error("Cannot save server settings: ComfyUI user directory unavailable", 500)
+        except OSError:
+            # The path stays in the log: any client can change sharing.
             logger.exception("Failed to save Sonder server settings")
-            return _json_error(f"Could not save server settings: {exc}", 500)
-        return web.json_response({
-            "allow_external_project_links": external_links.is_enabled(),
-            "can_manage": is_loopback_request(request),
-        })
+            return _json_error("Could not save server settings. The ComfyUI console says why.", 500)
+        return web.json_response(_server_settings_payload(request, values))
 
     @routes.post("/sonder-editor/projects/link")
     async def api_link_project(request: web.Request) -> web.Response:

@@ -6,17 +6,17 @@ individual media assets — on another drive. This module owns the consent switc
 mechanics for that workflow:
 
 - ``is_enabled()`` — the install-level "Allow external project links" flag. Server-side by
-  design (it gates server trust; a browser-local setting could not be enforced). Stored at
-  ``<comfy user dir>/sonder-editor/settings.json``; default OFF. When ON, ``path_security``
-  switches its containment checks to lexical comparison so links the user planted are
-  followed *everywhere the editor resolves files*.
+  design (it gates server trust; a browser-local setting could not be enforced). Kept by
+  ``server_settings`` (which owns ``settings.json``); default OFF, and OFF when the file
+  cannot be read. When ON, ``path_security`` switches its containment checks to lexical
+  comparison so links the user planted are followed *everywhere the editor resolves files*.
 - ``create_project_link`` / ``remove_project_link`` — "the symlink IS the registry": linking a
   project means creating a directory junction (or symlink) under ``<output>/sonder-projects``;
   unlinking removes only the reparse point, never the target's files.
 - ``is_reparse_child`` — child-level reparse detection that stays correct even when the scan
   root itself sits behind a symlink (as it does under Stability Matrix's output→Images link).
 
-Import discipline: stdlib + ``atomic_io`` + ``sdk_paths`` at module level; ``folder_paths`` and
+Import discipline: stdlib + ``server_settings`` at module level; ``folder_paths`` and
 ``path_security`` are imported lazily inside functions (``path_security`` lazily imports
 ``is_enabled`` from here, so a module-level import back would be a cycle).
 """
@@ -26,22 +26,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
-import uuid
 
-from .atomic_io import atomic_replace
-from .sdk_paths import sonder_user_dir
+from . import server_settings
 
 logger = logging.getLogger("sonder_editor")
-
-SETTINGS_VERSION = 1
-_FLAG_KEY = "allow_external_project_links"
-
-# The flag is consulted from path_within(), which runs per-entry inside the /assets media
-# snapshot loop (thousands of calls per request) — a per-call os.stat of settings.json is
-# too hot, so reads are TTL-cached. set_enabled() invalidates immediately (live toggle).
-_FLAG_CACHE_TTL_SEC = 1.0
-_flag_cache = {"value": False, "expires": 0.0}
 
 # Windows device names are rejected explicitly in the lexical trust path (realpath-based
 # containment used to catch them incidentally).
@@ -65,58 +53,11 @@ class LinkError(ValueError):
 # ── Flag store ────────────────────────────────────────────────────────────────
 
 
-def _settings_path() -> str:
-    root = sonder_user_dir()
-    return os.path.join(root, "settings.json") if root else ""
-
-
-def _read_settings() -> dict:
-    path = _settings_path()
-    if not path or not os.path.isfile(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("external_links: failed to read settings %s: %s", path, exc)
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def is_enabled() -> bool:
-    """Whether external links are trusted. Fail-safe OFF on any error (incl. no ComfyUI)."""
-    now = time.monotonic()
-    if now < _flag_cache["expires"]:
-        return _flag_cache["value"]
-    try:
-        value = bool(_read_settings().get(_FLAG_KEY, False))
-    except Exception:
-        value = False
-    _flag_cache["value"] = value
-    _flag_cache["expires"] = now + _FLAG_CACHE_TTL_SEC
-    return value
-
-
-def set_enabled(value: bool) -> None:
-    path = _settings_path()
-    if not path:
-        raise LinkError("Cannot save server settings: ComfyUI user directory unavailable", 500)
-    data = _read_settings()
-    data["version"] = SETTINGS_VERSION
-    data[_FLAG_KEY] = bool(value)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    atomic_replace(tmp, path)
-    _flag_cache["value"] = bool(value)
-    _flag_cache["expires"] = time.monotonic() + _FLAG_CACHE_TTL_SEC
-    logger.info("external_links: allow_external_project_links set to %s", bool(value))
-
-
-def invalidate_flag_cache() -> None:
-    """Force the next is_enabled() to re-read the settings file (tests / external edits)."""
-    _flag_cache["expires"] = 0.0
+    """Whether external links are trusted. Fail-safe OFF on any error (incl. no ComfyUI).
+    Cached by `server_settings`: path_within() asks per entry inside the /assets media
+    snapshot loop, thousands of times per request."""
+    return server_settings.links_enabled()
 
 
 # ── Reparse detection ─────────────────────────────────────────────────────────

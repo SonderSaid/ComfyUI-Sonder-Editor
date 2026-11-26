@@ -360,7 +360,9 @@ def test_the_decoder_reads_only_the_recipe_and_its_files(env, tmp_path, monkeypa
         monkeypatch.setattr(path_security, name, _refuse(name))
     monkeypatch.setattr(project_storage, "hydrate_job", _refuse("hydrate_job"))
     monkeypatch.setattr(m.external_links, "is_enabled", _refuse("external_links"))
-    monkeypatch.setattr(m.external_links, "_read_settings", _refuse("settings"))
+    server_settings = importlib.import_module(f"{PACKAGE}.server.server_settings")
+    monkeypatch.setattr(server_settings, "_read_document", _refuse("settings"))
+    monkeypatch.setattr(server_settings, "current", _refuse("settings"))
     monkeypatch.setattr(m.project_manager, "load_project", _refuse("load_project"))
     for label, family, spec, token, expected in work:
         # The token path receives the recipe back from its canonical JSON, as in a run.

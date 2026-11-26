@@ -10,7 +10,7 @@ const UNREPAIRABLE = {
     state_unreadable: 'The project’s state folder is missing or can’t be read. Reconnect its drive or restore the folder from a backup, then check again.',
     unavailable: 'Some stored parts can’t be read right now. Close other programs that use the project’s folder, or reconnect its drive, then check again.',
     held_unreadable: 'The list of kept parts, state/held.json, can’t be read. Move it out of the project’s folder, then check again.',
-    no_locks: 'This project’s drive doesn’t support file locks. Move the project to a local drive, then check again.',
+    no_locks: 'This project’s drive doesn’t support file locks, so it can’t be repaired while Share Projects Between ComfyUI Servers is on. Move the project to a local drive and check again. If no other ComfyUI server is running and none of its runs are going, you can instead turn the setting off in the editor’s Settings ▸ Server, then repair.',
 };
 const NAMES_SHOWN = 5;
 

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from server import project_manager as pm, project_repair as repair, project_storage as ps
+from server import project_manager as pm, project_repair as repair, project_storage as ps, server_settings
 from server.project_file_lock import ProjectBusyError
 from server.timeline_state import Asset, GenerationJob
 from test_project_mutation_pipeline_backend import DummyRequest, _load_route_module, _route_handler
@@ -825,7 +825,13 @@ def test_a_check_holds_the_project_lock(tmp_path, monkeypatch):
     assert held == [True]
 
 
-def test_a_busy_project_is_not_repaired(tmp_path, monkeypatch):
+@pytest.fixture
+def sharing_on(monkeypatch):
+    """Share Projects Between ComfyUI Servers: only then does a repair take the OS lock."""
+    monkeypatch.setattr(server_settings, "sharing_enabled", lambda: True)
+
+
+def test_a_busy_project_is_not_repaired(tmp_path, monkeypatch, sharing_on):
     project_dir = make(tmp_path)
     damage(component(project_dir, ASSET_A), "absent")
     report = repair.inspect_storage(project_dir)
@@ -838,13 +844,31 @@ def test_a_busy_project_is_not_repaired(tmp_path, monkeypatch):
     assert tree(project_dir) == before
 
 
-def test_a_filesystem_without_locks_is_checked_but_not_repaired(tmp_path, monkeypatch):
+def test_a_filesystem_without_locks_is_checked_but_not_repaired(tmp_path, monkeypatch, sharing_on):
     project_dir = make(tmp_path)
     damage(component(project_dir, ASSET_A), "absent")
     report = repair.inspect_storage(project_dir)
     monkeypatch.setattr(pm.ProjectFileLock, "try_acquire", lambda self: "unsupported")
     with pytest.raises(repair.RepairRefused, match="no_locks"):
         repair.repair_storage(project_dir, report["digest"])
+
+
+def test_a_server_that_does_not_share_repairs_without_the_os_lock(tmp_path, monkeypatch):
+    """Off (the default): the thread lock is the whole critical section, so a drive without
+    locks, or a lock file left by an earlier run, changes nothing."""
+    monkeypatch.setattr(server_settings, "sharing_enabled", lambda: False)
+    project_dir = make(tmp_path)
+    Path(project_dir, "project.lock").touch()
+    damage(component(project_dir, ASSET_A), "absent")
+    report = repair.inspect_storage(project_dir)
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("a server that does not share took the OS lock")
+
+    monkeypatch.setattr(pm, "ProjectFileLock", never)
+    result = repair.repair_storage(project_dir, report["digest"])
+    assert result["reopened"] is True
+    assert repair.inspect_storage(project_dir)["status"] == "healthy"
 
 
 def test_the_path_budget_of_a_deep_project(tmp_path, monkeypatch):

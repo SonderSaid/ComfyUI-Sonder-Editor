@@ -14,7 +14,8 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from server import project_manager as pm, project_storage as ps  # noqa: E402
+from server import project_file_lock as file_lock, project_manager as pm, project_storage as ps  # noqa: E402
+from server import server_settings  # noqa: E402
 from server.timeline_state import Asset  # noqa: E402
 
 FLAGS = sys.argv[1]
@@ -132,6 +133,8 @@ def role_load_loop(project_dir):
 def role_hold(project_dir):
     with pm._project_commit_lock(project_dir) as held:
         assert held
+        # The OS lock itself, not only an exclusive hold: a second handle is refused.
+        assert file_lock.ProjectFileLock(project_dir).try_acquire() == file_lock.CONTENDED
         raise_flag("holding")
         wait_flag("release")
 
@@ -170,4 +173,9 @@ def role_reader_paused_before_children(project_dir):
 
 
 if __name__ == "__main__":
+    # This process has no ComfyUI user directory, so it has no server settings file: the
+    # test says whether it shares its projects, and it must, or no role takes the lock.
+    if os.environ.get("CROSS_PROCESS_SHARING") == "1":
+        server_settings.sharing_enabled = lambda: True
+    assert server_settings.sharing_enabled(), "this worker would not take the cross-process lock"
     globals()["role_" + sys.argv[2]](*sys.argv[3:])

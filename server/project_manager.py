@@ -14,6 +14,7 @@ from typing import Callable
 from .atomic_io import atomic_replace_root as atomic_replace
 from . import external_links
 from . import project_storage
+from . import server_settings
 from .pack_version import pack_version
 from .path_security import path_within
 from .project_file_lock import CONTENDED, HELD, ProjectBusyError, ProjectFileLock
@@ -79,11 +80,19 @@ _UNLOCKED_FILESYSTEMS_WARNED: set[str] = set()
 
 @contextmanager
 def _project_commit_lock(project_dir: str, *, wait: float = COMMIT_LOCK_WAIT_SECONDS):
-    """The write lock plus the cross-process lock. Yields whether the latter is held.
+    """The write lock, plus the cross-process lock when this server shares its projects.
+    Yields whether the hold is *exclusive*: no other process can be inside.
 
-    ``False`` means the filesystem has no locks: a save proceeds as it always has, and a
-    sweep must not run. Raises `ProjectBusyError` when another process holds the lock for
-    ``wait`` seconds, before anything was published.
+    **Share Projects Between ComfyUI Servers** (``server_settings``, read once per hold)
+    decides. Off: the user says no other process opens these projects, so the thread lock
+    is the whole critical section and the hold is exclusive; no OS lock is taken and
+    ``project.lock`` is not created. A save that started before the setting was turned on
+    finishes unprotected.
+
+    On: the OS lock on ``project.lock`` is taken too. ``False`` then means the filesystem
+    has no locks: a save proceeds as it always has, and a sweep or repair must not run.
+    Raises `ProjectBusyError` when another process holds the lock for ``wait`` seconds,
+    before anything was published.
 
     While another process holds it, the thread lock is let go between attempts, so this
     process's loads never wait on that process. ``wait`` counts only that time: waiting
@@ -91,6 +100,10 @@ def _project_commit_lock(project_dir: str, *, wait: float = COMMIT_LOCK_WAIT_SEC
     attempts do not back off, because a growing interval starved one save for seconds.
     """
     thread_lock = _project_write_lock(project_dir)
+    if not server_settings.sharing_enabled():
+        with thread_lock:
+            yield True
+        return
     waited = 0.0
     while True:
         thread_lock.acquire()
@@ -126,12 +139,18 @@ def _warn_unlocked_filesystem(project_dir: str) -> None:
         _UNLOCKED_FILESYSTEMS_WARNED.add(key)
         logger.warning(
             "The filesystem of %s has no file locks: opening this project in two ComfyUI "
-            "processes at once is not safe, and its unused state files are never removed.",
+            "processes at once is not safe, and its unused state files are never removed. "
+            "Move it to a local drive, or turn off Share Projects Between ComfyUI Servers "
+            "(Settings > Server) if only this server opens it.",
             project_dir)
 
 
 def project_held_elsewhere(project_dir: str) -> bool:
-    """Whether another process holds the project's lock right now. Advisory."""
+    """Whether another process holds the project's lock right now. Advisory; always
+    ``False`` while this server does not share its projects, without waiting behind this
+    process's own saves."""
+    if not server_settings.sharing_enabled():
+        return False
     try:
         with _project_commit_lock(project_dir, wait=0):
             return False

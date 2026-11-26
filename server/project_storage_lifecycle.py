@@ -3,7 +3,8 @@
 No model is retained by the registry. Publication and lease acquisition use the
 project manager's lock; finalizers only enqueue work, never touch the filesystem.
 Leases protect this process's readers from its own sweeps. Another process's readers
-are protected by component retention, and its saves by the cross-process commit lock.
+are protected by component retention, and its saves by the cross-process commit lock
+when both servers have Share Projects Between ComfyUI Servers on.
 """
 import copy
 import atexit

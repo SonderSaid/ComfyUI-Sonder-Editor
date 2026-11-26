@@ -55,6 +55,18 @@ To open another project, choose it in the same selector. Inside the editor,
 **+ Scene** at the top adds a scene to the project, and the scene pill beside
 it switches scenes.
 
+## One project in two ComfyUI servers
+
+If more than one ComfyUI server opens the same projects, for example one for
+editing and one for generating, turn on **Settings ▸ Server ▸ Share Projects
+Between ComfyUI Servers** in every one of them before you open a project in
+more than one. **Settings** is the gear at the right of the timeline toolbar.
+A server with the setting off doesn't take part.
+
+The setting needs a drive that supports file locks, which is any local drive.
+Two computers opening one project on a network drive may not be protected, so
+keep shared projects on a local drive.
+
 ## Screen layout
 
 From top to bottom:

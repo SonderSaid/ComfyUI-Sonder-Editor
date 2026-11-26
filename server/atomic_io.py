@@ -11,7 +11,8 @@ bounded retry, since the colliding handle is almost always transient (a real
 
 Our own concurrent writers (the ComfyUI render worker, the bridge daemon thread,
 ``asyncio.to_thread`` workers, and the event-loop routes) are serialized by the
-per-project commit lock in ``project_manager.save_project``, across processes too, so
+per-project commit lock in ``project_manager.save_project`` (across processes too when
+Share Projects Between ComfyUI Servers is on), so
 this ``atomic_replace`` succeeds on the first attempt in the common case. The backoff
 is exercised by handle holders outside that lock: antivirus, the Search Indexer, an
 external viewer, and another ComfyUI process reading ``project.json``, since loads

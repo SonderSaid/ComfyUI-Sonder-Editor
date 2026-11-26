@@ -4,8 +4,12 @@ Two ComfyUI processes can open one project (a second install, an external link).
 in-process write lock cannot keep one from deleting or overwriting what the other is
 saving, so a commit and a component sweep also hold this: an OS lock on
 ``project.lock`` in the project folder. The OS drops it when its holder dies. Loads
-never take it; component retention protects them (``project_storage``). Sonder 0.9.3
-and older do not take it, so it protects only processes that do.
+never take it; component retention protects them (``project_storage``). It is taken
+only while **Share Projects Between ComfyUI Servers** is on (``server_settings``; off by
+default), and Sonder 0.9.3 and older never take it, so it protects only processes that
+do.
+
+``probe_locks`` checks a folder's drive before that setting is turned on.
 
 The file is never written and never deleted: deleting it would let two processes hold
 locks on two different files.
@@ -14,6 +18,7 @@ import errno
 import os
 import stat
 import time
+import uuid
 
 if os.name == "nt":
     import ctypes
@@ -39,7 +44,10 @@ _UNSUPPORTED_WINDOWS = {1, 50}
 # An indexer, antivirus or backup can hold the file for a moment.
 _OPEN_RETRY_DELAYS = (0.025, 0.05, 0.1, 0.2)
 
-PROJECT_BUSY_MESSAGE = "Another ComfyUI process is saving this project. Try again in a moment."
+# Busy is only possible while Share Projects Between ComfyUI Servers is on.
+PROJECT_BUSY_MESSAGE = (
+    "Another ComfyUI server is saving this project. Try again in a moment. If no other server "
+    "uses it, turn off Share Projects Between ComfyUI Servers in the editor's Settings ▸ Server.")
 
 
 class ProjectBusyError(PermissionError):
@@ -150,6 +158,16 @@ if os.name == "nt":
 
     def _unlock(fd):
         _kernel32.UnlockFileEx(msvcrt.get_osfhandle(fd), 0, 1, 0, _range())
+
+    def _raw_lock(fd):
+        """``None``, or the Windows error code (for `probe_locks`)."""
+        return _lock_file(fd) or None
+
+    def _is_conflict(error):
+        return error == 33  # ERROR_LOCK_VIOLATION
+
+    def _says_no_locks(error):
+        return error in _UNSUPPORTED_WINDOWS
 else:
     def _lock(fd):
         try:
@@ -163,3 +181,76 @@ else:
             fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
             pass
+
+    def _raw_lock(fd):
+        """``None``, or the errno (for `probe_locks`)."""
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            return exc.errno
+        return None
+
+    def _is_conflict(error):
+        return error in (errno.EWOULDBLOCK, errno.EAGAIN)
+
+    def _says_no_locks(error):
+        return error in _UNSUPPORTED
+
+
+PROBE_PREFIX = ".sonder-lock-probe-"
+PROBE_OK = "ok"
+PROBE_UNSUPPORTED = "unsupported"
+PROBE_FAILED = "check_failed"
+
+
+def probe_locks(directory):
+    """Whether file locks work in ``directory`` on this machine: ``(outcome, detail)``.
+
+    Two independent handles on a new file. The first must take the lock, the second must
+    get the platform's own conflict answer (not any error: production counts unclear
+    errors as busy, which here would pass a drive whose locks do not work), and the second
+    must take it once the first lets go. ``PROBE_UNSUPPORTED`` when the drive says it has
+    no locks or does not enforce them; ``PROBE_FAILED`` for anything else, with ``detail``
+    for the server log only (it can name a path). A pass says nothing about other hosts:
+    some network mounts enforce locks locally only.
+
+    Only the file this call created is removed; nothing else is touched.
+    """
+    path = os.path.join(directory, f"{PROBE_PREFIX}{uuid.uuid4().hex}")
+    flags = getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    first = second = None
+    created = False
+    try:
+        try:
+            first = os.open(path, flags | os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o666)
+            created = True
+            second = os.open(path, flags | os.O_RDWR)
+        except OSError as exc:
+            return PROBE_FAILED, f"could not create a test file: {exc}"
+        error = _raw_lock(first)
+        if error is not None:
+            outcome = PROBE_UNSUPPORTED if _says_no_locks(error) else PROBE_FAILED
+            return outcome, f"lock failed with {error}"
+        error = _raw_lock(second)
+        if error is None:
+            return PROBE_UNSUPPORTED, "a second handle took the lock while the first held it"
+        if not _is_conflict(error):
+            return PROBE_FAILED, f"a second handle failed with {error} instead of a lock conflict"
+        _unlock(first)
+        error = _raw_lock(second)
+        if error is not None:
+            return PROBE_FAILED, f"the lock could not be taken again after release ({error})"
+        _unlock(second)
+        return PROBE_OK, ""
+    finally:
+        for fd in (second, first):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        if created:
+            try:
+                os.remove(path)
+            except OSError:
+                pass

@@ -66,8 +66,10 @@ def repair_storage(project_dir, digest):
     """
     from .project_manager import (
         _next_modified_at, _project_commit_lock, load_project, notify_project_saved, write_project_root)
-    with _project_commit_lock(project_dir) as held:
-        if not held:  # no lock to keep another process's save or sweep out
+    with _project_commit_lock(project_dir) as exclusive:
+        # Not exclusive: this server shares its projects, but the drive has no file locks
+        # to keep another process's save or sweep out.
+        if not exclusive:
             raise RepairRefused("no_locks")
         plan = _Plan(project_dir)
         report = plan.report()

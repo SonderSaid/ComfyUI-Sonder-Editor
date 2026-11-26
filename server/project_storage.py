@@ -933,7 +933,8 @@ def collect_unreferenced_components(project_dir, *, retention_seconds=COMPONENT_
     The first pass takes no cross-process lock and, when there is nothing to record or
     delete, writes nothing. Otherwise the commit lock is taken without waiting and the
     document must still be the bytes the first pass validated, so nothing is deleted
-    beside another process's save. Runs on activity only: an idle project is not
+    beside another process's save (one that takes the lock: both servers need Share
+    Projects Between ComfyUI Servers on). Runs on activity only: an idle project is not
     revisited when a delay expires.
     """
     from .project_manager import _project_commit_lock, _project_write_lock
@@ -950,16 +951,17 @@ def collect_unreferenced_components(project_dir, *, retention_seconds=COMPONENT_
             return []
     with contextlib.ExitStack() as stack:
         try:
-            held = stack.enter_context(_project_commit_lock(project_dir, wait=0))
+            exclusive = stack.enter_context(_project_commit_lock(project_dir, wait=0))
         except OSError as exc:
             # Busy or read-only: a later sweep does it. Anything else is a real failure.
             if not _is_unwritable(exc):
                 raise
             logger.debug("Skipped the component sweep of %s: %s", project_dir, exc)
             return []
-        # Nothing protects a peer's save on a filesystem without locks, and a document
-        # that changed since the first pass was not validated.
-        if not held or _read_bytes(root_path) != root:
+        # Not exclusive: this server shares its projects but the filesystem has no locks,
+        # so nothing protects a peer's save. A document that changed since the first pass
+        # was not validated.
+        if not exclusive or _read_bytes(root_path) != root:
             return []
         unused = _unused_names(project_dir, storage)
         if unused is None:

@@ -42,6 +42,8 @@ EXEMPT = {
     "_maybeHealAudioConstraint": "Background metadata healing, deliberately unscoped.",
     "_revealProjectFolder": "Opens a folder, not a project-data mutation.",
     "_runGalleryAssetWrite": "Sends the caller's diagnostics; its callers are checked as writers.",
+    "_putServerSettings": ("Sends the caller's diagnostics and serializes server-settings writes; its "
+                           "callers are the two Settings > Server toggles, each inside its own gesture."),
 }
 
 

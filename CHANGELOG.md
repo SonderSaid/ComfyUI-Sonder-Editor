@@ -12,16 +12,17 @@ a fresh `[Unreleased]` block.
 ## [Unreleased]
 
 ### Added
+- **Settings ▸ Server ▸ Share Projects Between ComfyUI Servers**, off by default, for running two ComfyUI servers on the same projects. Turning it on checks that the projects folder's drive supports file locks.
 - **Check and repair…** in the Launcher's project menu finds missing or damaged stored parts of a project that won't open, says what a repair would lose, and repairs it after saving a copy of `project.json`.
 
 ### Fixed
 - A choice in **Modes** that sets a whole group to **Enabled**, **Muted** or **Bypassed** now sets every node in the group when you click it, including nodes added after you made the choice. Choices made with earlier versions do this too. A choice that sets the group's nodes differently is greyed out after a node joins or leaves the group, until you update it.
 - Changing a setting, a seed's mode or a node switch in Controls, or clicking a choice in **Modes**, right after another change such as the Editor's FPS now saves both. Before, Mount in Tab and fullscreen could refuse it with *The workflow changed*. It is refused only when the same setting or switch was changed elsewhere, or now sets a different input or different nodes, and the row or notice says which. A save that takes more than five seconds shows **Still saving…** and still lands, instead of reporting that it failed.
-- Two ComfyUI servers can have the same project open, for example one for editing and one for generating:
-  - Their saves no longer break the project, and an edit made from an older version is refused instead of overwriting the other server's save. Before, the project could stop opening, with the message that its stored data could not be read. Both servers need this version; 0.9.3 and older don't take part.
+- Two ComfyUI servers can have the same project open, for example one for editing and one for generating. Turn on **Settings ▸ Server ▸ Share Projects Between ComfyUI Servers** (off by default) in every server that opens it. It needs a drive that supports file locks, which is any local drive. Then:
+  - Their saves no longer break the project, and an edit made from an older version is refused instead of overwriting the other server's save. Before, the project could stop opening, with the message that its stored data could not be read. A server with the setting off, or with 0.9.3 or older, doesn't take part.
   - A take that finishes while the other server is saving waits for it.
-  - If the other server doesn't let go, the save says *Another ComfyUI process is saving this project. Try again in a moment.*
-  - Favorites, names and folders still save without that check: one set at the moment a take lands can drop it from the project, on one server too.
+  - If the other server doesn't let go, the save says *Another ComfyUI server is saving this project. Try again in a moment.*
+- Favorites, names and folders still save without the version check: one set at the moment a take lands can drop it from the project, with one server or two.
 - Undo and Redo reverse only your own edit:
   - A take that landed around the edit, or another server's change, is no longer removed along with it. Redo no longer hides such a take until it finishes.
   - Undo of the first text in a prompt channel removes the text, and Redo brings it back. Before, the text stayed and Redo was refused. The same goes for a Writing **Apply** that creates Subjects.
@@ -35,7 +36,7 @@ a fresh `[Unreleased]` block.
 - A queue run that fails keeps its own error when the job could not be marked failed.
 
 ### Changed
-- A project folder now holds an empty `project.lock` file. Stored details a project no longer uses are removed when you next use the project after a day, instead of within a minute.
+- A server with **Share Projects Between ComfyUI Servers** on keeps an empty `project.lock` file in each project folder it saves; it can stay there after the setting is turned off. Stored details a project no longer uses are removed when you next use the project after a day, instead of within a minute.
 
 ## [0.9.3] - 2026-11-23
 

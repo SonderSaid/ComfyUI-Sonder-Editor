@@ -2,6 +2,10 @@
 
 Every ordering here is forced by flag files (``cross_process_worker.py``). A barrier
 that is never met fails the test.
+
+Share Projects Between ComfyUI Servers is on for every test here, in this process and in
+every worker (which asserts it), unless a test turns it off: the cross-process lock is
+taken only then.
 """
 import asyncio
 import errno
@@ -22,6 +26,7 @@ from aiohttp.test_utils import make_mocked_request
 
 from server import project_commit, project_file_lock as file_lock, project_manager as pm, project_storage as ps
 from server import project_storage_lifecycle as lifecycle
+from server import project_repair as repair, server_settings
 from server.project_commit import created_ids_since, snapshot_item_ids
 from server.project_file_lock import PROJECT_BUSY_MESSAGE, ProjectBusyError
 from server.timeline_state import Asset
@@ -42,7 +47,7 @@ class Peers:
         process = subprocess.Popen(
             [sys.executable, str(WORKER), str(self.flags), role, *map(str, args)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            env={**os.environ, "CROSS_PROCESS_RESULT": str(result)})
+            env={**os.environ, "CROSS_PROCESS_RESULT": str(result), "CROSS_PROCESS_SHARING": "1"})
         process.result_file = result
         self.running.append(process)
         return process
@@ -61,6 +66,14 @@ class Peers:
         while not (self.flags / name).exists():
             assert time.monotonic() < deadline, f"barrier {name} was never met"
             time.sleep(0.005)
+
+
+@pytest.fixture(autouse=True)
+def sharing(monkeypatch):
+    """Share Projects Between ComfyUI Servers, on unless a test sets it off."""
+    state = {"on": True}
+    monkeypatch.setattr(server_settings, "sharing_enabled", lambda: state["on"])
+    return state
 
 
 @pytest.fixture
@@ -269,6 +282,65 @@ def test_a_filesystem_without_locks_saves_as_before_and_never_sweeps(tmp_path, m
     assert sum("no file locks" in record.message for record in caplog.records) == 1
     assert ps.collect_unreferenced_components(project_dir, retention_seconds=0) == []
     assert (Path(project_dir) / orphan["path"]).is_file()
+
+
+# ---------------------------------------------------------------------------
+# Share Projects Between ComfyUI Servers off (the default): no OS lock at all
+# ---------------------------------------------------------------------------
+
+def _never_lock(*_args, **_kwargs):
+    raise AssertionError("a server that does not share took the OS lock")
+
+
+def test_a_server_that_does_not_share_never_creates_project_lock(tmp_path, monkeypatch, sharing):
+    sharing["on"] = False
+    monkeypatch.setattr(pm, "ProjectFileLock", _never_lock)
+    project_dir = make_project(tmp_path)  # creates, saves three times and sweeps
+    pm.save_project(pm.load_project(project_dir), notify=False)
+    assert not (Path(project_dir) / "project.lock").exists()
+    assert pm.project_held_elsewhere(project_dir) is False
+
+
+def test_a_server_that_does_not_share_ignores_a_lock_left_by_an_earlier_run(tmp_path, monkeypatch, sharing):
+    project_dir = make_project(tmp_path)  # shared: leaves project.lock behind
+    assert (Path(project_dir) / "project.lock").exists()
+    sharing["on"] = False
+    monkeypatch.setattr(pm, "ProjectFileLock", _never_lock)
+    path = orphan(project_dir, 1)
+    pm.save_project(pm.load_project(project_dir), notify=False)
+    assert path.name in [os.path.basename(p) for p in
+                         ps.collect_unreferenced_components(project_dir, retention_seconds=0)]
+    assert not path.exists()
+
+
+def test_a_server_that_does_not_share_saves_and_sweeps_beside_a_held_lock(held, sharing):
+    """Off means the user said no other server opens the project: a holder elsewhere is
+    not waited for (that is what turning the setting on is for)."""
+    project_dir, _ = held
+    sharing["on"] = False
+    path = orphan(project_dir, 1)
+    started = time.monotonic()
+    project = pm.load_project(project_dir)
+    project.assets.append(Asset(asset_id="take", generation_params={"prompt": "take"}))
+    pm.save_project(project, notify=False, lock_wait=5)
+    assert ps.collect_unreferenced_components(project_dir, retention_seconds=0)
+    assert time.monotonic() - started < 3 and not path.exists()
+    assert "take" in {asset.asset_id for asset in assert_whole(project_dir).assets}
+
+
+def test_a_held_project_refuses_a_repair_and_changes_nothing(held, monkeypatch):
+    project_dir, _ = held
+    project = pm.load_project(project_dir)
+    descriptor = project._raw_data["storage"]["components"][ps.asset_component_name("a0")]
+    os.remove(Path(project_dir) / descriptor["path"])
+    del project
+    report = repair.inspect_storage(project_dir)
+    assert report["status"] == repair.DAMAGED
+    before = {path: path.read_bytes() for path in Path(project_dir).rglob("*") if path.is_file()}
+    monkeypatch.setattr(pm._project_commit_lock.__wrapped__, "__kwdefaults__", {"wait": 0.2})
+    with pytest.raises(ProjectBusyError):
+        repair.repair_storage(project_dir, report["digest"])
+    assert {path: path.read_bytes() for path in Path(project_dir).rglob("*") if path.is_file()} == before
 
 
 def test_the_lock_excludes_threads_and_a_second_instance(tmp_path):
@@ -494,7 +566,9 @@ def test_a_save_whose_root_replace_fails_only_restarts_the_delay(tmp_path, clock
     assert path.exists()
 
 
-def test_a_save_that_cannot_clear_its_record_fails_before_the_root(tmp_path, clock, monkeypatch):
+@pytest.mark.parametrize("shared", [True, False])
+def test_a_save_that_cannot_clear_its_record_fails_before_the_root(tmp_path, clock, monkeypatch, sharing, shared):
+    sharing["on"] = shared  # retention bookkeeping is part of every save, shared or not
     project_dir = make_project(tmp_path)
     params = {"prompt": "take", "workflow": {"k": 1}}
     ps.publish_component(project_dir, ps.asset_component_name("take"), params, format_version=3)

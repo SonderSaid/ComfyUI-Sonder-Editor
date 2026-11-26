@@ -408,6 +408,13 @@ function syncSettingsPanelControls() {
             ? "Loading server setting…"
             : refused ? MACHINE_ONLY_MESSAGE : "";
     }
+    if (controls.shareProjectsBetweenServers) {
+        // Open to every client in both directions: it grants no trust (see the route).
+        const resolved = this._serverSettingsLoaded === true;
+        controls.shareProjectsBetweenServers.disabled = !resolved;
+        controls.shareProjectsBetweenServers.checked = this._serverSettings?.share_projects_between_servers === true;
+        controls.shareProjectsBetweenServers.title = resolved ? "" : "Loading server setting…";
+    }
     if (controls.sdkShowLauncherButton) controls.sdkShowLauncherButton.checked = !!this._settings.sdk?.showLauncherButton;
     syncSdkSetupControls.call(this, controls);
     this._renderModelTemplateSettings?.();
@@ -1789,7 +1796,7 @@ function showSettingsPanel() {
 
     const serverSection = createSection(
         "Server",
-        "Install-level trust settings. These apply to everyone who can reach this ComfyUI server."
+        "Settings for this ComfyUI server. They apply to everyone who can reach it."
     );
     const externalLinksToggle = createCheckbox(
         serverSection,
@@ -1803,6 +1810,18 @@ function showSettingsPanel() {
     );
     externalLinksToggle.disabled = true;
     externalLinksToggle.title = "Loading server setting…";
+    const shareProjectsToggle = createCheckbox(
+        serverSection,
+        "shareProjectsBetweenServers",
+        "Share Projects Between ComfyUI Servers",
+        "Turn this on in every ComfyUI server that opens the same projects, for example one for editing and one for generating, before opening a project in more than one. It needs a drive that supports file locks, which is any local drive. Leave it off if only this server opens them.",
+        () => this._serverSettings?.share_projects_between_servers === true,
+        (checked) => {
+            Promise.resolve(this._setShareProjectsBetweenServers(checked)).catch(() => {});
+        }
+    );
+    shareProjectsToggle.disabled = true;
+    shareProjectsToggle.title = "Loading server setting…";
 
     let channelTemplatesSection = null;
     const promptsSection = createSection(

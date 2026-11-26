@@ -1249,6 +1249,8 @@ export class EditorWidget {
         this._referenceFramingAckSeq = 0;
         this._serverSettings = null;
         this._serverSettingsLoaded = false;
+        this._serverSettingsEpoch = 0;
+        this._serverSettingsWrites = null;
         this._activeProjectLinked = false;
 
         // Animatic toggle state
@@ -11349,6 +11351,7 @@ export class EditorWidget {
             get _serverSettingsLoaded() { return editor._serverSettingsLoaded; },
             _loadServerSettings: () => editor._loadServerSettings(),
             _setAllowExternalProjectLinks: (enabled) => editor._setAllowExternalProjectLinks(enabled),
+            _setShareProjectsBetweenServers: (enabled) => editor._setShareProjectsBetweenServers(enabled),
             get _sdkSetup() { return getSdkSetupClient().state; },
             _loadSdkSetup: () => getSdkSetupClient().refresh(),
             _installSdk: () => getSdkSetupClient().install(),
@@ -24311,26 +24314,64 @@ export class EditorWidget {
     }
 
     async _loadServerSettings() {
+        // A write that starts or finishes while this load is out makes its answer stale.
+        const epoch = this._serverSettingsEpoch || 0;
         this._serverSettingsLoaded = false;
         this._syncSettingsPanelControls();
         try {
             const resp = await fetch(api.apiURL("/sonder-editor/server-settings"));
             if (!resp.ok) throw new Error(`Failed to load server settings: ${resp.status}`);
             const data = await resp.json();
-            if (typeof data?.allow_external_project_links !== "boolean") {
+            if (typeof data?.allow_external_project_links !== "boolean"
+                || typeof data?.share_projects_between_servers !== "boolean") {
                 throw new Error("Server settings response was invalid");
             }
+            if (epoch !== (this._serverSettingsEpoch || 0)) return this._keepServerSettingsAfterStaleLoad();
             this._serverSettings = data;
             this._serverSettingsLoaded = true;
             return data;
         } catch (error) {
             console.warn("[Sonder] Failed to load server settings:", error);
+            if (epoch !== (this._serverSettingsEpoch || 0)) return this._keepServerSettingsAfterStaleLoad();
             this._serverSettings = null;
             this._serverSettingsLoaded = false;
             return null;
         } finally {
             this._syncSettingsPanelControls();
         }
+    }
+
+    // A load a write overtook keeps what that write left. A refused write leaves the settings
+    // held before it, so the panel is usable again rather than stuck on "Loading".
+    _keepServerSettingsAfterStaleLoad() {
+        this._serverSettingsLoaded = this._serverSettings != null;
+        return this._serverSettings;
+    }
+
+    // Server-settings writes run one at a time, and each moves the epoch when it starts and
+    // when it ends, so neither an older write nor a load that overlapped one can overwrite
+    // the newer answer. Every answer carries all settings, which replace the held ones.
+    _putServerSettings(body, diagnostics) {
+        const run = async () => {
+            this._serverSettingsEpoch = (this._serverSettingsEpoch || 0) + 1;
+            try {
+                const resp = await fetch(api.apiURL("/sonder-editor/server-settings"), withEditorMutationDiagnostics({
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body),
+                }, diagnostics));
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok) throw new Error(data?.error || "Could not update server setting");
+                this._serverSettings = data;
+                this._serverSettingsLoaded = true;
+                return data;
+            } finally {
+                this._serverSettingsEpoch += 1;
+            }
+        };
+        const queued = (this._serverSettingsWrites || Promise.resolve()).then(run, run);
+        this._serverSettingsWrites = queued.catch(() => {});
+        return queued;
     }
 
     async _setAllowExternalProjectLinks(...args) {
@@ -24341,19 +24382,36 @@ export class EditorWidget {
     async _setAllowExternalProjectLinksWithinGesture(diagnostics, enabled) {
         const requested = enabled === true;
         try {
-            const resp = await fetch(api.apiURL("/sonder-editor/server-settings"), withEditorMutationDiagnostics({
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ allow_external_project_links: requested }),
-            }, diagnostics));
-            const data = await resp.json().catch(() => ({}));
-            if (!resp.ok) throw new Error(data?.error || "Could not update server setting");
-            this._serverSettings = data;
-            this._serverSettingsLoaded = true;
+            await this._putServerSettings({ allow_external_project_links: requested }, diagnostics);
             await this._refreshProjectChoicesAndSwitch();
             notifySuccess(requested ? "External project links enabled" : "External project links disabled");
         } catch (error) {
             notifyError(error?.message || "Could not update external project links", { source: "external-project-links" });
+        } finally {
+            this._syncSettingsPanelControls();
+        }
+    }
+
+    async _setShareProjectsBetweenServers(...args) {
+        return this._withMutationGesture(
+            "setShareProjectsBetweenServers", (diagnostics) => this._setShareProjectsBetweenServersWithinGesture(diagnostics, ...args));
+    }
+
+    // Turning it on checks the projects folder's drive on the server; a refusal leaves it off
+    // and says why. Nothing about the open project changes, so nothing is refreshed.
+    async _setShareProjectsBetweenServersWithinGesture(diagnostics, enabled) {
+        const requested = enabled === true;
+        try {
+            await this._putServerSettings({ share_projects_between_servers: requested }, diagnostics);
+            // A toast title is one line of about 45 characters; the rest goes on its second line.
+            if (requested) {
+                notifySuccess("Project sharing turned on", { detail: "Turn it on in the other ComfyUI servers too." });
+            } else {
+                notifySuccess("Project sharing turned off");
+            }
+        } catch (error) {
+            notifyError(requested ? "Couldn't turn on project sharing" : "Couldn't turn off project sharing", {
+                detail: error?.message || "", source: "share-projects" });
         } finally {
             this._syncSettingsPanelControls();
         }

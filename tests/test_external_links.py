@@ -14,7 +14,7 @@ import pytest
 from aiohttp import web
 
 import server
-from server import external_links, routes
+from server import external_links, routes, server_settings
 from server.path_security import (
     path_within,
     project_media_path,
@@ -27,9 +27,9 @@ from server.timeline_state import Asset, TimelineProject
 
 @pytest.fixture(autouse=True)
 def _reset_external_link_cache():
-    external_links._flag_cache.update(value=False, expires=0.0)
+    server_settings.invalidate_cache()
     yield
-    external_links._flag_cache.update(value=False, expires=0.0)
+    server_settings.invalidate_cache()
 
 
 def _make_symlink(link_path, target):
@@ -76,7 +76,7 @@ def test_server_setting_roundtrip_and_cache_invalidation(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "folder_paths", fake_folder_paths)
 
     assert external_links.is_enabled() is False
-    external_links.set_enabled(True)
+    server_settings.update({server_settings.LINKS_KEY: True})
 
     settings_path = user_dir / "sonder-editor" / "settings.json"
     assert json.loads(settings_path.read_text(encoding="utf-8")) == {
@@ -85,7 +85,7 @@ def test_server_setting_roundtrip_and_cache_invalidation(tmp_path, monkeypatch):
     }
     assert external_links.is_enabled() is True
 
-    external_links.set_enabled(False)
+    server_settings.update({server_settings.LINKS_KEY: False})
     assert external_links.is_enabled() is False
 
 
@@ -105,6 +105,7 @@ def test_server_settings_and_link_routes_enforce_opt_in(tmp_path, monkeypatch):
 
     assert _response_json(asyncio.run(get_settings(_DummyRequest()))) == {
         "allow_external_project_links": False,
+        "share_projects_between_servers": False,
         "can_manage": True,
     }
     blocked = asyncio.run(link_project(_DummyRequest(body={"path": str(tmp_path / "missing")})))
@@ -114,7 +115,8 @@ def test_server_settings_and_link_routes_enforce_opt_in(tmp_path, monkeypatch):
 
     updated = asyncio.run(update_settings(_DummyRequest(body={"allow_external_project_links": True})))
     assert updated.status == 200
-    assert _response_json(updated) == {"allow_external_project_links": True, "can_manage": True}
+    assert _response_json(updated) == {
+        "allow_external_project_links": True, "share_projects_between_servers": False, "can_manage": True}
 
 
 def test_trusting_a_folder_is_machine_only_and_removing_trust_is_not(tmp_path, monkeypatch):
@@ -135,7 +137,7 @@ def test_trusting_a_folder_is_machine_only_and_removing_trust_is_not(tmp_path, m
     assert _response_json(refused_on) == {"ok": False, "code": "not_local", "error": "Change this on the ComfyUI machine."}
     assert external_links.is_enabled() is False
 
-    external_links.set_enabled(True)
+    server_settings.update({server_settings.LINKS_KEY: True})
     refused_link = asyncio.run(link_project(_DummyRequest(body={"path": str(tmp_path)}, remote=lan)))
     assert refused_link.status == 403 and _response_json(refused_link)["code"] == "not_local"
     assert not (output_dir / "sonder-projects").exists()
