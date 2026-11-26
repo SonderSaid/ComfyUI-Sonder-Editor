@@ -44,7 +44,7 @@ const listeners = new Map();
 const api = {addEventListener(t,cb){listeners.set(t,cb);},removeEventListener(t,cb){if(listeners.get(t)===cb)listeners.delete(t);},
     async fetchApi(url,init){
         assert.equal(url,'/sonder-editor/controls/describe');
-        const body=JSON.parse(init.body);calls.push(body);
+        const body=JSON.parse(init.body);calls.push(body);globalThis.onDescribe?.(body);
         const answer=clone(raw);
         if(wait)await new Promise(r=>release=r);
         if(body.changes){ answer.ok=!reject;answer.changes=reject?{}:(globalThis.canon?globalThis.canon(body.changes):body.changes);
@@ -298,6 +298,35 @@ if(SCENARIO==='stale-write') {
     wait=true;const task=host.applyChanges({'binding:steps:value':'30'});await deferred();
     sampler.widgets[0].value=45;release();assert.equal((await task).ok,false);assert.equal(sampler.widgets[0].value,45);assert.equal(captures,0);
 }
+// An edit that says what it expects (control_expectations.py) is validated
+// again when an unrelated save moves the graph, instead of being refused.
+const steps30={'binding:steps:value':'30'};
+const expectSteps=(workflow='')=>({expect:{workflow,targets:{'binding:steps:value':{targets:[['3','steps']],prior:'20'}}}});
+if(SCENARIO==='expected-unrelated-write') {
+    wait=true;const task=host.applyChanges(steps30,expectSteps());await deferred();
+    sampler.widgets[2].value=8;wait=false;release();const result=await task;
+    assert.equal(result.ok,true,JSON.stringify(result));assert.equal(sampler.widgets[0].value,30);assert.equal(sampler.widgets[2].value,8);
+    const writes=calls.filter(c=>c.changes);assert.equal(writes.length,2);
+    for(const c of writes)assert.deepEqual(c.expect,{'binding:steps:value':{targets:[['3','steps']],prior:'20'}});
+    assert.equal(captures,2);
+}
+if(SCENARIO==='expected-keeps-moving') {
+    globalThis.onDescribe=body=>{if(body.changes)sampler.widgets[2].value+=1;};
+    const result=await host.applyChanges(steps30,expectSteps());
+    assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/workflow changed/);
+    assert.equal(calls.filter(c=>c.changes).length,3);assert.equal(sampler.widgets[0].value,20);assert.equal(captures,0);
+}
+if(SCENARIO==='expected-other-workflow') {
+    root.id='wf-2';
+    const result=await host.applyChanges(steps30,expectSteps('wf-1'));
+    assert.equal(result.ok,false);assert.match(result.rejected[0].reason,/another workflow/);
+    assert.equal(calls.length,0);assert.equal(sampler.widgets[0].value,20);
+    // Its own workflow writes, and the view carries the id panels bind edits to.
+    assert.equal((await host.applyChanges(steps30,expectSteps('wf-2'))).ok,true);
+    host.setVisible(true);await settle();await settle();assert.equal(host.getView().workflow_id,'wf-2');
+    assert.equal(host.expectsAll(steps30,expectSteps().expect),true);
+    assert.equal(host.expectsAll({...steps30,'binding:steps:label':'S'},expectSteps().expect),false);
+}
 if(SCENARIO==='hide-during-write'||SCENARIO==='event-during-write') {
     host.setVisible(true);await settle();
     wait=true;const task=host.applyChanges({'binding:steps:value':'30'});await deferred();
@@ -529,7 +558,7 @@ SCENARIOS = ['restore', 'restore-rollback', 'restore-stale', 'restore-rebind', '
              'remove-rebind', 'manage-listing', 'filter-during-write', 'unsafe-seed', 'moved', 'rollback-callbacks', 'presentation', 'presentation-rollback', 'root', 'promoted', 'promoted-seed', 'no-relay', 'two-relays',
              'linked-or-gone', 'manifest-cap', 'hidden-hash', 'no-relay-names', 'relay-error-view', 'refusal', 'stale-write', 'stale-view',
              'destroy', 'rollback', 'serial', 'history-failure', 'precision-refusal', 'hide-during-write',
-             'event-during-write', 'group-batch-order', 'groups', 'groups-stale', 'groups-reparse', 'group-new-relay',
+             'event-during-write', 'expected-unrelated-write', 'expected-keeps-moving', 'expected-other-workflow', 'group-batch-order', 'groups', 'groups-stale', 'groups-reparse', 'group-new-relay',
              'preset', 'preset-rollback', 'preset-no-relay', 'dynamic-prompt',
              'category', 'category-rollback', 'category-no-relay', 'category-refused']
 

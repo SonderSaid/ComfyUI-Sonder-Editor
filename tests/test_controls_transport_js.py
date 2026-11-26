@@ -45,6 +45,13 @@ if(SCENARIO.startsWith('sdk')){
         resolveSave();assert.equal((await save).ok,true);const result=await generate;assert.equal(result.payload.observed,'31');
         const put=calls.find(c=>c.method==='PUT');assert.equal(put.headers['X-Sonder-SDK-Session'],'secret');assert.equal(put.headers['X-Sonder-Tab-Session'],'tab');
     }
+    if(SCENARIO==='sdk-expect'){
+        const expect={workflow:'',targets:{'binding:n:value':{targets:[['3','n']],prior:'30'}}};
+        assert.equal((await host.applyChanges({'binding:n:value':'31'},{expect})).ok,true);
+        const put=calls.findLast(c=>c.method==='PUT');assert.deepEqual(put.body.expect,expect.targets);
+        assert.equal((await host.applyChanges({'binding:n:label':'N'})).ok,true);
+        assert.equal('expect' in calls.findLast(c=>c.method==='PUT').body,false);
+    }
     if(SCENARIO==='sdk-refusal'){fail=true;assert.equal((await host.applyChanges({'binding:n:value':'bad'})).ok,false);
         // A settled refusal saved nothing; Generate runs the stored values instead
         // of repeating that old answer (the panel decides on saves still in flight).
@@ -149,7 +156,7 @@ if(SCENARIO.startsWith('mounted')){
         if(path.endsWith('/control_changes')){
             if(globalThis.postRefusal)return{ok:false,json:async()=>({ok:false,code:globalThis.postRefusal})};
             if(SCENARIO==='mounted-order'&&body.changes['binding:n:value']==='30')await new Promise(r=>postingResolve=r);
-            const rid=pending.length?'r2':'r';pending.push({request_id:rid,changes:body.changes});
+            const rid=pending.length?'r2':'r';pending.push({request_id:rid,changes:body.changes,expect:body.expect});
             if(SCENARIO==='mounted-post-race')await new Promise(r=>postingResolve=r);
             return{ok:true,json:async()=>({request_id:rid})};
         }
@@ -262,6 +269,14 @@ if(SCENARIO.startsWith('mounted')){
         delayHide=true;host.setVisible(false);host.setVisible(true);await settle();assert.ok(releaseHide);
         releaseHide();await settle();assert.equal(remoteVisible,true);
     }
+    if(SCENARIO==='mounted-expect'){
+        // What the edit expected travels with it, for the canvas to check.
+        const expect={workflow:'wf',targets:{'binding:n:value':{targets:[['3','n']],prior:'30'}}};
+        const save=host.applyChanges({'binding:n:value':'31'},{expect});await settle();
+        assert.deepEqual(pending[0].expect,expect);
+        host.applyChanges({'binding:n:label':'N'});await settle();assert.equal(pending[1].expect,undefined);
+        applied=['r'];host.changed({host_id:'h'});assert.equal((await save).ok,true);
+    }
     if(SCENARIO==='mounted-order'){
         const older=host.applyChanges({'binding:n:value':'30'}),newer=host.applyChanges({'binding:n:value':'31'});
         await settle();assert.equal(pending.length,0);postingResolve();await settle();
@@ -271,15 +286,21 @@ if(SCENARIO.startsWith('mounted')){
     host.destroy();
 }
 if(SCENARIO.startsWith('relay')){
-    let queue={ok:true,pending:SCENARIO==='relay-retry-idle'?[]:[{request_id:'r',prompt_hash:'before',changes:{'binding:n:value':'31'}}],controls_visible:true,controls_view_seq:1,
+    const expected=SCENARIO==='relay-stale-expected'?{workflow:'wf',targets:{'binding:n:value':{targets:[['3','n']],prior:'30'}}}:null;
+    let queue={ok:true,pending:SCENARIO==='relay-retry-idle'?[]:[{request_id:'r',prompt_hash:'before',changes:{'binding:n:value':'31'},...(expected?{expect:expected}:{})}],controls_visible:true,controls_view_seq:1,
         controls_manage:SCENARIO==='relay-manage',controls_filter:SCENARIO==='relay-manage'?'cfg':''};
     let hash='before',writes=0,puts=0,failPut=['relay-retry','relay-retry-idle','relay-owner-observation'].includes(SCENARIO),published=null;
     const callbacks=new Set();
     const managed=[];
     let canvasView=controlsView;
     const host={getView:()=>canvasView,setMountedVisible(){},setMountedManage(on,filter){managed.push([on,filter]);},refresh:async()=>controlsView,getPromptHash:async()=>hash,
-        subscribe(cb){callbacks.add(cb);return()=>callbacks.delete(cb);},async applyChanges(changes,options){assert.equal(await options.canApply(),true);assert.equal(options.expectedPromptHash,hash);writes++;hash='after';return{ok:true,rejected:[]};}};
-    if(SCENARIO==='relay-stale')hash='external';
+        subscribe(cb){callbacks.add(cb);return()=>callbacks.delete(cb);},expectsAll:(changes,expect)=>Object.keys(changes).every(k=>Object.hasOwn(expect?.targets||{},k)),
+        async applyChanges(changes,options){assert.equal(await options.canApply(),true);
+            // An edit carrying expectations is checked per target, never by the whole-graph hash.
+            if(expected){assert.deepEqual(options.expect,expected);assert.equal(options.expectedPromptHash,undefined);}
+            else assert.equal(options.expectedPromptHash,hash);
+            writes++;hash='after';return{ok:true,rejected:[]};}};
+    if(SCENARIO==='relay-stale'||SCENARIO==='relay-stale-expected')hash='external';
     const relay=createCanvasControlsRelay({host,identity:()=>({projectId:'P',hostId:'h',sessionId:'canvas'}),connected:()=>true,api:{fetchApi:async(path,init)=>{
         assert.ok(path.startsWith('/sonder-editor/project/P/'));
         if(init.method==='GET')return{ok:true,json:async()=>queue};
@@ -327,6 +348,8 @@ if(SCENARIO.startsWith('relay')){
         assert.equal(writes,1);assert.deepEqual(published.applied,['r']);
     }
     if(SCENARIO==='relay-stale'){assert.equal(writes,0);assert.equal(published.rejected[0].request_id,'r');}
+    // An unrelated save moved the canvas since the tab's view: the edit still lands.
+    if(SCENARIO==='relay-stale-expected'){assert.equal(writes,1);assert.deepEqual(published.applied,['r']);}
     if(SCENARIO==='relay-manage'){assert.deepEqual(managed[0],[true,'cfg']);relay.destroy();assert.deepEqual(managed.at(-1),[false,'']);}
     if(SCENARIO==='relay-ack'){assert.equal(writes,1);assert.deepEqual(published.applied,['r']);assert.equal(published.view_seq,2);}
     if(SCENARIO==='relay-invalid-view'){
@@ -431,7 +454,7 @@ if(SCENARIO==='canvas-http'||SCENARIO==='relay-error-recovery'||SCENARIO==='canv
 }
 console.log('ok');
 '''
-@pytest.mark.parametrize('scenario',['sdk-adopt-status','sdk-adopt-refusal','sdk-lost-answer','sdk-switching','sdk-hold','sdk-switch','sdk-stale-view','sdk-captures','sdk-busy','sdk-manage','mounted-manage','relay-manage','sdk-order','sdk-refusal','sdk-flush','mounted-restore','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','mounted-disconnected','mounted-canvas-reload','mounted-stale-read','relay-invalid-view','relay-listing','relay-retry-idle'])
+@pytest.mark.parametrize('scenario',['sdk-adopt-status','sdk-adopt-refusal','sdk-lost-answer','sdk-switching','sdk-hold','sdk-switch','sdk-stale-view','sdk-captures','sdk-busy','sdk-manage','mounted-manage','relay-manage','sdk-order','sdk-refusal','sdk-flush','mounted-restore','mounted-ack','mounted-post-race','mounted-refusal','mounted-visibility','mounted-order','relay-ack','relay-retry','relay-stale','relay-stale-expected','mounted-expect','sdk-expect','relay-owner-observation','canvas-http','canvas-revoked','relay-error-recovery','relay-too-large','relay-fit','mounted-abandon-restart','mounted-abandon-cleared','mounted-abandon-recreated','mounted-disconnected','mounted-canvas-reload','mounted-stale-read','relay-invalid-view','relay-listing','relay-retry-idle'])
 def test_controls_transport(scenario):
     node=shutil.which('node')
     if not node:pytest.skip('node required for host adapter tests')

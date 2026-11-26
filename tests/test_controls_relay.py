@@ -629,3 +629,23 @@ def test_views_demand_flag_and_view_publication_shape():
             assert not (await publish(broken))['ok'], bad
         assert (await sr.set_controls_visibility(PID, HID, TAB, False, views=False))['controls_views'] is False
     asyncio.run(run())
+
+
+def test_an_edit_expectation_rides_the_pending_row_and_a_malformed_one_never_queues():
+    """The tab's ``expect`` is shape-checked and stored for the canvas to check (control_expectations)."""
+    async def run():
+        await setup()
+        assert (await publish())['ok']
+        expect = {'workflow': 'wf', 'targets': {'binding:steps:value': {'targets': [['6', 'steps']], 'prior': '20'}}}
+        assert (await sr.post_control_changes(PID, HID, TAB, {'binding:steps:value': '30'}, expect=expect))['ok']
+        row = (await pending())['pending'][0]
+        assert row['expect'] == expect and row['changes'] == {'binding:steps:value': '30'}
+        assert 'expect' not in (await sr.post_control_changes(PID, HID, TAB, {'binding:steps:label': 'S'}))
+        assert 'expect' not in (await pending())['pending'][1]
+        for bad in ({'workflow': 'wf', 'targets': {'binding:other:value': {'targets': [], 'prior': 1}}},
+                    {'workflow': 7, 'targets': {}}, {'extra': 1},
+                    {'targets': {'binding:steps:value': {'targets': [['6', 'steps']], 'prior': 'x' * 70000}}}):
+            refused = await sr.post_control_changes(PID, HID, TAB, {'binding:steps:value': '31'}, expect=bad)
+            assert refused['code'] == 'invalid_change' and refused['rejected'][0]['reason']
+        assert len((await pending())['pending']) == 2
+    asyncio.run(run())

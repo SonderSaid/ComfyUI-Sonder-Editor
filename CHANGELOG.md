@@ -16,6 +16,7 @@ a fresh `[Unreleased]` block.
 
 ### Fixed
 - A choice in **Modes** that sets a whole group to **Enabled**, **Muted** or **Bypassed** now sets every node in the group when you click it, including nodes added after you made the choice. Choices made with earlier versions do this too. A choice that sets the group's nodes differently is greyed out after a node joins or leaves the group, until you update it.
+- Changing a setting, a seed's mode or a node switch in Controls, or clicking a choice in **Modes**, right after another change such as the Editor's FPS now saves both. Before, Mount in Tab and fullscreen could refuse it with *The workflow changed*. It is refused only when the same setting or switch was changed elsewhere, or now sets a different input or different nodes, and the row or notice says which. A save that takes more than five seconds shows **Still saving…** and still lands, instead of reporting that it failed.
 - Two ComfyUI servers can have the same project open, for example one for editing and one for generating:
   - Their saves no longer break the project, and an edit made from an older version is refused instead of overwriting the other server's save. Before, the project could stop opening, with the message that its stored data could not be read. Both servers need this version; 0.9.3 and older don't take part.
   - A take that finishes while the other server is saving waits for it.

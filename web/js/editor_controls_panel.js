@@ -24,6 +24,13 @@ import { EDITOR_COLORS as COLORS, FONT, RADIUS, SPACE, TYPE, applyNativeControlT
 let nextPanel = 0;
 let nextDescription = 0;
 const SEED_MODES = ["fixed", "increment", "decrement", "randomize"];
+// A save unanswered this long shows "Still saving…" on its row; it is still awaited.
+export const STILL_SAVING_MS = 5000;
+// How long a run, a Mode click or a switch waits on saves before it is refused.
+// The saves are still tracked after it; only the caller stops waiting.
+export const FLUSH_DEADLINE_MS = 10000;
+// A text this long expects only its inputs, not its value.
+const LONG_PRIOR_CHARS = 16384;
 const editable = d => d.status === "ok" && !d.read_only;
 const identified = d => !!(d.binding_id || d.note_id || d.execution_id);
 const baseOf = d => (d.binding_id ? "binding:" + d.binding_id : d.note_id ? "note:" + d.note_id
@@ -141,6 +148,8 @@ export function mountControlsPanel(container, host) {
     // Target -> reason of its latest refused or unconfirmed save, shown on the row
     // until a newer save of it succeeds or an authoritative view arrives.
     const failed = new Map();
+    // Targets whose save has run past STILL_SAVING_MS: shown, never given up on.
+    const slow = new Set();
     // Cards whose note needs its More/Less overflow check on the next frame.
     const noteChecks = new Set();
     let noteFrame = 0;
@@ -556,10 +565,36 @@ export function mountControlsPanel(container, host) {
         apply: saveLayout,
         notify: warning,
     });
+    // What the row held for `target` when the view drew it.
+    function viewPrior(row, target) {
+        if (target.endsWith(":seed_mode")) return row.spec?.seed_mode;
+        if (row.spec?.source === "execution") return row.spec.mode;
+        return row.spec?.value;
+    }
+    // What a value edit expects to find (server/control_expectations.py): the
+    // inputs the row was drawn with and what it held. Presentation edits send
+    // none and keep the writer's whole-workflow check.
+    function expectationFor(spec, target, prior) {
+        spec = spec || {};
+        const field = target.slice(target.lastIndexOf(":") + 1);
+        if (spec.source === "execution") {
+            if (field !== "mode" || !["enabled", "muted", "bypassed", "mixed"].includes(prior)) return null;
+            return { prior, members: (spec.members || []).map(m => String(m.path)) };
+        }
+        if (spec.source !== "binding" || !["value", "seed_mode"].includes(field)) return null;
+        const targets = (spec.targets || []).map(t => [String(t.path), String(t.input)]);
+        if (!targets.length) return null;
+        // A row list sends the rows it started from (`{rows, base}`), which the server checks.
+        // A long text goes without its prior (the server caps an expectation at
+        // 64 KiB): only its inputs are compared.
+        const long = typeof prior === "string" && prior.length > LONG_PRIOR_CHARS;
+        return (spec.kind === "ROWS" && field === "value") || long ? { targets } : { targets, prior };
+    }
     function commit(row, target, value, before) {
         const token = (row.mutations.get(target)?.token || 0) + 1;
         row.mutations.set(target, { token, pending: true });
         failed.delete(target);
+        slow.delete(target);
         const optimisticKey =
             target === row.target
                 ? "optimistic"
@@ -571,26 +606,37 @@ export function mountControlsPanel(container, host) {
                       ? "advancedOptimistic"
                       : "noteOptimistic";
         row[optimisticKey] = value;
-        let timer;
-        const actual = Promise.resolve().then(() => host.applyChanges({ [target]: value }));
+        // The baseline: an earlier edit of this target from this panel that no
+        // view has shown since decides it, once its answer is in (its value if
+        // saved, else what it expected), so rapid edits build on each other.
+        const workflow = typeof host.getView?.()?.workflow_id === "string" ? host.getView().workflow_id : "";
+        row.saves ||= new Map();
+        const last = row.saves.get(target);
+        const save = { value, prior: viewPrior(row, target), done: false, superseded: false };
+        const base = last && !last.superseded
+            ? last.settled.then(result => (result?.ok ? last.value : last.prior))
+            : Promise.resolve(save.prior);
+        // The inputs are the ones the gesture saw, even when the send waits.
+        const gestureSpec = row.spec;
+        const actual = base.then(prior => {
+            save.prior = prior;
+            const expected = expectationFor(gestureSpec, target, prior);
+            return host.applyChanges({ [target]: value },
+                expected ? { expect: { workflow, targets: { [target]: expected } } } : undefined);
+        });
+        save.settled = actual.catch(() => ({ ok: false })).then(result => { save.done = true; return result; });
+        row.saves.set(target, save);
+        // Past STILL_SAVING_MS the row says so and the save is still tracked:
+        // a slow answer is not a failed one.
+        const timer = setTimeout(() => {
+            if (destroyed || token !== row.mutations.get(target)?.token) return;
+            slow.add(target);
+            render();
+        }, STILL_SAVING_MS);
         const work = (async () => {
             let result;
             try {
-                result = await Promise.race([
-                    actual,
-                    new Promise(resolve => {
-                        timer = setTimeout(
-                            () =>
-                                resolve({
-                                    ok: false,
-                                    rejected: [
-                                        { target, reason: "The change was not confirmed. Try again once connected." },
-                                    ],
-                                }),
-                            5000,
-                        );
-                    }),
-                ]);
+                result = await actual;
             } catch (error) {
                 result = {
                     ok: false,
@@ -598,16 +644,22 @@ export function mountControlsPanel(container, host) {
                 };
             }
             clearTimeout(timer);
+            // Only this edit's own notice: a newer edit of the target may be slow too.
+            if (token === row.mutations.get(target)?.token) slow.delete(target);
             if (
                 destroyed ||
                 (validTargets && !validTargets.has(target)) ||
                 token !== row.mutations.get(target)?.token
             ) {
+                // A newer edit of this target owns the row: an older answer never repaints it.
+                if (!destroyed) render();
                 return true;
             }
             row.mutations.get(target).pending = false;
             if (!result.ok) {
-                failed.set(target, result.rejected?.[0]?.reason || "The change could not be saved.");
+                const reason = result.rejected?.[0]?.reason || "The change could not be saved.";
+                // Not confirmed: it may have landed, so nothing replays it.
+                failed.set(target, result.unconfirmed ? `Not confirmed: ${reason}` : `Not saved: ${reason}`);
                 row[optimisticKey] = undefined;
                 // A row list keeps its own copy while a field has focus; the
                 // next edit's base must be the stored rows, not the refused ones.
@@ -625,14 +677,6 @@ export function mountControlsPanel(container, host) {
             render();
             return !!result.ok;
         })();
-        // A save confirmed after its timeout is saved; retire the stale warning.
-        actual.then(
-            late => {
-                if (!late?.ok || destroyed || token !== row.mutations.get(target)?.token) return;
-                if (failed.delete(target)) render();
-            },
-            () => {},
-        );
         return track(work, changesRun(target));
     }
     function commitValue(row) {
@@ -1324,13 +1368,14 @@ export function mountControlsPanel(container, host) {
         // A canvas without row widgets shows its notice in place of the rows,
         // so the server's "add at least 1" error would only repeat it.
         const rowsNotice = spec.kind === "ROWS" && spec.rows_unavailable && !capabilities().serverRows;
-        const failure = [row.target, modeTarget, noteTarget, labelTarget, advancedTarget]
-            .map(target => failed.get(target))
-            .find(Boolean);
+        const rowTargets = [row.target, modeTarget, noteTarget, labelTarget, advancedTarget];
+        const failure = rowTargets.map(target => failed.get(target)).find(Boolean);
         // Why a setting is off is on its pill (title and description), not repeated here.
         const status = failure
-            ? `Not saved: ${failure}`
-            : spec.note_truncated
+            ? failure
+            : rowTargets.some(target => slow.has(target))
+              ? "Still saving…"
+              : spec.note_truncated
               ? "Edit this longer note on the canvas."
               : spec.reason ||
                 (rowsNotice ? "" : spec.error) ||
@@ -1505,6 +1550,13 @@ export function mountControlsPanel(container, host) {
                 for (const target of [...failed.keys()]) {
                     const owner = [...rows.values()].find(row => row.mutations.get(target)?.pending);
                     if (!owner) failed.delete(target);
+                }
+                // A view newer than a settled save is the next edit's baseline.
+                // Not one the canvas marked stale: it may predate that save.
+                if (!view.view_stale) {
+                    for (const row of rows.values()) for (const save of row.saves?.values() || []) {
+                        if (save.done) save.superseded = true;
+                    }
                 }
             }
         }
@@ -1771,9 +1823,21 @@ export function mountControlsPanel(container, host) {
         const mirror = mirrors.find(m => m.input === document.activeElement);
         if (mirror) mirror.input.blur();
         const savingNow = [...pending];
-        await closing;
-        await Promise.all(savingNow);
-        return (await Promise.all(blocking)).every(Boolean);
+        let timer;
+        const deadline = new Promise(resolve => { timer = setTimeout(() => resolve(false), FLUSH_DEADLINE_MS); });
+        try {
+            const settled = await Promise.race([
+                (async () => {
+                    await closing;
+                    await Promise.all(savingNow);
+                    return (await Promise.all(blocking)).every(Boolean);
+                })(),
+                deadline,
+            ]);
+            return settled;
+        } finally {
+            clearTimeout(timer);
+        }
     }
     const unsubscribe = host.subscribe(view => render(view));
     render();

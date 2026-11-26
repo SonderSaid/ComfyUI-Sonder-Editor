@@ -1110,18 +1110,39 @@ async def publish_controls_view(project_id: str, host_id: str, session_id: str, 
     return result
 
 
-async def post_control_changes(project_id: str, host_id: str, session_id: str, changes: Any) -> dict:
+def _clean_control_expect(raw: Any, changes: Any) -> dict | None:
+    """The tab's ``{workflow, targets}`` expectation, shape-checked. The canvas
+    checks it against its fresh view (control_expectations); never this
+    publication, which may trail the canvas."""
+    from . import control_expectations
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) - {"workflow", "targets"}:
+        raise control_descriptors.ControlValueError("Invalid expected state.")
+    workflow = raw.get("workflow", "")
+    if not isinstance(workflow, str) or len(workflow) > 128:
+        raise control_descriptors.ControlValueError("Invalid expected state.")
+    return {"workflow": workflow, "targets": control_expectations.clean(raw.get("targets") or {}, changes)}
+
+
+async def post_control_changes(project_id: str, host_id: str, session_id: str, changes: Any, *,
+                               expect: Any = None) -> dict:
+    try:
+        expected = _clean_control_expect(expect, changes)
+    except control_descriptors.ControlValueError as exc:
+        return {"ok": False, "code": "invalid_change", "rejected": [{"target": "", "reason": str(exc)}]}
     # Validation runs off the loop, so a publication (often the previous edit's
     # acknowledgement) can land meanwhile. Revalidate against the newer view a
     # few times rather than refusing an edit the tab could not have avoided.
     for _attempt in range(CONTROLS_POST_ATTEMPTS):
-        result = await _post_control_changes_once(project_id, host_id, session_id, changes)
+        result = await _post_control_changes_once(project_id, host_id, session_id, changes, expected)
         if result.get("code") != "stale_view":
             return result
     return result
 
 
-async def _post_control_changes_once(project_id: str, host_id: str, session_id: str, changes: Any) -> dict:
+async def _post_control_changes_once(project_id: str, host_id: str, session_id: str, changes: Any,
+                                     expected: dict | None = None) -> dict:
     key, events = _host_key(project_id, host_id), []
     async with _lock:
         code = _controls_gate_locked(key, session_id, "tab", events)
@@ -1159,7 +1180,8 @@ async def _post_control_changes_once(project_id: str, host_id: str, session_id: 
             rid = uuid.uuid4().hex
             # The canvas reads this row; it only compares two rows for equality.
             state["pending"].append({"request_id": rid, "session_tag": session_tag(session_id),
-                                     "view_seq": seq, "prompt_hash": state["prompt_hash"], "changes": cleaned})
+                                     "view_seq": seq, "prompt_hash": state["prompt_hash"], "changes": cleaned,
+                                     **({"expect": expected} if expected else {})})
             result = {"ok": True, "request_id": rid}
             events.append((key[0], {"type": "control_changes_pending", "project_id": key[0], "host_id": key[1]}))
     _schedule_events(events)

@@ -176,10 +176,12 @@ export function createCanvasControlsHost({app, api, getEditorNode,
     // Each describe takes a number when it starts; `adopted` is the newest one
     // adopted, so freshView can tell a read started after its call.
     let readSerial = 0, adopted = 0;
+    // The workflow an edit's expectation is bound to (control_expectations.py).
+    const workflowId = () => String(rootGraph()?.id ?? "");
     const adopt = (raw, started) => {
         // Canvas seeds follow the native mode; the export mirrored it.
         const bindings = raw.bindings || [];
-        view = {...raw, bindings, state: "ready", error: raw.error || null};
+        view = {...raw, bindings, state: "ready", error: raw.error || null, workflow_id: workflowId()};
         adopted = Math.max(adopted, started);
         notify();
     };
@@ -588,32 +590,61 @@ export function createCanvasControlsHost({app, api, getEditorNode,
         if (live) anchors.push(() => { setAnchor(live.node, live.name, id); return [live.node]; });
     }
 
-    async function write(changes, { expectedPromptHash = null, canApply = () => true } = {}) {
+    // Whether every change carries what its gesture saw. Only then may an
+    // unrelated graph edit (an Editor save) be validated past instead of
+    // refused: the server compares each target with that expectation.
+    const expectsAll = (changes, expect) => !!expect?.targets && typeof expect.targets === "object"
+        && Object.keys(changes || {}).length > 0
+        && Object.keys(changes).every(target => Object.hasOwn(expect.targets, target));
+    // Validate-to-write tries when the graph moves between them.
+    const EXPECTED_ATTEMPTS = 3;
+
+    async function write(changes, { expectedPromptHash = null, canApply = () => true, expect = null } = {}) {
         if (destroyed) return refused(changes, "The Controls panel has closed.");
         const id = identity();
         epoch++; // a passive read in flight must not land a pre-write view
         try {
-            const shot = await snapshot(id);
-            if (!sameGraph(id)) return refused(changes, "The workflow changed. Try again.");
-            if (!await canApply() || !sameGraph(id) || (expectedPromptHash && await promptHash(shot.graphHash) !== expectedPromptHash)) {
-                return refused(changes, "The workflow changed. Try again.");
+            const expecting = expectsAll(changes, expect);
+            if (expecting && expect.workflow && expect.workflow !== workflowId()) {
+                return refused(changes, "This edit was made on another workflow.");
             }
-            const raw = await describe(shot, changes, {candidates: batchCandidates(changes, id.root),
-                execution_candidates: batchExecutionCandidates(changes, id.root)});
-            if (!sameGraph(id) || (await snapshot(id)).graphHash !== shot.graphHash || !sameGraph(id)) {
-                return refused(changes, "The workflow changed. Try again.");
+            let shot = null, raw = null;
+            for (let attempt = 1; ; attempt++) {
+                const moved = () => attempt < (expecting ? EXPECTED_ATTEMPTS : 1) ? null
+                    : refused(changes, "The workflow changed. Try again.");
+                shot = await snapshot(id);
+                if (!sameGraph(id)) return refused(changes, "The workflow changed. Try again.");
+                // A whole-graph precondition only where no target says what it expects.
+                if (!await canApply() || !sameGraph(id)
+                    || (!expecting && expectedPromptHash && await promptHash(shot.graphHash) !== expectedPromptHash)) {
+                    return refused(changes, "The workflow changed. Try again.");
+                }
+                raw = await describe(shot, changes, {candidates: batchCandidates(changes, id.root),
+                    execution_candidates: batchExecutionCandidates(changes, id.root),
+                    ...(expecting ? {expect: expect.targets} : {})});
+                if (!sameGraph(id)) return refused(changes, "The workflow changed. Try again.");
+                if ((await snapshot(id)).graphHash !== shot.graphHash || !sameGraph(id)) {
+                    const stop = moved();
+                    if (stop) return stop;
+                    continue; // validated against a graph that has since moved: again, on the new one
+                }
+                if (!raw.ok) {
+                    // A refusal can mean the panel's view is behind the graph (a
+                    // row list changed natively): re-read it so a retry starts there.
+                    schedule();
+                    return {ok: false, rejected: raw.rejected || []};
+                }
+                if (!await canApply()) return refused(changes, "This tab no longer owns the editor.");
+                // An asynchronous permission check can overlap a native graph edit.
+                if (!sameGraph(id)) return refused(changes, "The workflow changed. Try again.");
+                if ((await snapshot(id)).graphHash !== shot.graphHash || !sameGraph(id)) {
+                    const stop = moved();
+                    if (stop) return stop;
+                    continue;
+                }
+                break;
             }
-            if (!raw.ok) {
-                // A refusal can mean the panel's view is behind the graph (a
-                // row list changed natively): re-read it so a retry starts there.
-                schedule();
-                return {ok: false, rejected: raw.rejected || []};
-            }
-            if (!await canApply()) return refused(changes, "This tab no longer owns the editor.");
-            // An asynchronous permission check can overlap a native graph edit.
-            if (!sameGraph(id) || (await snapshot(id)).graphHash !== shot.graphHash || !sameGraph(id)) {
-                return refused(changes, "The workflow changed. Try again.");
-            }
+            // No await from here to the write: it lands on the graph it validated.
             const {writes, anchors, modes} = operations(raw, raw.changes, id.root);
             const tracker = getChangeTracker();
             if (typeof tracker?.captureCanvasState !== "function") throw new Error("Workflow history is unavailable.");
@@ -721,6 +752,8 @@ export function createCanvasControlsHost({app, api, getEditorNode,
             }, options);
         },
         getPromptHash: async () => promptHash((await snapshot(identity())).graphHash),
+        // A mounted request may skip the whole-graph hash only when this holds.
+        expectsAll,
         applyChanges(changes, options) {
             const owned = { ...changes };
             const run = writeTail.then(() => write(owned, options));

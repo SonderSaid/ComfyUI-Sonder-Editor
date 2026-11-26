@@ -5,6 +5,7 @@ import copy
 
 from . import control_manifest as cm
 from . import control_descriptors as cd
+from . import control_expectations
 from . import control_rows
 
 
@@ -437,7 +438,9 @@ def preset_projection(view, presets, categories=None, *, origins=None, category_
         built[identity] = {"id": identity, "name": preset["name"], "description": preset["description"],
                            "order": preset["order"], "origin": (origins or {}).get(identity, "workflow"),
                            "state": state, "members": members, "execution": execution, "unavailable": unavailable,
-                           "reason": reason or (_refused_reason(view, rejected) if rejected else "")}
+                           "reason": reason or (_refused_reason(view, rejected) if rejected else ""),
+                           # What a click expects to apply (control_expectations): its whole live effect.
+                           "token": None if reason else control_expectations.choice_token(changes, view)}
     for identity, preset in presets.items():
         if preset.get("includes"):
             built[identity]["includes"] = [{

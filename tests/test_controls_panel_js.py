@@ -47,8 +47,8 @@ globalThis.document={createElement:t=>new El(t),createTextNode:t=>new El('#TEXT'
 document.activeElement=document.body;
 globalThis.Option=class extends El{constructor(text,value){super('option',text);this.value=value;}};
 globalThis.Event=class{constructor(type){this.type=type;}};
-const timeoutCalls=[];const nativeTimeout=setTimeout;
-globalThis.setTimeout=(f,ms)=>ms===5000?(timeoutCalls.push(f),timeoutCalls.length):nativeTimeout(f,ms);
+const timeoutCalls=[],deadlineCalls=[];const nativeTimeout=setTimeout;
+globalThis.setTimeout=(f,ms)=>ms===5000?(timeoutCalls.push(f),timeoutCalls.length):ms===10000?(deadlineCalls.push(f),-deadlineCalls.length):nativeTimeout(f,ms);
 const {renderPanelMarkdown}=await import(MARKDOWN_URL);
 const {mountControlsPanel}=await import(PANEL_URL);
 const walk=n=>[n,...n.children.flatMap(walk)];
@@ -64,13 +64,13 @@ if(SCENARIO==='markdown'){
         {source:'binding',binding_id:'seed',label:'Seed',kind:'SEED',value:'9',seed_mode:'fixed',note:'',status:'ok',order:3,group:'Advanced',section:'workflow'},
         {source:'binding',binding_id:'adv',label:'Advance',kind:'BOOLEAN',value:false,note:'',status:'ok',order:0,group:'',section:'editor'}],
         notes:[{source:'note',note_id:'intro',text:'# Intro',status:'ok',order:0,group:''}]};
-    const calls=[],notices=[],settingWrites=[],listeners=new Set();
+    const calls=[],opts=[],notices=[],settingWrites=[],listeners=new Set();
     const settings={render:{takePlacementMuted:false,linkedTakePlacement:true},batchRender:{maxFramesPerChunk:121},
         layout:{scaleControls:1},controls:{view:'rows',showAdvanced:false,showNotes:true}};
-    let refuse=false,defer=false,resolveWrite=null,refuseSetting=false;
+    let refuse=false,defer=false,resolveWrite=null,refuseSetting=false,unconfirmed=false;
     const host={getView:()=>view,subscribe(cb){listeners.add(cb);return()=>listeners.delete(cb);},getEditorSettings:()=>settings,
         setEditorSetting(k,v){settingWrites.push([k,v]);if(refuseSetting)throw Error('setting refused');const [s,n]=k.split('.');settings[s][n]=v;},notify:m=>notices.push(m),
-        async applyChanges(changes){calls.push(changes);if(defer)await new Promise(r=>resolveWrite=r);return refuse?{ok:false,rejected:[{reason:'server refusal'}]}:{ok:true,rejected:[]};}};
+        async applyChanges(changes,options){calls.push(changes);opts.push(options);if(defer)await new Promise(r=>resolveWrite=r);return unconfirmed?{ok:false,unconfirmed:true,rejected:[{reason:'The change could not be confirmed.'}]}:refuse?{ok:false,rejected:[{reason:'server refusal'}]}:{ok:true,rejected:[]};}};
     if(SCENARIO==='initial-error')view={...view,state:'error',error:'cached read failed'};
     // Lane and folder pickers (plans/bridge-selections-controls.md, D): the host's
     // picker sources stand in for controls_picker_sources.js.
@@ -515,9 +515,22 @@ if(SCENARIO==='markdown'){
         if(SCENARIO==='cancel'){assert.equal(calls.length,0);assert.equal(note('note:intro:text').textContent,'Intro');}
         else assert.deepEqual(calls,[{'note:intro:text':'# Edited'}]);
     }
-    if(SCENARIO==='refusal'||SCENARIO==='timeout'||SCENARIO==='initial-error'){
-        refuse=SCENARIO!=='timeout';defer=SCENARIO==='timeout';const el=input('binding:steps:value');el.focus();el.value='33';
-        const flush=panel.flushPending();await settle();if(defer)timeoutCalls.at(-1)();assert.equal(await flush,false);assert.equal(el.value,'20');assert.equal(notices.length,1);resolveWrite?.();
+    if(SCENARIO==='refusal'||SCENARIO==='initial-error'){
+        refuse=true;const el=input('binding:steps:value');el.focus();el.value='33';
+        const flush=panel.flushPending();await settle();assert.equal(await flush,false);assert.equal(el.value,'20');assert.equal(notices.length,1);
+    }
+    if(SCENARIO==='timeout'){
+        // A slow save says so and is still awaited: the flush waits for its answer.
+        defer=true;const el=input('binding:steps:value');el.focus();el.value='33';
+        let settled=false;const flush=panel.flushPending().then(ok=>{settled=true;return ok;});await settle();
+        timeoutCalls.at(-1)();await settle();
+        assert.match(byTarget('binding:steps:value').textContent,/Still saving…/);assert.equal(el.value,'33');assert.equal(settled,false);assert.equal(notices.length,0);
+        // A run waits only so long: the flush gives up, the save goes on.
+        deadlineCalls.at(-1)();assert.equal(await flush,false);
+        assert.match(byTarget('binding:steps:value').textContent,/Still saving…/);
+        resolveWrite();await settle();
+        assert.equal(el.value,'33');assert.doesNotMatch(byTarget('binding:steps:value').textContent,/Still saving|Not saved/);assert.equal(notices.length,0);
+        assert.equal(await panel.flushPending(),true);
     }
     if(SCENARIO==='flush'){
         const el=input('binding:steps:value');el.focus();el.value='32';assert.equal(await panel.flushPending(),true);assert.deepEqual(calls,[{'binding:steps:value':'32'}]);
@@ -549,11 +562,37 @@ if(SCENARIO==='markdown'){
         publish({...view});await settle();assert.doesNotMatch(byTarget('binding:steps:value').textContent,/Not saved/);
     }
     if(SCENARIO==='late-success'){
+        // Past five seconds the save is still the one tracked; its answer settles the row.
         defer=true;const el=input('binding:steps:value');el.focus();el.value='33';key('Enter');await settle();
-        timeoutCalls.at(-1)();await settle();assert.match(byTarget('binding:steps:value').textContent,/Not saved: The change was not confirmed/);
-        // The save lands after its warning: it is saved, and nothing blocks a run.
-        resolveWrite();await settle();assert.doesNotMatch(byTarget('binding:steps:value').textContent,/Not saved/);
-        assert.equal(await panel.flushPending(),true);
+        timeoutCalls.at(-1)();await settle();assert.match(byTarget('binding:steps:value').textContent,/Still saving…/);
+        resolveWrite();await settle();assert.doesNotMatch(byTarget('binding:steps:value').textContent,/Still saving|Not saved/);
+        assert.equal(await panel.flushPending(),true);assert.equal(calls.length,1);
+    }
+    if(SCENARIO==='unconfirmed'){
+        // A lost answer: the row says Not confirmed and nothing is sent again.
+        unconfirmed=true;const el=input('binding:steps:value');el.focus();el.value='33';key('Enter');await settle();
+        assert.match(byTarget('binding:steps:value').textContent,/Not confirmed: The change could not be confirmed/);
+        assert.equal(el.value,'20');assert.equal(calls.length,1);await settle();assert.equal(calls.length,1);
+    }
+    if(SCENARIO==='expectations'){
+        // Each value edit says what its row held and which inputs it sets; a second
+        // edit of the same field waits for the first and builds on its answer.
+        publish({...view,workflow_id:'wf-1',bindings:view.bindings.map(d=>({...d,targets:[{path:'6',input:d.binding_id}]}))});await settle();
+        defer=true;const el=input('binding:steps:value');el.focus();el.value='25';key('Enter');await settle();
+        assert.deepEqual(opts[0],{expect:{workflow:'wf-1',targets:{'binding:steps:value':{targets:[['6','steps']],prior:'20'}}}});
+        el.focus();el.value='31';key('Enter');await settle();assert.equal(calls.length,1,'the second waits for the first answer');assert.equal(el.value,'31');
+        resolveWrite();await settle();
+        assert.equal(calls.length,2);assert.equal(opts[1].expect.targets['binding:steps:value'].prior,'25');
+        // Refused: the next edit expects what the refused one expected.
+        refuse=true;resolveWrite();await settle();refuse=false;
+        el.focus();el.value='40';key('Enter');await settle();
+        assert.equal(opts[2].expect.targets['binding:steps:value'].prior,'25');resolveWrite();await settle();
+        // A view shown after the answers is the baseline again.
+        publish({...view,workflow_id:'wf-1',bindings:view.bindings.map(d=>({...d,value:d.binding_id==='steps'?'40':d.value,targets:[{path:'6',input:d.binding_id}]}))});await settle();
+        el.focus();el.value='41';key('Enter');await settle();assert.equal(opts[3].expect.targets['binding:steps:value'].prior,'40');resolveWrite();await settle();
+        // A seed's mode expects its mode.
+        defer=false;const mode=walk(byTarget('binding:seed:value')).find(n=>n.tagName==='SELECT');mode.value='increment';mode.dispatch('change');await settle();
+        assert.deepEqual(opts.at(-1).expect.targets['binding:seed:seed_mode'],{targets:[['6','seed']],prior:'fixed'});
     }
     if(SCENARIO==='note-refusal'){
         note('note:intro:text').dispatch('dblclick');walk(note('note:intro:text')).find(n=>n.tagName==='TEXTAREA').value='# Edited';
@@ -1096,7 +1135,7 @@ if(SCENARIO==='markdown'){
 console.log('ok');
 '''
 
-@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','notes-hidden','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app','pickers','note-titles','switches','tooltips'])
+@pytest.mark.parametrize('scenario',['value-title','editor-reorder','restore-notice','restore-all','description','group-editor-name','editor-focus-refresh','normal-view','manage','manage-sdk','manage-flush','hide-flush','combo-select-focus','combo-focus-return','combo-capped-keyboard','combo-capped-exact','combo-capped-current','combo-capped-filter','combo-query','layout','layout-refusal','layout-stale','layout-editor','combo','combo-capped','combo-ime','markdown','grouping','focus','focus-after-change','focus-after-refusal','metadata','cancel','note-save','ime','refusal','timeout','initial-error','flush','mode','cross-target-refusal','removed-failure','removed-pending','truncated','refusal-then-generate','late-success','unconfirmed','expectations','note-refusal','problem-statuses','loading','note-then-value','batch-mirror','search','advanced','notes-hidden','advanced-refusal','hidden-pending','cards-scale','group-note','groups-manage','groups-cap','rows','rows-notice','rows-app','pickers','note-titles','switches','tooltips'])
 def test_controls_panel(scenario, tmp_path):
     node=shutil.which('node')
     if not node:pytest.skip('node required for Controls renderer boundary tests')

@@ -88,11 +88,13 @@ export function createSdkControlsHost(owner) {
     const controlsPath = () =>
         owner._sessionPath("controls") +
         (manage.on ? `?manage=1&filter=${encodeURIComponent(manage.filter)}` : "");
-    const request = async (method, changes, templateId) => {
+    const request = async (method, changes, templateId, expect = null) => {
         const response = await owner._fetch(controlsPath(), {
             method,
             headers: owner.headers(method !== "GET"),
-            ...(changes ? { body: JSON.stringify({ changes, template_id: templateId }) } : {}),
+            // The template id binds the edit to its workflow; `expect` to what each target held.
+            ...(changes ? { body: JSON.stringify({ changes, template_id: templateId,
+                ...(expect?.targets ? { expect: expect.targets } : {}) }) } : {}),
         });
         const payload = await response.json();
         const result = { ok: response.ok, status: response.status, payload };
@@ -179,7 +181,7 @@ export function createSdkControlsHost(owner) {
                 return adoptions > before ? next : null;
             }, options);
         },
-        applyChanges(changes) {
+        applyChanges(changes, { expect = null } = {}) {
             const owned = { ...changes };
             // The workflow this edit was made on, whatever happens while it queues.
             const templateId = owner.templateId;
@@ -188,7 +190,7 @@ export function createSdkControlsHost(owner) {
                 if (destroyed || !owner.canWrite()) return failure(owned, "This session no longer owns the editor.");
                 epoch++;
                 try {
-                    const result = await request("PUT", owned, templateId);
+                    const result = await request("PUT", owned, templateId, expect);
                     if (destroyed) return failure(owned, "The editor has closed.");
                     if (result.ok) {
                         adopt(result.payload);
@@ -460,7 +462,7 @@ export function createMountedControlsHost({
         changed: event => {
             if (!event.host_id || event.host_id === hostId) void refresh();
         },
-        applyChanges(changes) {
+        applyChanges(changes, { expect = null } = {}) {
             const owned = { ...changes };
             const refusal = () => (destroyed ? "The editor has closed." : WRITE_REFUSALS[writeBlock()] || "");
             if (refusal()) return Promise.resolve(failure(owned, refusal()));
@@ -471,7 +473,8 @@ export function createMountedControlsHost({
                         resolve(failure(owned, refusal()));
                         return;
                     }
-                    const result = await mutation("control_changes", { changes: owned });
+                    // The canvas checks `expect` against its own fresh view, not this tab's.
+                    const result = await mutation("control_changes", { changes: owned, ...(expect ? { expect } : {}) });
                     if (destroyed) {
                         resolve(failure(owned, "The editor has closed."));
                         return;

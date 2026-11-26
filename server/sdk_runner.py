@@ -45,7 +45,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import control_descriptors, controls_snapshot, launcher_state, prompt_graph, run_control, run_feedback, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry, validation_refusal
+from . import control_descriptors, control_expectations, controls_snapshot, launcher_state, prompt_graph, run_control, run_feedback, sdk_proxy, sdk_progress, sdk_runs, sdk_templates, session_registry, validation_refusal
 from .control_manifest import RELAY_CLASS_TYPE
 from .editor_inputs import clean_editor_value, clean_editor_values, editor_optional_inputs
 from .sdk_install import install_state, uninstall_running
@@ -779,7 +779,8 @@ class SdkRunner:
                            template_id=session.template_id)
 
     async def change_controls(self, session_id: str, secret: str, tab_session_id: str, changes: Any, *,
-                              manage: bool = False, query: str = "", expected_template_id: Any = None) -> dict:
+                              manage: bool = False, query: str = "", expected_template_id: Any = None,
+                              expect: Any = None) -> dict:
         session = await self.authorized(session_id, secret, tab_session_id)
         template_id = session.template_id
         self._check_workflow(session, template_id, expected_template_id)
@@ -797,6 +798,13 @@ class SdkRunner:
             cleaned, rejected = await asyncio.to_thread(
                 control_descriptors.validate_binding_changes, snapshot["view"], changes, prompt=snapshot["prompt"],
                 structural="sdk", inventory=inventory)
+            if not rejected and expect is not None:
+                # Checked under the template lock, against the view this batch validated against.
+                try:
+                    rejected = control_expectations.check(snapshot["view"], changes,
+                                                          control_expectations.clean(expect, changes))
+                except control_descriptors.ControlValueError as exc:
+                    rejected = [{"target": "", "reason": str(exc)}]
             if rejected:
                 raise SdkError("Some changes could not be saved.", "invalid_change", 400, rejected=rejected)
             await self.authorized(session_id, secret, tab_session_id)

@@ -403,7 +403,7 @@ def register_sdk_routes(
         body = body if isinstance(body, dict) else {}
         snapshot = await runner.change_controls(
             session_id, _secret(request), _tab(request), body.get("changes"),
-            manage=manage, query=query, expected_template_id=body.get("template_id"))
+            manage=manage, query=query, expected_template_id=body.get("template_id"), expect=body.get("expect"))
         view = await asyncio.to_thread(control_descriptors.json_safe, snapshot["view"])
         return web.json_response({"ok": True, "view": view, "seq": snapshot["seq"], "template_id": snapshot["template_id"]})
 

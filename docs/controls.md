@@ -30,6 +30,10 @@ Click a value and change it. A seed shows its mode beside it. To read what a
 setting does, hold the
 pointer over its name: the node's own help appears under it.
 
+If the same setting was changed somewhere else after you last saw it, on the
+canvas or in another tab, your change is not saved: the setting shows the
+newer value and says so under it. Change it again if you still want yours.
+
 A small line near the top of the Controls tab, under the search box (and
 under the **Modes** table when the workflow has one), hides what you don't
 need:

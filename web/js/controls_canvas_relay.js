@@ -287,7 +287,11 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
                         allowedHashes.add(hash);
                         lastHash = hash;
                     }
-                    if (!allowedHashes.has(pending.prompt_hash) && pending.prompt_hash !== hash) {
+                    // An edit that says what each target expected is checked per
+                    // target on the canvas's fresh view, so an unrelated save since
+                    // the tab's view (an Editor FPS change) doesn't refuse it.
+                    const expecting = !!pending.expect && !!host.expectsAll?.(pending.changes, pending.expect);
+                    if (!expecting && !allowedHashes.has(pending.prompt_hash) && pending.prompt_hash !== hash) {
                         processed.set(pending.request_id, {
                             ok: false,
                             rejected: Object.keys(pending.changes).map(target => ({
@@ -297,9 +301,9 @@ export function createCanvasControlsRelay({ host, identity, api, connected = () 
                         });
                         continue;
                     }
-                    allowedHashes.add(pending.prompt_hash);
+                    if (!expecting) allowedHashes.add(pending.prompt_hash);
                     const outcome = await host.applyChanges(pending.changes, {
-                        expectedPromptHash: hash,
+                        ...(expecting ? { expect: pending.expect } : { expectedPromptHash: hash }),
                         canApply: async () => {
                             if (!current(stamp, id)) return false;
                             // Registry membership, rather than a delayed owner observation,

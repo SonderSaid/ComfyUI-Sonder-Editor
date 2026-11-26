@@ -320,6 +320,14 @@ def _describe_controls_body(raw: bytes) -> dict:
         cleaned, rejected = control_descriptors.validate_binding_changes(
             view, body["changes"], prompt=readable, structural="canvas", inventory=inventory or [],
             execution_inventory=execution_inventory or [])
+        if not rejected and body.get("expect") is not None:
+            # What the gesture saw: an unrelated save since then passes, the same setting changed does not.
+            from . import control_expectations
+            try:
+                rejected = control_expectations.check(
+                    view, body["changes"], control_expectations.clean(body["expect"], body["changes"]))
+            except control_descriptors.ControlValueError as exc:
+                rejected = [{"target": "", "reason": str(exc)}]
         view.update(ok=not bool(rejected), changes={} if rejected else cleaned, rejected=rejected)
     return control_descriptors.json_safe(view)
 
@@ -12455,7 +12463,8 @@ if routes is not None:
             return _json_error(str(exc), 404)
         body = await _control_relay_body(request)
         payload = await post_control_changes(project_id, str(body.get("host_id") or ""),
-                                            str(body.get("session_id") or ""), body.get("changes"))
+                                            str(body.get("session_id") or ""), body.get("changes"),
+                                            expect=body.get("expect"))
         return await _control_relay_response(payload)
 
     @routes.get("/sonder-editor/project/{project_id}/control_changes")

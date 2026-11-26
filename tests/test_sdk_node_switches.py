@@ -385,3 +385,41 @@ def test_added_members_follow_only_a_switch_whose_recorded_members_were_all_off_
     # A renumbered member (stored as another kind) is neither counted nor new.
     renumbered = {**muted, "9": ("bypassed", "TextNode")}
     assert ce.added_member_modes(switch_, muted, renumbered, ["6", "7"]) == {}
+
+
+def test_an_app_edit_checks_what_it_expected_under_the_template_lock(world):
+    """Another tab's change to the same setting refuses; an unrelated one passes."""
+    install(world, template())
+    session = open_session(world)
+    steps = {"targets": [["6", "steps"]], "prior": "20"}
+    other = asyncio.run(world.runner.change_controls(session.session_id, session.secret, "tab-1",
+                                                    {"binding:steps2:value": "12"}))
+    assert other["view"]
+    # Pass 2's steps changed meanwhile: Pass 1's edit still lands.
+    asyncio.run(world.runner.change_controls(session.session_id, session.secret, "tab-1", {"binding:steps:value": "25"},
+                                             expect={"binding:steps:value": steps}))
+    assert sdk_templates.read_control_values(world.template_id)["bindings"]["steps"]["value"] == 25
+    # Its own setting changed elsewhere (now 25, expected 20): refused, value kept.
+    with pytest.raises(SdkError) as refused:
+        asyncio.run(world.runner.change_controls(session.session_id, session.secret, "tab-1",
+                                                 {"binding:steps:value": "31"}, expect={"binding:steps:value": steps}))
+    assert "changed to 25 elsewhere" in refused.value.payload()["rejected"][0]["reason"]
+    assert sdk_templates.read_control_values(world.template_id)["bindings"]["steps"]["value"] == 25
+    with pytest.raises(SdkError) as malformed:
+        asyncio.run(world.runner.change_controls(session.session_id, session.secret, "tab-1",
+                                                 {"binding:steps:value": "31"}, expect={"binding:steps:value": {"prior": 1}}))
+    assert malformed.value.payload()["rejected"][0]["reason"] == "Invalid expected state."
+
+
+def test_an_app_mode_click_refuses_when_its_group_changed_after_the_click(world):
+    install(world, template(presets={"off": {"name": "Passes off", "members": {}, "execution": {"both": {"modes": {"6": "muted", "7": "muted"}}}}}))
+    session = open_session(world)
+    view = change(world, session, {"binding:steps:value": "21"})["view"]
+    token = next(p for p in view["presets"] if p["id"] == "off")["token"]
+    assert token
+    asyncio.run(world.runner.change_controls(session.session_id, session.secret, "tab-1", {"preset:off:apply": True},
+                                             expect={"preset:off:apply": {"token": token}}))
+    with pytest.raises(SdkError) as refused:
+        asyncio.run(world.runner.change_controls(session.session_id, session.secret, "tab-1", {"preset:off:apply": True},
+                                                 expect={"preset:off:apply": {"token": "0" * 16}}))
+    assert "changed after you clicked it" in refused.value.payload()["rejected"][0]["reason"]
